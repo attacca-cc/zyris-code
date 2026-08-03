@@ -148,7 +148,9 @@ fn truncate(s: &str, limit: usize) -> String {
 }
 
 /// 상자 왼쪽 바깥에 걸친 전각 글자의 앞 절반을 공백으로 바꾼다.
-fn scrub_left_edge(frame: &mut Frame, box_area: Rect) {
+///
+/// 등록 코드 창(`enroll.rs`)도 같은 일을 한다 — 겹쳐 띄우는 창은 다 이 길을 쓴다.
+pub(crate) fn scrub_left_edge(frame: &mut Frame, box_area: Rect) {
     if box_area.x == 0 {
         return;
     }

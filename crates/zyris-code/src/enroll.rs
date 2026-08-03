@@ -1,34 +1,24 @@
-//! 재등록이 일어나는 순간을 알아채고 사람에게 말한다.
+//! 재등록이 일어나는 순간을 알아채고 **코드를 화면에 그린다.**
 //!
-//! **등록 코드는 우리가 못 그린다.** 상류가 stdout에 `println!`으로 찍고
-//! (`zyris::enroll::http`) 값으로 내주는 길이 없다. 한때 `EnrollmentUi`라는 훅을 로컬
-//! zyris에 만들어 썼는데, 그 코드가 어디에도 올라가 있지 않아 워킹트리가 사라지자 이
-//! 리포가 통째로 빌드되지 않았다 — **상류에 없는 API에 기대지 않는다.**
-//!
-//! 그래도 첫 등록은 멀쩡하다. **TUI는 `on_connect`에서 뜨므로** 처음 켤 때는 화면이 아직
-//! 없고, 상류가 찍는 상자가 그대로 터미널에 남는다. 덮어쓸 프레임이 없다.
-//!
-//! 깨지는 것은 **화면이 떠 있는데 재등록이 일어날 때**다(자격이 revoke되거나 리프레시가
-//! 영영 실패한 뒤). ratatui가 다음 프레임에 그 위를 덮어 코드가 한 번 깜박이고 사라진다.
-//! 그때 사람에게는 "아무 일도 안 일어나는 화면"만 남는다.
-//!
-//! 여기서 하는 일은 그 순간을 알아채고 화면에 한 줄 남기는 것뿐이다. 코드를 그리지는
-//! 못해도, **무슨 일이 벌어졌고 무엇을 하면 되는지**는 말할 수 있다.
+//! 상류(zyris)는 `EnrollmentUi` 훅을 제공한다(`Enroller::with_ui`, PR #6). 이 훅에 우리
+//! 화면을 꽂으면, 등록 코드가 stdout 상자로 나가는 대신 `Frame::Enroll`로 화면에 도착한다 —
+//! 예전의 "코드가 화면 뒤 터미널로 새는" 문제가 구조적으로 사라진다. 화면이 없으면
+//! (첫 실행이 화면보다 먼저인 극단) 예전처럼 상자로 찍는다.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
-use async_trait::async_trait;
-use zyris::enroll::CredentialStore;
-use zyris::runtime::credentials::{Credentials, CredentialsError};
+use zyris::enroll::{AuthorizeResponse, CredentialStore, EnrollmentUi, TokenResponse};
+use zyris::runtime::credentials::Credentials;
 
-use crate::app::Frame;
+use crate::app::{EnrollPhase, EnrollView, Frame};
 use crate::tools::bridge::Bridge;
 
 /// 이 노드가 쓸 자격.
 ///
 /// 순서는 상류 `credentials::from_env`와 **같아야 한다** — 사람이 명시한 것이 언제나 이기고,
-/// 사람에게 물어야 하는 등록은 맨 나중이다. 다른 점은 등록 경로를 `Watch`로 감싸는 것
+/// 사람에게 물어야 하는 등록은 맨 나중이다. 다른 점은 등록 경로를 화면과 잇는 것
 /// 하나뿐이다. 저장소를 우리가 만들어 쥐고 있으므로 자격 파일 경로를 짐작할 필요가 없다.
 ///
 /// **스코프는 여기 오기 전에 정해져 있어야 한다.** `Enroller`가 `config.scopes`를 이 자리에서
@@ -55,6 +45,7 @@ pub fn source(
     );
     let store = store as Arc<dyn CredentialStore>;
 
+    // 등록 코드는 이 화면이 그린다. 화면이 없으면 상자로 빠진다(`ScreenEnroll::show`).
     let enroller = zyris::enroll::Enroller::new(
         &config.url,
         config.node_name.clone(),
@@ -62,13 +53,50 @@ pub fn source(
         config.scopes.clone(),
         store.clone(),
     )
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| e.to_string())?
+    .with_ui(Arc::new(ScreenEnroll { bridge: bridge.clone() }));
     let creds: Arc<dyn Credentials> =
         Arc::new(zyris::runtime::credentials::DeviceGrant::new(enroller));
 
-    let creds = Arc::new(Watch::new(creds, store.clone(), bridge.clone()));
     let reauth = Reauth { store, spent: Arc::new(AtomicBool::new(false)) };
     Ok((creds, Some(reauth)))
+}
+
+/// 등록 코드를 화면으로 옮기는 훅. 상류의 폴링 루프가 이 메서드를 부른다.
+///
+/// `show`가 화면에 닿으면 그 순간부터 화면이 표시를 소유한다 — stdout에는 아무것도
+/// 안 나간다. 닿지 않으면(화면이 아직 없거나 이미 죽은 경우) 예전처럼 상자로 찍는다.
+pub struct ScreenEnroll {
+    bridge: Bridge,
+}
+
+impl EnrollmentUi for ScreenEnroll {
+    fn show(&self, response: &AuthorizeResponse) {
+        let view = EnrollView {
+            code: response.user_code.clone(),
+            uri: response.verification_uri.clone(),
+            expires_at: std::time::Instant::now()
+                + Duration::from_secs(response.expires_in.max(0) as u64),
+            phase: EnrollPhase::Waiting,
+        };
+        if !self.bridge.reaches_screen(Frame::Enroll(view)) {
+            // 화면이 없으면 상자로 찍는다 — 예전과 같은 길이다. 훅이 있어도
+            // 첫 실행(화면이 뜨기 전)은 이것이 전부다.
+            println!("{}", zyris::enroll::authorization_notice(response));
+        }
+    }
+
+    fn lapsed(&self) {
+        self.bridge.frame(Frame::EnrollPhase(EnrollPhase::Lapsed));
+    }
+
+    fn denied(&self) {
+        self.bridge.frame(Frame::EnrollPhase(EnrollPhase::Denied));
+    }
+
+    fn authorized(&self, _response: &TokenResponse) {
+        self.bridge.frame(Frame::EnrollDone);
+    }
 }
 
 /// 자격을 버리고 다시 승인받게 하는 손잡이. **프로세스당 한 번만 쓴다.**
@@ -92,8 +120,9 @@ impl Reauth {
 
     /// 자격을 버린다. 실제로 버렸으면 참이다.
     ///
-    /// **지금 도는 연결은 그대로 둔다.** 여기서 끊으면 상류가 등록 코드를 TUI 위에 찍고,
-    /// 사람은 화면이 깨진 채로 코드를 못 본다. 다음에 켤 때 화면 없이 깨끗하게 묻는다.
+    /// **지금 도는 연결은 그대로 둔다.** 여기서 끊으면 상류가 등록을 화면 위에 띄우고,
+    /// 사람은 등록 코드를 **화면에서** 본다 — 예전처럼 터미널로 새지 않는다. 그래도
+    /// 자격은 비워 두므로, 다음에 켤 때(또는 지금 연결이 끊겼다 붙을 때) 깨끗하게 묻는다.
     pub async fn discard_once(&self) -> bool {
         if self.spent.swap(true, Ordering::SeqCst) {
             return false;
@@ -108,96 +137,16 @@ impl Reauth {
     }
 }
 
-/// 화면이 떠 있는 동안 등록 코드가 터미널로 새면 하는 말.
-pub const REENROLLED: &str = "**인증이 만료되어 다시 등록해야 합니다.** 새 등록 코드가 이 \
-     창 뒤 터미널에 찍혔습니다. 화면에 가려 보이지 않으니 zyris-code를 껐다 다시 켜 주세요.";
-
-/// 자격을 감싸 **등록이 임박한 순간**을 알아챈다.
-///
-/// 판정은 하나다: 자격 저장소가 비어 있으면 상류는 등록으로 간다. 저장소를 들고 있으므로
-/// 경로를 짐작할 필요가 없다 — 예전에는 "자격 파일이 있는지"로 코드가 뜰 때를 알아맞히려
-/// 했고, 그건 상류가 무엇을 언제 찍는지 추측하는 일이었다.
-pub struct Watch {
-    inner: Arc<dyn Credentials>,
-    store: Arc<dyn CredentialStore>,
-    bridge: Bridge,
-    /// **한 번만 말한다.** `bearer()`는 dial 직전마다 불리므로, 못 붙는 동안 재시도가
-    /// 도는 내내 같은 줄이 쌓인다.
-    said: AtomicBool,
-}
-
-impl Watch {
-    pub fn new(
-        inner: Arc<dyn Credentials>,
-        store: Arc<dyn CredentialStore>,
-        bridge: Bridge,
-    ) -> Watch {
-        Watch { inner, store, bridge, said: AtomicBool::new(false) }
-    }
-
-    /// 화면이 떠 있는데 등록으로 갈 참이면 한 줄 남긴다.
-    ///
-    /// **화면이 없으면 아무 말도 안 한다.** 그때는 상류의 상자가 그대로 보이고, 그 위에
-    /// 우리 줄을 덧붙이면 상자의 테두리만 흐려진다.
-    async fn warn_if_screen_is_up(&self) {
-        if !self.bridge.has_screen() || self.said.load(Ordering::SeqCst) {
-            return;
-        }
-        // 못 읽는 저장소는 상류도 못 읽는다 — 그쪽도 등록으로 간다(`load_forgiving`).
-        let empty = matches!(self.store.load().await, Ok(None) | Err(_));
-        if empty && !self.said.swap(true, Ordering::SeqCst) {
-            tracing::warn!("화면이 떠 있는 동안 재등록이 시작됐다. 코드는 터미널로 나간다");
-            self.bridge.frame(Frame::Notice(REENROLLED.to_string()));
-        }
-    }
-}
-
-#[async_trait]
-impl Credentials for Watch {
-    async fn bearer(&self) -> Result<String, CredentialsError> {
-        self.warn_if_screen_is_up().await;
-        self.inner.bearer().await
-    }
-
-    async fn refresh(&self) -> Result<bool, CredentialsError> {
-        let refreshed = self.inner.refresh().await;
-        // 리프레시가 자격을 버렸으면 다음 `bearer()`가 등록으로 간다. 그 판정은 저장소를
-        // 다시 읽어 하므로 여기서는 **다시 말할 수 있게 풀어 주기만** 한다.
-        self.said.store(false, Ordering::SeqCst);
-        refreshed
-    }
-
-    fn describe(&self) -> String {
-        self.inner.describe()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use tokio::sync::mpsc;
-    use zyris::enroll::{MemoryCredentialStore, StoredCredential};
+    use zyris::enroll::MemoryCredentialStore;
 
     use crate::app::Action;
 
-    /// 무엇을 하든 자격은 그대로 흘려보낸다. **감시가 인증을 바꾸면 안 된다.**
-    struct Fixed;
-
-    #[async_trait]
-    impl Credentials for Fixed {
-        async fn bearer(&self) -> Result<String, CredentialsError> {
-            Ok("znt_test".to_string())
-        }
-        async fn refresh(&self) -> Result<bool, CredentialsError> {
-            Ok(true)
-        }
-        fn describe(&self) -> String {
-            "고정 토큰".to_string()
-        }
-    }
-
-    fn stored() -> StoredCredential {
-        StoredCredential::new(
+    fn stored() -> zyris::enroll::StoredCredential {
+        zyris::enroll::StoredCredential::new(
             "a".into(),
             "r".into(),
             "n".into(),
@@ -207,53 +156,76 @@ mod tests {
         )
     }
 
+    fn authorize() -> AuthorizeResponse {
+        AuthorizeResponse {
+            device_code: "zdc_secret".into(),
+            user_code: "WXQR-7KBD".into(),
+            verification_uri: "https://attacca.example/settings/zyris/device".into(),
+            expires_in: 600,
+            interval: 5,
+        }
+    }
+
     /// 화면을 붙인 다리와, 그 화면이 받는 통.
-    fn with_screen() -> (Bridge, mpsc::UnboundedReceiver<Action>) {
+    fn with_screen() -> (Bridge, mpsc::UnboundedReceiver<crate::app::AppMsg>) {
         let bridge = Bridge::new();
         let (tx, rx) = mpsc::unbounded_channel();
         bridge.attach(tx);
         (bridge, rx)
     }
 
-    /// **화면이 떠 있는데 자격이 없으면** 코드가 터미널로 새는 것이니 한 줄 남긴다.
-    #[tokio::test]
-    async fn a_reenrollment_behind_the_screen_is_said_out_loud() {
+    /// **화면이 떠 있으면 코드가 화면으로 간다.** stdout으로 새지 않는다.
+    #[test]
+    fn the_code_goes_to_the_screen_when_one_is_up() {
         let (bridge, mut screen) = with_screen();
-        let watch = Watch::new(Arc::new(Fixed), Arc::new(MemoryCredentialStore::new()), bridge);
+        ScreenEnroll { bridge }.show(&authorize());
 
-        assert_eq!(watch.bearer().await.unwrap(), "znt_test");
-        let said = screen.try_recv().expect("한 줄 남겨야 한다");
-        // **무슨 말을 하는지가 요점이다.** 코드를 못 그리는 대신 무엇을 하면 되는지 말한다.
-        assert!(
-            matches!(said, Action::Frame(Frame::Notice(text)) if text.contains("다시 켜")),
-            "다시 켜라는 말이 있어야 한다"
-        );
+        match screen.try_recv().expect("화면에 가야 한다") {
+            (_, Action::Frame(Frame::Enroll(view))) => {
+                assert_eq!(view.code, "WXQR-7KBD");
+                assert_eq!(view.uri, "https://attacca.example/settings/zyris/device");
+                assert_eq!(view.phase, EnrollPhase::Waiting);
+            }
+            other => panic!("등록 프레임이어야 한다: {other:?}"),
+        }
     }
 
-    /// **자격이 있으면 등록으로 안 간다.** 평소의 길에서 말이 나오면 그게 소음이다.
-    #[tokio::test]
-    async fn nothing_is_said_when_the_credential_is_there() {
-        let (bridge, mut screen) = with_screen();
-        let store = Arc::new(MemoryCredentialStore::new());
-        store.save(&stored()).await.unwrap();
-        let watch = Watch::new(Arc::new(Fixed), store, bridge);
-
-        watch.bearer().await.unwrap();
-        assert!(screen.try_recv().is_err(), "평소의 길에서는 조용해야 한다");
-    }
-
-    /// **첫 등록은 화면이 없다**(TUI는 `on_connect`에서 뜬다). 그때는 상류의 상자가 그대로
-    /// 보이므로 우리가 끼어들 이유가 없다.
-    #[tokio::test]
-    async fn the_first_enrollment_has_no_screen_to_warn() {
+    /// **화면이 없으면 상자로 찍는다**(예전 길). 그 자리가 첫 실행의 전부다.
+    #[test]
+    fn without_a_screen_the_code_is_printed() {
         let bridge = Bridge::new();
-        let watch =
-            Watch::new(Arc::new(Fixed), Arc::new(MemoryCredentialStore::new()), bridge.clone());
-        watch.bearer().await.unwrap();
+        // 화면 없이 부르면 stdout으로 상자가 나간다 — 패닉이 없고 다만 그뿐이다.
+        ScreenEnroll { bridge }.show(&authorize());
+    }
 
-        let (tx, mut screen) = mpsc::unbounded_channel();
-        bridge.attach(tx);
-        assert!(screen.try_recv().is_err(), "화면이 붙기 전에 한 말은 아무 데도 안 남는다");
+    /// **만료·거부·승인이 화면에 닿는다.** 조용히 사라지면 사람은 무슨 일인지 모른다.
+    #[test]
+    fn the_outcomes_reach_the_screen() {
+        let (bridge, mut screen) = with_screen();
+        let ui = ScreenEnroll { bridge };
+
+        ui.lapsed();
+        match screen.try_recv().expect("만료가 화면에 가야 한다") {
+            (_, Action::Frame(Frame::EnrollPhase(EnrollPhase::Lapsed))) => {}
+            other => panic!("만료 프레임이어야 한다: {other:?}"),
+        }
+
+        ui.denied();
+        match screen.try_recv().expect("거부가 화면에 가야 한다") {
+            (_, Action::Frame(Frame::EnrollPhase(EnrollPhase::Denied))) => {}
+            other => panic!("거부 프레임이어야 한다: {other:?}"),
+        }
+
+        ui.authorized(&TokenResponse {
+            access_token: "zna_x".into(),
+            refresh_token: "znr_x".into(),
+            expires_in: 3600,
+            scope: String::new(),
+            node_id: "n".into(),
+            node_name: "hello node".into(),
+            owner_email: "allen@example.com".into(),
+        });
+        assert!(matches!(screen.try_recv(), Ok((_, Action::Frame(Frame::EnrollDone)))));
     }
 
     /// **자격은 프로세스당 한 번만 버린다.** 사람이 또 좁게 승인할 수 있는데, 붙을 때마다
@@ -275,17 +247,11 @@ mod tests {
         assert!(reauth.spent(), "해 봤다는 것이 판정에 들어간다");
     }
 
-    /// **한 번만 말한다.** `bearer()`는 dial 직전마다 불리므로, 못 붙는 동안 재시도가 도는
-    /// 내내 같은 줄이 쌓이면 대화가 그것으로 덮인다.
-    #[tokio::test]
-    async fn the_same_warning_is_not_repeated_every_dial() {
-        let (bridge, mut screen) = with_screen();
-        let watch = Watch::new(Arc::new(Fixed), Arc::new(MemoryCredentialStore::new()), bridge);
-
-        watch.bearer().await.unwrap();
-        watch.bearer().await.unwrap();
-        watch.bearer().await.unwrap();
-        assert!(screen.try_recv().is_ok(), "첫 번째는 말한다");
-        assert!(screen.try_recv().is_err(), "그 뒤로는 조용하다");
+    /// **토큰을 직접 준 자리에는 버릴 자격이 없다.** `Reauth`가 없는 것이 그 상태다.
+    #[test]
+    fn a_static_token_has_no_reauth() {
+        // source()가 StaticToken 경로로 빠지면 Some(reauth)가 아니다 — 환경변수를
+        // 흔들 수 없으므로 여기서는 손잡이가 `None`일 수 있다는 계약만 적는다.
+        // 실제 판정은 `conn::missing_scopes` 테스트가 잠근다.
     }
 }

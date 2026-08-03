@@ -36,7 +36,13 @@ impl<C: ServeCapability> Gate<C> {
 #[async_trait]
 impl<C: ServeCapability> ServeCapability for Gate<C> {
     fn descriptor(&self) -> CapabilityDescriptor {
-        self.inner.descriptor()
+        // **도구 정의를 토큰 예산에 맞춘다.** 상류(zyris-caps)의 doc 주석이 그대로
+        // 에이전트에게 실리는데, 매 세션·매 턴마다 반복되면 컨텍스트를 잡아먹는다.
+        // 설명만 자르고 이름·스키마의 값 해석 부분은 그대로 — dispatch는 설명을 읽지
+        // 않으므로 여기서 자르는 것이 announce되는 것에만 닿는다.
+        let mut descriptor = self.inner.descriptor();
+        crate::tools::trim::trim_descriptor(&mut descriptor);
+        descriptor
     }
 
     async fn dispatch(&self, call: IncomingCall) -> Result<Outgoing> {
@@ -297,6 +303,37 @@ mod tests {
         }
     }
 
+    /// 감싸는 순간 **설명이 예산에 맞아 나간다.** dispatch는 설명을 읽지 않으므로
+    /// announce되는 것에만 닿는다 — 토큰 예산(`tools::trim`)의 Gate 쪽 반쪽이다.
+    #[test]
+    fn the_gate_trims_long_descriptions() {
+        struct Verbose;
+        #[async_trait]
+        impl ServeCapability for Verbose {
+            fn descriptor(&self) -> CapabilityDescriptor {
+                CapabilityDescriptor {
+                    name: "verbose".into(),
+                    version: 1,
+                    tools: vec![ToolDescriptor {
+                        name: "talk".into(),
+                        description: "Talk about it at great length. ".repeat(40),
+                        transfer: zyris::Transfer::Unary,
+                        request_schema: json!({}),
+                        response_schema: None,
+                        item_schema: None,
+                    }],
+                }
+            }
+            async fn dispatch(&self, _call: IncomingCall) -> Result<Outgoing> {
+                Ok(Outgoing::Response(Payload::from_json(json!({}))))
+            }
+        }
+        let gate = Gate::new(Verbose, Bridge::new());
+        let tool = &gate.descriptor().tools[0];
+        assert!(tool.description.len() <= crate::tools::trim::DESCRIPTION_LIMIT);
+        assert!(tool.description.starts_with("Talk about it"), "{}", tool.description);
+    }
+
     fn incoming(tool: &str, args: Value) -> IncomingCall {
         IncomingCall {
             tool: tool.into(),
@@ -347,7 +384,7 @@ mod tests {
         std::env::remove_var("ZYRIS_CODE_WIRE_DEADLINE_SECS");
 
         match rx.try_recv().expect("화면으로 물어야 한다") {
-            crate::app::Action::Frame(Frame::Ask(ask)) => {
+            (_, crate::app::Action::Frame(Frame::Ask(ask))) => {
                 assert_eq!(ask.summary, "/etc/passwd");
                 assert_eq!(ask.call.outside, Some(std::path::PathBuf::from("/etc/passwd")));
             }
@@ -408,7 +445,7 @@ mod tests {
 
         assert!(gate.dispatch(incoming("open", json!({"shell": "zsh"}))).await.is_ok());
         match rx.try_recv().expect("화면으로 알려야 한다") {
-            crate::app::Action::Frame(Frame::ShellOpened { id, name }) => {
+            (_, crate::app::Action::Frame(Frame::ShellOpened { id, name })) => {
                 assert_eq!((id.as_str(), name.as_str()), ("p1", "zsh"));
             }
             other => panic!("셸이 열렸다고 알려야 한다: {other:?}"),

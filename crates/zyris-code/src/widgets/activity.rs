@@ -32,36 +32,41 @@ pub fn parts_at(
     state: &State,
     now: std::time::Instant,
 ) -> (ratatui::style::Color, String, &'static str) {
+    let lang = state.lang;
     // 지금 알아야 할 것이 위다. 종료 예고가 무엇보다 먼저다.
     if state.quit_pending() {
-        return (theme::WARNING, "한 번 더 Ctrl+C를 누르면 종료합니다".into(), "");
+        return (theme::WARNING, lang.quit_armed().to_string(), "");
     }
     // 알림은 시간이 지나면 저절로 사라진다 — `State::status`가 그 판정을 한다.
     if let Some(s) = state.status() {
         return (theme::WARNING, s.to_string(), "");
     }
     if !state.connected {
-        return (theme::WARNING, state.lang.connecting().to_string(), "");
+        return (theme::WARNING, lang.connecting().to_string(), "");
     }
     // **"작업 중…"보다 구체적이다.** 명령은 완료될 때 한 번만 결과를 주므로, 무엇이
     // 도는지 여기서 말하지 않으면 사람은 최대 55초를 눈뜬장님으로 기다린다.
     // **멈춰 달라고 말한 뒤가 먼저다.** 서버가 답할 때까지는 "작업 중"이 그대로라,
     // 그걸 계속 보여주면 Ctrl+C가 안 먹은 줄 알고 또 누른다.
     if state.running && state.stopping {
-        return (theme::WARNING, state.lang.stopping().to_string(), state.lang.ctrl_c_quits());
+        return (theme::WARNING, lang.stopping().to_string(), lang.ctrl_c_quits());
     }
     if let Some((_, command, since)) = &state.running_exec {
         let secs = now.saturating_duration_since(*since).as_secs();
-        return (theme::ACCENT, format!("▶ {command}  ·  {secs}초"), "Esc 정지");
+        return (theme::ACCENT, lang.running_command(command, secs), lang.esc_stops());
     }
     if state.running {
-        return (theme::ACCENT, "작업 중…".into(), "Esc 정지");
+        return (theme::ACCENT, lang.working().to_string(), lang.esc_stops());
     }
     if state.asking.is_some() {
-        return (theme::WARNING, "대기 중 — 답을 고르세요".into(), "↑↓ 이동 · Enter 고르기");
+        return (
+            theme::WARNING,
+            lang.waiting_answer().to_string(),
+            lang.waiting_answer_hint(),
+        );
     }
     // 쉬는 중에는 도움말을 붙이지 않는다. 늘 떠 있는 안내는 곧 안 읽힌다.
-    (theme::TEXT_MUTED, "쉬는 중".into(), "")
+    (theme::TEXT_MUTED, lang.idle().to_string(), "")
 }
 
 pub fn draw(frame: &mut Frame, area: Rect, state: &State) {

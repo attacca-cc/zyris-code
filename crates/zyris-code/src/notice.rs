@@ -16,6 +16,8 @@ use std::time::Duration;
 use tracing::field::{Field, Visit};
 use tracing_subscriber::layer::{Context, Layer};
 
+use crate::tools::bridge::Bridge;
+
 /// 이만큼 못 붙으면 처음 말한다. 눌렀다 떼는 사이에 끼어들지 않을 만큼은 기다린다.
 const FIRST: u64 = 3;
 /// 그 뒤로는 이 간격으로만 되풀이한다. 매초 찍으면 그건 그것대로 못 읽는다.
@@ -106,7 +108,12 @@ impl Notice {
     ///
     /// 이제 가르는 기준은 **주워 둔 사유가 있는가**다. 없으면 아직 기다리는 중이고,
     /// 그때는 차분한 색으로 **한 번만** 말한다. 있으면 그것이 진짜 실패다.
-    pub fn watch(&self) {
+    ///
+    /// **화면이 뜨면 입을 다문다.** 화면이 있는 동안 셸에 끼어들면 ratatui가 그린 자리를
+    /// 덮고, 그 칸을 "안 바뀌었다"고 여겨 다시 그리지도 않는다 — 등록 코드 창도 화면이
+    /// 말해 준다(`enroll.rs`). 화면은 `on_connect`가 아니라 **앱이 뜨는 순간** 붙으므로,
+    /// 첫 등록(연결 전)부터 이 감시자는 조용하다.
+    pub fn watch(&self, bridge: Bridge) {
         let notice = self.clone();
         tokio::spawn(async move {
             let mut waited = 0u64;
@@ -115,6 +122,10 @@ impl Notice {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 if notice.0.connected.load(Ordering::SeqCst) {
                     return;
+                }
+                // 화면이 있으면 화면이 말한다 — 셸은 끼어들지 않는다.
+                if bridge.has_screen() {
+                    continue;
                 }
                 waited += 1;
                 let why = notice.0.last.lock().unwrap().clone();

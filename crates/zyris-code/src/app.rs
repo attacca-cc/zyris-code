@@ -58,6 +58,34 @@ pub enum Frame {
     /// 재등록이 시작됐다 같은 것).
     /// `STATUS_WINDOW` 뒤에 저절로 사라진다.
     Notice(String),
+    /// 등록 코드가 발급됐다. **이 순간부터 화면이 코드 표시를 소유한다** —
+    /// 상류의 stdout 상자는 조용해진다(`enroll::ScreenEnroll`).
+    Enroll(EnrollView),
+    /// 코드가 만료됐거나(`Lapsed`) 브라우저에서 거부됐다(`Denied`). 창은 그대로 두고
+    /// 사정만 바꿔 말한다.
+    EnrollPhase(EnrollPhase),
+    /// 승인돼서 자격이 저장됐다. 창을 닫는다.
+    EnrollDone,
+}
+
+/// 등록 코드 창에 그릴 것.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnrollView {
+    pub code: String,
+    pub uri: String,
+    /// 코드가 만료되는 시각. 그리기 쪽이 남은 시간을 이것으로 잰다.
+    pub expires_at: std::time::Instant,
+    pub phase: EnrollPhase,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnrollPhase {
+    /// 승인을 기다리는 중.
+    Waiting,
+    /// 코드가 만료됐다. 새 코드를 요청하는 중이고, 오면 `Frame::Enroll`이 다시 온다.
+    Lapsed,
+    /// 브라우저에서 거부했다.
+    Denied,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -113,6 +141,9 @@ pub enum Action {
     ArmQuit,
     Cancel,
     Quit,
+    /// 등록 코드 창을 닫는다. **Esc로만 닫힌다** — 다른 키가 창을 치우면
+    /// 코드를 보지도 못한 채 승인 단계를 지나친다.
+    EnrollClose,
     Frame(Frame),
 }
 
@@ -215,6 +246,13 @@ pub struct State {
     /// 지금 답을 기다리는 물음. **한 번에 하나만 띄운다** — 둘이 겹치면 무엇에
     /// 답하는지 알 수 없다.
     pub pending: Option<ToolAsk>,
+    /// 등록 코드 창. **재등록이 시작되면 저절로 여기 들어온다.**
+    ///
+    /// `None`이 평소다. 자격이 revoke되거나 리프레시가 영영 실패하면 상류가
+    /// `EnrollmentUi::show`를 부르고 그것이 이 자리를 채운다(`enroll::ScreenEnroll`).
+    /// Esc로 닫으면 `None`으로 돌아간다 — 등록 자체는 배경에서 계속 돌고,
+    /// 승인되면 `EnrollDone`이 닫는다.
+    pub enroll: Option<EnrollView>,
     /// 뒤에서 기다리는 물음들. 앞의 것에 답하면 하나가 올라온다.
     pub ask_queue: std::collections::VecDeque<ToolAsk>,
     /// `run()`이 집어 간다. `apply`는 순수하므로 직접 보내지 못한다.
@@ -302,6 +340,7 @@ impl Default for State {
             shells: Vec::new(),
             command_out: None,
             pending: None,
+            enroll: None,
             ask_queue: std::collections::VecDeque::new(),
             verdict_out: None,
             grants: crate::tools::gate::Grants::default(),
@@ -400,6 +439,16 @@ impl State {
 
 pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+    // **등록 코드 창이 제일 위다.** 코드를 보는 중에 다른 키가 엉뚱한 일을 하면
+    // 안 된다 — Esc로만 닫고, Ctrl+C(끄기)만 통과한다. 등록 자체는 배경에서
+    // 계속 돌므로 Esc로 닫아도 등록이 끊기지는 않는다.
+    if state.enroll.is_some() && !(ctrl && matches!(key.code, KeyCode::Char('c'))) {
+        return match key.code {
+            KeyCode::Esc => vec![Action::EnrollClose],
+            _ => vec![],
+        };
+    }
 
     // 질문이 열려 있으면 키가 그쪽으로 간다. 답을 기다리느라 턴이 막혀 있으므로
     // 지금 사람이 할 일은 그것 하나다. 종료만은 언제나 통한다.
@@ -796,6 +845,10 @@ pub fn apply(state: &mut State, action: &Action) {
         // 보여주고, 다음 Ctrl+C가 종료로 넘어갈지도 이걸로 정해진다.
         Action::Cancel => state.stopping = true,
         Action::Quit => {}
+        // **등록 자체는 여기서 끊지 않는다.** 창만 닫고, 배경의 상류 폴링은 계속
+        // 돌아간다 — 승인되면 `EnrollDone`이 다시 닫고, 만료되면 새 코드와 함께
+        // 창이 도로 온다.
+        Action::EnrollClose => state.enroll = None,
         Action::Frame(frame) => apply_frame(state, frame),
     }
 }
@@ -884,6 +937,16 @@ fn apply_frame(state: &mut State, frame: &Frame) {
                 state.running_exec = None;
             }
         }
+        // 등록 코드 창. 재등록이 시작되면 저절로 뜬다. 만료 뒤 새 코드가 오면
+        // 내용만 갈아 끼운다 — 창은 사람이 Esc로 닫지 않는 한 유지된다.
+        Frame::Enroll(view) => state.enroll = Some(view.clone()),
+        Frame::EnrollPhase(phase) => {
+            if let Some(view) = &mut state.enroll {
+                view.phase = *phase;
+            }
+        }
+        // 승인돼서 자격이 저장됐다. 창을 닫는다.
+        Frame::EnrollDone => state.enroll = None,
         Frame::Notice(text) => state.set_status(text.clone()),
     }
 }
@@ -1143,7 +1206,11 @@ fn title_for_osc(title: &str) -> String {
 /// `ratatui::init()`이 raw 모드와 대체 화면을 함께 잡는다 — 직접 또 잡지 않는다.
 /// 마우스 캡처만 따로 켠다. 어떻게 끝나든 되돌리지 않으면 셸이 망가진 채 남으므로,
 /// 본체를 별도 함수로 두고 결과와 무관하게 복구한다.
-pub async fn run(api_rx: ApiRx, bridge: crate::tools::bridge::Bridge) -> anyhow::Result<()> {
+pub async fn run(
+    api_rx: ApiRx,
+    bridge: crate::tools::bridge::Bridge,
+    die: tokio::sync::watch::Receiver<bool>,
+) -> anyhow::Result<()> {
     let mut terminal = ratatui::init();
     execute!(
         io::stdout(),
@@ -1158,7 +1225,7 @@ pub async fn run(api_rx: ApiRx, bridge: crate::tools::bridge::Bridge) -> anyhow:
         crossterm::terminal::DisableLineWrap,
     )?;
 
-    let result = run_inner(&mut terminal, api_rx, bridge).await;
+    let result = run_inner(&mut terminal, api_rx, bridge, die).await;
 
     let _ = execute!(
         io::stdout(),
@@ -1176,6 +1243,22 @@ pub async fn run(api_rx: ApiRx, bridge: crate::tools::bridge::Bridge) -> anyhow:
 /// 연결이 끊겼다 붙으면 손잡이가 바뀐다. 앱은 매번 여기서 **최신 것을 집어** 쓴다 —
 /// 처음 것을 붙들고 있으면 재연결 뒤 모든 호출이 죽은 연결로 나간다.
 pub type ApiRx = tokio::sync::watch::Receiver<Option<Arc<AttaccaApiClient>>>;
+
+/// 화면 통로에 실리는 것. `Some(세션 id)`는 그 세션의 턴 스트림에서 온 프레임이고,
+/// `None`은 화면 밖(도구·다리)에서 온 것이다.
+///
+/// **낡은 세션의 프레임은 받는 쪽이 버린다.** 일을 걸어 두고 다른 세션으로 갈아타면
+/// 앞 세션의 턴은 서버에서 계속 돌고 그 스트림도 계속 프레임을 보낸다 — 태그가 없으면
+/// 지금 보는 세션의 타임라인에 앞 세션의 메시지가 섞인다. 실제로 그렇게 섞였다.
+pub type AppMsg = (Option<String>, Action);
+
+/// 화면이 지금 보고 있는 세션의 프레임인가. `None`(화면 밖에서 온 것)은 항상 통과한다.
+fn frame_is_current(sid: &Option<String>, current: Option<&str>) -> bool {
+    match sid {
+        None => true,
+        Some(id) => current == Some(id.as_str()),
+    }
+}
 
 /// 지금 손잡이. 아직 안 붙었으면 `None`.
 fn api_of(rx: &ApiRx) -> Option<Arc<AttaccaApiClient>> {
@@ -1202,20 +1285,96 @@ async fn run_inner(
     terminal: &mut ratatui::DefaultTerminal,
     mut api_rx: ApiRx,
     bridge: crate::tools::bridge::Bridge,
+    mut die: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
-    // 첫 손잡이가 올 때까지 기다린다. 훅이 보내고 앱을 띄우므로 대개 이미 와 있다.
+    let mut state = State::new();
+
+    // **화면을 먼저 붙인다.** 등록 코드 창이 첫 연결 전에도 도달해야 한다 —
+    // `enroll::ScreenEnroll`은 `Frame::Enroll`을 여기로 보낸다.
+    let (tx, mut rx) = mpsc::unbounded_channel::<AppMsg>();
+
+    // **여기서부터 도구가 화면에 물어볼 수 있다.** 이 전에 오는 호출은 물을 곳이 없어
+    // 거부된다 — 조용히 통과시키면 승인 없이 파일이 바뀐다.
+    bridge.attach(tx.clone());
+    bridge.sync(state.mode, &state.grants);
+
+    let mut keys = EventStream::new();
+    let mut ticker = tokio::time::interval(frame_interval());
+    let mut last_size: Option<(u16, u16)> = None;
+    let mut dirty = true;
+
+    // **첫 손잡이가 올 때까지 화면을 그리며 기다린다.** 이 동안이 첫 등록이다 —
+    // "연결 중…" 위에 등록 코드 창이 뜬다. 손잡이는 `on_connect`가 보낸다.
     let api = loop {
         if let Some(api) = api_of(&api_rx) {
             break api;
         }
-        if api_rx.changed().await.is_err() {
+        if *die.borrow() {
             anyhow::bail!("연결이 끊겼습니다.");
+        }
+        tokio::select! {
+            result = api_rx.changed() => {
+                // 보내는 쪽이 사라졌다 — 러너가 끝났다. `die`가 아닌 길로도
+                // 멈춰야 조용히 닫힌다.
+                if result.is_err() {
+                    anyhow::bail!("연결이 끊겼습니다.");
+                }
+            }
+            _ = die.changed() => {}
+            Some((sid, action)) = rx.recv() => {
+                // 화면이 아직 없다(첫 등록). 이때 오는 스트림 프레임은 낡은 것이다.
+                if !frame_is_current(&sid, None) {
+                    continue;
+                }
+                apply(&mut state, &action);
+                dirty = true;
+            }
+            Some(Ok(ev)) = keys.next() => {
+                let mut quit = false;
+                match ev {
+                    TermEvent::Key(k) => {
+                        for action in on_key(&state, k) {
+                            if matches!(action, Action::Quit) {
+                                quit = true;
+                                break;
+                            }
+                            apply(&mut state, &action);
+                        }
+                    }
+                    TermEvent::Resize(w, h) if last_size != Some((w, h)) => {
+                        last_size = Some((w, h));
+                        repaint(terminal);
+                    }
+                    _ => {}
+                }
+                if quit {
+                    // 아직 세션도 턴도 없다 — 그냥 닫는다.
+                    return Ok(());
+                }
+                dirty = true;
+            }
+            _ = ticker.tick() => {
+                state.tick = state.tick.wrapping_add(1);
+                // 등록 코드 창이 떠 있으면 남은 시간이 흐르므로 계속 그린다.
+                if state.enroll.is_some() {
+                    dirty = true;
+                }
+            }
+        }
+        if dirty {
+            terminal.draw(|f| widgets::draw(f, &mut state))?;
+            dirty = false;
         }
     };
 
     let mut api = api;
-    let mut state = State::new();
     state.connected = true;
+    // **"연결 중…"이 화면에 얼어붙지 않게 한다.** 붙은 것을 반드시 다시 그린다 —
+    // wait 루프가 마지막에 그린 프레임은 아직 연결 전이고, `dirty`가 그대로 꺼져
+    // 있으면 아무 키나 누르기 전까지 "연결 중…"이 남는다(실제로 그렇게 남았다).
+    // "연결됨"을 잠깐 보여 준 뒤 6초 후 `쉬는 중`으로 내려간다.
+    dirty = true;
+    state.set_status(state.lang.connected());
 
     // 승인한 사람이 요청보다 적게 줬을 수 있다. **그러면 목록이 조용히 빈 채로 돌아온다** —
     // 오류가 아니라 빈 결과라, 사람은 자기 계정에 에이전트가 없는 줄 안다.
@@ -1261,13 +1420,6 @@ async fn run_inner(
     // 내내 참이라, work·job 예약이 말할 때마다 되살아난다.
     let mut last_mode = state.mode;
 
-    let (tx, mut rx) = mpsc::unbounded_channel::<Action>();
-
-    // **여기서부터 도구가 화면에 물어볼 수 있다.** 이 전에 오는 호출은 물을 곳이 없어
-    // 거부된다 — 조용히 통과시키면 승인 없이 파일이 바뀐다.
-    bridge.attach(tx.clone());
-    bridge.sync(state.mode, &state.grants);
-
     // 답을 기다리는 질문이 남아 있으면 그 세션으로 들어간다. 끄기 전에 답하지 않았다면
     // 서버는 아직 기다리고 있고, 사람이 손으로 찾아 들어가야 한다면 답할 길이 없는 것과
     // 같다.
@@ -1287,10 +1439,6 @@ async fn run_inner(
     let mut last_draw = Instant::now();
     set_terminal_title(&state.title);
     let mut shown_title = state.title.clone();
-    // 마지막으로 실제로 그린 터미널 크기. 같은 크기의 resize가 연달아 와도 한 번만
-    // 지운다 — 그때마다 전체를 지우면 모바일 SSH에서 화면이 반짝인다.
-    let mut last_size: Option<(u16, u16)> = None;
-    let mut dirty = true;
     // 종료 예고는 시간이 지나면 저절로 풀린다. 그런데 아무 입력이 없으면 다시 그릴 일이
     // 없어서 안내 글자가 화면에 남는다 — 풀린 프레임을 잡아 한 번 더 그린다.
     let mut last_quit_pending = false;
@@ -1473,7 +1621,14 @@ async fn run_inner(
                     last_draw = Instant::now();
                 }
             }
-            Some(action) = rx.recv() => {
+            Some((sid, action)) = rx.recv() => {
+                // **낡은 세션의 프레임은 버린다.** 화면을 갈아탔는데 앞 세션의 메시지가
+                // 계속 올라오면 안 된다 — 일을 걸어 두고 다른 세션에서 대화하는 동안
+                // 그 일의 이벤트가 여기로 쏟아진다. 턴은 서버에서 계속 돌고, 그 세션으로
+                // 돌아가면 다시 열 때 히스토리로 보인다.
+                if !frame_is_current(&sid, session.id()) {
+                    continue;
+                }
                 apply(&mut state, &action);
                 // 턴이 끝나는 프레임이 여기로 온다 — 대기열을 비울 자리도 여기다.
                 flush_queue(&api, &mut session, &agent_id, &mut state, &tx).await;
@@ -1484,6 +1639,8 @@ async fn run_inner(
                 if let Some(fresh) = api_of(&api_rx) {
                     api = fresh;
                     state.connected = true;
+                    // 끊겼다 붙은 것도 화면에 보인다 — connecting → connected → idle.
+                    state.set_status(state.lang.connected());
                     if let Some(id) = session.id().map(str::to_string) {
                         spawn_stream(Arc::clone(&api), id, state.last_cursor, tx.clone());
                     }
@@ -1535,6 +1692,10 @@ async fn run_inner(
                 if state.running {
                     dirty = true;
                 }
+                // 등록 코드 창이 떠 있으면 남은 시간이 흐르므로 계속 그린다.
+                if state.enroll.is_some() {
+                    dirty = true;
+                }
                 // 턴이 도는 동안에는 묶어서 그린다. 스트리밍 한 조각이 3.4KB라 초당
                 // 스무 번이면 원격 터미널에 가장 부담이 큰 자리다 — 사람 눈에는 열 번이나
                 // 스무 번이나 같지만 나가는 양은 절반이 된다.
@@ -1549,6 +1710,9 @@ async fn run_inner(
             // **밖에서 끄라고 해도 끄는 것은 같다.** `kill`이나 터미널 창을 닫은
             // 것(SIGHUP)이 여기로 온다 — 그 길로 죽으면 서버에서 돌던 턴이 남는다.
             Some(()) = shutdown.recv() => break 'app,
+            // **러너가 끝났다.** `main`이 이 채널에 신호를 보내면(치명적 오류) 화면도
+            // 조용히 닫는다 — 터미널을 되돌린 뒤 `main`이 사유를 말한다.
+            _ = die.changed(), if *die.borrow() => break 'app,
             // 스스로 고치기. 마지막 치유 뒤로 그린 적이 있을 때만 한다 — 가만히 있는
             // 화면은 깨질 일이 없고, 쉬는 세션이 SSH로 계속 바이트를 밀 이유도 없다.
             _ = heal.tick(), if healing => {
@@ -1631,7 +1795,7 @@ async fn pick(
     state: &mut State,
     session: &mut Session,
     agent_id: &mut String,
-    tx: &mpsc::UnboundedSender<Action>,
+    tx: &mpsc::UnboundedSender<AppMsg>,
 ) -> anyhow::Result<()> {
     use crate::picker::{Pick, Picker};
 
@@ -1696,7 +1860,7 @@ async fn switch(
     session: &mut Session,
     id: String,
     project_id: Option<String>,
-    tx: &mpsc::UnboundedSender<Action>,
+    tx: &mpsc::UnboundedSender<AppMsg>,
 ) -> anyhow::Result<()> {
     let events = crate::conn::history(api, &id).await?;
 
@@ -2013,7 +2177,7 @@ async fn flush_queue(
     session: &mut Session,
     agent_id: &str,
     state: &mut State,
-    tx: &mpsc::UnboundedSender<Action>,
+    tx: &mpsc::UnboundedSender<AppMsg>,
 ) {
     if !std::mem::take(&mut state.flush_queue) {
         return;
@@ -2043,11 +2207,26 @@ async fn flush_queue(
 
 /// 모드가 정한 곳으로 다음 메시지가 가도록 세션 예약을 맞춘다. **모드가 바뀐 순간에만 돈다.**
 ///
+/// **하던 대화가 있으면 모드는 그것을 가로채지 않는다.** work·job으로 바꿔도 지금
+/// 세션은 그대로 이어가고, 새 work·job은 새 쓰레드에서 연다 — 예전에는 모드를
+/// 바꾸는 순간 예약이 서서 다음 메시지가 조용히 새 세션을 열었다. 실제로 그렇게
+/// 헷갈렸다. 사람에게는 "지금 대화는 그대로"라고 말해 준다.
+///
 /// 판정 자체는 `Mode::route()`가 하고 여기는 그것을 세션에 옮기고 사람에게 말할 뿐이다.
-/// **말하는 것이 절반이다** — 모드만 바뀐 줄 알고 하던 얘기를 이어 쓰면 그 말이 통째로
-/// work의 목표가 되어 버린다.
 fn restage(state: &mut State, session: &mut Session) {
     let route = state.mode.route();
+    // 세션이 있으면 예약하지 않는다 — `open_for`의 "예약이 없고 id가 있으면 이어
+    // 붙인다"가 그대로 동작해 다음 메시지는 지금 대화로 간다.
+    if session.id().is_some() {
+        session.set_route(crate::mode::Route::Session);
+        let said = match route {
+            crate::mode::Route::Work => state.lang.mode_continues_work().to_string(),
+            crate::mode::Route::Job => state.lang.mode_continues_job().to_string(),
+            crate::mode::Route::Session => return,
+        };
+        state.timeline.say(said);
+        return;
+    }
     session.set_route(route);
     match route {
         crate::mode::Route::Session => {}
@@ -2066,7 +2245,7 @@ async fn send_and_tell(
     session: &mut Session,
     agent_id: &str,
     text: &str,
-    tx: &mpsc::UnboundedSender<Action>,
+    tx: &mpsc::UnboundedSender<AppMsg>,
 ) {
     match send(api, session, agent_id, text, state.last_cursor, state.mode, tx).await {
         Ok(announced) => {
@@ -2100,7 +2279,7 @@ async fn send(
     text: &str,
     after: Option<i64>,
     mode: Mode,
-    tx: &mpsc::UnboundedSender<Action>,
+    tx: &mpsc::UnboundedSender<AppMsg>,
 ) -> anyhow::Result<Option<(crate::mode::Route, String)>> {
     let opened = session.open_for(api, agent_id, text, mode).await?;
     let id = opened.id;
@@ -2120,21 +2299,31 @@ async fn send(
 }
 
 /// 턴 스트림을 배경에서 읽어 액션으로 흘려보낸다.
+///
+/// 프레임마다 **자기 세션의 id를 태그로 실어** 보낸다. 받는 쪽은 그 태그로 낡은
+/// 세션의 프레임을 버린다(`frame_is_current`) — 스트림을 끊는 대신 버리는 이유는
+/// 서버에서 도는 턴을 죽이지 않기 위해서다. 그 세션으로 돌아가면 다시 열 때
+/// 히스토리로 전부 보인다.
 fn spawn_stream(
     api: Arc<AttaccaApiClient>,
     session_id: String,
     after: Option<i64>,
-    tx: mpsc::UnboundedSender<Action>,
+    tx: mpsc::UnboundedSender<AppMsg>,
 ) {
     tokio::spawn(async move {
+        let tag = session_id.clone();
         match api.turn_events(session_id, after).await {
             Ok(mut stream) => {
                 // `Streaming`은 head와 items로 나뉜다. head가 현재 실행 상태를 들고 온다.
-                let _ = tx.send(Action::Frame(Frame::Status { running: stream.head.running }));
+                let _ =
+                    tx.send((Some(tag.clone()), Action::Frame(Frame::Status { running: stream.head.running })));
                 while let Some(frame) = stream.items.next().await {
                     match frame {
                         Ok(f) => {
-                            if tx.send(Action::Frame(frame_from(f))).is_err() {
+                            if tx
+                                .send((Some(tag.clone()), Action::Frame(frame_from(f))))
+                                .is_err()
+                            {
                                 break; // 앱이 끝났다.
                             }
                         }
@@ -2145,7 +2334,7 @@ fn spawn_stream(
                     }
                 }
                 // 스트림이 끝나면 턴도 끝난 것이다. 상태줄이 "작업 중"에 얼어붙으면 안 된다.
-                let _ = tx.send(Action::Frame(Frame::Status { running: false }));
+                let _ = tx.send((Some(tag), Action::Frame(Frame::Status { running: false })));
             }
             Err(e) => tracing::error!(error = %e, "턴 스트림을 열지 못했다"),
         }
@@ -2268,6 +2457,74 @@ mod tests {
         );
     }
 
+    fn enroll() -> EnrollView {
+        EnrollView {
+            code: "WXQR-7KBD".into(),
+            uri: "https://attacca.example/settings/zyris/device".into(),
+            expires_at: Instant::now() + Duration::from_secs(600),
+            phase: EnrollPhase::Waiting,
+        }
+    }
+
+    /// **등록 코드 창은 Esc로만 닫힌다.** 다른 키가 창을 치우면 코드를 보지도
+    /// 못한 채 승인 단계를 지나친다 — `y`가 승인 창에 먹히지도 않아야 한다.
+    #[test]
+    fn the_enroll_window_closes_only_with_esc() {
+        let mut s = state();
+        apply(&mut s, &Action::Frame(Frame::Enroll(enroll())));
+        assert!(s.enroll.is_some());
+
+        // 아무 키나 눌러도 창은 그대로다.
+        assert_eq!(
+            on_key(&s, key(KeyCode::Char('y'), KeyModifiers::NONE)),
+            vec![],
+            "등록 중에 y가 승인으로 먹히면 안 된다"
+        );
+        assert_eq!(on_key(&s, key(KeyCode::Enter, KeyModifiers::NONE)), vec![]);
+        assert_eq!(on_key(&s, key(KeyCode::Up, KeyModifiers::NONE)), vec![]);
+
+        // Esc 하나만 닫는다.
+        assert_eq!(on_key(&s, key(KeyCode::Esc, KeyModifiers::NONE)), vec![Action::EnrollClose]);
+        apply(&mut s, &Action::EnrollClose);
+        assert!(s.enroll.is_none(), "Esc로 닫아야 한다");
+    }
+
+    /// **등록 코드 창이 떠 있어도 끄는 길은 막지 않는다.** Ctrl+C는 언제나 통한다 —
+    /// 화면이 코드를 가린 채 죽은 채로 남으면 빠져나갈 길이 없다.
+    #[test]
+    fn ctrl_c_still_quits_while_the_enroll_window_is_up() {
+        let mut s = state();
+        apply(&mut s, &Action::Frame(Frame::Enroll(enroll())));
+        assert_eq!(
+            on_key(&s, key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            vec![Action::ArmQuit]
+        );
+    }
+
+    /// **승인이 도착하면 창이 저절로 닫힌다.** 사람이 Esc를 누르지 않아도
+    /// 붙었으면 등록 창이 남아 있을 이유가 없다.
+    #[test]
+    fn approving_clears_the_enroll_window() {
+        let mut s = state();
+        apply(&mut s, &Action::Frame(Frame::Enroll(enroll())));
+        apply(&mut s, &Action::Frame(Frame::EnrollDone));
+        assert!(s.enroll.is_none(), "승인됐는데 창이 남아 있다");
+    }
+
+    /// 만료·거부는 창을 닫지 않고 **사정만 바꾼다** — 새 코드가 오면 그 위에
+    /// 다시 그리므로, 닫아 버리면 중간 상태를 놓친다.
+    #[test]
+    fn a_lapsed_or_denied_code_changes_the_phase_not_the_window() {
+        let mut s = state();
+        apply(&mut s, &Action::Frame(Frame::Enroll(enroll())));
+        apply(&mut s, &Action::Frame(Frame::EnrollPhase(EnrollPhase::Lapsed)));
+        assert_eq!(s.enroll.as_ref().unwrap().phase, EnrollPhase::Lapsed);
+        assert!(s.enroll.is_some(), "만료됐다고 창을 닫으면 안 된다");
+
+        apply(&mut s, &Action::Frame(Frame::EnrollPhase(EnrollPhase::Denied)));
+        assert_eq!(s.enroll.as_ref().unwrap().phase, EnrollPhase::Denied);
+    }
+
     /// 앱이 마지막으로 한 말.
     fn last_system(state: &mut State) -> String {
         state
@@ -2305,6 +2562,41 @@ mod tests {
         apply(&mut s, &Action::Submit("/mode 계획".into()));
         assert_eq!(s.command_out.as_deref(), Some("/mode 계획"));
         assert!(s.queued.is_empty(), "{:?}", s.queued);
+    }
+
+    /// **하던 대화가 있으면 모드가 그것을 가로채지 않는다.** work·job으로 바꿔도
+    /// 다음 메시지는 지금 세션으로 간다 — 예전에는 모드를 바꾸는 순간 예약이 서서
+    /// 조용히 새 세션을 열었다. 실제로 그렇게 헷갈렸다.
+    #[test]
+    fn restage_keeps_the_active_conversation() {
+        let mut s = State::new();
+        s.lang = crate::lang::Lang::Ko;
+        let mut session = Session::new(None);
+        session.switch_to("지금-세션".into(), None);
+        s.mode = crate::mode::Mode::Work;
+        restage(&mut s, &mut session);
+        assert_eq!(session.pending_open(), None, "하던 대화를 가로채면 안 된다");
+        assert!(last_system(&mut s).contains("이어갑니다"), "{}", last_system(&mut s));
+
+        // 영어 화면도 같은 뜻을 말한다 — 번역이 빠지면 안 된다.
+        let mut s = State::new();
+        s.lang = crate::lang::Lang::En;
+        let mut session = Session::new(None);
+        session.switch_to("지금-세션".into(), None);
+        s.mode = crate::mode::Mode::Work;
+        restage(&mut s, &mut session);
+        assert!(last_system(&mut s).contains("continues as-is"), "{}", last_system(&mut s));
+    }
+
+    /// 대화가 없으면 모드가 무엇을 열지 정한다 — 첫 메시지가 work·job이 된다.
+    #[test]
+    fn restage_stages_an_open_only_without_a_conversation() {
+        let mut s = State::new();
+        let mut session = Session::new(None);
+        s.mode = crate::mode::Mode::Job;
+        restage(&mut s, &mut session);
+        assert_eq!(session.pending_open(), Some(crate::mode::Route::Job));
+        assert!(last_system(&mut s).contains("job"), "{}", last_system(&mut s));
     }
 
     /// 평범한 메시지는 그대로 서버로 간다.
@@ -2654,6 +2946,23 @@ mod tests {
         let mut s = state();
         apply(&mut s, &Action::Frame(Frame::Event { cursor: 42, entry: None }));
         assert_eq!(s.last_cursor, Some(42));
+    }
+
+    /// **낡은 세션의 프레임은 화면에 닿으면 안 된다.** 일을 걸어 두고 다른 세션으로
+    /// 갈아타면 앞 세션의 턴은 서버에서 계속 돌고 그 스트림도 계속 보낸다 — 태그가
+    /// 지금 세션과 다르면 버린다. 화면 밖(도구·다리)에서 온 것은 언제나 통과한다.
+    #[test]
+    fn a_frame_from_a_stale_session_is_dropped() {
+        // 화면 밖에서 온 것(None)은 세션과 무관하게 통과한다.
+        assert!(frame_is_current(&None, Some("현재")));
+        assert!(frame_is_current(&None, None));
+        // 자기 세션의 프레임은 통과한다.
+        assert!(frame_is_current(&Some("a".into()), Some("a")));
+        // **낡은 세션의 프레임은 버린다** — 화면을 갈아탔는데 앞 세션의 메시지가
+        // 계속 올라오면 안 된다.
+        assert!(!frame_is_current(&Some("옛 세션".into()), Some("새 세션")));
+        // 세션이 아직 없는데 스트림 프레임이 오는 것도 낡은 것이다.
+        assert!(!frame_is_current(&Some("어떤 세션".into()), None));
     }
 
     /// 휠은 마지막으로 그린 뷰포트 크기를 기준으로 움직인다 — apply는 순수해야 하므로

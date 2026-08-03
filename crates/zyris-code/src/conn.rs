@@ -263,23 +263,22 @@ pub fn needs_reenrollment(granted: &[String], already_tried: bool) -> bool {
 /// 않으므로, 할 수 있는 일은 자격을 버리고 다시 승인받는 것 하나뿐이다. 그 방법을 적는다.
 pub fn missing_scopes_message(missing: &[&str]) -> String {
     format!(
-        "**권한이 모자랍니다: {}**. 승인할 때 정해진 권한은 나중에 넓어지지 않습니다. \
-         zyris-code를 다시 켜면 새 등록 코드가 뜨니, 승인 화면에서 권한을 **모두** \
-         체크해 주세요.",
+        "**권한이 모자랍니다: {}**. 승인할 때 정해진 권한은 나중에 넓어지지 않습니다.\n\n\
+         다시 연결되면 등록 코드 창이 뜨니, 승인 화면에서 권한을 **모두** 체크해 주세요.",
         missing.join(", ")
     )
 }
 
 /// 모자란 권한 때문에 자격을 버렸을 때 할 말.
 ///
-/// **"다시 켜면 된다"까지 말해야 한다.** 여기서 연결을 끊고 그 자리에서 다시 묻지 않는
-/// 이유는, 상류가 등록 코드를 stdout에 찍어 TUI 위에 겹치기 때문이다 — 화면이 없는
-/// 다음 실행이 코드를 보여주기에 훨씬 낫다.
+/// **등록 코드 창이 뜨면 그 자리에서 승인하면 된다고 말해야 한다.** 예전에는 자격을
+/// 버리면 코드가 stdout으로 나가 화면에 가려 "껐다 켜라"고 했지만, 이제는
+/// `EnrollmentUi` 훅이 코드를 화면에 그린다(`enroll.rs`) — 다시 연결될 때 창이 뜬다.
 pub fn scopes_will_be_asked_again(missing: &[&str]) -> String {
     format!(
-        "**권한이 모자랍니다: {}**. 다시 승인받을 수 있도록 이 컴퓨터의 자격을 비웠습니다. \
-         zyris-code를 껐다 켜면 새 등록 코드가 뜨니, 승인 화면에서 권한을 **모두** 체크해 \
-         주세요. 지금 연결은 그대로 쓸 수 있습니다.",
+        "**권한이 모자랍니다: {}**. 다시 승인받을 수 있도록 이 컴퓨터의 자격을 비웠습니다.\n\n\
+         다시 연결되면 등록 코드 창이 뜨니, 승인 화면에서 권한을 **모두** 체크해 주세요. \
+         지금 연결은 그대로 쓸 수 있습니다.",
         missing.join(", ")
     )
 }
@@ -304,7 +303,25 @@ pub fn agent_name() -> String {
 /// 나가 도로 호스트 이름만 남는다. 그때는 **구별되는 쪽을 앞에 둔다.**
 pub fn node_name() -> String {
     let host = zyris::machine_name().unwrap_or_else(|| "node".to_string());
-    let natural = format!("{host} {SUFFIX}");
+    let dir = std::env::current_dir()
+        .ok()
+        .and_then(|d| d.file_name().map(|n| n.to_string_lossy().into_owned()));
+    compose_name(&host, dir.as_deref())
+}
+
+/// 이름을 짓는 순수한 판. `dir`은 작업 디렉터리의 마지막 조각이다.
+///
+/// **작업 디렉터리를 이름에 단다.** 같은 머신의 서로 다른 디렉터리에 띄운 창이
+/// attacca의 노드 목록에서 구별되어야 한다 — `arch zyris-code · zyris-daemon`처럼.
+/// 슬러그는 16자에서 잘리므로 디렉터리는 표시 이름에만 남는다(슬러그는 언제나
+/// `arch-zyris-code` 꼴). 디렉터리가 앱 이름과 같으면(이 리포에서 도는 경우) 붙이지
+/// 않는다 — 같은 것이 두 번 말할 이유가 없다.
+fn compose_name(host: &str, dir: Option<&str>) -> String {
+    let suffix = dir.filter(|d| !d.is_empty() && *d != SUFFIX);
+    let natural = match suffix {
+        Some(dir) => format!("{host} {SUFFIX} · {dir}"),
+        None => format!("{host} {SUFFIX}"),
+    };
     if slug_of(&natural).contains(SUFFIX) {
         natural
     } else {
@@ -323,6 +340,71 @@ pub fn node_slug() -> String {
 
 /// 이름 뒤에 붙는 이 앱의 표시. 슬러그에서 이것이 살아남아야 구별이 된다.
 const SUFFIX: &str = "zyris-code";
+
+// ── 창 잠금 ────────────────────────────────────────────────────────────────
+//
+// **같은 자격을 쓰는 창이 둘이면 서버 레지스트리는 나중 연결로 덮어쓴다.** 조용히
+// 꼬이지 않게, 먼저 떠 있는 창이 있으면 그 사실을 화면에 말한다. 막지는 않는다 —
+// 같은 디렉터리라면 어느 창이 받든 바뀌는 파일은 같다(CLAUDE.md "창 여럿").
+
+/// 잠금 파일 이름. 프로필로 갈라서, 서로 다른 프로필(다른 노드)은 서로를 방해하지 않는다.
+fn instance_lock_path(config_dir: &std::path::Path, profile: &str) -> std::path::PathBuf {
+    config_dir.join(format!(".instance-{}.lock", slugify_profile(profile)))
+}
+
+/// 살아 있는 동안 잠금 파일을 지우는 손잡이. **창이 끝나면 어느 길로든 지워진다.**
+pub struct InstanceLock(std::path::PathBuf);
+
+impl Drop for InstanceLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// 이 프로필로 **이미 살아 있는** 다른 창이 있는가. 잠금 파일의 PID가 살아 있으면 참 —
+/// 죽은 창의 흔적은 살아 있는 창이 아니다.
+pub fn another_instance_alive(config_dir: &std::path::Path, profile: &str) -> bool {
+    let Ok(pid) = std::fs::read_to_string(instance_lock_path(config_dir, profile)) else {
+        return false;
+    };
+    process_alive(pid.trim())
+}
+
+/// 잠금을 건다. 이미 살아 있는 창이 있으면 `None` — 그때는 알림만 띄우고 그대로 간다.
+///
+/// **죽은 창의 흔적은 치우고 다시 건다.** PID 하나만 쓰므로 동시에 두 창이 걸면 나중
+/// 것이 이긴다 — 이 잠금은 "누가 주인인가"가 아니라 "다른 살아 있는 창이 있나"를 묻는
+/// 그물이라, 경합이 지는 쪽도 다음 검사에서 다른 쪽을 보게 된다.
+pub fn claim_instance_lock(config_dir: &std::path::Path, profile: &str) -> Option<InstanceLock> {
+    let path = instance_lock_path(config_dir, profile);
+    if another_instance_alive(config_dir, profile) {
+        return None;
+    }
+    let _ = std::fs::remove_file(&path);
+    if std::fs::write(&path, std::process::id().to_string()).is_ok() {
+        Some(InstanceLock(path))
+    } else {
+        None
+    }
+}
+
+#[cfg(unix)]
+fn process_alive(pid: &str) -> bool {
+    let Ok(pid) = pid.trim().parse::<u32>() else { return false; };
+    // PID 0은 "내 프로세스 그룹"이라 kill(0, 0)이 언제나 성공한다 — 그럴 리 없는 값으로 친다.
+    if pid == 0 {
+        return false;
+    }
+    // kill(pid, 0): 신호는 보내지 않고 그 PID가 존재하는지만 묻는다.
+    unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+#[cfg(not(unix))]
+fn process_alive(_pid: &str) -> bool {
+    // 프로세스 존재를 묻는 길이 없는 플랫폼에서는 남은 파일을 죽은 것으로 친다 —
+    // 다음 창이 그냥 덮어쓰고, 경고는 유닉스에서만 의미가 있다.
+    false
+}
 
 /// attacca의 `slugify_node_name`과 **같은 규칙**이다(`attacca-domain/src/zyris_node.rs`).
 ///
@@ -902,6 +984,59 @@ mod tests {
         let slug = slug_of(&name);
         assert!(slug.contains("zyris-code"), "앱 이름이 잘려 나갔다: {name} → {slug}");
         assert!(slug.len() <= 16, "{slug}");
+    }
+
+    /// **작업 디렉터리가 이름에 붙는다.** 같은 머신의 다른 디렉터리가 구별되어야 한다.
+    /// 슬러그는 16자에서 잘리므로 표시 이름에만 남는다.
+    #[test]
+    fn the_node_name_carries_the_working_directory() {
+        assert_eq!(
+            compose_name("arch", Some("zyris-daemon")),
+            "arch zyris-code · zyris-daemon"
+        );
+        assert_eq!(slug_of("arch zyris-code · zyris-daemon"), "arch-zyris-code");
+        // 앱 이름과 같은 디렉터리는 붙이지 않는다 — 중복이다.
+        assert_eq!(compose_name("arch", Some("zyris-code")), "arch zyris-code");
+        // 디렉터리가 없어도(루트 등) 평소 이름이다.
+        assert_eq!(compose_name("arch", None), "arch zyris-code");
+    }
+
+    /// 죽은 창의 흔적은 살아 있는 창이 아니다. PID 0은 kill(0, 0)이 언제나 성공하므로
+    /// 반드시 죽은 값으로 쳐야 한다.
+    #[test]
+    fn a_stale_instance_lock_is_not_a_living_window() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(instance_lock_path(dir.path(), "test"), "0").unwrap();
+        assert!(!another_instance_alive(dir.path(), "test"));
+    }
+
+    /// 잠금을 걸면 그 프로필의 "다른 창"이 있음을 알 수 있고, 손잡이가 Drop되면 풀린다.
+    /// 둘째 창은 잠금을 다시 걸 수 없다 — 그게 알림이 갈 자리다.
+    #[test]
+    fn claiming_the_lock_marks_another_window_and_releasing_clears_it() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!another_instance_alive(dir.path(), "test"));
+        let lock = claim_instance_lock(dir.path(), "test").expect("첫 창은 주인이다");
+        assert!(another_instance_alive(dir.path(), "test"));
+        assert!(
+            claim_instance_lock(dir.path(), "test").is_none(),
+            "둘째 창은 주인이 될 수 없다"
+        );
+        drop(lock);
+        assert!(!another_instance_alive(dir.path(), "test"), "풀렸는데 남아 있다");
+    }
+
+    /// 죽은 PID가 적힌 잠금은 치우고 다시 건다 — 죽은 창 때문에 두 번째 창이 알림을
+    /// 잘못 받으면 그것도 소음이다.
+    #[test]
+    fn a_dead_pid_lock_is_reclaimed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(instance_lock_path(dir.path(), "test"), "4000000000").unwrap();
+        assert!(!another_instance_alive(dir.path(), "test"));
+        assert!(
+            claim_instance_lock(dir.path(), "test").is_some(),
+            "죽은 창의 잠금은 치워야 한다"
+        );
     }
 
     /// 에이전트를 바꾸면 **다음 메시지에서 새 세션이 열린다.** 세션의 에이전트는 만들 때

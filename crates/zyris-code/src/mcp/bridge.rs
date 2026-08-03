@@ -68,7 +68,7 @@ impl McpCapability {
 #[async_trait]
 impl ServeCapability for McpCapability {
     fn descriptor(&self) -> CapabilityDescriptor {
-        CapabilityDescriptor {
+        let mut descriptor = CapabilityDescriptor {
             name: self.name.clone(),
             version: 1,
             tools: self
@@ -84,7 +84,10 @@ impl ServeCapability for McpCapability {
                     item_schema: None,
                 })
                 .collect(),
-        }
+        };
+        // 설명을 예산에 맞춘다 — `tools::trim`과 같은 이유다.
+        crate::tools::trim::trim_descriptor(&mut descriptor);
+        descriptor
     }
 
     async fn dispatch(&self, call: IncomingCall) -> Result<Outgoing> {

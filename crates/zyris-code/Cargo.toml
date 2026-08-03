@@ -43,6 +43,8 @@ ignore = "0.4"
 regex = "1"
 futures-util = "0.3.32"
 base64 = "0.23.0"
+# 창 잠금의 PID 생존 검사(`conn::instance_lock`). 이미 트리에 있어 네트워크 없이 빌드된다.
+libc = "0.2"
 
 [dev-dependencies]
 # 도구 테스트가 진짜 파일을 쓴다. 모의 파일시스템으로는 경로 해석 실수가 안 잡힌다.

@@ -21,6 +21,7 @@
 mod activity;
 mod approve;
 mod ask;
+mod enroll;
 mod input;
 mod picker;
 mod sidebar;
@@ -119,6 +120,12 @@ pub fn draw(frame: &mut Frame, state: &mut State) {
     // 목록은 맨 위에 겹친다 — 열려 있는 동안은 그것이 지금 할 일이다.
     if let Some(p) = &state.picker {
         picker::draw(frame, full, p, state.lang);
+    }
+
+    // **등록 코드 창은 그 위에 겹친다.** 코드를 보는 중에는 다른 일을 하면 안 된다 —
+    // 키 처리도 이것이 제일 위다(`on_key`).
+    if let Some(view) = &state.enroll {
+        enroll::draw(frame, full, view, state.lang);
     }
 
     // **기본은 배경을 안 칠한다** — 터미널이 자기 배경을 쓴다. 앱이 칠하면 격자 밖(창

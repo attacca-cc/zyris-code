@@ -160,7 +160,7 @@ impl Lang {
         self.pick("멈추는 중…", "Stopping…")
     }
     pub fn idle(self) -> &'static str {
-        self.pick("쉬는 중", "Idle")
+        self.pick("쉬는 중", "Taking a break")
     }
     pub fn esc_stops(self) -> &'static str {
         self.pick("Esc 정지", "Esc stops")
@@ -176,6 +176,26 @@ impl Lang {
     }
     pub fn quit_armed(self) -> &'static str {
         self.pick("한 번 더 Ctrl+C를 누르면 끝냅니다", "Press Ctrl+C again to quit")
+    }
+    /// 붙었다. 활동 줄이 이걸 잠깐 보여준 뒤 `idle()`로 내려간다 —
+    /// 사용자가 보는 전이는 connecting → connected → taking a break다.
+    pub fn connected(self) -> &'static str {
+        self.pick("연결됨", "Connected")
+    }
+    /// 명령이 도는 동안 활동 줄에 보여 줄 것.
+    pub fn running_command(self, command: &str, secs: u64) -> String {
+        match self {
+            Lang::Ko => format!("▶ {command}  ·  {secs}초"),
+            Lang::En => format!("▶ {command}  ·  {secs}s"),
+        }
+    }
+    /// 질문을 기다리는 동안 활동 줄에 보여 줄 것.
+    pub fn waiting_answer(self) -> &'static str {
+        self.pick("대기 중 — 답을 고르세요", "Waiting — answer the question")
+    }
+    /// 질문을 기다리는 동안 활동 줄 오른쪽에 붙는 도움말.
+    pub fn waiting_answer_hint(self) -> &'static str {
+        self.pick("↑↓ 이동 · Enter 고르기", "↑↓ move · Enter choose")
     }
 
     pub fn mode_now(self, mode: &str) -> String {
@@ -213,6 +233,25 @@ impl Lang {
              되묻는 것이 있으면 그대로 답하면 됩니다.",
             "Your next message becomes a **job** — hand it over and it runs to the end. \
              If it asks something back, just answer here.",
+        )
+    }
+
+    /// 세션이 있는데 work 모드로 바꿨을 때. **모드는 더 이상 새 것을 열지 않는다** —
+    /// 하던 대화가 그대로 이어지고, 새 work는 새 쓰레드에서 연다.
+    pub fn mode_continues_work(self) -> &'static str {
+        self.pick(
+            "모드가 **work**입니다. 지금 대화는 그대로 이어갑니다 — \
+             새 work는 ←의 새 쓰레드에서 엽니다.",
+            "Mode is **work**. This conversation continues as-is — \
+             start a new work from a new thread (←).",
+        )
+    }
+    pub fn mode_continues_job(self) -> &'static str {
+        self.pick(
+            "모드가 **job**입니다. 지금 대화는 그대로 이어갑니다 — \
+             새 job은 ←의 새 쓰레드에서 엽니다.",
+            "Mode is **job**. This conversation continues as-is — \
+             start a new job from a new thread (←).",
         )
     }
 
@@ -391,6 +430,39 @@ impl Lang {
         )
     }
 
+    // ── 등록 코드 창
+    pub fn enroll_title(self) -> &'static str {
+        self.pick("Attacca 연결", "Connect to Attacca")
+    }
+    pub fn enroll_steps(self) -> &'static str {
+        self.pick(
+            "브라우저에서 이 주소를 열고, 아래 코드를 입력해 승인해 주세요:",
+            "Open this address in your browser and enter the code below:",
+        )
+    }
+    pub fn enroll_expires(self, secs: u64) -> String {
+        let minutes = secs.div_ceil(60);
+        match self {
+            Lang::Ko => format!("코드는 {minutes}분 후 만료됩니다."),
+            Lang::En => format!("Code expires in {minutes} minute(s)."),
+        }
+    }
+    pub fn enroll_lapsed(self) -> &'static str {
+        self.pick(
+            "코드가 만료됐습니다. 새 코드를 요청하는 중입니다…",
+            "That code expired. Requesting a new one…",
+        )
+    }
+    pub fn enroll_denied(self) -> &'static str {
+        self.pick(
+            "브라우저에서 거부했습니다. Esc를 눌러 닫으세요.",
+            "The request was declined in the browser. Press Esc to close.",
+        )
+    }
+    pub fn enroll_keys(self) -> &'static str {
+        self.pick("Esc 닫기", "Esc close")
+    }
+
     // ── `/lang`
     pub fn lang_now(self) -> String {
         match self {
@@ -475,6 +547,8 @@ mod tests {
             (ko.working(), en.working()),
             (ko.idle(), en.idle()),
             (ko.stopping(), en.stopping()),
+            (ko.connected(), en.connected()),
+            (ko.waiting_answer(), en.waiting_answer()),
             (ko.new_thread(), en.new_thread()),
             (ko.projects(), en.projects()),
             (ko.agents(), en.agents()),
@@ -483,6 +557,11 @@ mod tests {
             (ko.mode_plan(), en.mode_plan()),
             (ko.approve_keys(), en.approve_keys()),
             (ko.esc_stops(), en.esc_stops()),
+            (ko.enroll_title(), en.enroll_title()),
+            (ko.enroll_steps(), en.enroll_steps()),
+            (ko.enroll_lapsed(), en.enroll_lapsed()),
+            (ko.enroll_denied(), en.enroll_denied()),
+            (ko.enroll_keys(), en.enroll_keys()),
         ];
         for (k, e) in pairs {
             assert_ne!(k, e, "번역이 안 된 문구가 있다: {k}");
@@ -509,6 +588,15 @@ mod tests {
             en.esc_stops(),
             en.quit_armed(),
             en.lang_changed(),
+            en.enroll_title(),
+            en.enroll_steps(),
+            en.enroll_lapsed(),
+            en.enroll_denied(),
+            en.enroll_keys(),
+            en.connected(),
+            en.waiting_answer(),
+            en.mode_continues_work(),
+            en.mode_continues_job(),
         ];
         for text in said {
             assert!(

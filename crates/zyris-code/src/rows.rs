@@ -33,7 +33,9 @@ fn body_width(width: u16) -> u16 {
 /// 카드 하나의 접힘 상태.
 ///
 /// **기본은 접힘이다.** 추론은 훑어보는 것이지 읽는 것이 아니라, 답을 보러 온 화면을
-/// 생각 더미가 밀어내면 안 된다. 펴는 것은 사람이 Ctrl+O로 한다.
+/// 생각 더미가 밀어내면 안 된다. **접혀도 도구 줄은 보인다** — 숨기는 것은 추론
+/// 본문뿐이다. 무슨 일을 했는지까지 가리면 사람은 에이전트가 뭘 하는지 모른다.
+/// 펴는 것은 사람이 Ctrl+O로 한다.
 ///
 /// **저절로 바뀌는 일은 없다.** 예전에는 추론 중에 펴고 답이 시작되면 접었는데, 그러면
 /// 읽고 있던 화면이 스스로 움직이고 "늦게 온 추론이 도로 펴면 안 된다" 같은 예외가
@@ -382,104 +384,107 @@ fn make(item: &Item, width: u16, folds: &Folds) -> Made {
             }
             out.push(Line::from(card));
 
-            if fold.open {
-                // **온 순서 그대로다.** 생각 → 도구 → 생각 → 도구.
-                for part in parts {
-                    match part {
-                        Part::Think(text) => {
-                            // **`│ `를 쓰지 않는다.** 답변 안의 코드블록이 그것을 쓰고
-                            // 있어서(`markdown.rs`), 같은 모양이면 눈이 둘을 같은
-                            // 것으로 읽는다. 점선이 "생각 중"에도 더 맞는다.
-                            for line in markdown::render(text, body_width(width)) {
-                                let mut spans = vec![Span::styled(
-                                    "┊ ",
-                                    Style::default().fg(theme::BORDER_LIGHT),
-                                )];
-                                // 본문을 통째로 흐리게 다시 칠한다. 답변과 같은 밝기면
-                                // 무엇이 결론인지 안 보인다 — 추론 안의 강조나 인라인
-                                // 코드 색을 잃는 것은 그 대가로 치른다.
-                                spans.extend(line.spans.into_iter().map(|s| {
-                                    Span::styled(
-                                        s.content.to_string(),
-                                        s.style.fg(theme::TEXT_MUTED),
-                                    )
-                                }));
-                                out.push(Line::from(spans));
-                            }
-                        }
-                        Part::Step(step) => {
-                            let dot = if step.failed { theme::DANGER } else { theme::SUCCESS };
-                            // 펼칠 것이 있는 줄만 누를 수 있다. 눌러도 아무 일이
-                            // 없으면 고장으로 보인다.
-                            let can_open = !step.detail.is_empty() || step.diff.is_some();
-                            let open = can_open && folds.get(&step.seq).is_some_and(|f| f.open);
-                            if can_open {
-                                heads.push((out.len(), step.seq));
-                            }
-                            // **이름과 요약을 따로 칠한다.** 추론이 흐린 색으로 화면을
-                            // 채우는데 도구까지 같은 색이면 "무엇을 했는가"가 생각
-                            // 더미에 묻힌다. 훑을 때 눈이 잡는 것은 이 이름이다.
-                            let mut head = vec![
-                                Span::styled("● ", Style::default().fg(dot)),
-                                Span::styled(
-                                    step.name.clone(),
-                                    Style::default().fg(theme::TOOL).add_modifier(Modifier::BOLD),
-                                ),
-                            ];
-                            if !step.note.is_empty() {
-                                head.push(Span::styled(
-                                    format!("  {}", step.note),
-                                    Style::default().fg(theme::TOOL_ARG),
-                                ));
-                            }
-                            // **접혀 있어도 얼마나 바뀌었는지는 보인다.** 펴야 알 수
-                            // 있으면 훑어보는 것만으로는 무슨 일이 있었는지 모른다.
-                            if let Some(d) = &step.diff {
-                                head.extend(counts(d.added, d.removed));
-                            }
-                            // 펼칠 수 있다는 것을 알려 준다. 모르면 아무도 안 누른다.
-                            head.push(Span::styled(
-                                match (can_open, open) {
-                                    (false, _) => "",
-                                    (true, false) => "  ▸",
-                                    (true, true) => "  ▾",
-                                },
+            // **도구 줄은 접혀도 보인다.** 카드 접힘은 추론을 숨기는 것이지 무슨
+            // 일을 했는지까지 가리는 것이 아니다 — 툴 사용은 대화의 흐름이라
+            // 생각 더미에 묻히면 사람은 에이전트가 뭘 하는지 모른다. 펼치면
+            // 생각 줄이 그 자리에 끼어들어 "생각 → 도구 → 생각 → 도구" 순서가
+            // 그대로 보인다.
+            for part in parts {
+                match part {
+                    Part::Think(text) if fold.open => {
+                        // **`│ `를 쓰지 않는다.** 답변 안의 코드블록이 그것을 쓰고
+                        // 있어서(`markdown.rs`), 같은 모양이면 눈이 둘을 같은
+                        // 것으로 읽는다. 점선이 "생각 중"에도 더 맞는다.
+                        for line in markdown::render(text, body_width(width)) {
+                            let mut spans = vec![Span::styled(
+                                "┊ ",
                                 Style::default().fg(theme::BORDER_LIGHT),
+                            )];
+                            // 본문을 통째로 흐리게 다시 칠한다. 답변과 같은 밝기면
+                            // 무엇이 결론인지 안 보인다 — 추론 안의 강조나 인라인
+                            // 코드 색을 잃는 것은 그 대가로 치른다.
+                            spans.extend(line.spans.into_iter().map(|s| {
+                                Span::styled(
+                                    s.content.to_string(),
+                                    s.style.fg(theme::TEXT_MUTED),
+                                )
+                            }));
+                            out.push(Line::from(spans));
+                        }
+                    }
+                    Part::Step(step) => {
+                        let dot = if step.failed { theme::DANGER } else { theme::SUCCESS };
+                        // 펼칠 것이 있는 줄만 누를 수 있다. 눌러도 아무 일이
+                        // 없으면 고장으로 보인다.
+                        let can_open = !step.detail.is_empty() || step.diff.is_some();
+                        let open = can_open && folds.get(&step.seq).is_some_and(|f| f.open);
+                        if can_open {
+                            heads.push((out.len(), step.seq));
+                        }
+                        // **이름과 요약을 따로 칠한다.** 추론이 흐린 색으로 화면을
+                        // 채우는데 도구까지 같은 색이면 "무엇을 했는가"가 생각
+                        // 더미에 묻힌다. 훑을 때 눈이 잡는 것은 이 이름이다.
+                        let mut head = vec![
+                            Span::styled("● ", Style::default().fg(dot)),
+                            Span::styled(
+                                step.name.clone(),
+                                Style::default().fg(theme::TOOL).add_modifier(Modifier::BOLD),
+                            ),
+                        ];
+                        if !step.note.is_empty() {
+                            head.push(Span::styled(
+                                format!("  {}", step.note),
+                                Style::default().fg(theme::TOOL_ARG),
                             ));
-                            out.push(Line::from(head));
-                            if open {
-                                match &step.diff {
-                                    // **diff가 있으면 그것만 보여 준다.** 같은 내용을
-                                    // JSON으로 한 번 더 얹으면 화면만 두 배로 길어지고
-                                    // 사람이 읽는 것은 diff 쪽이다.
-                                    Some(d) => {
-                                        for line in &d.lines {
-                                            out.push(diff_line(line, body_width(width) as usize));
-                                        }
+                        }
+                        // **접혀 있어도 얼마나 바뀌었는지는 보인다.** 펴야 알 수
+                        // 있으면 훑어보는 것만으로는 무슨 일이 있었는지 모른다.
+                        if let Some(d) = &step.diff {
+                            head.extend(counts(d.added, d.removed));
+                        }
+                        // 펼칠 수 있다는 것을 알려 준다. 모르면 아무도 안 누른다.
+                        head.push(Span::styled(
+                            match (can_open, open) {
+                                (false, _) => "",
+                                (true, false) => "  ▸",
+                                (true, true) => "  ▾",
+                            },
+                            Style::default().fg(theme::BORDER_LIGHT),
+                        ));
+                        out.push(Line::from(head));
+                        if open {
+                            match &step.diff {
+                                // **diff가 있으면 그것만 보여 준다.** 같은 내용을
+                                // JSON으로 한 번 더 얹으면 화면만 두 배로 길어지고
+                                // 사람이 읽는 것은 diff 쪽이다.
+                                Some(d) => {
+                                    for line in &d.lines {
+                                        out.push(diff_line(line, body_width(width) as usize));
                                     }
-                                    // 상세는 **그대로** 보여 준다. 마크다운으로 해석하면
-                                    // JSON의 `*`나 `_`가 강조로 먹혀 원문이 망가진다.
-                                    None => {
-                                        for (i, line) in wrap_plain(&step.detail, body_width(width))
-                                            .into_iter()
-                                            .enumerate()
-                                        {
-                                            out.push(Line::from(vec![
-                                                Span::styled(
-                                                    if i == 0 { "  ⎿ " } else { "    " },
-                                                    Style::default().fg(theme::BORDER_LIGHT),
-                                                ),
-                                                Span::styled(
-                                                    line,
-                                                    Style::default().fg(theme::TEXT_MUTED),
-                                                ),
-                                            ]));
-                                        }
+                                }
+                                // 상세는 **그대로** 보여 준다. 마크다운으로 해석하면
+                                // JSON의 `*`나 `_`가 강조로 먹혀 원문이 망가진다.
+                                None => {
+                                    for (i, line) in wrap_plain(&step.detail, body_width(width))
+                                        .into_iter()
+                                        .enumerate()
+                                    {
+                                        out.push(Line::from(vec![
+                                            Span::styled(
+                                                if i == 0 { "  ⎿ " } else { "    " },
+                                                Style::default().fg(theme::BORDER_LIGHT),
+                                            ),
+                                            Span::styled(
+                                                line,
+                                                Style::default().fg(theme::TEXT_MUTED),
+                                            ),
+                                        ]));
                                     }
                                 }
                             }
                         }
                     }
+                    Part::Think(_) => {}
                 }
             }
         }
@@ -634,13 +639,29 @@ mod tests {
         work_at(1)
     }
 
+    /// **접혀도 도구 줄은 보인다.** 카드 접힘은 추론을 숨기는 것이지 무슨 일을
+    /// 했는지까지 가리는 것이 아니다 — 툴 사용은 대화의 흐름이라 생각 더미에
+    /// 묻히면 사람은 에이전트가 뭘 하는지 모른다.
     #[test]
-    fn a_folded_card_shows_only_its_title() {
+    fn a_folded_card_hides_thinking_but_shows_tools() {
         let folds = Folds::from([(1, Fold::default())]);
         let out = plain(&rows(&[work()], 40, &folds));
-        assert_eq!(out.len(), 1, "접힌 카드는 한 줄이다: {out:?}");
-        assert!(out[0].contains("스크롤 계산 위치를 찾는 중"));
-        assert!(!out[0].contains("먼저 구조를 보자"));
+        assert!(out[0].contains("스크롤 계산 위치를 찾는 중"), "머리줄이 없다: {out:?}");
+        assert!(out.iter().any(|l| l.contains("grep")), "접혀도 도구는 보여야 한다: {out:?}");
+        assert!(
+            !out.iter().any(|l| l.contains("먼저 구조를 보자")),
+            "추론은 접혀 있어야 한다: {out:?}"
+        );
+    }
+
+    /// 펼치면 생각이 도구 사이에 끼어든다 — 온 순서 그대로다.
+    #[test]
+    fn an_open_card_interleaves_thinking_with_tools() {
+        let folds = Folds::from([(1, Fold { open: true })]);
+        let out = plain(&rows(&[work()], 40, &folds));
+        let think = out.iter().position(|l| l.contains("먼저 구조를 보자")).expect("생각이 없다");
+        let tool = out.iter().position(|l| l.contains("grep")).expect("도구가 없다");
+        assert!(think < tool, "생각이 도구보다 앞에 있어야 한다: {out:?}");
     }
 
     #[test]
@@ -661,10 +682,13 @@ mod tests {
     }
 
     /// 접힘 상태를 모르는 카드는 접혀 있어야 한다 — 기본은 조용한 화면이다.
+    /// (도구 줄은 그 화면에도 선다.)
     #[test]
     fn a_card_with_no_fold_state_defaults_to_folded() {
         let out = plain(&rows(&[work()], 40, &Folds::new()));
-        assert_eq!(out.len(), 1, "{out:?}");
+        assert!(out[0].contains("스크롤 계산 위치를 찾는 중"), "{out:?}");
+        assert!(!out.iter().any(|l| l.contains("먼저 구조를 보자")), "추론이 보인다: {out:?}");
+        assert!(out.iter().any(|l| l.contains("grep")), "도구가 안 보인다: {out:?}");
     }
 
     #[test]
@@ -717,8 +741,7 @@ mod tests {
         assert_eq!(note.style.fg, Some(theme::TOOL_ARG));
     }
 
-    /// **접혀도 무엇이 바뀌었는지는 보인다.** 턴이 끝나 카드가 접히면 지금은 흔적이
-    /// 통째로 사라진다 — 수치가 도구 줄에만 있고 그건 펴야 보이기 때문이다.
+    /// **접혀도 무엇이 바뀌었는지는 보인다.** 머리줄과 도구 줄 양쪽에 수치가 있다.
     #[test]
     fn a_folded_card_still_shows_how_much_changed() {
         let d = crate::tools::diff::Diff::parse("-a\n+b\n", "src/app.rs", 12, 3).unwrap();
@@ -735,9 +758,12 @@ mod tests {
             })],
         }];
         let out = plain(&rows(&items, 60, &Folds::new()));
-        assert_eq!(out.len(), 1, "접혀야 한다: {out:?}");
-        assert!(out[0].contains("+12"), "{out:?}");
-        assert!(out[0].contains("−3"), "{out:?}");
+        assert!(out[0].contains("+12"), "머리줄에 수치가 없다: {out:?}");
+        assert!(out[0].contains("−3"), "머리줄에 수치가 없다: {out:?}");
+        assert!(
+            out.iter().any(|l| l.contains("src/app.rs")),
+            "접힌 상태에도 도구 줄은 보여야 한다: {out:?}"
+        );
     }
 
     /// 아무것도 안 바꾼 카드에 `+0 −0`을 붙이면 그건 그것대로 시끄럽다.
@@ -1018,6 +1044,21 @@ mod tests {
         assert_eq!(by_seq, vec![1, 100], "카드 머리와 도구 줄 둘 다 눌려야 한다");
 
         // 도구 줄의 행이 실제로 그 도구 줄이어야 한다 — 어긋나면 엉뚱한 게 펴진다.
+        let lines = r.plain();
+        let row = r.cards.iter().find(|(_, s)| **s == 100).map(|(r, _)| *r).unwrap();
+        assert!(lines[row].contains("grep"), "{:?}", lines[row]);
+    }
+
+    /// **접힌 카드의 도구 줄도 눌러 펼 수 있어야 한다** — 보이는 것이면 누를 수
+    /// 있어야 한다. 도구 상세는 카드 접힘과 무관하게 따로 펴진다.
+    #[test]
+    fn folded_tool_rows_are_still_clickable() {
+        let items = [work_at(1)];
+        let r = rows(&items, 60, &Folds::new());
+        let mut by_seq: Vec<i64> = r.cards.values().copied().collect();
+        by_seq.sort();
+        assert_eq!(by_seq, vec![1, 100], "머리와 도구 줄 둘 다 눌려야 한다");
+
         let lines = r.plain();
         let row = r.cards.iter().find(|(_, s)| **s == 100).map(|(r, _)| *r).unwrap();
         assert!(lines[row].contains("grep"), "{:?}", lines[row]);

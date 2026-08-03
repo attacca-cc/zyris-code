@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::{mpsc, oneshot};
 
-use crate::app::{Action, Frame, ToolAsk, Verdict};
+use crate::app::{Action, AppMsg, Frame, ToolAsk, Verdict};
 use crate::mode::Mode;
 use crate::tools::gate::{decide, Call, Decision, Grants};
 
@@ -30,7 +30,13 @@ struct Inner {
     /// 작업 디렉터리. **밖으로 나가는지 재는 기준이다.**
     root: Mutex<PathBuf>,
     /// 화면으로 보낼 것. 화면이 뜨기 전에는 비어 있다.
-    to_app: Mutex<Option<mpsc::UnboundedSender<Action>>>,
+    ///
+    /// `AppMsg`의 `None`은 화면 밖(도구·다리)에서 온 것임을 뜻한다 — 턴 스트림만
+    /// 자기 세션 id를 태그로 실어 보낸다(`app::spawn_stream`).
+    to_app: Mutex<Option<mpsc::UnboundedSender<AppMsg>>>,
+    /// 화면이 붙었을 때 깨우는 신호. `main`이 등록 코드가 화면으로 갈 수 있게
+    /// 첫 등록 전에 화면 붙기를 기다릴 때 쓴다.
+    screen_ready: tokio::sync::Notify,
     /// 답을 기다리는 물음들.
     waiting: Mutex<HashMap<u64, oneshot::Sender<Verdict>>>,
     /// 세션을 만들 때 실을 스킬 목록. `tools::announce`가 정하고 화면이 집어 간다.
@@ -59,8 +65,27 @@ impl Bridge {
     }
 
     /// 화면이 뜨면 자기 손잡이를 꽂는다. 이 전에 오는 물음은 갈 곳이 없어 거부가 된다.
-    pub fn attach(&self, to_app: mpsc::UnboundedSender<Action>) {
+    pub fn attach(&self, to_app: mpsc::UnboundedSender<AppMsg>) {
         *self.0.to_app.lock().unwrap() = Some(to_app);
+        // 첫 등록은 화면이 뜨기 전에 시작될 수 있다(`main`이 러너를 돌리기 전에
+        // 앱을 띄운다). 등록 코드가 화면으로 가도록, 붙기를 기다리는 쪽을 깨운다.
+        self.0.screen_ready.notify_waiters();
+    }
+
+    /// 화면이 붙기를 기다린다. **이미 붙어 있으면 곧바로 돌아온다.**
+    ///
+    /// `main`이 러너를 돌리기 전에 이걸 부른다 — 등록 코드 창(`Frame::Enroll`)이
+    /// 첫 연결부터 화면에 도달할 수 있게 하는 순서 보장이다.
+    pub async fn wait_screen(&self) {
+        if self.has_screen() {
+            return;
+        }
+        let notified = self.0.screen_ready.notified();
+        // 기다림을 만들고 나서 다시 본다 — 그 사이에 붙었을 수 있다.
+        if self.has_screen() {
+            return;
+        }
+        notified.await;
     }
 
     /// 화면 쪽 판정 재료를 옮겨 둔다. I/O 자리가 상태를 만질 때마다 부른다.
@@ -178,7 +203,8 @@ impl Bridge {
     }
 
     fn send(&self, action: Action) -> Option<()> {
-        self.0.to_app.lock().unwrap().as_ref()?.send(action).ok()
+        // 다리에서 나가는 것은 화면 밖의 일이다 — 세션 태그 없이 보낸다.
+        self.0.to_app.lock().unwrap().as_ref()?.send((None, action)).ok()
     }
 }
 

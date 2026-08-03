@@ -9,7 +9,6 @@ use zyris::runtime::Runner;
 use zyris::NodeKind;
 // `AttaccaApi`는 트레이트다. 메서드를 부르려면 클라이언트 타입만으로는 안 되고
 // 트레이트가 스코프에 있어야 한다 — 없으면 "method not found"로 막힌다.
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::watch;
@@ -50,8 +49,10 @@ async fn main() -> ExitCode {
         }
     }
 
-    // 못 붙는 동안 지켜보다 빨간 글씨로 말한다. 붙으면 저절로 조용해진다.
-    notice.watch();
+    // 못 붙는 동안 지켜보다 빨간 글씨로 말한다. 붙으면 저절로 조용해지고,
+    // **화면이 뜨면 입을 다문다** — 화면이 말한다(등록 코드 창 포함).
+    // 다리는 아래에서 만들므로 `watch` 호출도 그 뒤로 옮긴다.
+    // 화면은 러너보다 먼저 띄우므로, 첫 등록부터 이 감시자는 조용하다.
 
     // **화면 말을 먼저 정한다.** 붙기 전에 셸로 나가는 말(`notice`)도 이 값을 쓴다.
     // 순서: `$ZYRIS_CODE_LANG` → 지난번에 고른 것 → 로케일.
@@ -107,20 +108,29 @@ async fn main() -> ExitCode {
         std::env::set_var("ZYRIS_NODE_NAME", zyris_code::conn::node_name());
     }
 
-    // **앱은 한 번만 띄운다.**
-    //
-    // `Runner`는 재연결할 때마다 `on_connect`를 다시 spawn한다. 훅이 그대로 앱을 띄우면
-    // 유휴 상태로 두다 연결이 한 번 끊겼다 붙는 순간 TUI가 둘이 되어 같은 터미널을 두고
-    // 싸운다 — 화면이 깨지고 입력이 엉킨다.
-    //
-    // 그래서 첫 연결만 앱을 띄우고, 이후 연결은 손잡이만 갈아 끼워 준다. 앱은 매번
-    // 최신 손잡이를 집어 쓴다.
-    let started = Arc::new(AtomicBool::new(false));
+    // **앱은 러너보다 먼저 띄운다.** 그래야 첫 등록(연결 전)부터 등록 코드 창이
+    // 화면에 뜬다 — 예전처럼 stdout 상자가 터미널에 새는 일이 없다. `Runner`는
+    // 재연결할 때마다 `on_connect`를 다시 부르지만, 앱은 여기서 한 번만 띄우고
+    // 손잡이만 갈아 끼운다(`api_rx`).
     let (api_tx, api_rx) = watch::channel::<Option<Arc<AttaccaApiClient>>>(None);
     let api_tx = Arc::new(api_tx);
 
     // 도구 쪽과 화면 쪽을 잇는 다리. **화면이 붙기 전에는 어떤 승인도 받을 수 없다.**
     let bridge = zyris_code::tools::bridge::Bridge::new();
+
+    // 못 붙는 동안 지켜보다 셸에 말한다. **화면이 뜨면 입을 다문다** — 화면이
+    // 말한다(등록 코드 창 포함). 화면은 러너보다 먼저 뜨므로 첫 등록부터 조용하다.
+    notice.watch(bridge.clone());
+
+    // 러너가 치명적으로 끝났을 때 화면에도 닫으라고 보내는 신호. 앱은 이것을 보고
+    // 터미널을 되돌린 뒤 끝나고, `main`이 그다음에 사유를 셸에 말한다.
+    let (die_tx, die_rx) = watch::channel(false);
+
+    // **화면을 먼저 띄운다.** `on_connect`가 아니라 여기다 — 등록 코드 창이
+    // 첫 연결 전에도 도달해야 한다(`enroll::ScreenEnroll`).
+    let mut app_task = tokio::spawn(app::run(api_rx.clone(), bridge.clone(), die_rx));
+    // 러너가 돌기 전에 화면이 붙기를 기다린다 — 첫 등록 코드가 화면으로 갈 수 있게.
+    bridge.wait_screen().await;
 
     // **여기서부터 이 노드는 에이전트에게 컴퓨터를 내준다.**
     //
@@ -128,23 +138,35 @@ async fn main() -> ExitCode {
     // 이 컴퓨터를 만질 수 있다. 막는 것은 `tools::guard::Gate` 하나뿐이다.
     let cwd = zyris_code::tools::working_dir();
 
-    // **창을 여럿 띄우는 것에 대해 아무것도 하지 않는다.**
+    // **창을 여럿 띄우는 것은 막지 않는다. 알리기는 한다.**
     //
-    // 예전에는 두 번째 창을 막았고, 그다음에는 알림을 띄웠다. 둘 다 걷어냈다 — 같은
-    // 디렉터리라면 attacca가 어느 창으로 도구 호출을 보내든 **바뀌는 파일은 같다.**
-    // 알림은 그 사실을 바꾸지 못하면서 뜰 때마다 화면 위에 한 덩이를 얹을 뿐이다.
+    // 같은 자격을 쓰는 창이 둘이면 서버 레지스트리는 **나중 연결로 덮어쓴다** — 먼저
+    // 뜬 창의 소켓은 살아 있는 채로 도구 호출을 못 받는다. 막는 것은 그 사실을 바꾸지
+    // 못하므로(같은 디렉터리라면 어느 창이 받든 바뀌는 파일은 같다) 두 번째 창을
+    // 거부하지는 않지만, 조용히 꼬이면 사람은 어느 창이 받는지 알 길이 없다. 그래서
+    // 먼저 살아 있는 창이 있으면 그 사실을 활동 줄에 한 번 말해 준다
+    // (`conn::another_instance_alive`, 잠금 파일은 `.instance-<프로필>.lock`).
     //
     // 하나만 알고 있으면 된다: 판정(계획 모드·열어 둔 디렉터리)과 승인 창은 **호출을 받은
     // 창의 것**이다. 두 창의 모드가 다르면 어느 쪽 규칙으로 걸릴지는 서버가 정한다.
-    // **등록 코드는 상류가 stdout에 찍는다.** 값으로 받는 길이 없다.
+    if let Some(dir) = zyris_code::conn::credential_dir() {
+        let profile = std::env::var("ZYRIS_PROFILE")
+            .unwrap_or_else(|_| zyris_code::conn::APP.to_string());
+        if zyris_code::conn::another_instance_alive(&dir, &profile) {
+            tracing::warn!("다른 zyris-code 창이 같은 자격으로 붙어 있습니다. 도구 호출은 서버가 고른 창으로 갑니다.");
+            bridge.frame(zyris_code::app::Frame::Notice(
+                "다른 zyris-code 창이 이미 같은 자격으로 붙어 있습니다. 승인 창이 그 창에 떠 있을 수 있습니다."
+                    .to_string(),
+            ));
+        } else {
+            // 살아 있는 동안 잠금을 붙들고 간다 — 창이 끝나면 Drop이 지운다.
+            let _lock = zyris_code::conn::claim_instance_lock(&dir, &profile);
+        }
+    }
     //
-    // 처음 켤 때는 그래도 괜찮다 — TUI는 `on_connect`에서 뜨므로 그때 화면은 아직 없고,
-    // 상류가 찍은 상자가 터미널에 그대로 남는다. 문제는 **화면이 떠 있는데 재등록이
-    // 일어날 때**뿐이고, 그때는 `enroll::Watch`가 알아채 화면에 한 줄 남긴다.
-    //
-    // 한때는 `EnrollmentUi` 훅을 만들어 코드를 값으로 받았는데, 그 훅이 로컬 zyris에만
-    // 있고 어디에도 올라가 있지 않아 이 리포가 통째로 안 빌드됐다. **상류에 없는 API에
-    // 기대지 않는다.**
+    // **등록 코드는 상류의 `EnrollmentUi` 훅이 화면으로 보낸다**(`enroll.rs`, 상류 PR #6).
+    // 화면이 없을 때만(앱을 못 띄운 극단) stdout 상자로 빠진다. 예전처럼 "화면 뒤
+    // 터미널로 새는" 문제는 구조적으로 없다.
     let config = zyris::runtime::RunConfig::from_env();
     let creds: Arc<dyn zyris::runtime::credentials::Credentials> =
         match zyris_code::enroll::source(&config, &bridge) {
@@ -195,15 +217,13 @@ async fn main() -> ExitCode {
         let bridge = bridge.clone();
         let notice = notice.clone();
         move |conn| {
-            let started = Arc::clone(&started);
             let api_tx = Arc::clone(&api_tx);
-            let api_rx = api_rx.clone();
             // `on_connect`는 재연결마다 다시 불린다. 다리와 알림은 손잡이라 사본으로
             // 넘긴다 — 통째로 옮기면 두 번째 연결에서 옮길 것이 없다.
             let bridge = bridge.clone();
             let notice = notice.clone();
             async move {
-                // **붙었다.** 화면이 뜰 참이므로 셸 알림은 여기서 입을 다문다 —
+                // **붙었다.** 화면이 이미 떠 있으므로 셸 알림은 입을 다문다 —
                 // ratatui가 그리는 자리에 끼어들면 그 칸은 다시 그려지지 않는다.
                 notice.connected();
 
@@ -221,28 +241,8 @@ async fn main() -> ExitCode {
 
                 match conn.wait_capability::<AttaccaApiClient>(CONSUME_WAIT).await {
                     Ok(api) => {
-                        // 새 손잡이를 먼저 알린다. 이미 도는 앱은 이걸 집어 쓴다.
+                        // 새 손잡이를 알린다. 이미 도는 앱은 이걸 집어 쓴다.
                         let _ = api_tx.send(Some(Arc::new(api)));
-                        if started.swap(true, Ordering::SeqCst) {
-                            tracing::info!("다시 붙었다. 앱은 이미 돌고 있다");
-                            return;
-                        }
-                        let code = match app::run(api_rx, bridge).await {
-                            Ok(()) => 0,
-                            Err(e) => {
-                                tracing::error!(error = %e, "앱이 끝났다");
-                                1
-                            }
-                        };
-                        // 화면을 닫았으면 프로세스도 끝나야 한다.
-                        //
-                        // `Runner::run()`은 훅이 끝나도 연결을 붙들고 계속 돈다. 의도적
-                        // 종료로 치는 경로는 SIGINT 하나뿐인데, TUI는 raw 모드라 Ctrl+C가
-                        // 시그널이 되지 않고 바이트로 들어온다 — 그래서 여기서 끝낸다.
-                        // `conn.close()`는 Runner가 "끊겼다"로 보고 재연결하므로 답이 아니다.
-                        //
-                        // 터미널은 `app::run`이 이미 되돌린 뒤다.
-                        std::process::exit(code);
                     }
                     Err(e) => {
                         tracing::error!(error = %e, "서버가 attacca_api를 announce하지 않았다")
@@ -257,11 +257,40 @@ async fn main() -> ExitCode {
     zyris_code::tools::start_mcp(runner.capabilities(), cwd, bridge);
 
     // **조용히 죽지 않는다.** `run()`은 사유를 로그로만 보내고 종료 코드만 남긴다.
-    match runner.try_run().await {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
+    //
+    // 러너와 앱 중 **먼저 끝나는 쪽이 종료를 정한다.** 앱이 먼저 끝나면(사용자가
+    // Ctrl+C로 껐다) 그대로 성공으로 끝나고, 러너가 먼저 끝나면(치명적 오류) 화면에도
+    // 닫으라고 알린 뒤 — 터미널을 되돌리게 — 사유를 셸에 말하고 종료 코드를 남긴다.
+    let running = runner.try_run();
+    tokio::pin!(running);
+    // 두 가지를 모두 `&mut`로 빌린다 — 러너가 먼저 끝나면 앱을 아직 붙들고
+    // 터미널을 되돌리게 한 뒤 사유를 말해야 하므로, 그쪽에서 다시 기다린다.
+    let outcome = tokio::select! {
+        result = &mut running => RunnerEnded::Runner(result),
+        app_result = &mut app_task => RunnerEnded::App(app_result),
+    };
+    match outcome {
+        // 러너가 깨끗하게 끝났다(SIGINT).
+        RunnerEnded::Runner(Ok(())) => ExitCode::SUCCESS,
+        RunnerEnded::Runner(Err(e)) => {
+            // 화면이 살아 있으면 먼저 닫는다 — 터미널을 되돌린 뒤에 말해야
+            // 사유가 보인다. 못 닫으면(앱이 이미 죽은 경우) 그냥 말한다.
+            let _ = die_tx.send(true);
+            let _ = tokio::time::timeout(Duration::from_secs(3), app_task).await;
             notice.fatal(&e.to_string());
             e.exit_code()
         }
+        // 화면을 닫았으면 프로세스도 끝나야 한다. `Runner::run()`은 훅이 끝나도
+        // 연결을 붙들고 계속 돈다 — 앱이 끝났다는 것이 곧 종료 신호다.
+        RunnerEnded::App(app_result) => match app_result {
+            Ok(Ok(())) => ExitCode::SUCCESS,
+            _ => ExitCode::FAILURE,
+        },
     }
+}
+
+/// 러너와 앱 중 무엇이 먼저 끝났는가. 종료 코드를 정하는 갈래다.
+enum RunnerEnded {
+    Runner(Result<(), zyris::runtime::RunError>),
+    App(Result<Result<(), anyhow::Error>, tokio::task::JoinError>),
 }

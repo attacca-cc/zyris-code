@@ -306,7 +306,8 @@ fn drawing_at_a_very_narrow_width_does_not_panic() {
     let _ = dump(&mut s, 12, 6);
 }
 
-/// **"연결됨"은 어디에도 없다.** 잘 붙어 있다는 것을 계속 알릴 이유가 없다.
+/// **"연결됨"은 잠깐만 보인다.** 붙은 직후 상태 줄로 한 번 보여 주고(`Connected`)
+/// 저절로 사라진다 — 계속 알릴 이유가 없다. 상태가 없는 평소에는 아무것도 없다.
 #[test]
 fn a_healthy_connection_is_not_announced_anywhere() {
     let mut s = State::new();
@@ -338,6 +339,7 @@ const ACTIVITY_FROM_BOTTOM: usize = 5;
 #[test]
 fn what_is_happening_now_sits_between_the_chat_and_the_input_box() {
     let mut s = State::new();
+    s.lang = zyris_code::lang::Lang::Ko;
     s.connected = true;
     let screen = dump(&mut s, 40, 12);
     let lines: Vec<&str> = screen.lines().collect();
@@ -359,6 +361,7 @@ fn what_is_happening_now_sits_between_the_chat_and_the_input_box() {
 #[test]
 fn the_quit_hint_wins_over_everything_else() {
     let mut s = State::new();
+    s.lang = zyris_code::lang::Lang::Ko;
     s.connected = true;
     s.running = true;
     s.quit_armed_at = Some(std::time::Instant::now());
@@ -1405,6 +1408,7 @@ fn a_running_command_is_named_in_the_activity_line() {
 #[test]
 fn a_finished_command_leaves_the_activity_line() {
     let mut s = State::new();
+    s.lang = zyris_code::lang::Lang::Ko;
     s.connected = true;
     s.running = true;
     apply(&mut s, &Action::Frame(AppFrame::ExecStart { id: 1, command: "cargo build".into() }));
@@ -1431,6 +1435,7 @@ fn finishing_another_command_does_not_clear_the_running_one() {
 fn the_activity_line_counts_the_seconds() {
     use std::time::{Duration, Instant};
     let mut s = State::new();
+    s.lang = zyris_code::lang::Lang::Ko;
     s.connected = true;
     s.running = true;
     apply(&mut s, &Action::Frame(AppFrame::ExecStart { id: 1, command: "sleep 30".into() }));
@@ -1451,6 +1456,58 @@ fn asking_to_stop_shows_on_the_activity_line() {
     let screen = dump(&mut s, 80, 12);
     assert!(screen.contains("Stopping"), "멈추라고 한 것이 안 보인다:\n{screen}");
     assert!(screen.contains("Ctrl+C quits"), "그다음 Ctrl+C가 무엇인지 말해야 한다:\n{screen}");
+}
+
+// ── 등록 코드 창 ──────────────────────────────────────────────────────────
+
+fn enroll_view() -> zyris_code::app::EnrollView {
+    zyris_code::app::EnrollView {
+        code: "WXQR-7KBD".into(),
+        uri: "https://attacca.example/settings/zyris/device".into(),
+        expires_at: std::time::Instant::now() + std::time::Duration::from_secs(600),
+        phase: zyris_code::app::EnrollPhase::Waiting,
+    }
+}
+
+/// 등록 코드가 화면 가운데 상자로 뜬다 — 예전의 stdout 상자가 아니다.
+#[test]
+fn the_enroll_window_shows_the_code_and_the_address() {
+    let mut s = State::new();
+    apply(&mut s, &Action::Frame(AppFrame::Enroll(enroll_view())));
+    let screen = dump(&mut s, 80, 24);
+    assert!(screen.contains("WXQR-7KBD"), "코드가 안 보인다:\n{screen}");
+    assert!(
+        screen.contains("attacca.example/settings/zyris/device"),
+        "주소가 안 보인다:\n{screen}"
+    );
+    assert!(screen.contains("Connect to Attacca"), "제목이 없다:\n{screen}");
+    assert!(screen.contains("Esc close"), "닫는 키 안내가 없다:\n{screen}");
+}
+
+/// 거부되면 사정이 바뀐다 — 조용히 닫히면 사람은 무슨 일인지 모른다.
+#[test]
+fn a_denied_enrollment_says_so_in_the_window() {
+    let mut s = State::new();
+    apply(&mut s, &Action::Frame(AppFrame::Enroll(enroll_view())));
+    apply(&mut s, &Action::Frame(AppFrame::EnrollPhase(zyris_code::app::EnrollPhase::Denied)));
+    let screen = dump(&mut s, 80, 24);
+    assert!(screen.contains("declined"), "거부가 안 보인다:\n{screen}");
+}
+
+/// 등록 코드 창은 대화 위에 겹친다 — 코드를 보는 중에는 뒤가 안 보여도 된다.
+#[test]
+fn the_enroll_window_overlays_the_conversation() {
+    let mut s = State::new();
+    apply(
+        &mut s,
+        &Action::Frame(AppFrame::Event {
+            cursor: 1,
+            entry: Some(Entry { seq: 1, kind: EntryKind::Agent("뒤에 있는 대화".into()) }),
+        }),
+    );
+    apply(&mut s, &Action::Frame(AppFrame::Enroll(enroll_view())));
+    let screen = dump(&mut s, 80, 24);
+    assert!(screen.contains("WXQR-7KBD"), "코드가 안 보인다:\n{screen}");
 }
 
 // ── 승인 화면 ──────────────────────────────────────────────────────────────

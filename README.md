@@ -42,15 +42,20 @@ refreshing never widens them, so a grant missing `agents:read` or
 `projects:read` shows an empty agent or project list rather than an error.
 zyris-code names what is missing and asks once for a fresh code.
 
-The first enrolment registers as `<hostname> zyris-code` rather than the bare
-hostname, so it stays distinct from any other zyris node on the same machine.
-Override with `ZYRIS_NODE_NAME`; `/cwd` shows what this window registered as.
+The first enrolment registers as `<hostname> zyris-code · <directory>` rather
+than the bare hostname, so it stays distinct from any other zyris node on the
+same machine — and windows in different directories are distinguishable in
+Attacca at a glance. Override with `ZYRIS_NODE_NAME`; `/cwd` shows what this
+window registered as.
 
 **Open as many windows as you like.** Nothing stops a second one, in the same
 directory or another. What you should know is that this deployment gives one
 credential exactly one node: connecting twice returns the same `node_id`, and
 the server routes tool calls to whichever connection arrived last. The earlier
-window keeps drawing, keeps its history, and receives no tool calls.
+window keeps drawing, keeps its history, and receives no tool calls. A window
+that starts while another is already using the same credential says so on the
+activity line (an instance lock with a PID liveness check), so the takeover is
+not silent.
 
 In the same directory that changes nothing worth guarding against — whichever
 window the agent reaches, the files it edits are the same. Across different
@@ -68,10 +73,13 @@ Machines that share a hostname (`arch`, `nixos`) each enrol separately, so they
 are distinct nodes on the server and the slug is disambiguated automatically.
 Only the display name collides — name them with `ZYRIS_NODE_NAME`.
 
-If the credential is ever revoked mid-session, the enrollment code is drawn in
-the UI itself — a panel over the conversation with the URL, the code, and a
-countdown — and a line stays in the chat so it is still there after the panel
-closes.
+If the credential is ever revoked mid-session — the node is deleted in Attacca,
+or its grant chain breaks — zyris-code notices and **draws the enrollment code in
+the UI itself**: a panel over the conversation with the URL, the code and a
+countdown. The panel is dismissed only with `Esc`; approving in the browser
+closes it on its own, and a fresh code re-opens it if the old one lapses. The
+same panel is what you see on a first launch, since the UI starts before the
+connection is even established.
 
 Run it **from the directory you want to work in** — that directory defines the
 fence described below.
@@ -303,7 +311,7 @@ Plugins are loaded at startup, so restart to pick up a newly installed one.
 | `Ctrl+B` | Toggle the sidebar |
 | `←` | Project and session picker |
 | `↑` / `↓` | Recall previous messages |
-| `Esc` | Cancel the running turn |
+| `Esc` | Cancel the running turn; close the enrollment-code panel (the only key that does) |
 | `Ctrl+C` | Cancel the running turn; press again to arm quitting, once more to quit |
 | `y` / `n` / `a` | Answer an approval prompt |
 | Wheel · drag | Scroll · select and copy |
@@ -319,7 +327,13 @@ seconds the window closes anyway.
 
 Work cards are folded and unfolded by hand (`Ctrl+O`) and never move on their
 own — a screen that folds itself while you are reading it is worse than one card
-too many.
+too many. Folding hides the **reasoning**; the tool rows stay visible underneath
+the card head, so you can see what the agent did without opening anything.
+Clicking a tool row opens its detail independently of the card.
+
+Switching to another session (`←`) while a turn is running does not stop that
+turn — it keeps running on the server, and its events stop appearing here. When
+you switch back, the conversation is re-read and you see where it got to.
 
 Messages typed while a turn is running are queued and sent in order when it ends.
 
