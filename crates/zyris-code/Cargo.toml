@@ -1,0 +1,49 @@
+[package]
+name = "zyris-code"
+version = "0.1.0"
+edition = "2021"
+description = "Attacca 에이전트와 대화하는 터미널 클라이언트 (ratatui)"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "zyris_code"
+path = "src/lib.rs"
+
+[[bin]]
+name = "zyris-code"
+path = "src/main.rs"
+
+[dependencies]
+zyris.workspace = true
+zyris-attacca.workspace = true
+zyris-caps.workspace = true
+zyris-capkit.workspace = true
+
+# `#[zyris::capability]`가 만드는 코드가 쓴다. **버전을 상류와 맞춘다** — 다르면 매크로가
+# 만든 타입이 상류의 것과 달라져 트레이트가 안 맞는다.
+schemars = "1.2.2"
+serde = { version = "1.0.228", features = ["derive"] }
+async-trait = "0.1.91"
+
+ratatui = "0.30"
+crossterm = { version = "0.29", features = ["event-stream"] }
+# `process`·`io-util`은 MCP 서버를 자식 프로세스로 띄우고 줄 단위로 주고받는 데 쓴다.
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "process", "io-util"] }
+unicode-width = "0.2"
+anyhow = "1.0"
+serde_json = "1.0.150"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+pulldown-cmark = { version = "0.13.4", default-features = false }
+# 줄 단위 diff. 직접 짜면 큰 파일에서 느려지고, 그건 도구 호출 예산 안에서 일어나는 일이다.
+similar = "2"
+# ripgrep이 쓰는 워커. **`.gitignore`를 존중하는 것이 요점이다** — target/을 뒤지면 이
+# 머신에서 몇 초가 날아가고 나오는 것은 빌드 산출물뿐이다. glob 매칭도 여기 것을 쓴다.
+ignore = "0.4"
+regex = "1"
+futures-util = "0.3.32"
+base64 = "0.23.0"
+
+[dev-dependencies]
+# 도구 테스트가 진짜 파일을 쓴다. 모의 파일시스템으로는 경로 해석 실수가 안 잡힌다.
+tempfile = "3"

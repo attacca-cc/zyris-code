@@ -1,0 +1,30 @@
+/target
+.env
+*.log
+.direnv
+
+# Working notes: instructions written for coding agents, and the design/plan
+# trail behind them. Useful in a local checkout, noise in a published one.
+CLAUDE.md
+AGENTS.md
+docs/
+
+# Per-machine configuration. `.mcp.json` in particular can hold API tokens.
+.mcp.json
+.zyris-code/
+.claude/
+
+# Editor and OS droppings. Not everyone on a checkout uses the same tools.
+.idea/
+.vscode/
+.DS_Store
+*.swp
+
+# The PTY smoke scripts are run, not imported — but a stray import leaves this behind.
+__pycache__/
+
+# Profiling output. `tests/perf.rs` prints numbers; these are what the profilers drop
+# next to it when someone digs further.
+perf.data
+perf.data.old
+flamegraph.svg
