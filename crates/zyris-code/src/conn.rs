@@ -4,8 +4,8 @@ use anyhow::{anyhow, Result};
 // `AttaccaApi`는 트레이트다. 메서드를 부르려면 클라이언트 타입만으로는 안 되고 트레이트가
 // 스코프에 있어야 한다 — 없으면 "method not found"로 막힌다.
 use zyris_attacca::{
-    AttaccaApi, AttaccaApiClient, ZHistoryQuery, ZNewJob, ZNewSession, ZNewWork, ZSessionFilter,
-    ZTurnFrame,
+    AttaccaApi, AttaccaApiClient, ZHistoryQuery, ZNewJob, ZNewProject, ZNewSession, ZNewWork,
+    ZSessionFilter, ZTurnFrame,
 };
 
 use crate::app::Frame;
@@ -31,6 +31,7 @@ pub const DEFAULT_AGENT: &str = "Main Agent";
 /// | `me` | 없음 |
 /// | `list_agents` | `agents:read` |
 /// | `list_projects` | `projects:read` |
+/// | `create_project` | `projects:write` |
 /// | `list_sessions`·`session_usage`·`session_history` | `sessions:read` |
 /// | `create_session_with`·`send_message`·`cancel_turn` | `sessions:write` |
 /// | `turn_events` | `events:read` |
@@ -57,9 +58,11 @@ pub const DEFAULT_AGENT: &str = "Main Agent";
 /// POST /api/zyris/v1/device/authorize {"scopes":[…,"nodes:write"], …}
 ///   → 422 … unknown variant `nodes:write`, expected one of `agents:read`, … `events:read`
 /// ```
-pub const REQUIRED_SCOPES: [&str; 9] = [
+pub const REQUIRED_SCOPES: [&str; 10] = [
     "agents:read",
     "projects:read",
+    // `/project <이름>`이 쓴다. 2026-08-03에 배포본에 재 보고 넣었다 — 200이었다.
+    "projects:write",
     "sessions:read",
     "sessions:write",
     "events:read",
@@ -517,14 +520,25 @@ impl Session {
         api: &AttaccaApiClient,
         agent_id: &str,
         message: &str,
+        mode: crate::mode::Mode,
     ) -> Result<Opened> {
         // **예약은 한 번 쓰면 없어진다.** 안 지우면 job 모드에 머무는 동안 말할 때마다
         // job이 하나씩 생겨, 되묻는 말에 답할 자리가 영영 안 생긴다.
-        match self.pending_open.take() {
-            Some(Route::Job) => self.open_job(api, agent_id, message).await,
-            Some(Route::Work) => self.open_work(api, agent_id, message).await,
-            // `Route::Session`은 `set_route`가 `None`으로 옮기므로 여기 오지 않는다.
-            Some(Route::Session) | None => {
+        //
+        // **예약이 없어도 대화가 아직 없으면 모드가 정한다.** 예약은 모드가 *바뀌는*
+        // 순간에만 걸리므로 안 걸리는 자리가 여럿이다 — 켜자마자 첫 마디, `/agent`으로
+        // 새 쓰레드를 예약한 뒤, `＋ 새 세션` 뒤. 거기서 세션만 만들면 **하단 바는 job인데
+        // 열리는 것은 맨 세션**이 된다. 실제로 그렇게 걸렸다.
+        let route = match self.pending_open.take() {
+            Some(staged) => staged,
+            // 이어 갈 대화가 있으면 이어 간다. 모드는 *새로 열 때* 무엇을 열지만 정한다.
+            None if self.id.is_some() => Route::Session,
+            None => mode.route(),
+        };
+        match route {
+            Route::Job => self.open_job(api, agent_id, message).await,
+            Route::Work => self.open_work(api, agent_id, message).await,
+            Route::Session => {
                 let id = self.ensure(api, agent_id).await?;
                 Ok(Opened { id, sent: false, announced: None })
             }
@@ -634,6 +648,22 @@ pub fn frame_from(f: ZTurnFrame) -> Frame {
         ZTurnFrame::Delta { kind, text } => Frame::Delta { kind, text },
         ZTurnFrame::Status { running } => Frame::Status { running },
     }
+}
+
+/// 프로젝트를 만든다. 만든 것의 `(id, 이름)`을 준다.
+///
+/// **이름이 비면 부르지 않는다** — 서버가 무엇을 만들지 모르고, 목록에 이름 없는 줄이
+/// 하나 생기면 지우는 길이 이 앱에 없다.
+pub async fn create_project(api: &AttaccaApiClient, name: &str) -> Result<(String, String)> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(anyhow!("프로젝트 이름을 같이 적어 주세요: `/project 이름`"));
+    }
+    let p = api
+        .create_project(ZNewProject { name: name.to_string(), description: None })
+        .await
+        .map_err(|e| anyhow!("프로젝트를 만들지 못했습니다: {e}"))?;
+    Ok((p.id, p.name))
 }
 
 /// 프로젝트 목록을 픽커가 쓰는 모양으로.
@@ -980,6 +1010,36 @@ mod tests {
     #[test]
     fn a_fresh_session_has_no_project_of_its_own() {
         assert_eq!(Session::new(None).project(), None);
+    }
+
+    /// **모드가 정하는 것은 예약이 없을 때도 통해야 한다.**
+    ///
+    /// 예약은 모드가 *바뀌는* 순간에만 걸린다. 그래서 안 걸리는 자리가 여럿이다 — 켜자마자
+    /// 첫 마디, `/agent` 뒤, `＋ 새 세션` 뒤. 거기서 세션만 만들면 **하단 바는 job인데
+    /// 열리는 것은 맨 세션**이 된다. 실제로 그렇게 걸렸다.
+    ///
+    /// 여기서는 `open_for`를 부를 수 없으므로(서버가 필요하다) 그 판정을 그대로 흉내 낸다.
+    /// 갈라지면 이 테스트가 지키는 것이 없어지니, `open_for`를 고치면 여기도 고칠 것.
+    #[test]
+    fn with_no_conversation_yet_the_mode_decides_what_opens() {
+        use crate::mode::Mode;
+        let route_for = |staged: Option<Route>, has_id: bool, mode: Mode| match staged {
+            Some(r) => r,
+            None if has_id => Route::Session,
+            None => mode.route(),
+        };
+
+        // 대화가 없고 예약도 없다 → 모드가 정한다.
+        assert_eq!(route_for(None, false, Mode::Job), Route::Job, "job 모드인데 맨 세션이 열린다");
+        assert_eq!(route_for(None, false, Mode::Work), Route::Work);
+        assert_eq!(route_for(None, false, Mode::Normal), Route::Session);
+        assert_eq!(route_for(None, false, Mode::Plan), Route::Session);
+
+        // 이어 갈 대화가 있으면 이어 간다 — 말할 때마다 job이 하나씩 생기면 안 된다.
+        assert_eq!(route_for(None, true, Mode::Job), Route::Session);
+
+        // 예약이 있으면 그것이 이긴다. 하던 대화가 있어도 새로 연다.
+        assert_eq!(route_for(Some(Route::Job), true, Mode::Normal), Route::Job);
     }
 
     /// 렌더하지 않는 이벤트여도 커서는 넘겨야 한다 — 재개 위치를 놓치면 안 된다.

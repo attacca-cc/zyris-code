@@ -103,26 +103,25 @@ Outside the working directory. Approval required
 
 ## Modes
 
-`Shift+Tab` cycles through three modes, shown in the bottom bar. A mode decides two
+`Shift+Tab` cycles through four modes, shown in the bottom bar. A mode decides two
 things: whether tools may run, and where your next message goes.
 
 | Mode | Tools | Your next message |
 |---|---|---|
-| **job** (default) | Run. The fence above still applies. | Opens an Attacca **job** — hand it over and it runs to the end. If it asks something back, answer right here. |
-| **plan** (계획) | Nothing is changed and no command runs; the agent has to describe its plan first. Reading still works — you cannot plan what you cannot see. | Stays in the conversation you are already having. |
-| **work** | Run, same as job. | Opens an Attacca **work**: it is planned into a task graph, each task running in its own git worktree. Two gates need a person to open them. |
+| **normal** (기본) | Run. The fence above still applies. | Goes to the conversation you are already having. |
+| **plan** (계획) | Nothing is changed and no command runs; the agent has to describe its plan first. Reading still works — you cannot plan what you cannot see. | Same as normal. |
+| **work** | Run, same as normal. | Opens an Attacca **work**: it is planned into a task graph, each task running in its own git worktree. Two gates need a person to open them. |
+| **job** | Run, same as normal. | Opens an Attacca **job** — hand it over and it runs to the end. If it asks something back, answer right here. |
 
-`job` is the resting state. There is no separate "plain session" mode — a job *is* a
-session, and it also shows up in Attacca with a state and a place in your lists.
+`normal` and `plan` share one conversation, so you can switch between them mid-thread
+without losing your place. `work` and `job` open something new with your **next message
+only**; after that you are talking to it.
 
-`plan` is the only mode that stays in the current conversation, so you can switch it on
-mid-thread without losing your place. `job` and `work` open something new with your
-**next message only**; after that you are talking to it.
-
-`/mode job|plan|work` does the same thing without the keyboard. `/mode normal` and
-`/mode 기본` still work — they mean `job` now.
+`/mode normal|plan|work|job` does the same thing without the keyboard.
 
 Whatever you open lands in **the project you last picked** (`←`), not the default one.
+`/project <name>` makes a new project and moves into it; the `+ New project` row in the
+project list types that command for you.
 
 `work` and `job` are deliberately untranslated — they are what Attacca calls them, so
 what you open here is what you look up there.
@@ -299,7 +298,7 @@ Plugins are loaded at startup, so restart to pick up a newly installed one.
 | Key | Does |
 |---|---|
 | `Enter` | Send |
-| `Shift+Tab` | Cycle mode: job → plan → work |
+| `Shift+Tab` | Cycle mode: normal → plan → work → job |
 | `Ctrl+O` | Fold / unfold the work card |
 | `Ctrl+B` | Toggle the sidebar |
 | `←` | Project and session picker |

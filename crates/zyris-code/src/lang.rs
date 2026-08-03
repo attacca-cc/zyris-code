@@ -269,9 +269,23 @@ impl Lang {
     pub fn new_project(self) -> &'static str {
         self.pick("＋ 새 프로젝트", "+ New project")
     }
-    /// 왜 못 누르는지 그 자리에서 말한다.
+    /// 고르면 무슨 일이 벌어지는지 그 자리에서 말한다. **누르면 바로 만들지 않는다** —
+    /// 이름을 받아야 하는데 목록에는 글자를 칠 자리가 없어서, `/project `를 입력란에
+    /// 넣어 주고 이름은 사람이 친다.
     pub fn new_project_note(self) -> &'static str {
-        self.pick("Zyris로는 아직 만들 수 없습니다", "Cannot be created from Zyris yet")
+        self.pick("이름을 이어서 칩니다", "type a name after it")
+    }
+    pub fn project_created(self, name: &str) -> String {
+        match self {
+            Lang::Ko => format!(
+                "프로젝트 **{name}**을 만들고 그 안으로 들어왔습니다. \
+                 여기서 여는 thread·job·work는 이 프로젝트의 것이 됩니다."
+            ),
+            Lang::En => format!(
+                "Created project **{name}** and moved into it. \
+                 Threads, jobs and works you open here belong to it."
+            ),
+        }
     }
     pub fn default_project(self) -> &'static str {
         self.pick("기본", "default")

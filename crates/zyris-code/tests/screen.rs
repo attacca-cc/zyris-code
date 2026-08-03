@@ -93,7 +93,7 @@ fn a_rule_separates_the_input_box_from_the_bottom_bar() {
     assert!(lines[lines.len() - 3].contains('안'), "입력이 그 자리에 없다:\n{screen}");
     assert!(lines[lines.len() - 2].starts_with('─'), "가름선이 없다:\n{screen}");
     // 기본 화면 말은 영어다(`lang::Lang` 기본값). 하단 바의 모드 이름으로 본다.
-    assert!(lines[lines.len() - 1].contains("job"), "맨 아래가 하단 바가 아니다:\n{screen}");
+    assert!(lines[lines.len() - 1].contains("normal"), "맨 아래가 하단 바가 아니다:\n{screen}");
 }
 
 /// 긴 입력은 다음 줄로 내려간다. 잘려 나가면 무엇을 치고 있는지 알 수 없다.
@@ -412,11 +412,11 @@ fn the_mode_and_agent_sit_at_the_left_of_the_bottom_bar() {
     s.agent = "Main Agent".into();
     let screen = dump(&mut s, 40, 10);
     let bottom = screen.lines().last().unwrap();
-    assert!(bottom.trim_start().starts_with("job"), "모드가 맨 왼쪽이 아니다: {bottom:?}");
+    assert!(bottom.trim_start().starts_with("normal"), "모드가 맨 왼쪽이 아니다: {bottom:?}");
     assert!(bottom.contains("Main Agent"), "에이전트가 없다: {bottom:?}");
 }
 
-/// Shift+Tab으로 job → 계획 → work → job.
+/// Shift+Tab으로 기본 → 계획 → work → job → 기본.
 ///
 /// **모드를 더하면서 `Mode::next`를 안 고치면 새 모드에 키로는 영영 못 간다** —
 /// `/mode`로만 갈 수 있는 모드는 아무도 안 쓴다.
@@ -428,7 +428,7 @@ fn shift_tab_cycles_the_mode() {
 
     let mut s = State::new();
     let key = KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT);
-    for expected in [Mode::Plan, Mode::Work, Mode::Job] {
+    for expected in [Mode::Plan, Mode::Work, Mode::Job, Mode::Normal] {
         for a in on_key(&s, key) {
             apply(&mut s, &a);
         }
@@ -446,7 +446,7 @@ fn the_status_bar_names_the_mode_it_is_in() {
     let key = KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT);
     // **맨 아랫줄만 본다.** 화면 전체에서 찾으면 사이드바나 활동 줄의 다른 글자가 우연히
     // 걸려, 하단 바가 비어 있어도 초록으로 지나간다.
-    for expected in ["plan", "work", "job"] {
+    for expected in ["plan", "work", "job", "normal"] {
         for a in on_key(&s, key) {
             apply(&mut s, &a);
         }
@@ -821,7 +821,7 @@ fn the_picker_overlays_the_conversation_and_takes_the_keys() {
     assert_eq!(on_key(&s, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)), vec![Action::PickBack]);
 }
 
-/// 세션 목록의 생성 줄은 눌러야 하고, 프로젝트 생성 줄은 왜 못 누르는지 말해야 한다.
+/// 두 생성 줄이 서로 다르게 동작한다. **세션은 바로 만들고, 프로젝트는 이름을 받아야 한다.**
 #[test]
 fn the_create_rows_behave_differently_by_level() {
     use zyris_code::picker::{Pick, Picker};
@@ -830,7 +830,7 @@ fn the_create_rows_behave_differently_by_level() {
         Picker::projects(vec![("p1".into(), "기본".into(), true)], zyris_code::lang::Lang::Ko);
     let mut at_create = projects.clone();
     at_create.cursor = 0;
-    assert!(matches!(at_create.pick(), Some(Pick::Unavailable(_))));
+    assert_eq!(at_create.pick(), Some(Pick::TypeCommand { text: "/project ".into() }));
 
     let sessions = Picker::sessions("p1".into(), "기본".into(), vec![], zyris_code::lang::Lang::Ko);
     assert_eq!(sessions.pick(), Some(Pick::NewSession { project_id: "p1".into() }));

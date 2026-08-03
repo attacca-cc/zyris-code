@@ -26,6 +26,8 @@ pub enum Command {
     Cwd,
     /// 인자가 없으면 목록을 열고, 있으면 그 이름으로 바로 간다.
     Agent(Option<String>),
+    /// 이 이름으로 프로젝트를 만들고 그 안으로 들어간다. 인자가 없으면 목록을 연다.
+    Project(Option<String>),
     Plugin(Plugin),
     Undo,
     Clear,
@@ -97,6 +99,9 @@ pub fn parse(text: &str) -> Option<Command> {
         "rules" | "claude" | "agents" => Command::Rules,
         "cwd" | "pwd" => Command::Cwd,
         "agent" => Command::Agent(some(arg)),
+        // **이름에 공백이 있을 수 있다.** 첫 낱말에서 자르면 `/project 새 프로젝트`가
+        // `새`가 된다 — `arg`를 통째로 쓴다.
+        "project" | "proj" => Command::Project(some(arg)),
         "plugin" | "plugins" => Command::Plugin(plugin_action(arg)),
         "undo" => Command::Undo,
         "clear" => Command::Clear,
@@ -149,11 +154,10 @@ fn plugin_action(arg: &str) -> Plugin {
 /// 받아 준다: **받는 쪽을 넓히는 것은 공짜지만, 화면에 두 이름이 돌아다니는 것은 그렇지 않다.**
 fn mode_named(s: &str) -> Option<Mode> {
     match s {
-        // `기본`·`normal`은 job으로 합쳤다(2026-08-03). **손에 익은 이름은 계속 받아 준다** —
-        // 안 받으면 `Unknown`으로 떨어져 "그런 모드 없다"가 되는데, 사람이 뜻한 것은 있다.
-        "잡" | "job" | "기본" | "normal" | "default" => Some(Mode::Job),
+        "기본" | "normal" | "default" => Some(Mode::Normal),
         "계획" | "plan" => Some(Mode::Plan),
         "작업" | "work" => Some(Mode::Work),
+        "잡" | "job" => Some(Mode::Job),
         _ => None,
     }
 }
@@ -164,9 +168,10 @@ pub fn catalogue(lang: crate::lang::Lang) -> Vec<(&'static str, &'static str)> {
     match lang {
         Lang::Ko => vec![
             ("/help", "쓸 수 있는 명령"),
-            ("/mode", "모드를 보거나 바꿉니다 (job·계획·work)"),
+            ("/mode", "모드를 보거나 바꿉니다 (기본·계획·work·job)"),
             ("/lang", "화면 말을 바꿉니다 (ko·en)"),
             ("/agent", "에이전트를 고릅니다. 다음 메시지에서 새 쓰레드가 열립니다"),
+            ("/project", "프로젝트를 만들고 그 안으로 들어갑니다 (이름을 이어서 칩니다)"),
             ("/mcp", "붙은 MCP 서버와 도구 수"),
             ("/skills", "쓸 수 있는 스킬"),
             ("/plugin", "플러그인을 받고 지웁니다 (add·remove·update)"),
@@ -180,9 +185,10 @@ pub fn catalogue(lang: crate::lang::Lang) -> Vec<(&'static str, &'static str)> {
         ],
         Lang::En => vec![
             ("/help", "What you can type"),
-            ("/mode", "Show or change the mode (job / plan / work)"),
+            ("/mode", "Show or change the mode (normal / plan / work / job)"),
             ("/lang", "Change the interface language (ko / en)"),
             ("/agent", "Pick an agent. A new thread opens with your next message"),
+            ("/project", "Create a project and move into it (type a name after it)"),
             ("/mcp", "MCP servers that connected, and how many tools each brought"),
             ("/skills", "Skills available here"),
             ("/plugin", "Install and remove plugins (add / remove / update)"),
@@ -205,7 +211,7 @@ pub fn keys(lang: crate::lang::Lang) -> Vec<(&'static str, &'static str)> {
     use crate::lang::Lang;
     match lang {
         Lang::Ko => vec![
-            ("Shift+Tab", "모드 바꾸기 (job → 계획 → work)"),
+            ("Shift+Tab", "모드 바꾸기 (기본 → 계획 → work → job)"),
             ("←", "프로젝트·쓰레드 목록 (입력란이 비었을 때)"),
             ("↑ ↓", "보낸 말 되살리기"),
             ("Ctrl+O", "작업 카드 접기·펴기"),
@@ -217,7 +223,7 @@ pub fn keys(lang: crate::lang::Lang) -> Vec<(&'static str, &'static str)> {
             ("드래그", "고른 글이 놓는 순간 클립보드로"),
         ],
         Lang::En => vec![
-            ("Shift+Tab", "Switch mode (job → plan → work)"),
+            ("Shift+Tab", "Switch mode (normal → plan → work → job)"),
             ("←", "Project and thread list (when the input box is empty)"),
             ("↑ ↓", "Bring back something you sent"),
             ("Ctrl+O", "Fold or unfold a work card"),
@@ -271,6 +277,7 @@ mod tests {
 
     #[test]
     fn mode_takes_the_korean_names_shown_on_screen() {
+        assert_eq!(parse("/mode 기본"), Some(Command::Mode(Some(Mode::Normal))));
         assert_eq!(parse("/mode 잡"), Some(Command::Mode(Some(Mode::Job))));
         assert_eq!(parse("/mode 계획"), Some(Command::Mode(Some(Mode::Plan))));
     }
@@ -280,9 +287,7 @@ mod tests {
     fn mode_also_takes_the_english_names() {
         assert_eq!(parse("/mode plan"), Some(Command::Mode(Some(Mode::Plan))));
         assert_eq!(parse("/mode job"), Some(Command::Mode(Some(Mode::Job))));
-        // 합치기 전의 이름도 계속 받는다 — 손에 익은 사람이 있다.
-        assert_eq!(parse("/mode 기본"), Some(Command::Mode(Some(Mode::Job))));
-        assert_eq!(parse("/mode normal"), Some(Command::Mode(Some(Mode::Job))));
+        assert_eq!(parse("/mode normal"), Some(Command::Mode(Some(Mode::Normal))));
     }
 
     /// **모르는 모드 이름을 조용히 무시하면 안 바뀐 줄 모른다.**

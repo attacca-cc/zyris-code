@@ -999,6 +999,8 @@ pub fn run_command(state: &mut State, text: &str) -> Option<crate::command::Comm
         | Command::Skills
         | Command::Rules
         | Command::Agent(_)
+        // 서버가 필요하다 — `finish_command`가 마저 한다.
+        | Command::Project(_)
         | Command::Plugin(_)
         | Command::Changes
         | Command::Undo => {}
@@ -1767,6 +1769,23 @@ async fn finish_command(
             Err(e) => state.timeline.say(format!("에이전트 목록을 읽지 못했습니다: {e}")),
         },
         Command::Agent(Some(name)) => switch_agent(api, state, session, agent_id, &name).await,
+        // 인자가 없으면 목록을 연다 — 만들기 전에 이미 있는 것을 보는 편이 낫다.
+        Command::Project(None) => match crate::conn::projects(api).await {
+            Ok(items) => state.picker = Some(crate::picker::Picker::projects(items, state.lang)),
+            Err(e) => state.timeline.say(format!("{e}")),
+        },
+        Command::Project(Some(name)) => match crate::conn::create_project(api, &name).await {
+            Ok((id, name)) => {
+                // **만들고 그 안으로 들어간다.** 만들어 놓고 다시 골라야 하면 두 번 일이고,
+                // 방금 만든 것 말고 다른 데서 일을 시작하는 사고가 난다.
+                session.enter_project(id);
+                session.stage_new_default();
+                state.picker = None;
+                let said = state.lang.project_created(&name);
+                state.timeline.say(said);
+            }
+            Err(e) => state.timeline.say(format!("{e}")),
+        },
         Command::Plugin(what) => {
             let said = run_plugin(state, what).await;
             state.timeline.say(said);
@@ -2004,7 +2023,7 @@ async fn flush_queue(
         return;
     }
     while let Some(text) = state.queued.first().cloned() {
-        match send(api, session, agent_id, &text, state.last_cursor, tx).await {
+        match send(api, session, agent_id, &text, state.last_cursor, state.mode, tx).await {
             Ok(announced) => {
                 state.queued.remove(0);
                 state.remember_sent(&text);
@@ -2049,7 +2068,7 @@ async fn send_and_tell(
     text: &str,
     tx: &mpsc::UnboundedSender<Action>,
 ) {
-    match send(api, session, agent_id, text, state.last_cursor, tx).await {
+    match send(api, session, agent_id, text, state.last_cursor, state.mode, tx).await {
         Ok(announced) => {
             if let Some(said) = opened_text(state.lang, announced) {
                 state.timeline.say(said);
@@ -2080,9 +2099,10 @@ async fn send(
     agent_id: &str,
     text: &str,
     after: Option<i64>,
+    mode: Mode,
     tx: &mpsc::UnboundedSender<Action>,
 ) -> anyhow::Result<Option<(crate::mode::Route, String)>> {
-    let opened = session.open_for(api, agent_id, text).await?;
+    let opened = session.open_for(api, agent_id, text, mode).await?;
     let id = opened.id;
     // **job·work는 여는 요청이 첫 메시지를 이미 먹었다**(`ZNewJob::message`). 여기서 또
     // 보내면 같은 말이 두 번 들어가고, job은 그것을 새 지시로 읽는다.

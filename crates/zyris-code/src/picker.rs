@@ -3,8 +3,9 @@
 //! → 를 누르면 프로젝트 목록이 열리고, 프로젝트를 고르면 그 안의 세션 목록으로 들어간다.
 //! 각 목록 맨 위에는 "새로 만들기" 줄이 있다.
 //!
-//! **프로젝트 생성은 아직 못 한다.** `attacca_api`에 만드는 도구가 없다(`list_projects`뿐).
-//! 자리는 두되 누를 수 없다고 표시한다 — 없는 것처럼 감추면 왜 없는지 알 수 없다.
+//! **프로젝트를 만드는 줄은 이름을 받아야 한다.** 그런데 목록에는 글자를 칠 자리가 없다.
+//! 그래서 그 줄은 `/project `를 입력란에 넣어 주고 **이름은 사람이 이어서 친다** —
+//! 슬래시 명령 목록이 쓰는 `TypeCommand`와 같은 수법이고, 새 화면을 하나 더 만들지 않는다.
 //!
 //! 여기는 순수하다. 목록을 가져오고 세션을 만드는 것은 I/O 자리가 한다.
 
@@ -142,9 +143,9 @@ impl Picker {
         let mut rows = vec![Row {
             id: None,
             label: lang.new_project().into(),
-            // 왜 못 누르는지 그 자리에서 말한다.
+            // 누르면 무슨 일이 벌어지는지 그 자리에서 말한다.
             note: Some(lang.new_project_note().into()),
-            enabled: false,
+            enabled: true,
         }];
         rows.extend(items.into_iter().map(|(id, name, is_default)| Row {
             id: Some(id),
@@ -266,13 +267,14 @@ impl Picker {
             (Level::Sessions { project_id, .. }, None) => {
                 Some(Pick::NewSession { project_id: project_id.clone() })
             }
+            // **바로 만들지 않는다.** 이름을 받아야 하는데 목록에 칠 자리가 없다.
+            (Level::Projects, None) => Some(Pick::TypeCommand { text: "/project ".into() }),
             (Level::Agents, Some(name)) => Some(Pick::UseAgent { name: name.clone() }),
             (Level::Commands, Some(text)) => Some(Pick::TypeCommand { text: text.clone() }),
             (Level::Languages, Some(code)) => {
                 crate::lang::Lang::parse(code).map(|lang| Pick::UseLang { lang })
             }
-            (Level::Projects, None)
-            | (Level::Agents, None)
+            (Level::Agents, None)
             | (Level::Commands, None)
             | (Level::Languages, None) => None,
         }
@@ -446,7 +448,7 @@ mod tests {
     fn the_project_list_starts_with_a_create_row() {
         let p = projects();
         assert_eq!(p.rows[0].label, "＋ 새 프로젝트");
-        assert!(!p.rows[0].enabled, "만드는 도구가 없으니 못 누른다");
+        assert!(p.rows[0].enabled, "이제 만들 수 있다 — `projects:write`가 생겼다");
         assert_eq!(p.rows.len(), 3);
     }
 
@@ -465,14 +467,18 @@ mod tests {
         );
     }
 
-    /// 못 누르는 줄은 왜 못 누르는지 말해 준다 — 조용히 아무 일도 안 하면 고장으로 보인다.
+    /// **누른다고 바로 만들지 않는다.** 이름을 받아야 하는데 목록에는 글자를 칠 자리가
+    /// 없어서, `/project `를 입력란에 넣어 주고 이름은 사람이 이어서 친다.
     #[test]
-    fn picking_the_disabled_create_row_says_why() {
+    fn picking_the_create_row_types_the_command_for_you() {
         let mut p = projects();
         p.cursor = 0;
         match p.pick() {
-            Some(Pick::Unavailable(why)) => assert!(why.contains("아직"), "{why}"),
-            other => panic!("이유를 말해야 한다: {other:?}"),
+            Some(Pick::TypeCommand { text }) => {
+                assert_eq!(text, "/project ");
+                assert!(text.ends_with(' '), "이름을 바로 이어 칠 수 있어야 한다");
+            }
+            other => panic!("입력란에 넣어 줘야 한다: {other:?}"),
         }
     }
 
