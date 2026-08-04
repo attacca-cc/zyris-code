@@ -99,6 +99,8 @@ pub enum EnrollPhase {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
     Insert(char),
+    /// 붙여넣기 한 덩어리. 줄바꿈이 섞여도 그대로 넣는다.
+    Paste(String),
     Backspace,
     Delete,
     DeleteWord,
@@ -447,6 +449,7 @@ impl State {
 
 pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
 
     // **등록 코드 창이 제일 위다.** 코드를 보는 중에 다른 키가 엉뚱한 일을 하면
     // 안 된다 — Esc로만 닫고, Ctrl+C(끄기)만 통과한다. 등록 자체는 배경에서
@@ -543,6 +546,10 @@ pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
         // 선택 중이면 Esc가 선택을 푼다. 실행 중 취소보다 앞이다 — 눈앞의 것이 먼저다.
         KeyCode::Esc if state.selection.is_some() => vec![Action::ClearSelection],
         KeyCode::Esc if state.running => vec![Action::Cancel],
+        // **Alt+Enter는 줄바꿈이다.** 터미널은 Shift+Enter를 Enter와 구분하지
+        // 못한다(둘 다 \r 한 바이트). crossterm이 ESC+\r을 Enter+ALT로 해석하므로
+        // 모든 터미널에서 줄바꿈을 넣을 수 있다 — 전송 arm보다 앞에 있어야 한다.
+        KeyCode::Enter if alt => vec![Action::Insert('\n')],
         KeyCode::Enter if !state.input.text.is_empty() => {
             vec![Action::Submit(state.input.text.clone())]
         }
@@ -594,14 +601,21 @@ fn ask_key(a: &crate::question::Answering, key: KeyEvent, ctrl: bool) -> Vec<Act
 pub fn apply(state: &mut State, action: &Action) {
     // 글자를 고치는 순간 되살리기에서 빠져나온다. 안 그러면 고쳐 놓은 것을 ↓ 한 번에
     // 잃는다 — 되살린 말을 고쳐 보내는 것이 이 기능의 목적인데 그걸 막는 셈이 된다.
-    if matches!(action, Action::Insert(_) | Action::Backspace | Action::Delete | Action::DeleteWord)
-    {
+    if matches!(
+        action,
+        Action::Insert(_) | Action::Paste(_) | Action::Backspace | Action::Delete | Action::DeleteWord
+    ) {
         state.recall = None;
     }
     match action {
         Action::Insert(c) => {
             state.editor().insert(*c);
             follow_the_slash(state);
+        }
+        Action::Paste(text) => {
+            // 줄바꿈이 섞여도 그대로 넣는다. 슬래시 명령 목록은 열지 않는다 —
+            // 붙여넣기로 모드가 바뀌면 안 된다. 되살리기 해제는 위 matches!가 한다.
+            state.editor().insert_str(text);
         }
         Action::Backspace => {
             state.editor().backspace();
@@ -1254,6 +1268,11 @@ pub async fn run(
         // 다른 창에 갔다 오면 터미널이 화면을 되살려 주지 않는 경우가 있다. 포커스가
         // 돌아온 것을 알아야 통째로 다시 그릴 수 있다.
         crossterm::event::EnableFocusChange,
+        // **붙여넣기를 한 덩어리로 받는다.** 꺼져 있으면 터미널이 붙여넣기를 치는
+        // 것처럼 흘려보내고, 내용의 줄바꿈이 Enter로 해석되어 여러 줄 프롬프트의
+        // 첫 줄이 그대로 전송돼 버린다. 켜면 ESC[200~…ESC[201~로 감싸져
+        // `Event::Paste` 한 건으로 온다.
+        crossterm::event::EnableBracketedPaste,
         // **줄 넘김을 끈다.** 우리가 센 글자 폭과 터미널이 그리는 폭이 한 칸이라도
         // 어긋나면(`●`·`·`·`─` 같은 글자는 터미널 설정에 따라 두 칸이 된다) 줄 끝이
         // 넘쳐 **아랫줄로 흘러내리고**, 그 아래가 통째로 밀린다. 꺼 두면 넘친 글자는
@@ -1267,6 +1286,7 @@ pub async fn run(
         io::stdout(),
         crossterm::event::DisableMouseCapture,
         crossterm::event::DisableFocusChange,
+        crossterm::event::DisableBracketedPaste,
         // 줄 넘김은 셸이 쓰는 것이다. 안 되돌리면 셸에서 긴 명령이 잘려 보인다.
         crossterm::terminal::EnableLineWrap,
     );
@@ -1376,6 +1396,9 @@ async fn run_inner(
                             }
                             apply(&mut state, &action);
                         }
+                    }
+                    TermEvent::Paste(text) => {
+                        apply(&mut state, &Action::Paste(text));
                     }
                     TermEvent::Resize(w, h) if last_size != Some((w, h)) => {
                         last_size = Some((w, h));
@@ -1511,6 +1534,8 @@ async fn run_inner(
             Some(Ok(ev)) = keys.next() => {
                 let actions = match ev {
                     TermEvent::Key(k) => on_key(&state, k),
+                    // 붙여넣기는 키가 아니다 — Enter로 쪼개지 않고 한 덩어리로 넣는다.
+                    TermEvent::Paste(text) => vec![Action::Paste(text)],
                     TermEvent::Mouse(m) => match m.kind {
                         MouseEventKind::ScrollUp => vec![Action::Wheel(1)],
                         MouseEventKind::ScrollDown => vec![Action::Wheel(-1)],
@@ -1862,6 +1887,9 @@ fn shutdown_signals() -> mpsc::Receiver<()> {
                 // 안 끝나면 화면을 되돌리고 강제로 끝낸다 — `kill`이 언제나
                 // 통하게. 정상 종료는 그 전에 끝나므로 이 줄이 먼저 도는 일은 없다.
                 tokio::time::sleep(SHUTDOWN_FORCE).await;
+                // 강제 종료라도 bracketed paste는 되돌리고 간다 — 안 하면 셸이
+                // 붙여넣기를 계속 한 덩어리로 감싼다.
+                let _ = execute!(io::stdout(), crossterm::event::DisableBracketedPaste);
                 ratatui::restore();
                 std::process::exit(0);
             });
@@ -2467,6 +2495,43 @@ mod tests {
         apply(&mut s, &Action::Frame(Frame::Ask(ask(7))));
         apply(&mut s, &Action::Approve);
         assert_eq!(s.verdict_out, Some((7, Verdict::Allow)));
+    }
+
+    /// Alt+Enter는 줄바꿈이지 전송이 아니다. Shift+Enter는 터미널이 Enter와
+    /// 구분해 주지 않으므로 이 키가 정본이다.
+    #[test]
+    fn alt_enter_inserts_a_newline_instead_of_submitting() {
+        let mut s = state();
+        apply(&mut s, &Action::Insert('a'));
+        assert_eq!(
+            on_key(&s, key(KeyCode::Enter, KeyModifiers::ALT)),
+            vec![Action::Insert('\n')]
+        );
+        assert_eq!(
+            on_key(&s, key(KeyCode::Enter, KeyModifiers::NONE)),
+            vec![Action::Submit("a".into())]
+        );
+    }
+
+    /// 붙여넣기는 줄바꿈을 그대로 살린다 — Enter처럼 쪼개면 여러 줄 프롬프트의
+    /// 첫 줄이 그냥 전송돼 버린다.
+    #[test]
+    fn paste_inserts_multiline_verbatim() {
+        let mut s = state();
+        apply(&mut s, &Action::Paste("한 줄\n두 줄".into()));
+        assert_eq!(s.input.text, "한 줄\n두 줄");
+        assert_eq!(s.input.height(40), 2);
+    }
+
+    /// 붙여넣기는 커서 자리에 들어간다. 중간에 붙여도 앞뒤가 그대로다.
+    #[test]
+    fn paste_lands_at_the_cursor() {
+        let mut s = state();
+        apply(&mut s, &Action::Insert('가'));
+        apply(&mut s, &Action::Insert('다'));
+        apply(&mut s, &Action::Left);
+        apply(&mut s, &Action::Paste("나\n라".into()));
+        assert_eq!(s.input.text, "가나\n라다");
     }
 
     /// **`a`는 그 디렉터리째로 연다.** 파일 하나하나를 다시 묻는 것은 쓸 수 없다.
