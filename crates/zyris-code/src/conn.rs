@@ -12,6 +12,31 @@ use crate::app::Frame;
 use crate::event::entry_from;
 use crate::mode::Route;
 
+/// 서버 호출 하나에 거는 마감. 죽은 연결(반쪽 TCP — 상대가 FIN/RST 없이 사라진
+/// 자리)은 답도 오류도 없이 영원히 기다리게 하므로, 마감이 없으면 화면 루프가
+/// 그 자리에 갇혀 프리즈한다 — 키도 시그널도 안 먹는 상태가 된다(2026-08-04
+/// 실측). 모든 서버 호출이 이 마감 아래로 들어가야 한다.
+const CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// 마감을 건 서버 호출. 죽은 연결 위에서 영원히 기다리지 않는다.
+/// 마감이 지나면 연결을 닫아 Runner가 다시 붙게 만든다.
+pub(crate) async fn within<T>(
+    api: &AttaccaApiClient,
+    fut: impl std::future::Future<Output = zyris::Result<T>>,
+) -> Result<T> {
+    match tokio::time::timeout(CALL_TIMEOUT, fut).await {
+        Ok(result) => result.map_err(|e| anyhow!("{e}")),
+        Err(_) => {
+            tracing::warn!(
+                "서버 호출이 {}초 안에 답하지 않았다 — 연결을 끊고 다시 붙는다",
+                CALL_TIMEOUT.as_secs()
+            );
+            api.handle().connection().close("call timed out");
+            Err(anyhow!("서버가 {}초 안에 답하지 않았습니다", CALL_TIMEOUT.as_secs()))
+        }
+    }
+}
+
 /// 지금 붙는 에이전트의 이름.
 ///
 /// **원래 목적지는 `zyris-code`다**(`prompts/agents/zyris_code.yml`의 `name`). 그런데 그
@@ -564,8 +589,9 @@ impl Session {
 
     /// 이름으로 에이전트를 찾는다. `/agent`과 시작 시점이 같은 길을 쓴다.
     pub async fn agent_id_named(api: &AttaccaApiClient, wanted: &str) -> Result<String> {
-        let agents =
-            api.list_agents().await.map_err(|e| anyhow!("에이전트 목록을 읽지 못했습니다: {e}"))?;
+        let agents = within(api, api.list_agents())
+            .await
+            .map_err(|e| anyhow!("에이전트 목록을 읽지 못했습니다: {e}"))?;
         agents.into_iter().find(|a| a.name == wanted).map(|a| a.id).ok_or_else(|| {
             anyhow!("'{wanted}' 에이전트가 계정에 없습니다. /agent으로 목록을 볼 수 있습니다.")
         })
@@ -579,16 +605,15 @@ impl Session {
         if let Some(id) = &self.id {
             return Ok(id.clone());
         }
-        let session = api
-            .create_session_with(ZNewSession {
-                agent_id: agent_id.to_string(),
-                title: None,
-                // 예약해 둔 프로젝트가 있으면 거기에 만든다. 없으면 기본 프로젝트다.
-                project_id: self.project.clone(),
-                preamble: self.preamble.clone(),
-            })
-            .await
-            .map_err(|e| anyhow!("thread를 만들지 못했습니다: {e}"))?;
+        let session = within(api, api.create_session_with(ZNewSession {
+            agent_id: agent_id.to_string(),
+            title: None,
+            // 예약해 둔 프로젝트가 있으면 거기에 만든다. 없으면 기본 프로젝트다.
+            project_id: self.project.clone(),
+            preamble: self.preamble.clone(),
+        }))
+        .await
+        .map_err(|e| anyhow!("thread를 만들지 못했습니다: {e}"))?;
         self.id = Some(session.id.clone());
         Ok(session.id)
     }
@@ -634,25 +659,24 @@ impl Session {
         agent_id: &str,
         message: &str,
     ) -> Result<Opened> {
-        let job = api
-            .create_job(ZNewJob {
-                message: message.to_string(),
-                // **고른 에이전트로 돌린다.** 비우면 Main Agent로 가는데, 그러면 `/agent`으로
-                // 고른 것이 화면에만 남고 실제로 도는 것은 다른 에이전트가 된다.
-                agent_id: Some(agent_id.to_string()),
-                project_id: self.project.clone(),
-                // 배포본의 시간대를 그대로 쓴다. 이 머신의 시간대를 억지로 밀어 넣으면
-                // 같은 계정의 다른 job과 답이 갈린다.
-                timezone: None,
-                // **둘 다 끄고 둔다.** `planning`은 job을 work로 넘기는 것이고 `plan_mode`는
-                // job 안에서 계획을 받고 멈추는 것인데, 여기서는 모드가 이미 그 갈래다 —
-                // job 모드는 "시켜 놓는다"이고, 계획이 필요하면 계획 모드나 work 모드다.
-                planning: false,
-                plan_mode: false,
-                data: vec![],
-            })
-            .await
-            .map_err(|e| anyhow!("job을 걸지 못했습니다: {e}"))?;
+        let job = within(api, api.create_job(ZNewJob {
+            message: message.to_string(),
+            // **고른 에이전트로 돌린다.** 비우면 Main Agent로 가는데, 그러면 `/agent`으로
+            // 고른 것이 화면에만 남고 실제로 도는 것은 다른 에이전트가 된다.
+            agent_id: Some(agent_id.to_string()),
+            project_id: self.project.clone(),
+            // 배포본의 시간대를 그대로 쓴다. 이 머신의 시간대를 억지로 밀어 넣으면
+            // 같은 계정의 다른 job과 답이 갈린다.
+            timezone: None,
+            // **둘 다 끄고 둔다.** `planning`은 job을 work로 넘기는 것이고 `plan_mode`는
+            // job 안에서 계획을 받고 멈추는 것인데, 여기서는 모드가 이미 그 갈래다 —
+            // job 모드는 "시켜 놓는다"이고, 계획이 필요하면 계획 모드나 work 모드다.
+            planning: false,
+            plan_mode: false,
+            data: vec![],
+        }))
+        .await
+        .map_err(|e| anyhow!("job을 걸지 못했습니다: {e}"))?;
 
         let id = job.session_id.clone().ok_or_else(|| {
             anyhow!(
@@ -672,16 +696,15 @@ impl Session {
         agent_id: &str,
         message: &str,
     ) -> Result<Opened> {
-        let work = api
-            .create_work(ZNewWork {
-                message: message.to_string(),
-                agent_id: Some(agent_id.to_string()),
-                // **work의 태스크는 프로젝트의 체크아웃에서 돈다.** 여기가 비면 기본
-                // 프로젝트가 되고, 그것이 무엇을 바꿔도 되는지를 정한다.
-                project_id: self.project.clone(),
-            })
-            .await
-            .map_err(|e| anyhow!("work를 만들지 못했습니다: {e}"))?;
+        let work = within(api, api.create_work(ZNewWork {
+            message: message.to_string(),
+            agent_id: Some(agent_id.to_string()),
+            // **work의 태스크는 프로젝트의 체크아웃에서 돈다.** 여기가 비면 기본
+            // 프로젝트가 되고, 그것이 무엇을 바꿔도 되는지를 정한다.
+            project_id: self.project.clone(),
+        }))
+        .await
+        .map_err(|e| anyhow!("work를 만들지 못했습니다: {e}"))?;
 
         let id = planner_session(api, &work).await?;
         self.id = Some(id.clone());
@@ -702,7 +725,7 @@ async fn planner_session(api: &AttaccaApiClient, work: &zyris_attacca::ZWork) ->
     }
     for _ in 0..PLANNER_TRIES {
         tokio::time::sleep(PLANNER_WAIT).await;
-        match api.get_work(work.id.clone()).await {
+        match within(api, api.get_work(work.id.clone())).await {
             Ok(fresh) => {
                 if let Some(id) = fresh.planner_session_id {
                     return Ok(id);
@@ -741,8 +764,7 @@ pub async fn create_project(api: &AttaccaApiClient, name: &str) -> Result<(Strin
     if name.is_empty() {
         return Err(anyhow!("프로젝트 이름을 같이 적어 주세요: `/project 이름`"));
     }
-    let p = api
-        .create_project(ZNewProject { name: name.to_string(), description: None })
+    let p = within(api, api.create_project(ZNewProject { name: name.to_string(), description: None }))
         .await
         .map_err(|e| anyhow!("프로젝트를 만들지 못했습니다: {e}"))?;
     Ok((p.id, p.name))
@@ -750,8 +772,9 @@ pub async fn create_project(api: &AttaccaApiClient, name: &str) -> Result<(Strin
 
 /// 프로젝트 목록을 픽커가 쓰는 모양으로.
 pub async fn projects(api: &AttaccaApiClient) -> Result<Vec<(String, String, bool)>> {
-    let items =
-        api.list_projects().await.map_err(|e| anyhow!("프로젝트 목록을 읽지 못했습니다: {e}"))?;
+    let items = within(api, api.list_projects())
+        .await
+        .map_err(|e| anyhow!("프로젝트 목록을 읽지 못했습니다: {e}"))?;
     Ok(items.into_iter().map(|p| (p.id, p.name, p.is_default)).collect())
 }
 
@@ -760,10 +783,12 @@ pub async fn sessions(
     api: &AttaccaApiClient,
     project_id: &str,
 ) -> Result<Vec<(String, String, bool)>> {
-    let items = api
-        .list_sessions(ZSessionFilter { project_id: Some(project_id.to_string()), limit: Some(50) })
-        .await
-        .map_err(|e| anyhow!("thread 목록을 읽지 못했습니다: {e}"))?;
+    let items = within(api, api.list_sessions(ZSessionFilter {
+        project_id: Some(project_id.to_string()),
+        limit: Some(50),
+    }))
+    .await
+    .map_err(|e| anyhow!("thread 목록을 읽지 못했습니다: {e}"))?;
     Ok(items
         .into_iter()
         .map(|s| {
@@ -781,7 +806,7 @@ pub async fn history(
     api: &AttaccaApiClient,
     session_id: &str,
 ) -> Result<Vec<zyris_attacca::ZSessionEvent>> {
-    api.session_history(session_id.to_string(), ZHistoryQuery::default())
+    within(api, api.session_history(session_id.to_string(), ZHistoryQuery::default()))
         .await
         .map_err(|e| anyhow!("지난 기록을 읽지 못했습니다: {e}"))
 }
@@ -794,8 +819,9 @@ pub async fn history(
 /// 막혀 있는 세션은 `running`이 서 있으므로 목록만으로 좁혀진다. 히스토리는 그 몇 개만
 /// 읽는다.
 pub async fn session_awaiting_answer(api: &AttaccaApiClient) -> Option<String> {
-    let sessions =
-        api.list_sessions(ZSessionFilter { project_id: None, limit: Some(50) }).await.ok()?;
+    let sessions = within(api, api.list_sessions(ZSessionFilter { project_id: None, limit: Some(50) }))
+        .await
+        .ok()?;
     for s in sessions.into_iter().filter(|s| s.running).take(5) {
         let events = history(api, &s.id).await.ok()?;
         // 답을 기다리는 질문이 하나라도 있으면 그 세션이다.
@@ -815,7 +841,7 @@ pub async fn session_awaiting_answer(api: &AttaccaApiClient) -> Option<String> {
 /// 세션 사용량. 배포가 미터링을 안 하면 `capability_not_announced`가 오는데,
 /// 그건 오류가 아니라 "이 배포에는 그 기능이 없다"이므로 조용히 비운다.
 pub async fn usage(api: &AttaccaApiClient, session_id: &str) -> Option<crate::sidebar::Usage> {
-    let u = api.session_usage(session_id.to_string()).await.ok()?;
+    let u = within(api, api.session_usage(session_id.to_string())).await.ok()?;
     Some(crate::sidebar::Usage {
         model: u.model,
         context_tokens: u.context_tokens,
@@ -826,8 +852,9 @@ pub async fn usage(api: &AttaccaApiClient, session_id: &str) -> Option<crate::si
 
 /// 이 세션의 제목. 아직 없으면 `None` — 첫 메시지 뒤에 붙는다.
 pub async fn session_title(api: &AttaccaApiClient, session_id: &str) -> Option<String> {
-    let sessions =
-        api.list_sessions(ZSessionFilter { project_id: None, limit: Some(100) }).await.ok()?;
+    let sessions = within(api, api.list_sessions(ZSessionFilter { project_id: None, limit: Some(100) }))
+        .await
+        .ok()?;
     sessions
         .into_iter()
         .find(|s| s.id == session_id)

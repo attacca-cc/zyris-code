@@ -51,6 +51,14 @@ pub enum Frame {
     ExecDone {
         id: u64,
     },
+    /// **배경 폴링의 결과.** 사용량·제목은 네트워크가 필요한데, 그걸 화면 루프가
+    /// 기다리면 죽은 연결 위에서 루프가 갇힌다 — 그래서 폴링은 루프 밖 태스크가
+    /// 하고 결과만 프레임으로 들여보낸다. 세션 id로 태그해 갈아탄 뒤의 낡은
+    /// 결과는 버린다(`frame_is_current`).
+    Poll {
+        usage: Option<crate::sidebar::Usage>,
+        title: Option<String>,
+    },
     /// **소켓이 끊겼다.** zyris `Runner`가 알아서 다시 붙지만, 그동안 화면은 아무 일도
     /// 없는 것처럼 보인다 — 조용한 실패가 제일 나쁘다. 사유를 그대로 들고 온다.
     Disconnected(String),
@@ -363,6 +371,9 @@ pub const STATUS_WINDOW: Duration = Duration::from_secs(6);
 /// 한 번의 왕복이면 되는 일이라 짧게 잡는다. **넘겨도 창은 닫는다** — 끄려는 사람을
 /// 붙잡아 두는 것이 남은 턴 하나보다 나쁘다.
 pub const STOP_WAIT: Duration = Duration::from_secs(3);
+/// 종료 신호 뒤 이만큼 지나도 앱이 안 끝나면 화면을 되돌리고 강제로 끝낸다.
+/// 루프가 갇혀 신호를 못 받은 경우의 안전망이다.
+const SHUTDOWN_FORCE: Duration = Duration::from_secs(5);
 
 impl State {
     pub fn new() -> Self {
@@ -921,6 +932,19 @@ fn apply_frame(state: &mut State, frame: &Frame) {
                 waiting.expired = true;
             }
         }
+        // 배경 폴링 결과. 값이 없으면 서버가 답하지 않은 것이다 — 조용히 지나친다.
+        Frame::Poll { usage, title } => {
+            if let Some(u) = usage {
+                if u != &state.sidebar.usage {
+                    state.sidebar.usage = u.clone();
+                }
+            }
+            if let Some(t) = title {
+                if !t.trim().is_empty() {
+                    state.title = t.clone();
+                }
+            }
+        }
         // **끊긴 것은 화면이 말한다.** 활동 줄이 "연결 중…"으로 바뀌고, 사유는 알림으로
         // 한 번 지나간다. 다시 붙는 것은 Runner가 하고, 붙으면 `api_rx`가 알려 준다.
         Frame::Disconnected(why) => {
@@ -1099,6 +1123,7 @@ fn grants_text(grants: &crate::tools::gate::Grants) -> String {
 // ---------------------------------------------------------------------------
 
 use std::io;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crossterm::event::{Event as TermEvent, EventStream, MouseButton, MouseEventKind};
@@ -1146,6 +1171,12 @@ const STREAM_MIN_GAP: Duration = Duration::from_millis(100);
 
 /// 사용량과 제목을 다시 물어보는 간격. 매 프레임 물으면 서버를 두들기게 된다.
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
+
+/// 앱 루프 감시. 루프가 이 간격으로 진행도를 올리고, 마지막 진행 뒤 이만큼
+/// 지나도 안 올라오면 화면을 되돌리고 프로세스를 끝낸다 — 루프가 블로킹에
+/// 갇혀 시그널조차 못 받는 "제어 불능"을 구조적으로 없앤다.
+const LOOP_WATCHDOG_INTERVAL: Duration = Duration::from_secs(10);
+const LOOP_WATCHDOG_STALL: Duration = Duration::from_secs(60);
 
 /// 화면을 통째로 다시 그려 **스스로 고치는** 간격(밀리초). 0이면 끄고, 기본은 2초다.
 ///
@@ -1381,7 +1412,9 @@ async fn run_inner(
     //
     // 승인 때 정해진 권한은 나중에 넓어지지 않는다. 토큰을 아무리 갱신해도 그대로다.
     // 그래서 여기서 말할 것은 "부족합니다"가 아니라 **무엇을 해야 하는가**다.
-    if let Ok(me) = api.me().await {
+    // **죽은 연결 위에서 영원히 기다리지 않는다.** `me()`가 마감을 넘기면
+    // 서버가 죽은 것으로 보고 자격 검사를 건너뛴다 — 화면은 계속 떠야 한다.
+    if let Ok(me) = crate::conn::within(&api, api.me()).await {
         // 부르는 것 전부를 본다. 예전에는 셋만 봐서, `agents:read`나 `projects:read`가
         // 빠졌을 때 목록만 비고 아무 말도 없었다.
         let missing = crate::conn::missing_scopes(&me.scopes);
@@ -1444,8 +1477,31 @@ async fn run_inner(
     let mut last_quit_pending = false;
     let mut last_had_status = false;
     let mut shutdown = shutdown_signals();
+    // **루프가 멈추면 아무도 모른다.** 죽은 연결 위의 await는 마감으로 풀리지만,
+    // 그 밖의 블로킹(막힌 터미널 쓰기 등)은 남을 수 있다. 그러면 키도 시그널도
+    // 루프가 살아 있어야 닿는데 루프가 죽어 있으니 아무것도 안 먹는다. 진행도를
+    // 별도 태스크가 지켜보고, 멈춘 지 오래면 화면을 되돌리고 프로세스를 끝낸다 —
+    // "끌 수 없는" 상태가 구조적으로 생기지 않게.
+    let progress = Arc::new(AtomicU64::new(0));
+    let watchdog_progress = Arc::clone(&progress);
+    let watchdog = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(LOOP_WATCHDOG_INTERVAL).await;
+            let seen = watchdog_progress.load(Ordering::Relaxed);
+            tokio::time::sleep(LOOP_WATCHDOG_STALL).await;
+            if watchdog_progress.load(Ordering::Relaxed) == seen {
+                tracing::error!(
+                    "앱 루프가 {}초 동안 멈췄다 — 화면을 되돌리고 끝낸다",
+                    LOOP_WATCHDOG_STALL.as_secs()
+                );
+                let _ = ratatui::restore();
+                std::process::exit(1);
+            }
+        }
+    });
 
     'app: loop {
+        progress.fetch_add(1, Ordering::Relaxed);
         tokio::select! {
             Some(Ok(ev)) = keys.next() => {
                 let actions = match ev {
@@ -1540,7 +1596,8 @@ async fn run_inner(
                         }
                         Action::Cancel => {
                             if let Some(id) = session.id() {
-                                let _ = api.cancel_turn(id.to_string()).await;
+                                let _ = crate::conn::within(&api, api.cancel_turn(id.to_string()))
+                                    .await;
                             }
                         }
                         // 화면을 지우기만 한다. 바로 아래에서 다시 그린다.
@@ -1630,6 +1687,12 @@ async fn run_inner(
                     continue;
                 }
                 apply(&mut state, &action);
+                // 배경 폴링이 제목을 바꿨으면 창 제목도 따라간다. `switch`도
+                // state.title을 바꾸므로 여기 한 자리에서 함께 본다.
+                if state.title != shown_title {
+                    set_terminal_title(&state.title);
+                    shown_title = state.title.clone();
+                }
                 // 턴이 끝나는 프레임이 여기로 온다 — 대기열을 비울 자리도 여기다.
                 flush_queue(&api, &mut session, &agent_id, &mut state, &tx).await;
                 dirty = true;
@@ -1648,21 +1711,23 @@ async fn run_inner(
                 }
             }
             // 사용량과 제목은 이벤트로 오지 않으므로 주기적으로 물어본다.
+            //
+            // **네트워크는 루프 밖에서 돈다.** 죽은 연결 위의 await는 마감(`within`)
+            // 이 풀 때까지 루프를 붙들고, 그동안 키도 그리기도 멈춘다 — 네트워크가
+            // 불안정할 때 화면이 버벅이는 그 자리다. 여기서는 태스크만 띄우고
+            // 결과는 `Frame::Poll`로 돌아온다. 그때 `dirty = true`가 붙어 그려진다.
             _ = poll.tick() => {
                 if let Some(id) = session.id().map(str::to_string) {
-                    if let Some(u) = crate::conn::usage(&api, &id).await {
-                        if u != state.sidebar.usage {
-                            state.sidebar.usage = u;
-                            dirty = true;
-                        }
-                    }
-                    let want = crate::conn::session_title(&api, &id)
-                        .await
-                        .unwrap_or_else(|| "Zyris Code".into());
-                    if want != state.title {
-                        state.title = want;
-                        dirty = true;
-                    }
+                    let api = Arc::clone(&api);
+                    let tx = tx.clone();
+                    tokio::spawn(async move {
+                        let usage = crate::conn::usage(&api, &id).await;
+                        let title = crate::conn::session_title(&api, &id).await;
+                        let _ = tx.send((
+                            Some(id),
+                            Action::Frame(Frame::Poll { usage, title }),
+                        ));
+                    });
                 }
                 if state.title != shown_title {
                     set_terminal_title(&state.title);
@@ -1729,6 +1794,10 @@ async fn run_inner(
         }
     }
 
+    // 정상 종료 경로다. 감시 태스크가 남아 있으면 60초 뒤 오판으로 프로세스를
+    // 끝낼 수 있으니 여기서 끊는다.
+    watchdog.abort();
+
     // **창을 닫으면 서버에서도 멈춘다.**
     //
     // 턴은 서버에서 돈다 — 이쪽이 사라져도 저쪽은 계속 생각하고, 도구를 부를 때마다
@@ -1783,6 +1852,13 @@ fn shutdown_signals() -> mpsc::Receiver<()> {
             tokio::spawn(async move {
                 sig.recv().await;
                 let _ = tx.send(()).await;
+                // **루프가 어딘가에 갇혀 있으면 위 신호는 영영 처리되지 않는다.**
+                // (select!의 shutdown 가지를 루프가 돌아와야 본다.) 몇 초 뒤에도
+                // 안 끝나면 화면을 되돌리고 강제로 끝낸다 — `kill`이 언제나
+                // 통하게. 정상 종료는 그 전에 끝나므로 이 줄이 먼저 도는 일은 없다.
+                tokio::time::sleep(SHUTDOWN_FORCE).await;
+                let _ = ratatui::restore();
+                std::process::exit(0);
             });
         }
     }
@@ -1917,7 +1993,7 @@ async fn finish_command(
             let found = crate::instructions::collect(&state.cwd);
             state.timeline.say(rules_text(&found));
         }
-        Command::Agent(None) => match api.list_agents().await {
+        Command::Agent(None) => match crate::conn::within(api, api.list_agents()).await {
             Ok(agents) => {
                 let rows = agents
                     .into_iter()
@@ -2286,7 +2362,7 @@ async fn send(
     // **job·work는 여는 요청이 첫 메시지를 이미 먹었다**(`ZNewJob::message`). 여기서 또
     // 보내면 같은 말이 두 번 들어가고, job은 그것을 새 지시로 읽는다.
     if !opened.sent {
-        api.send_message(id.clone(), text.to_string(), vec![])
+        crate::conn::within(api, api.send_message(id.clone(), text.to_string(), vec![]))
             .await
             .map_err(|e| anyhow::anyhow!("전송하지 못했습니다: {e}"))?;
     }
@@ -2312,7 +2388,7 @@ fn spawn_stream(
 ) {
     tokio::spawn(async move {
         let tag = session_id.clone();
-        match api.turn_events(session_id, after).await {
+        match crate::conn::within(&api, api.turn_events(session_id, after)).await {
             Ok(mut stream) => {
                 // `Streaming`은 head와 items로 나뉜다. head가 현재 실행 상태를 들고 온다.
                 let _ =
