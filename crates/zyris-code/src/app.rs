@@ -5,7 +5,7 @@
 
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use zyris_attacca::ZDeltaKind;
 
 use crate::event::{Entry, EntryKind};
@@ -460,6 +460,13 @@ impl State {
 }
 
 pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
+    // **Windows는 키를 누를 때와 뗄 때를 각각 KeyEvent로 보낸다.** kind를 걸러내지
+    // 않으면 한 번 누른 키가 두 번 입력된다 — `/exit`를 치면 `//eexxitit`이 되는 그
+    // 버그다(ratatui issue #347). macOS/Linux에는 release 이벤트가 없어 이 증상이
+    // Windows에서만 나타난다. 길게 누르는 Repeat는 그대로 둔다 — 그건 중복이 아니다.
+    if key.kind == KeyEventKind::Release {
+        return vec![];
+    }
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
 
@@ -1907,7 +1914,11 @@ async fn run_inner(
             // 스스로 고치기. 마지막 치유 뒤로 그린 적이 있을 때만 한다 — 가만히 있는
             // 화면은 깨질 일이 없고, 쉬는 세션이 SSH로 계속 바이트를 밀 이유도 없다.
             _ = heal.tick(), if healing => {
-                if drew_since_heal {
+                // **턴이 도는 동안은 치유하지 않는다.** 스트리밍이 이미 매 프레임 화면을
+                // 다시 그리므로 부스러기가 쌓일 틈이 없고, 무엇보다 SSH처럼 느린 링크에서
+                // 전체 덮어쓰기(~21KB)가 스트리밍 프레임과 겹쳐 그려진 화면 위에 어긋난
+                // 위치로 다시 그려져 **같은 단어가 두 번 보인다**(Termius 실측).
+                if drew_since_heal && !state.running {
                     // **지우지 않고 모든 칸을 강제로 다시 내보낸다.** clear는 깜빡임의
                     // 원인이다 — `force_update`가 diff를 우회해 전 칸을 덮어써서 전각
                     // 글자 뒤 trailing 칸의 잔상을 치운다. 다음 draw는 일반 diff로 돌아간다.
@@ -2686,6 +2697,29 @@ mod tests {
         );
         // **Enter는 없다.** 다음 말을 치려고 누르던 손이 승인을 눌러 버리면 안 된다.
         assert!(on_key(&s, key(KeyCode::Enter, KeyModifiers::NONE)).is_empty());
+    }
+
+    /// Windows는 press와 release를 각각 KeyEvent로 보낸다. release를 걸러내지 않으면
+    /// 한 번 누른 키가 두 번 입력된다 — `/exit`가 `//eexxitit`이 되는 버그(ratatui
+    /// issue #347). macOS/Linux에는 release 이벤트가 없어 이 테스트는 그냥 지켜 준다.
+    #[test]
+    fn a_key_release_is_not_typed_twice() {
+        let s = state();
+        assert_eq!(
+            on_key(&s, key(KeyCode::Char('x'), KeyModifiers::NONE)),
+            vec![Action::Insert('x')],
+            "press는 입력이어야 한다"
+        );
+        let release = KeyEvent::new_with_kind(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        );
+        assert_eq!(
+            on_key(&s, release),
+            vec![],
+            "release는 입력이 아니어야 한다 — Windows에서 한 번 누른 키가 두 번 들어간다"
+        );
     }
 
     /// 승인 창이 없을 때는 그냥 글자다.
