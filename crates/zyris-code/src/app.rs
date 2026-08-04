@@ -134,6 +134,11 @@ pub enum Action {
     PickConfirm,
     /// 뒤로. 세션 단계면 프로젝트 목록으로, 프로젝트 단계면 닫는다.
     PickBack,
+    /// 새 프로젝트 양식. 다음 칸 / 앞 칸 / 만들기 / 닫기.
+    FormNext,
+    FormPrev,
+    FormConfirm,
+    FormCancel,
     ToggleSidebar,
     CycleMode,
     Approve,
@@ -234,6 +239,11 @@ pub struct State {
     pub submit_now: bool,
     /// 열려 있는 프로젝트/세션 목록.
     pub picker: Option<crate::picker::Picker>,
+    /// 새 프로젝트 양식. ← 목록에서 "＋ 새 프로젝트"를 고르면 열린다. **목록은 그대로
+    /// 아래에 있으므로** Esc로 닫으면 다시 그 자리로 돌아온다.
+    pub new_project: Option<crate::newproject::Form>,
+    /// 양식이 Enter를 받으면 여기에 담는다 — (이름, 설명). 만들기는 I/O 자리가 한다.
+    pub project_out: Option<(String, String)>,
     /// 오른쪽 사이드바 내용.
     pub sidebar: crate::sidebar::Sidebar,
     /// 사이드바를 보여줄까. 기본은 켜짐.
@@ -339,6 +349,8 @@ impl Default for State {
             ask_area: None,
             submit_now: false,
             picker: None,
+            new_project: None,
+            project_out: None,
             sidebar: crate::sidebar::Sidebar::new(),
             sidebar_on: true,
             title: "Zyris Code".into(),
@@ -482,6 +494,25 @@ pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
         };
     }
 
+    // **새 프로젝트 양식이 목록 위에 있다.** 목록은 그대로 아래에 열려 있으므로 Esc로
+    // 닫으면 다시 그 자리로 돌아온다. 글자는 양식의 활성 칸으로 간다.
+    if state.new_project.is_some() && !(ctrl && matches!(key.code, KeyCode::Char('c'))) {
+        return match key.code {
+            KeyCode::Enter => vec![Action::FormConfirm],
+            KeyCode::Esc => vec![Action::FormCancel],
+            KeyCode::Tab | KeyCode::Down => vec![Action::FormNext],
+            KeyCode::BackTab | KeyCode::Up => vec![Action::FormPrev],
+            KeyCode::Backspace => vec![Action::Backspace],
+            KeyCode::Delete => vec![Action::Delete],
+            KeyCode::Left => vec![Action::Left],
+            KeyCode::Right => vec![Action::Right],
+            KeyCode::Home => vec![Action::Home],
+            KeyCode::End => vec![Action::End],
+            KeyCode::Char(c) if !ctrl => vec![Action::Insert(c)],
+            _ => vec![],
+        };
+    }
+
     if state.picker.is_some() && !(ctrl && matches!(key.code, KeyCode::Char('c'))) {
         // **명령 목록은 치면서 고르는 것이다.** 글자가 이동키(k·j)로 먹히면
         // `/skills`를 칠 수 없다 — 여기서는 글자가 그대로 입력이고 목록이 좁혀진다.
@@ -606,6 +637,42 @@ pub fn apply(state: &mut State, action: &Action) {
         Action::Insert(_) | Action::Paste(_) | Action::Backspace | Action::Delete | Action::DeleteWord
     ) {
         state.recall = None;
+    }
+
+    // **새 프로젝트 양식이 열려 있으면 글자 키는 양식의 활성 칸으로 간다.** 아래
+    // 입력란에 새어 들어가면 안 된다 — 양식은 다른 자리다. 만들기는 여기서 서버를
+    // 부르지 않고 `project_out`에만 담는다 — I/O가 실제로 만든다.
+    if state.new_project.is_some() {
+        match action {
+            Action::Insert(c) => {
+                state.new_project.as_mut().expect("방금 확인했다").active().insert(*c)
+            }
+            Action::Paste(text) => {
+                state.new_project.as_mut().expect("방금 확인했다").active().insert_str(text)
+            }
+            Action::Backspace => {
+                state.new_project.as_mut().expect("방금 확인했다").active().backspace()
+            }
+            Action::Delete => state.new_project.as_mut().expect("방금 확인했다").active().delete(),
+            Action::DeleteWord => {
+                state.new_project.as_mut().expect("방금 확인했다").active().delete_word()
+            }
+            Action::Left => state.new_project.as_mut().expect("방금 확인했다").active().left(),
+            Action::Right => state.new_project.as_mut().expect("방금 확인했다").active().right(),
+            Action::Home => state.new_project.as_mut().expect("방금 확인했다").active().home(),
+            Action::End => state.new_project.as_mut().expect("방금 확인했다").active().end(),
+            Action::FormNext => state.new_project.as_mut().expect("방금 확인했다").next(),
+            Action::FormPrev => state.new_project.as_mut().expect("방금 확인했다").prev(),
+            Action::FormConfirm => {
+                let done = state.new_project.as_mut().and_then(|form| form.submit(state.lang));
+                if let Some((name, description)) = done {
+                    state.project_out = Some((name, description));
+                }
+            }
+            Action::FormCancel => state.new_project = None,
+            _ => {}
+        }
+        return;
     }
     match action {
         Action::Insert(c) => {
@@ -880,6 +947,9 @@ pub fn apply(state: &mut State, action: &Action) {
         // 돌아간다 — 승인되면 `EnrollDone`이 다시 닫고, 만료되면 새 코드와 함께
         // 창이 도로 온다.
         Action::EnrollClose => state.enroll = None,
+        // **양식이 닫혀 있으면 여기까지 오는 Form* 은 없다** — 열려 있으면 위의 가드가
+        // 가로챈다. 그래도 나열해야 exhaustive 하다.
+        Action::FormNext | Action::FormPrev | Action::FormConfirm | Action::FormCancel => {}
         Action::Frame(frame) => apply_frame(state, frame),
     }
 }
@@ -1106,7 +1176,6 @@ pub fn run_command(state: &mut State, text: &str) -> Option<crate::command::Comm
         | Command::Rules
         | Command::Agent(_)
         // 서버가 필요하다 — `finish_command`가 마저 한다.
-        | Command::Project(_)
         | Command::Plugin(_)
         | Command::Changes
         | Command::Undo => {}
@@ -1679,6 +1748,33 @@ async fn run_inner(
                         }
                     }
 
+                    // **새 프로젝트 만들기.** 양식이 Enter를 받으면 여기서 만든다 — I/O라
+                    // `apply`가 못 한다. 실패하면 사유를 양식에 남기고 그대로 둔다 —
+                    // 고쳐서 다시 만들 수 있어야 한다.
+                    if let Some((name, description)) = state.project_out.take() {
+                        match crate::conn::create_project(&api, &name, Some(&description)).await {
+                            Ok((id, name)) => {
+                                // **만들고 그 안으로 들어간다.** 만들어 놓고 다시 골라야
+                                // 하면 두 번 일이고, 방금 만든 것 말고 다른 데서 일을
+                                // 시작하는 사고가 난다.
+                                session.enter_project(id);
+                                session.stage_new_default();
+                                // 앞 세션의 턴 상태를 치운다 — 새 프로젝트로 갔는데
+                                // "작업 중"이 남으면 안 된다.
+                                leave_session(&mut state);
+                                state.new_project = None;
+                                state.picker = None;
+                                let said = state.lang.project_created(&name);
+                                state.timeline.say(said);
+                            }
+                            Err(e) => {
+                                if let Some(form) = &mut state.new_project {
+                                    form.error = Some(e.to_string());
+                                }
+                            }
+                        }
+                    }
+
                     // **모드가 바뀐 뒤에 할 일은 여기 하나로 모은다.** 들어오는 길이 둘이라
                     // (Shift+Tab은 `apply`, `/mode`는 바로 위 `finish_command`) 각자
                     // 고치면 언젠가 한쪽만 고친다 — 실제로 `/mode`가 게이트에 안 닿고 있었다.
@@ -1953,6 +2049,12 @@ async fn pick(
             state.picker = None;
             switch_agent(api, state, session, agent_id, &name).await;
         }
+        // **바로 만들지 않는다.** 이름과 설명을 받아야 한다 — 양식이 그 자리를 맡는다.
+        Pick::NewProject => {
+            // **목록은 그대로 둔다.** 양식이 그 위에 얹히고, Esc로 닫으면 다시 그
+            // 자리로 돌아온다 — 다시 열어 목록을 받아올 필요가 없다.
+            state.new_project = Some(crate::newproject::Form::new());
+        }
         // **바로 실행하지 않는다.** `/mode`처럼 인자를 받는 것이 있어서, 고른 뒤
         // 이어 칠 수 있어야 한다. 뒤에 공백을 붙여 두면 바로 인자를 칠 수 있다.
         Pick::TypeCommand { text } => {
@@ -2062,25 +2164,6 @@ async fn finish_command(
             Err(e) => state.timeline.say(format!("에이전트 목록을 읽지 못했습니다: {e}")),
         },
         Command::Agent(Some(name)) => switch_agent(api, state, session, agent_id, &name).await,
-        // 인자가 없으면 목록을 연다 — 만들기 전에 이미 있는 것을 보는 편이 낫다.
-        Command::Project(None) => match crate::conn::projects(api).await {
-            Ok(items) => state.picker = Some(crate::picker::Picker::projects(items, state.lang)),
-            Err(e) => state.timeline.say(format!("{e}")),
-        },
-        Command::Project(Some(name)) => match crate::conn::create_project(api, &name).await {
-            Ok((id, name)) => {
-                // **만들고 그 안으로 들어간다.** 만들어 놓고 다시 골라야 하면 두 번 일이고,
-                // 방금 만든 것 말고 다른 데서 일을 시작하는 사고가 난다.
-                session.enter_project(id);
-                session.stage_new_default();
-                // 앞 세션의 턴 상태를 치운다 — 새 프로젝트로 갔는데 "작업 중"이 남으면 안 된다.
-                leave_session(state);
-                state.picker = None;
-                let said = state.lang.project_created(&name);
-                state.timeline.say(said);
-            }
-            Err(e) => state.timeline.say(format!("{e}")),
-        },
         Command::Plugin(what) => {
             let said = run_plugin(state, what).await;
             state.timeline.say(said);
@@ -2448,15 +2531,14 @@ fn spawn_stream(
         match crate::conn::within(&api, api.turn_events(session_id, after)).await {
             Ok(mut stream) => {
                 // `Streaming`은 head와 items로 나뉜다. head가 현재 실행 상태를 들고 온다.
-                let _ =
-                    tx.send((Some(tag.clone()), Action::Frame(Frame::Status { running: stream.head.running })));
+                let _ = tx.send((
+                    Some(tag.clone()),
+                    Action::Frame(Frame::Status { running: stream.head.running }),
+                ));
                 while let Some(frame) = stream.items.next().await {
                     match frame {
                         Ok(f) => {
-                            if tx
-                                .send((Some(tag.clone()), Action::Frame(frame_from(f))))
-                                .is_err()
-                            {
+                            if tx.send((Some(tag.clone()), Action::Frame(frame_from(f)))).is_err() {
                                 break; // 앱이 끝났다.
                             }
                         }
@@ -3014,6 +3096,68 @@ mod tests {
         apply(&mut s, &Action::Backspace);
         apply(&mut s, &Action::Backspace);
         assert!(s.picker.is_none(), "다 지웠는데 목록이 남았다");
+    }
+
+    // ── 새 프로젝트 양식
+
+    /// 양식이 열려 있으면 글자는 그 활성 칸으로 간다 — 아래 입력란에 새어 들어가면 안 된다.
+    #[test]
+    fn typing_goes_to_the_form_while_it_is_open() {
+        let mut s = state();
+        s.new_project = Some(crate::newproject::Form::new());
+        apply(&mut s, &Action::Insert('가'));
+        apply(&mut s, &Action::FormNext);
+        apply(&mut s, &Action::Insert('나'));
+        let form = s.new_project.as_ref().unwrap();
+        assert_eq!(form.name.text, "가");
+        assert_eq!(form.description.text, "나");
+        assert!(s.input.text.is_empty(), "아래 입력란에 샜다: {:?}", s.input.text);
+    }
+
+    /// 만들기. **이름이 비면 조용히 넘어가지 않는다** — 사유를 양식에 담는다.
+    #[test]
+    fn confirming_without_a_name_says_so() {
+        let mut s = state();
+        s.new_project = Some(crate::newproject::Form::new());
+        apply(&mut s, &Action::FormConfirm);
+        let form = s.new_project.as_ref().unwrap();
+        assert!(form.error.is_some(), "이름이 비었는데 사유가 없다");
+        assert!(s.project_out.is_none(), "서버를 부르면 안 된다");
+    }
+
+    /// 이름이 있으면 (이름, 설명)이 만들기 자리로 간다 — 만들어진 것은 아니다.
+    #[test]
+    fn confirming_with_a_name_stages_creation() {
+        let mut s = state();
+        s.new_project = Some(crate::newproject::Form::new());
+        for c in "제목".chars() {
+            apply(&mut s, &Action::Insert(c));
+        }
+        apply(&mut s, &Action::FormConfirm);
+        assert_eq!(s.project_out, Some(("제목".to_string(), String::new())));
+        assert!(s.new_project.is_some(), "만들어지기 전에는 양식이 남아 있어야 한다");
+    }
+
+    /// Esc는 양식을 닫는다 — 목록은 그대로 아래에 있으므로 다시 그 자리로 돌아온다.
+    #[test]
+    fn escaping_closes_the_form_not_the_list() {
+        let mut s = state();
+        s.picker = Some(crate::picker::Picker::loading_projects());
+        s.new_project = Some(crate::newproject::Form::new());
+        apply(&mut s, &Action::FormCancel);
+        assert!(s.new_project.is_none());
+        assert!(s.picker.is_some(), "목록까지 닫으면 다시 받아와야 한다");
+    }
+
+    /// 양식이 열려 있으면 키가 양식으로 간다.
+    #[test]
+    fn keys_route_to_the_form_while_it_is_open() {
+        let mut s = state();
+        s.new_project = Some(crate::newproject::Form::new());
+        assert_eq!(on_key(&s, key(KeyCode::Enter, KeyModifiers::NONE)), vec![Action::FormConfirm]);
+        assert_eq!(on_key(&s, key(KeyCode::Esc, KeyModifiers::NONE)), vec![Action::FormCancel]);
+        assert_eq!(on_key(&s, key(KeyCode::Tab, KeyModifiers::NONE)), vec![Action::FormNext]);
+        assert_eq!(on_key(&s, key(KeyCode::BackTab, KeyModifiers::NONE)), vec![Action::FormPrev]);
     }
 
     fn work_start(seq: i64) -> Action {

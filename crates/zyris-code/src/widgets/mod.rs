@@ -23,6 +23,7 @@ mod approve;
 mod ask;
 mod enroll;
 mod input;
+mod newproject;
 mod picker;
 mod sidebar;
 mod status;
@@ -120,6 +121,12 @@ pub fn draw(frame: &mut Frame, state: &mut State) {
     // 목록은 맨 위에 겹친다 — 열려 있는 동안은 그것이 지금 할 일이다.
     if let Some(p) = &state.picker {
         picker::draw(frame, full, p, state.lang);
+    }
+
+    // **새 프로젝트 양식은 목록 위에 얹힌다.** 목록은 그대로 아래에 있으므로 Esc로
+    // 닫으면 다시 그 자리로 돌아온다.
+    if let Some(form) = &state.new_project {
+        newproject::draw(frame, full, form, state.lang);
     }
 
     // **등록 코드 창은 그 위에 겹친다.** 코드를 보는 중에는 다른 일을 하면 안 된다 —

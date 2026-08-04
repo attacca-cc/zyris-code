@@ -1,11 +1,11 @@
 //! 프로젝트와 세션 고르기.
 //!
-//! → 를 누르면 프로젝트 목록이 열리고, 프로젝트를 고르면 그 안의 세션 목록으로 들어간다.
+//! ← 를 누르면 프로젝트 목록이 열리고, 프로젝트를 고르면 그 안의 세션 목록으로 들어간다.
 //! 각 목록 맨 위에는 "새로 만들기" 줄이 있다.
 //!
-//! **프로젝트를 만드는 줄은 이름을 받아야 한다.** 그런데 목록에는 글자를 칠 자리가 없다.
-//! 그래서 그 줄은 `/project `를 입력란에 넣어 주고 **이름은 사람이 이어서 친다** —
-//! 슬래시 명령 목록이 쓰는 `TypeCommand`와 같은 수법이고, 새 화면을 하나 더 만들지 않는다.
+//! **프로젝트를 만드는 줄은 이름과 설명을 받아야 한다.** 그런데 목록에는 글자를 칠 자리가
+//! 없다. 그래서 그 줄은 양식(`newproject::Form`)을 연다 — 이름과 설명을 두 칸에 나눠
+//! 받고, 목록은 그 아래에 그대로 열려 있어서 Esc로 닫으면 다시 그 자리로 돌아온다.
 //!
 //! 여기는 순수하다. 목록을 가져오고 세션을 만드는 것은 I/O 자리가 한다.
 
@@ -47,6 +47,8 @@ pub enum Pick {
     OpenSession { id: String, project_id: String },
     /// 이 프로젝트에 새 세션을 만든다.
     NewSession { project_id: String },
+    /// 새 프로젝트 양식(`newproject::Form`)을 연다. 이름과 설명을 받아 만든다.
+    NewProject,
     /// 이 에이전트로 간다. 다음 메시지에서 새 세션이 열린다.
     UseAgent { name: String },
     /// 이 명령을 입력란에 넣는다. **바로 실행하지 않는다** — `/mode`처럼 인자를 받는
@@ -267,16 +269,14 @@ impl Picker {
             (Level::Sessions { project_id, .. }, None) => {
                 Some(Pick::NewSession { project_id: project_id.clone() })
             }
-            // **바로 만들지 않는다.** 이름을 받아야 하는데 목록에 칠 자리가 없다.
-            (Level::Projects, None) => Some(Pick::TypeCommand { text: "/project ".into() }),
+            // **바로 만들지 않는다.** 이름과 설명을 받아야 한다 — 양식이 그 자리를 맡는다.
+            (Level::Projects, None) => Some(Pick::NewProject),
             (Level::Agents, Some(name)) => Some(Pick::UseAgent { name: name.clone() }),
             (Level::Commands, Some(text)) => Some(Pick::TypeCommand { text: text.clone() }),
             (Level::Languages, Some(code)) => {
                 crate::lang::Lang::parse(code).map(|lang| Pick::UseLang { lang })
             }
-            (Level::Agents, None)
-            | (Level::Commands, None)
-            | (Level::Languages, None) => None,
+            (Level::Agents, None) | (Level::Commands, None) | (Level::Languages, None) => None,
         }
     }
 
@@ -467,19 +467,12 @@ mod tests {
         );
     }
 
-    /// **누른다고 바로 만들지 않는다.** 이름을 받아야 하는데 목록에는 글자를 칠 자리가
-    /// 없어서, `/project `를 입력란에 넣어 주고 이름은 사람이 이어서 친다.
+    /// **누른다고 바로 만들지 않는다.** 이름과 설명을 받아야 한다 — 양식을 연다.
     #[test]
-    fn picking_the_create_row_types_the_command_for_you() {
+    fn picking_the_create_row_opens_the_form() {
         let mut p = projects();
         p.cursor = 0;
-        match p.pick() {
-            Some(Pick::TypeCommand { text }) => {
-                assert_eq!(text, "/project ");
-                assert!(text.ends_with(' '), "이름을 바로 이어 칠 수 있어야 한다");
-            }
-            other => panic!("입력란에 넣어 줘야 한다: {other:?}"),
-        }
+        assert_eq!(p.pick(), Some(Pick::NewProject));
     }
 
     #[test]

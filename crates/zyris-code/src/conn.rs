@@ -86,7 +86,7 @@ pub const DEFAULT_AGENT: &str = "Main Agent";
 pub const REQUIRED_SCOPES: [&str; 10] = [
     "agents:read",
     "projects:read",
-    // `/project <이름>`이 쓴다. 2026-08-03에 배포본에 재 보고 넣었다 — 200이었다.
+    // 프로젝트 양식이 쓴다. 2026-08-03에 배포본에 재 보고 넣었다 — 200이었다.
     "projects:write",
     "sessions:read",
     "sessions:write",
@@ -605,13 +605,16 @@ impl Session {
         if let Some(id) = &self.id {
             return Ok(id.clone());
         }
-        let session = within(api, api.create_session_with(ZNewSession {
-            agent_id: agent_id.to_string(),
-            title: None,
-            // 예약해 둔 프로젝트가 있으면 거기에 만든다. 없으면 기본 프로젝트다.
-            project_id: self.project.clone(),
-            preamble: self.preamble.clone(),
-        }))
+        let session = within(
+            api,
+            api.create_session_with(ZNewSession {
+                agent_id: agent_id.to_string(),
+                title: None,
+                // 예약해 둔 프로젝트가 있으면 거기에 만든다. 없으면 기본 프로젝트다.
+                project_id: self.project.clone(),
+                preamble: self.preamble.clone(),
+            }),
+        )
         .await
         .map_err(|e| anyhow!("thread를 만들지 못했습니다: {e}"))?;
         self.id = Some(session.id.clone());
@@ -659,22 +662,25 @@ impl Session {
         agent_id: &str,
         message: &str,
     ) -> Result<Opened> {
-        let job = within(api, api.create_job(ZNewJob {
-            message: message.to_string(),
-            // **고른 에이전트로 돌린다.** 비우면 Main Agent로 가는데, 그러면 `/agent`으로
-            // 고른 것이 화면에만 남고 실제로 도는 것은 다른 에이전트가 된다.
-            agent_id: Some(agent_id.to_string()),
-            project_id: self.project.clone(),
-            // 배포본의 시간대를 그대로 쓴다. 이 머신의 시간대를 억지로 밀어 넣으면
-            // 같은 계정의 다른 job과 답이 갈린다.
-            timezone: None,
-            // **둘 다 끄고 둔다.** `planning`은 job을 work로 넘기는 것이고 `plan_mode`는
-            // job 안에서 계획을 받고 멈추는 것인데, 여기서는 모드가 이미 그 갈래다 —
-            // job 모드는 "시켜 놓는다"이고, 계획이 필요하면 계획 모드나 work 모드다.
-            planning: false,
-            plan_mode: false,
-            data: vec![],
-        }))
+        let job = within(
+            api,
+            api.create_job(ZNewJob {
+                message: message.to_string(),
+                // **고른 에이전트로 돌린다.** 비우면 Main Agent로 가는데, 그러면 `/agent`으로
+                // 고른 것이 화면에만 남고 실제로 도는 것은 다른 에이전트가 된다.
+                agent_id: Some(agent_id.to_string()),
+                project_id: self.project.clone(),
+                // 배포본의 시간대를 그대로 쓴다. 이 머신의 시간대를 억지로 밀어 넣으면
+                // 같은 계정의 다른 job과 답이 갈린다.
+                timezone: None,
+                // **둘 다 끄고 둔다.** `planning`은 job을 work로 넘기는 것이고 `plan_mode`는
+                // job 안에서 계획을 받고 멈추는 것인데, 여기서는 모드가 이미 그 갈래다 —
+                // job 모드는 "시켜 놓는다"이고, 계획이 필요하면 계획 모드나 work 모드다.
+                planning: false,
+                plan_mode: false,
+                data: vec![],
+            }),
+        )
         .await
         .map_err(|e| anyhow!("job을 걸지 못했습니다: {e}"))?;
 
@@ -696,13 +702,16 @@ impl Session {
         agent_id: &str,
         message: &str,
     ) -> Result<Opened> {
-        let work = within(api, api.create_work(ZNewWork {
-            message: message.to_string(),
-            agent_id: Some(agent_id.to_string()),
-            // **work의 태스크는 프로젝트의 체크아웃에서 돈다.** 여기가 비면 기본
-            // 프로젝트가 되고, 그것이 무엇을 바꿔도 되는지를 정한다.
-            project_id: self.project.clone(),
-        }))
+        let work = within(
+            api,
+            api.create_work(ZNewWork {
+                message: message.to_string(),
+                agent_id: Some(agent_id.to_string()),
+                // **work의 태스크는 프로젝트의 체크아웃에서 돈다.** 여기가 비면 기본
+                // 프로젝트가 되고, 그것이 무엇을 바꿔도 되는지를 정한다.
+                project_id: self.project.clone(),
+            }),
+        )
         .await
         .map_err(|e| anyhow!("work를 만들지 못했습니다: {e}"))?;
 
@@ -758,15 +767,25 @@ pub fn frame_from(f: ZTurnFrame) -> Frame {
 /// 프로젝트를 만든다. 만든 것의 `(id, 이름)`을 준다.
 ///
 /// **이름이 비면 부르지 않는다** — 서버가 무엇을 만들지 모르고, 목록에 이름 없는 줄이
-/// 하나 생기면 지우는 길이 이 앱에 없다.
-pub async fn create_project(api: &AttaccaApiClient, name: &str) -> Result<(String, String)> {
+/// 하나 생기면 지우는 길이 이 앱에 없다. 설명은 비워도 된다.
+pub async fn create_project(
+    api: &AttaccaApiClient,
+    name: &str,
+    description: Option<&str>,
+) -> Result<(String, String)> {
     let name = name.trim();
     if name.is_empty() {
-        return Err(anyhow!("프로젝트 이름을 같이 적어 주세요: `/project 이름`"));
+        return Err(anyhow!("프로젝트 이름을 적어 주세요."));
     }
-    let p = within(api, api.create_project(ZNewProject { name: name.to_string(), description: None }))
-        .await
-        .map_err(|e| anyhow!("프로젝트를 만들지 못했습니다: {e}"))?;
+    let p = within(
+        api,
+        api.create_project(ZNewProject {
+            name: name.to_string(),
+            description: description.map(str::to_string),
+        }),
+    )
+    .await
+    .map_err(|e| anyhow!("프로젝트를 만들지 못했습니다: {e}"))?;
     Ok((p.id, p.name))
 }
 
@@ -783,10 +802,13 @@ pub async fn sessions(
     api: &AttaccaApiClient,
     project_id: &str,
 ) -> Result<Vec<(String, String, bool)>> {
-    let items = within(api, api.list_sessions(ZSessionFilter {
-        project_id: Some(project_id.to_string()),
-        limit: Some(50),
-    }))
+    let items = within(
+        api,
+        api.list_sessions(ZSessionFilter {
+            project_id: Some(project_id.to_string()),
+            limit: Some(50),
+        }),
+    )
     .await
     .map_err(|e| anyhow!("thread 목록을 읽지 못했습니다: {e}"))?;
     Ok(items

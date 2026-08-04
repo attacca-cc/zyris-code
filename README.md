@@ -128,8 +128,8 @@ only**; after that you are talking to it.
 `/mode normal|plan|work|job` does the same thing without the keyboard.
 
 Whatever you open lands in **the project you last picked** (`←`), not the default one.
-`/project <name>` makes a new project and moves into it; the `+ New project` row in the
-project list types that command for you.
+The `+ New project` row in the project list opens a small form — type a name and an
+optional description, Enter creates it and moves you in.
 
 `work` and `job` are deliberately untranslated — they are what Attacca calls them, so
 what you open here is what you look up there.

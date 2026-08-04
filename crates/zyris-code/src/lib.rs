@@ -18,6 +18,7 @@ pub mod lang;
 pub mod markdown;
 pub mod mcp;
 pub mod mode;
+pub mod newproject;
 pub mod notice;
 pub mod picker;
 pub mod plugin;

@@ -26,8 +26,6 @@ pub enum Command {
     Cwd,
     /// 인자가 없으면 목록을 열고, 있으면 그 이름으로 바로 간다.
     Agent(Option<String>),
-    /// 이 이름으로 프로젝트를 만들고 그 안으로 들어간다. 인자가 없으면 목록을 연다.
-    Project(Option<String>),
     Plugin(Plugin),
     Undo,
     Clear,
@@ -99,9 +97,6 @@ pub fn parse(text: &str) -> Option<Command> {
         "rules" | "claude" | "agents" => Command::Rules,
         "cwd" | "pwd" => Command::Cwd,
         "agent" => Command::Agent(some(arg)),
-        // **이름에 공백이 있을 수 있다.** 첫 낱말에서 자르면 `/project 새 프로젝트`가
-        // `새`가 된다 — `arg`를 통째로 쓴다.
-        "project" | "proj" => Command::Project(some(arg)),
         "plugin" | "plugins" => Command::Plugin(plugin_action(arg)),
         "undo" => Command::Undo,
         "clear" => Command::Clear,
@@ -171,7 +166,6 @@ pub fn catalogue(lang: crate::lang::Lang) -> Vec<(&'static str, &'static str)> {
             ("/mode", "모드를 보거나 바꿉니다 (기본·계획·work·job)"),
             ("/lang", "화면 말을 바꿉니다 (ko·en)"),
             ("/agent", "에이전트를 고릅니다. 다음 메시지에서 새 쓰레드가 열립니다"),
-            ("/project", "프로젝트를 만들고 그 안으로 들어갑니다 (이름을 이어서 칩니다)"),
             ("/mcp", "붙은 MCP 서버와 도구 수"),
             ("/skills", "쓸 수 있는 스킬"),
             ("/plugin", "플러그인을 받고 지웁니다 (add·remove·update)"),
@@ -188,7 +182,6 @@ pub fn catalogue(lang: crate::lang::Lang) -> Vec<(&'static str, &'static str)> {
             ("/mode", "Show or change the mode (normal / plan / work / job)"),
             ("/lang", "Change the interface language (ko / en)"),
             ("/agent", "Pick an agent. A new thread opens with your next message"),
-            ("/project", "Create a project and move into it (type a name after it)"),
             ("/mcp", "MCP servers that connected, and how many tools each brought"),
             ("/skills", "Skills available here"),
             ("/plugin", "Install and remove plugins (add / remove / update)"),
@@ -368,6 +361,19 @@ mod tests {
             let got = parse(name);
             assert!(got.is_some(), "{name}을 파서가 모른다");
             assert!(!matches!(got, Some(Command::Unknown(_))), "{name}이 모르는 것으로 떨어진다");
+        }
+    }
+
+    /// **프로젝트는 이제 목록에서 양식으로 만든다** — 명령이 따로 필요 없다.
+    #[test]
+    fn project_is_not_a_command_anymore() {
+        // 모르는 명령은 조용히 삼키지 않는다 — 무엇이 잘못됐는지 말해 줘야 한다.
+        assert_eq!(parse("/project"), Some(Command::Unknown("project".into())));
+        assert_eq!(parse("/project 새 프로젝트"), Some(Command::Unknown("project".into())));
+        for (name, _) in
+            catalogue(crate::lang::Lang::Ko).iter().chain(catalogue(crate::lang::Lang::En).iter())
+        {
+            assert_ne!(*name, "/project", "목록에 /project가 남아 있다");
         }
     }
 

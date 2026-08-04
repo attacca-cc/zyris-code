@@ -824,7 +824,7 @@ fn the_picker_overlays_the_conversation_and_takes_the_keys() {
     assert_eq!(on_key(&s, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)), vec![Action::PickBack]);
 }
 
-/// 두 생성 줄이 서로 다르게 동작한다. **세션은 바로 만들고, 프로젝트는 이름을 받아야 한다.**
+/// 두 생성 줄이 서로 다르게 동작한다. **세션은 바로 만들고, 프로젝트는 양식으로 받는다.**
 #[test]
 fn the_create_rows_behave_differently_by_level() {
     use zyris_code::picker::{Pick, Picker};
@@ -833,10 +833,43 @@ fn the_create_rows_behave_differently_by_level() {
         Picker::projects(vec![("p1".into(), "기본".into(), true)], zyris_code::lang::Lang::Ko);
     let mut at_create = projects.clone();
     at_create.cursor = 0;
-    assert_eq!(at_create.pick(), Some(Pick::TypeCommand { text: "/project ".into() }));
+    assert_eq!(at_create.pick(), Some(Pick::NewProject));
 
     let sessions = Picker::sessions("p1".into(), "기본".into(), vec![], zyris_code::lang::Lang::Ko);
     assert_eq!(sessions.pick(), Some(Pick::NewSession { project_id: "p1".into() }));
+}
+
+/// 새 프로젝트 양식: 제목·이름·설명 칸이 보이고, 친 글자는 이름 칸으로 간다.
+#[test]
+fn the_new_project_form_renders_and_types_into_the_name_field() {
+    use crossterm::event::KeyCode;
+    use zyris_code::app::on_key;
+    use zyris_code::newproject::Form;
+
+    let mut s = State::new();
+    s.lang = zyris_code::lang::Lang::Ko;
+    s.new_project = Some(Form::new());
+
+    let screen = dump(&mut s, 70, 16);
+    assert!(screen.contains("새 프로젝트"), "제목이 없다\n{screen}");
+    assert!(screen.contains("이름"), "이름 칸이 없다\n{screen}");
+    assert!(screen.contains("설명"), "설명 칸이 없다\n{screen}");
+    assert!(screen.contains("Enter 만들기"), "안내가 없다\n{screen}");
+
+    // 친 글자는 양식의 이름 칸으로 간다 — 아래 입력란에 새면 안 된다.
+    for a in on_key(&s, key(KeyCode::Char('가'))) {
+        apply(&mut s, &a);
+    }
+    assert_eq!(s.new_project.as_ref().unwrap().name.text, "가");
+    assert_eq!(s.input.text, "");
+    let screen = dump(&mut s, 70, 16);
+    assert!(screen.contains('가'), "친 글자가 화면에 없다\n{screen}");
+
+    // Esc는 양식을 닫는다.
+    for a in on_key(&s, key(KeyCode::Esc)) {
+        apply(&mut s, &a);
+    }
+    assert!(s.new_project.is_none(), "Esc가 양식을 안 닫았다");
 }
 
 /// 세션 제목은 길이가 제멋대로다. 안 자르면 상자를 뚫고 나가 화면이 무너진다.

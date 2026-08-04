@@ -119,7 +119,7 @@ fn tool_summary(payload: &Value, name: &str) -> String {
         "open" | "open_stream" => pick("shell").or(Some("기본 셸")),
         // PTY를 이어 쓰는 것들은 어느 셸인지가 전부다.
         "read" | "write" | "screen" | "resize" | "close" if pick("pty").is_some() => pick("pty"),
-        "edit" | "multi_edit" | "write" | "stat" | "list" | "read_stream" => pick("path"),
+        "edit" | "multi_edit" | "write" | "version" | "stat" | "list" | "read_stream" => pick("path"),
         // 모르는 도구(서버 빌트인·MCP)는 흔한 이름부터 찾아보고, 없으면 첫 문자열이다.
         _ => ["path", "name", "query", "title", "content", "url", "id"]
             .into_iter()
@@ -533,6 +533,7 @@ mod tests {
             added: d.added,
             removed: d.removed,
             diff: d.to_unified(),
+            version: "0:0".into(),
         })
         .unwrap();
         let e = ev(

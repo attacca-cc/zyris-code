@@ -308,11 +308,36 @@ impl Lang {
     pub fn new_project(self) -> &'static str {
         self.pick("＋ 새 프로젝트", "+ New project")
     }
-    /// 고르면 무슨 일이 벌어지는지 그 자리에서 말한다. **누르면 바로 만들지 않는다** —
-    /// 이름을 받아야 하는데 목록에는 글자를 칠 자리가 없어서, `/project `를 입력란에
-    /// 넣어 주고 이름은 사람이 친다.
+    /// 고르면 이름과 설명을 적는 양식이 열린다 — 목록에는 글자를 칠 자리가 없다.
     pub fn new_project_note(self) -> &'static str {
-        self.pick("이름을 이어서 칩니다", "type a name after it")
+        self.pick("이름과 설명을 적습니다", "type a name and description")
+    }
+    // ── 새 프로젝트 양식
+    pub fn project_form_title(self) -> &'static str {
+        self.pick("새 프로젝트", "New project")
+    }
+    pub fn project_name(self) -> &'static str {
+        self.pick("이름", "Name")
+    }
+    pub fn project_name_placeholder(self) -> &'static str {
+        self.pick("프로젝트 이름", "project name")
+    }
+    pub fn project_description(self) -> &'static str {
+        self.pick("설명", "Description")
+    }
+    pub fn project_description_placeholder(self) -> &'static str {
+        self.pick("무엇을 하는 곳인지", "what it is for")
+    }
+    pub fn project_form_keys(self) -> &'static str {
+        self.pick(
+            "Tab 다음 칸 · Enter 만들기 · Esc 닫기",
+            "Tab next field · Enter create · Esc close",
+        )
+    }
+    /// **이름이 비면 만들지 않는다** — 무엇을 만들지 모르고, 목록에 이름 없는 줄이
+    /// 생기면 지우는 길이 없다.
+    pub fn project_name_required(self) -> &'static str {
+        self.pick("이름을 적어 주세요.", "Type a name.")
     }
     pub fn project_created(self, name: &str) -> String {
         match self {
@@ -551,6 +576,10 @@ mod tests {
             (ko.waiting_answer(), en.waiting_answer()),
             (ko.new_thread(), en.new_thread()),
             (ko.projects(), en.projects()),
+            (ko.new_project(), en.new_project()),
+            (ko.project_form_title(), en.project_form_title()),
+            (ko.project_form_keys(), en.project_form_keys()),
+            (ko.project_name_required(), en.project_name_required()),
             (ko.agents(), en.agents()),
             (ko.commands(), en.commands()),
             (ko.mode_normal(), en.mode_normal()),
@@ -597,6 +626,13 @@ mod tests {
             en.waiting_answer(),
             en.mode_continues_work(),
             en.mode_continues_job(),
+            en.project_form_title(),
+            en.project_name(),
+            en.project_name_placeholder(),
+            en.project_description(),
+            en.project_description_placeholder(),
+            en.project_form_keys(),
+            en.project_name_required(),
         ];
         for text in said {
             assert!(
