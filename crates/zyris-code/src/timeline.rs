@@ -93,6 +93,8 @@ pub struct Timeline {
     entries: BTreeMap<i64, Entry>,
     /// 아직 durable 이벤트로 오지 않은 답변 델타.
     live_assistant: String,
+    /// 답변 델타가 시작된 시점의 마지막 이벤트 seq. 그 자리 뒤에 임시 텍스트를 놓는다.
+    live_after: Option<i64>,
     /// 열려 있는 작업 카드의 추론 델타.
     live_reasoning: String,
     /// 만들어 둔 항목들. **바뀐 게 없으면 다시 만들지 않는다.**
@@ -142,6 +144,7 @@ impl Timeline {
         self.entries.clear();
         self.said.clear();
         self.live_assistant.clear();
+        self.live_after = None;
         self.live_reasoning.clear();
         self.dirty = true;
     }
@@ -149,7 +152,10 @@ impl Timeline {
     pub fn upsert(&mut self, entry: Entry) {
         match &entry.kind {
             // durable 답변이 왔으면 델타 버퍼는 제 몫을 다했다. 안 비우면 두 벌로 보인다.
-            EntryKind::Agent(_) => self.live_assistant.clear(),
+            EntryKind::Agent(_) => {
+                self.live_assistant.clear();
+                self.live_after = None;
+            }
             // 새 런이 열리면 앞 런의 추론이 딸려가면 안 된다.
             EntryKind::WorkStart(_) => self.live_reasoning.clear(),
             _ => {}
@@ -160,7 +166,14 @@ impl Timeline {
 
     pub fn push_delta(&mut self, kind: ZDeltaKind, text: &str) {
         match kind {
-            ZDeltaKind::Assistant => self.live_assistant.push_str(text),
+            ZDeltaKind::Assistant => {
+                // 스트리밍이 시작된 자리를 기억한다 — 그 뒤에 이어지는 도구 호출이
+                // 있으면 답변 텍스트는 그 **위**에 있어야 한다.
+                if self.live_assistant.is_empty() {
+                    self.live_after = self.entries.keys().next_back().copied();
+                }
+                self.live_assistant.push_str(text);
+            }
             ZDeltaKind::Reasoning => self.live_reasoning.push_str(text),
         }
         self.dirty = true;
@@ -188,9 +201,18 @@ impl Timeline {
     fn build(&self) -> Vec<Item> {
         let mut out: Vec<Item> = Vec::new();
         let mut open_work: Option<usize> = None;
+        // 스트리밍 답변을 놓을 자리. 턴이 시작된 시점(`live_after`) 뒤의 **첫 이벤트
+        // 앞에** 끼운다 — 끝에 붙이면 그 뒤에 온 도구 줄 아래로 밀려 "순서가
+        // 뒤바뀐" 화면이 된다(실제로 그렇게 보였다).
+        let mut live = (!self.live_assistant.is_empty()).then_some(LIVE_ASSISTANT_SEQ);
+        let live_after = self.live_after.unwrap_or(0);
 
         for entry in self.entries.values() {
             let seq = entry.seq;
+            if let Some(id) = live.filter(|_| seq > live_after) {
+                out.push(Item::Agent { seq: id, text: self.live_assistant.clone() });
+                live = None;
+            }
             match &entry.kind {
                 EntryKind::User(text) => {
                     open_work = None;
@@ -264,10 +286,9 @@ impl Timeline {
             }
         }
 
-        // 아직 durable로 굳지 않은 답변 델타는 맨 끝에 임시로 붙인다.
-        if !self.live_assistant.is_empty() {
-            let seq = self.entries.keys().last().copied().unwrap_or(0) + 1;
-            out.push(Item::Agent { seq, text: self.live_assistant.clone() });
+        // 앞에서 못 끼웠으면(스트리밍이 아직 이벤트보다 뒤) 맨 끝에 붙인다.
+        if let Some(id) = live {
+            out.push(Item::Agent { seq: id, text: self.live_assistant.clone() });
         }
 
         self.weave_in_what_the_app_said(out)
@@ -277,6 +298,9 @@ impl Timeline {
     ///
     /// **한 번에 훑으며 합친다.** 하나씩 `insert`하면 앞서 넣은 것이 뒤 계산을 밀어
     /// 같은 자리에 말이 둘 이상 있을 때 순서가 뒤집힌다.
+    ///
+    /// 위치는 seq 비교가 아니라 **"after 항목 바로 뒤"**다 — 암시적 작업 카드처럼
+    /// 항목 seq가 양수 구간을 벗어나 있어도 말한 자리가 흔들리지 않는다.
     fn weave_in_what_the_app_said(&self, items: Vec<Item>) -> Vec<Item> {
         if self.said.is_empty() {
             return items;
@@ -284,11 +308,20 @@ impl Timeline {
         let mut out = Vec::with_capacity(items.len() + self.said.len());
         let mut said = self.said.iter().peekable();
         let mine = |s: &Said| Item::System { seq: s.seq, text: s.text.clone() };
+        // 아무 이벤트도 없을 때 한 말은 맨 앞에 선다.
+        while said.peek().is_some_and(|s| s.after == 0) {
+            out.push(mine(said.next().expect("방금 봤다")));
+        }
+        let mut pending: Vec<&Said> = Vec::new();
         for item in items {
-            while said.peek().is_some_and(|s| s.after < item.seq()) {
-                out.push(mine(said.next().expect("방금 봤다")));
+            // 이 항목 뒤에 놓일 말들 — after가 이 항목의 seq인 것.
+            while said.peek().is_some_and(|s| s.after == item.seq()) {
+                pending.push(said.next().expect("방금 봤다"));
             }
             out.push(item);
+            if !pending.is_empty() {
+                out.extend(pending.drain(..).map(mine));
+            }
         }
         out.extend(said.map(mine));
         out
@@ -307,6 +340,16 @@ fn short_name(name: &str) -> String {
     name.rsplit("__").next().unwrap_or(name).to_string()
 }
 
+/// 스트리밍 중인 답변 텍스트의 항목 seq. 언제나 하나만 있으므로 고정 상수다.
+const LIVE_ASSISTANT_SEQ: i64 = i64::MIN;
+
+/// 암시적 작업 카드의 항목 seq. 서버 seq(양수)·앱 말(음수 소수)·라이브 답변과 겹치지
+/// 않도록 아주 먼 음수로 만든다 — 겹치면 접힘 상태와 줄 캐시가 두 항목을 한 자리로
+/// 본다.
+fn implicit_seq(first: i64) -> i64 {
+    i64::MIN + first
+}
+
 /// 추론을 덧붙인다. 도구 없이 이어진 추론은 한 덩어리로 합친다 —
 /// 사이에 아무 일도 없었으면 나눠 봐야 읽기만 나빠진다.
 /// 지금 열려 있는 작업 카드. **없으면 만든다.**
@@ -323,7 +366,10 @@ fn card_for(out: &mut Vec<Item>, open_work: &mut Option<usize>, seq: i64) -> usi
         return at;
     }
     let at = out.len();
-    out.push(Item::Work { seq, title: String::new(), parts: Vec::new() });
+    // **암시적 카드의 접힘 키를 첫 부분의 seq와 겹치지 않게** 만든다. 겹치면
+    // 카드를 펼 때 첫 도구의 상세도 같은 키를 공유해 같이 펼쳐진다(실제로 그렇게
+    // 보였다 — 추론 없는 툴 전용 턴에서 카드를 누르면 첫 도구의 인자·결과가 열린다).
+    out.push(Item::Work { seq: implicit_seq(seq), title: String::new(), parts: Vec::new() });
     *open_work = Some(at);
     at
 }
@@ -473,6 +519,59 @@ mod tests {
             Item::Work { parts, .. } => assert_eq!(parts.len(), 1, "{parts:?}"),
             other => panic!("작업 카드여야 한다: {other:?}"),
         }
+    }
+
+    /// **암시적 카드의 접힘 키는 첫 도구의 것과 겹치면 안 된다.** 겹치면 카드를
+    /// 펼 때 첫 도구의 상세도 같은 키를 공유해 같이 펼쳐진다 — 추론 없는 툴 전용
+    /// 턴에서 카드를 누르면 첫 도구의 인자·결과가 열린다(실제로 그렇게 보였다).
+    #[test]
+    fn an_implicit_cards_fold_key_never_collides_with_its_first_tool() {
+        let mut t = Timeline::new();
+        t.upsert(e(
+            2,
+            EntryKind::Tool {
+                name: "zyris__arch__terminal__exec".into(),
+                summary: "커밋".into(),
+                failed: false,
+                detail: "인자\n{}\n\n출력\nok".into(),
+                todo: None,
+                diff: None,
+            },
+        ));
+        let Item::Work { seq, parts, .. } = &t.items()[0] else {
+            panic!("암시적 카드여야 한다");
+        };
+        let Part::Step(first) = &parts[0] else {
+            panic!("첫 부분은 도구여야 한다");
+        };
+        assert_ne!(*seq, first.seq, "카드 접힘 키가 첫 도구와 겹친다");
+    }
+
+    /// **스트리밍 답변은 턴이 시작된 자리에 선다.** 끝에 붙이면 그 뒤에 온 도구 줄
+    /// 아래로 밀려 순서가 뒤바뀐 것처럼 보인다(실제로 그렇게 보였다).
+    #[test]
+    fn the_streaming_answer_sits_where_the_turn_started() {
+        let mut t = Timeline::new();
+        t.upsert(e(1, EntryKind::User("질문".into())));
+        t.push_delta(ZDeltaKind::Assistant, "전부 통과");
+        t.upsert(e(
+            2,
+            EntryKind::Tool {
+                name: "zyris__arch__terminal__exec".into(),
+                summary: "커밋".into(),
+                failed: false,
+                detail: "인자\n{}\n\n출력\nok".into(),
+                todo: None,
+                diff: None,
+            },
+        ));
+        let items = t.items().to_vec();
+        let agent_at = items
+            .iter()
+            .position(|i| matches!(i, Item::Agent { text, .. } if text == "전부 통과"));
+        let work_at = items.iter().position(|i| matches!(i, Item::Work { .. }));
+        assert!(agent_at.is_some() && work_at.is_some(), "{items:?}");
+        assert!(agent_at.unwrap() < work_at.unwrap(), "텍스트가 도구 아래로 밀렸다: {items:?}");
     }
 
     /// **뒤늦게 온 `work_summary`가 그 카드를 이어받는다.** 이벤트는 seq 순으로 다시

@@ -269,8 +269,6 @@ pub struct State {
     pub grants: crate::tools::gate::Grants,
     /// 지금 도는 명령 — (번호, 명령, 시작한 때). 활동 줄이 이것을 보여준다.
     pub running_exec: Option<(u64, String, Instant)>,
-    /// 지금 열려 있는 작업 카드의 seq.
-    open_work: Option<i64>,
     /// 자가치유 틱이 세운다. 다음 draw가 **모든 칸을 강제로 다시 내보낸다** —
     /// `AlwaysUpdate` 플래그로 diff를 우회해 덮어쓴다. 지우지 않으므로 깜빡이지 않는다.
     pub force_update: bool,
@@ -353,7 +351,6 @@ impl Default for State {
             verdict_out: None,
             grants: crate::tools::gate::Grants::default(),
             running_exec: None,
-            open_work: None,
             force_update: false,
             lang: crate::lang::current(),
         }
@@ -642,7 +639,16 @@ pub fn apply(state: &mut State, action: &Action) {
             state.scroll.wheel(*notches, total, height);
         }
         Action::ToggleFold => {
-            if let Some(seq) = state.open_work {
+            // **마지막 작업 카드를 접고 편다** — work_summary가 없어 암시적으로
+            // 생긴 카드(추론 없는 툴 전용 턴)도 대상이다. 추론 줄 클릭과 같은 동작.
+            let last = state
+                .timeline
+                .items()
+                .iter()
+                .rev()
+                .find(|i| matches!(i, crate::timeline::Item::Work { .. }))
+                .map(|i| i.seq());
+            if let Some(seq) = last {
                 let fold = state.folds.entry(seq).or_default();
                 fold.open = !fold.open;
             }
@@ -871,7 +877,6 @@ fn apply_frame(state: &mut State, frame: &Frame) {
             state.last_cursor = Some(*cursor);
             let Some(entry) = entry else { return };
             if let EntryKind::WorkStart(_) = entry.kind {
-                state.open_work = Some(entry.seq);
                 state.folds.entry(entry.seq).or_default();
             }
             // 답을 기다리는 질문이 오면 곧바로 답하기 모드로 들어간다. 턴이 막혀 있으므로
@@ -1494,7 +1499,7 @@ async fn run_inner(
                     "앱 루프가 {}초 동안 멈췄다 — 화면을 되돌리고 끝낸다",
                     LOOP_WATCHDOG_STALL.as_secs()
                 );
-                let _ = ratatui::restore();
+                ratatui::restore();
                 std::process::exit(1);
             }
         }
@@ -1857,7 +1862,7 @@ fn shutdown_signals() -> mpsc::Receiver<()> {
                 // 안 끝나면 화면을 되돌리고 강제로 끝낸다 — `kill`이 언제나
                 // 통하게. 정상 종료는 그 전에 끝나므로 이 줄이 먼저 도는 일은 없다.
                 tokio::time::sleep(SHUTDOWN_FORCE).await;
-                let _ = ratatui::restore();
+                ratatui::restore();
                 std::process::exit(0);
             });
         }
