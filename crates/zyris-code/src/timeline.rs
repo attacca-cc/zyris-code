@@ -32,6 +32,8 @@ pub struct Step {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Part {
     Think(String),
+    /// 런 중에 에이전트가 한 말. 도구·추론과 함께 온 순서대로 선다.
+    Text(String),
     Step(Step),
 }
 
@@ -91,10 +93,8 @@ impl Item {
 #[derive(Debug, Default)]
 pub struct Timeline {
     entries: BTreeMap<i64, Entry>,
-    /// 아직 durable 이벤트로 오지 않은 답변 델타.
-    live_assistant: String,
-    /// 답변 델타가 시작된 시점의 마지막 이벤트 seq. 그 자리 뒤에 임시 텍스트를 놓는다.
-    live_after: Option<i64>,
+    /// 아직 durable로 굳지 않은 답변 텍스트 토막. 앵커 순서로 쌓인다.
+    live_text: Vec<LiveText>,
     /// 열려 있는 작업 카드의 추론 델타.
     live_reasoning: String,
     /// 만들어 둔 항목들. **바뀐 게 없으면 다시 만들지 않는다.**
@@ -110,6 +110,17 @@ pub struct Timeline {
     said: Vec<Said>,
     /// 다음에 줄 앱 항목의 seq. **음수다** — 아래 설명을 볼 것.
     next_said: i64,
+}
+
+/// 스트리밍으로 흘러온 답변 텍스트 한 토막.
+///
+/// durable 이벤트 사이에 흐른 텍스트라 아직 `entries`에 없다. 앵커(`after`) 뒤,
+/// 다음 이벤트 앞에 선다. durable `chat_agent`가 오면 그 자리를 넘겨받고 사라진다.
+#[derive(Debug, Clone)]
+struct LiveText {
+    /// 이 토막이 흐르기 시작할 때의 마지막 durable seq.
+    after: i64,
+    text: String,
 }
 
 /// 앱이 한 말 하나.
@@ -143,22 +154,15 @@ impl Timeline {
     pub fn clear(&mut self) {
         self.entries.clear();
         self.said.clear();
-        self.live_assistant.clear();
-        self.live_after = None;
+        self.live_text.clear();
         self.live_reasoning.clear();
         self.dirty = true;
     }
 
     pub fn upsert(&mut self, entry: Entry) {
-        match &entry.kind {
-            // durable 답변이 왔으면 델타 버퍼는 제 몫을 다했다. 안 비우면 두 벌로 보인다.
-            EntryKind::Agent(_) => {
-                self.live_assistant.clear();
-                self.live_after = None;
-            }
-            // 새 런이 열리면 앞 런의 추론이 딸려가면 안 된다.
-            EntryKind::WorkStart(_) => self.live_reasoning.clear(),
-            _ => {}
+        // 새 런이 열리면 앞 런의 추론이 딸려가면 안 된다.
+        if let EntryKind::WorkStart(_) = &entry.kind {
+            self.live_reasoning.clear();
         }
         self.entries.insert(entry.seq, entry);
         self.dirty = true;
@@ -167,12 +171,14 @@ impl Timeline {
     pub fn push_delta(&mut self, kind: ZDeltaKind, text: &str) {
         match kind {
             ZDeltaKind::Assistant => {
-                // 스트리밍이 시작된 자리를 기억한다 — 그 뒤에 이어지는 도구 호출이
-                // 있으면 답변 텍스트는 그 **위**에 있어야 한다.
-                if self.live_assistant.is_empty() {
-                    self.live_after = self.entries.keys().next_back().copied();
+                // 토막의 앵커는 "지금 마지막 durable 이벤트 뒤"다. 사이에 durable
+                // 이벤트가 끼지 않았으면 같은 토막으로 합쳐져 하나의 답변으로 보이고,
+                // 도구 호출이 끼면 새 토막이 되어 그 도구 **앞에** 선다.
+                let after = self.entries.keys().next_back().copied().unwrap_or(0);
+                match self.live_text.last_mut() {
+                    Some(seg) if seg.after == after => seg.text.push_str(text),
+                    _ => self.live_text.push(LiveText { after, text: text.to_string() }),
                 }
-                self.live_assistant.push_str(text);
             }
             ZDeltaKind::Reasoning => self.live_reasoning.push_str(text),
         }
@@ -198,28 +204,40 @@ impl Timeline {
         &self.cache
     }
 
-    fn build(&self) -> Vec<Item> {
+    fn build(&mut self) -> Vec<Item> {
         let mut out: Vec<Item> = Vec::new();
         let mut open_work: Option<usize> = None;
-        // 스트리밍 답변을 놓을 자리. 턴이 시작된 시점(`live_after`) 뒤의 **첫 이벤트
-        // 앞에** 끼운다 — 끝에 붙이면 그 뒤에 온 도구 줄 아래로 밀려 "순서가
-        // 뒤바뀐" 화면이 된다(실제로 그렇게 보였다).
-        let mut live = (!self.live_assistant.is_empty()).then_some(LIVE_ASSISTANT_SEQ);
-        let live_after = self.live_after.unwrap_or(0);
+        // 스트리밍 텍스트 토막. 이벤트 사이 제자리에 끼운다 — 끝에 몰아 붙이면
+        // 뒤에 온 도구 줄 아래로 밀려 "순서가 뒤바뀐" 화면이 된다(실제로 그렇게
+        // 보였다). durable `chat_agent`가 와서 굳으면 그 자리를 넘겨받고 지워진다.
+        let mut live: Vec<LiveText> = std::mem::take(&mut self.live_text);
+        // 이미 제자리에 놓은 토막까지. 이 build 안에서는 토막을 한 번만 배치한다.
+        let mut flushed = 0usize;
 
         for entry in self.entries.values() {
             let seq = entry.seq;
-            if let Some(id) = live.filter(|_| seq > live_after) {
-                out.push(Item::Agent { seq: id, text: self.live_assistant.clone() });
-                live = None;
+            // durable 답변이 왔으면 그보다 앞선 토막은 제 몫을 다했다 — 같은 글이
+            // 두 벌로 보이면 안 된다.
+            if matches!(entry.kind, EntryKind::Agent(_)) {
+                live.retain(|s| s.after >= seq);
             }
+            // 이 이벤트 앞에 놓일 토막을 지금의 열린 카드에 끼운다.
+            flush_live(&mut out, &mut open_work, &live, seq, &mut self.next_said, &mut flushed);
             match &entry.kind {
                 EntryKind::User(text) => {
                     open_work = None;
                     out.push(Item::User { seq, text: text.clone() });
                 }
                 EntryKind::Agent(text) => {
-                    open_work = None;
+                    // **런 중에 온 답변은 카드 안에 선다** — 도구 사이 메시지가 카드
+                    // 밖으로 밀려나면 무엇을 말하다 무엇을 했는지가 흩어진다. 카드가
+                    // 없으면 평범한 답변으로.
+                    if let Some(at) = open_work {
+                        if let Item::Work { parts, .. } = &mut out[at] {
+                            parts.push(Part::Text(text.clone()));
+                            continue;
+                        }
+                    }
                     out.push(Item::Agent { seq, text: text.clone() });
                 }
                 EntryKind::Error(message) => {
@@ -278,6 +296,9 @@ impl Timeline {
             }
         }
 
+        // 끝까지 남은 토막 — 열린 카드 끝 또는 독립 답변으로.
+        flush_live(&mut out, &mut open_work, &live, i64::MAX, &mut self.next_said, &mut flushed);
+
         // 아직 durable로 굳지 않은 추론 델타를 열린 카드 **끝에** 얹는다. 도구를 쓴
         // 뒤에 다시 생각하는 중이면 그 도구 아래에 붙어야 순서가 맞는다.
         if !self.live_reasoning.is_empty() {
@@ -286,11 +307,8 @@ impl Timeline {
             }
         }
 
-        // 앞에서 못 끼웠으면(스트리밍이 아직 이벤트보다 뒤) 맨 끝에 붙인다.
-        if let Some(id) = live {
-            out.push(Item::Agent { seq: id, text: self.live_assistant.clone() });
-        }
-
+        // 미래의 이벤트 뒤에 설 토막(아직 안 온 앵커)은 다시 들고 간다.
+        self.live_text = live;
         self.weave_in_what_the_app_said(out)
     }
 
@@ -340,14 +358,58 @@ fn short_name(name: &str) -> String {
     name.rsplit("__").next().unwrap_or(name).to_string()
 }
 
-/// 스트리밍 중인 답변 텍스트의 항목 seq. 언제나 하나만 있으므로 고정 상수다.
-const LIVE_ASSISTANT_SEQ: i64 = i64::MIN;
-
 /// 암시적 작업 카드의 항목 seq. 서버 seq(양수)·앱 말(음수 소수)·라이브 답변과 겹치지
 /// 않도록 아주 먼 음수로 만든다 — 겹치면 접힘 상태와 줄 캐시가 두 항목을 한 자리로
 /// 본다.
 fn implicit_seq(first: i64) -> i64 {
     i64::MIN + first
+}
+
+/// 앵커가 `up_to`보다 앞선 스트리밍 토막을 지금 자리에 밀어 넣는다.
+///
+/// 카드가 열려 있으면 그 안에(첫 도구 앞, 아니면 끝), 없으면 독립 답변으로. 토막은
+/// 앵커 순서로 쌓이므로 앞에서부터 차례로 본다. **지우지 않는다** — durable가 오기
+/// 전까지는 이 토막이 그 텍스트의 유일한 자리이므로, 배치가 매번 처음부터 다시 하므로
+/// 두 벌이 될 일도 없다.
+fn flush_live(
+    out: &mut Vec<Item>,
+    open_work: &mut Option<usize>,
+    live: &[LiveText],
+    up_to: i64,
+    next_seq: &mut i64,
+    from: &mut usize,
+) {
+    // 토막은 앵커 순서로 쌓이고, `from`은 이 build에서 이미 배치한 만큼이다.
+    // 없으면 같은 토막이 이벤트마다 다시 들어가 두 벌이 된다.
+    while *from < live.len() {
+        let seg = &live[*from];
+        if seg.after >= up_to {
+            break;
+        }
+        match open_work {
+            Some(at) => {
+                if let Item::Work { parts, .. } = &mut out[*at] {
+                    splice_text(parts, seg.after, &seg.text);
+                }
+            }
+            None => {
+                // 독립 답변은 앱 말과 같은 음수 seq 공간을 쓴다 — 겹치면 안 된다.
+                out.push(Item::Agent { seq: *next_seq, text: seg.text.clone() });
+                *next_seq -= 1;
+            }
+        }
+        *from += 1;
+    }
+}
+
+/// 토막을 카드 안 제자리에 끼운다 — 앵커(`after`) 뒤에 온 첫 도구 **앞**, 도구가
+/// 없으면 끝. 추론 줄 사이에 끼어 있어도 온 순서가 유지된다.
+fn splice_text(parts: &mut Vec<Part>, after: i64, text: &str) {
+    let at = parts
+        .iter()
+        .position(|p| matches!(p, Part::Step(s) if s.seq > after))
+        .unwrap_or(parts.len());
+    parts.insert(at, Part::Text(text.to_string()));
 }
 
 /// 추론을 덧붙인다. 도구 없이 이어진 추론은 한 덩어리로 합친다 —
@@ -795,5 +857,132 @@ mod tests {
             Item::Work { parts, .. } => assert!(parts.is_empty(), "{parts:?}"),
             other => panic!("작업 카드여야 한다: {other:?}"),
         }
+    }
+
+    fn tool_at(seq: i64, name: &str, note: &str) -> Entry {
+        e(
+            seq,
+            EntryKind::Tool {
+                name: name.into(),
+                summary: note.into(),
+                failed: false,
+                // `step_at` 기대값과 맞추기 위해 상세도 같은 꼴을 쓴다.
+                detail: "인자\n{}".into(),
+                todo: None,
+                diff: None,
+            },
+        )
+    }
+
+    /// **런 중에 온 답변은 카드 안에 선다** — 도구 사이 메시지가 카드 밖으로
+    /// 밀려나면 "무엇을 말하다 무엇을 했는지"가 흩어진다. 카드도 조각나면 안 된다.
+    #[test]
+    fn agent_text_during_a_run_goes_into_the_card_in_order() {
+        let mut t = Timeline::new();
+        t.upsert(e(1, EntryKind::WorkStart("커밋".into())));
+        t.upsert(e(2, EntryKind::Agent("이제 커밋합니다".into())));
+        t.upsert(tool_at(3, "exec", "git commit"));
+        t.upsert(e(4, EntryKind::Agent("커밋하고 푸시하는 중".into())));
+        t.upsert(tool_at(5, "exec", "git push"));
+
+        let items = t.items().to_vec();
+        assert_eq!(items.len(), 1, "카드가 쪼개지면 안 된다: {items:?}");
+        match &items[0] {
+            Item::Work { parts, .. } => assert_eq!(
+                parts,
+                &vec![
+                    Part::Text("이제 커밋합니다".into()),
+                    Part::Step(step_at(3, "exec", "git commit")),
+                    Part::Text("커밋하고 푸시하는 중".into()),
+                    Part::Step(step_at(5, "exec", "git push")),
+                ],
+                "말한 순서 그대로 카드 안에 있어야 한다"
+            ),
+            other => panic!("작업 카드여야 한다: {other:?}"),
+        }
+    }
+
+    /// **스트리밍 텍스트는 그 뒤에 오는 도구 앞에 선다** — 카드 안, 도구 줄 위.
+    #[test]
+    fn live_text_during_a_run_lands_before_the_following_tool() {
+        let mut t = Timeline::new();
+        t.upsert(e(1, EntryKind::WorkStart("커밋".into())));
+        t.push_delta(ZDeltaKind::Assistant, "전부 통과. 이제 커밋합니다");
+        t.upsert(tool_at(2, "exec", "git commit"));
+        let Item::Work { parts, .. } = &t.items()[0] else {
+            panic!("작업 카드여야 한다");
+        };
+        assert_eq!(
+            parts,
+            &vec![
+                Part::Text("전부 통과. 이제 커밋합니다".into()),
+                Part::Step(step_at(2, "exec", "git commit")),
+            ],
+            "텍스트가 도구 아래로 밀렸다"
+        );
+    }
+
+    /// **도구로 갈라진 스트리밍 텍스트는 두 토막으로 나뉜다** — 하나로 합쳐지면
+    /// 두 메시지가 한 덩어리로 보인다.
+    #[test]
+    fn live_text_split_by_a_tool_stays_two_segments() {
+        let mut t = Timeline::new();
+        t.upsert(e(1, EntryKind::WorkStart("커밋".into())));
+        t.push_delta(ZDeltaKind::Assistant, "이제 커밋합니다");
+        t.upsert(tool_at(2, "exec", "git commit"));
+        t.push_delta(ZDeltaKind::Assistant, "커밋하고 푸시하는 중");
+        let Item::Work { parts, .. } = &t.items()[0] else {
+            panic!("작업 카드여야 한다");
+        };
+        assert_eq!(
+            parts,
+            &vec![
+                Part::Text("이제 커밋합니다".into()),
+                Part::Step(step_at(2, "exec", "git commit")),
+                Part::Text("커밋하고 푸시하는 중".into()),
+            ],
+            "도구 사이 두 토막이 합쳐졌다: {parts:?}"
+        );
+    }
+
+    /// **사용자가 끼어들면 그 뒤의 텍스트는 카드 밖 독립 답변이다.**
+    #[test]
+    fn text_after_a_user_interrupt_stays_standalone() {
+        let mut t = Timeline::new();
+        t.upsert(e(1, EntryKind::WorkStart("런".into())));
+        t.upsert(tool_at(2, "grep", "rows"));
+        t.upsert(e(3, EntryKind::User("잠깐".into())));
+        t.push_delta(ZDeltaKind::Assistant, "네 알겠습니다");
+
+        let items = t.items().to_vec();
+        let work = items.iter().filter(|i| matches!(i, Item::Work { .. })).count();
+        assert_eq!(work, 1, "끼어든 뒤에 새 카드가 생기면 안 된다: {items:?}");
+        let user_at = items.iter().position(|i| matches!(i, Item::User { .. })).unwrap();
+        let agent_at =
+            items.iter().position(|i| matches!(i, Item::Agent { text, .. } if text == "네 알겠습니다"))
+                .expect("독립 답변이 없다");
+        assert!(user_at < agent_at, "답변이 사용자 말 뒤에 있어야 한다: {items:?}");
+    }
+
+    /// **토막은 다시 만들어도 두 벌이 되지 않는다** — 배치가 매번 처음부터 다시 하므로
+    /// 토막이 남아 있어도 카드 안에는 한 번만 들어간다.
+    #[test]
+    fn live_segments_are_not_duplicated_across_rebuilds() {
+        let mut t = Timeline::new();
+        t.upsert(e(1, EntryKind::WorkStart("런".into())));
+        t.push_delta(ZDeltaKind::Assistant, "생각");
+        let _ = t.items();
+        t.upsert(tool_at(2, "grep", "rows"));
+        let Item::Work { parts, .. } = &t.items()[0] else {
+            panic!("작업 카드여야 한다");
+        };
+        assert_eq!(
+            parts,
+            &vec![
+                Part::Text("생각".into()),
+                Part::Step(step_at(2, "grep", "rows")),
+            ],
+            "토막이 두 번 들어갔다: {parts:?}"
+        );
     }
 }

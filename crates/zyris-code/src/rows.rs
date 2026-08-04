@@ -116,7 +116,7 @@ fn affecting(item: &Item, folds: &Folds) -> Affecting {
     if let Item::Work { parts, .. } = item {
         out.extend(parts.iter().filter_map(|p| match p {
             Part::Step(s) => Some(at(s.seq)),
-            Part::Think(_) => None,
+            Part::Think(_) | Part::Text(_) => None,
         }));
     }
     out
@@ -412,13 +412,33 @@ fn make(item: &Item, width: u16, folds: &Folds) -> Made {
                             out.push(Line::from(spans));
                         }
                     }
+                    Part::Text(text) => {
+                        // **런 중의 메시지.** 접혀도 보인다 — 카드 접힘은 추론을
+                        // 숨기는 것이지 대화 흐름까지 가리는 것이 아니다. 도구 줄과
+                        // 같은 정책. 클릭 대상은 아니다 — 추론 줄과 달리 메시지는
+                        // 내용이지 손잡이가 아니다.
+                        for (i, line) in
+                            markdown::render(text, body_width(width)).into_iter().enumerate()
+                        {
+                            let mut spans = vec![match i {
+                                0 => Span::styled("◆ ", Style::default().fg(theme::ACCENT)),
+                                _ => pad(),
+                            }];
+                            spans.extend(line.spans);
+                            out.push(Line::from(spans));
+                        }
+                    }
                     Part::Step(step) => {
                         let dot = if step.failed { theme::DANGER } else { theme::SUCCESS };
                         // 펼칠 것이 있는 줄만 누를 수 있다. 눌러도 아무 일이
                         // 없으면 고장으로 보인다.
                         let can_open = !step.detail.is_empty() || step.diff.is_some();
-                        let open = can_open && folds.get(&step.seq).is_some_and(|f| f.open);
-                        if can_open {
+                        // **접힌 카드의 도구는 상세를 열 수 없다** — 카드를 접었다는
+                        // 것은 다 접었다는 뜻이다. 접혀 있는데 눌러도 아무 일 없는
+                        // 줄은 클릭 대상이 아니다.
+                        let open =
+                            fold.open && can_open && folds.get(&step.seq).is_some_and(|f| f.open);
+                        if fold.open && can_open {
                             heads.push((out.len(), step.seq));
                         }
                         // **이름과 요약을 따로 칠한다.** 추론이 흐린 색으로 화면을
@@ -444,7 +464,7 @@ fn make(item: &Item, width: u16, folds: &Folds) -> Made {
                         }
                         // 펼칠 수 있다는 것을 알려 준다. 모르면 아무도 안 누른다.
                         head.push(Span::styled(
-                            match (can_open, open) {
+                            match (fold.open && can_open, open) {
                                 (false, _) => "",
                                 (true, false) => "  ▸",
                                 (true, true) => "  ▾",
@@ -471,6 +491,7 @@ fn make(item: &Item, width: u16, folds: &Folds) -> Made {
                                     out.extend(tool_detail_lines(
                                         &step.detail,
                                         body_width(width),
+                                        step.failed,
                                     ));
                                 }
                             }
@@ -565,13 +586,22 @@ fn wrap_plain(text: &str, width: u16) -> Vec<String> {
 /// 도구 상세의 섹션 머리말. `event::tool_detail`이 이 이름으로 조립한다.
 const TOOL_SECTIONS: [&str; 4] = ["인자", "출력", "결과", "오류"];
 
-/// 도구 상세("인자\n…\n\n출력\n…")를 **섹션별로** 그린다.
+/// 도구 상세("인자\n…\n\n출력\n…")를 **박스로** 그린다.
 ///
-/// 그대로 평문으로 늘어놓으면 JSON 덤프와 셸 출력이 구분되지 않는다. 머리말 줄은
-/// 색·마커로 따로 칠하고 본문은 그 아래로 들여쓴다. 마크다운으로 해석하지 않는
-/// 것은 예전과 같다 — JSON의 `*`·`_`가 강조로 먹히면 원문이 망가진다.
-fn tool_detail_lines(detail: &str, width: u16) -> Vec<Line<'static>> {
+/// 그대로 평문으로 늘어놓으면 JSON 덤프와 셸 출력이 구분되지 않는다. 상세 전체를
+/// 테두리로 감싸 도구 줄의 아래쪽 공간과 갈라 보이고, "인자/출력/결과/오류" 머리말은
+/// 색·마커로 따로 칠한다. 실패한 도구는 테두리까지 위험색이다. 마크다운으로 해석하지
+/// 않는 것은 예전과 같다 — JSON의 `*`·`_`가 강조로 먹히면 원문이 망가진다.
+fn tool_detail_lines(detail: &str, width: u16, failed: bool) -> Vec<Line<'static>> {
+    let border = if failed { theme::DANGER } else { theme::BORDER_LIGHT };
+    // "│ " 거터를 뺀 안쪽 폭. 테두리까지 합치면 화면 폭과 같다.
+    let inner = width.saturating_sub(2).max(8);
     let mut out: Vec<Line<'static>> = Vec::new();
+    // 위 테두리.
+    out.push(Line::from(Span::styled(
+        format!("┌{}┐", "─".repeat(inner as usize)),
+        Style::default().fg(border),
+    )));
     let mut section: Option<&'static str> = None;
     // 머리말은 앞이 빈 줄(또는 첫 줄)에서만 인정한다 — 본문에 같은 단어가 있어도
     // 섞이지 않게.
@@ -589,10 +619,13 @@ fn tool_detail_lines(detail: &str, width: u16) -> Vec<Line<'static>> {
                 "결과" => ("⎿ 결과", theme::BORDER_LIGHT),
                 _ => ("⎿ 오류", theme::DANGER),
             };
-            out.push(Line::from(Span::styled(
-                mark.to_string(),
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            )));
+            out.push(Line::from(vec![
+                Span::styled("│ ", Style::default().fg(border)),
+                Span::styled(
+                    mark.to_string(),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+            ]));
             prev_blank = false;
             continue;
         }
@@ -601,17 +634,19 @@ fn tool_detail_lines(detail: &str, width: u16) -> Vec<Line<'static>> {
             Some("출력") => theme::TEXT,
             _ => theme::TEXT_MUTED,
         };
-        for (i, line) in wrap_plain(raw, width).into_iter().enumerate() {
+        for line in wrap_plain(raw, inner).into_iter() {
             out.push(Line::from(vec![
-                Span::styled(
-                    if i == 0 { "  ⎿ " } else { "    " },
-                    Style::default().fg(theme::BORDER_LIGHT),
-                ),
+                Span::styled("│ ", Style::default().fg(border)),
                 Span::styled(line, Style::default().fg(color)),
             ]));
         }
         prev_blank = trimmed.is_empty();
     }
+    // 아래 테두리.
+    out.push(Line::from(Span::styled(
+        format!("└{}┘", "─".repeat(inner as usize)),
+        Style::default().fg(border),
+    )));
     out
 }
 
@@ -1097,19 +1132,94 @@ mod tests {
         assert!(lines[row].contains("grep"), "{:?}", lines[row]);
     }
 
-    /// **접힌 카드의 도구 줄도 눌러 펼 수 있어야 한다** — 보이는 것이면 누를 수
-    /// 있어야 한다. 도구 상세는 카드 접힘과 무관하게 따로 펴진다.
+    /// **접힌 카드의 도구 줄은 누를 수 없다** — 상세는 카드를 펴야 열리므로,
+    /// 접힌 상태에서 눌러도 아무 일 없는 줄은 클릭 대상이 아니다.
     #[test]
-    fn folded_tool_rows_are_still_clickable() {
+    fn folded_tool_rows_are_not_clickable() {
         let items = [work_at(1)];
         let r = rows(&items, 60, &Folds::new());
         let mut by_seq: Vec<i64> = r.cards.values().copied().collect();
         by_seq.sort();
-        assert_eq!(by_seq, vec![1, 100], "머리와 도구 줄 둘 다 눌려야 한다");
+        assert_eq!(by_seq, vec![1], "접힌 카드에서는 머리만 눌려야 한다");
+    }
 
+    /// **접힌 카드에서는 도구 상세가 열려 있어도 보이지 않는다** — 카드를 접었다는
+    /// 것은 다 접었다는 뜻이다. (추론 클릭으로 카드를 접으면 아래 도구 상세가 다
+    /// 펼쳐진 채 남는 것이 사용자가 본 증상이다.)
+    #[test]
+    fn a_folded_card_hides_open_tool_details() {
+        let items = [work_at(1)];
+        // 도구 상세는 열려 있는데 카드는 접혀 있다.
+        let folds = Folds::from([(100, Fold { open: true })]);
+        let out = plain(&rows(&items, 60, &folds));
+        assert!(out.iter().any(|l| l.contains("grep")), "도구 줄은 보여야 한다: {out:?}");
+        assert!(
+            !out.iter().any(|l| l.contains("인자")),
+            "접힌 카드에 도구 상세가 보인다: {out:?}"
+        );
+    }
+
+    /// **런 중 메시지는 접혀도 보인다** — 카드 접힘은 추론을 숨기는 것이지 대화
+    /// 흐름까지 가리는 것이 아니다.
+    #[test]
+    fn a_text_part_shows_even_when_the_card_is_folded() {
+        let items = [Item::Work {
+            seq: 1,
+            title: "커밋하는 중".into(),
+            parts: vec![
+                Part::Text("이제 커밋합니다".into()),
+                Part::Step(step_at(100, "exec")),
+            ],
+        }];
+        let out = plain(&rows(&items, 60, &Folds::new()));
+        assert!(
+            out.iter().any(|l| l.contains("이제 커밋합니다")),
+            "접혀도 메시지는 보여야 한다: {out:?}"
+        );
+        assert!(out.iter().any(|l| l.contains("exec")), "{out:?}");
+    }
+
+    /// **런 중 메시지는 클릭 대상이 아니다** — 누르면 카드가 접히는 추론 줄과
+    /// 달리 메시지는 내용이다.
+    #[test]
+    fn a_text_part_is_not_clickable() {
+        let items = [Item::Work {
+            seq: 1,
+            title: "커밋하는 중".into(),
+            parts: vec![
+                Part::Text("이제 커밋합니다".into()),
+                Part::Step(step_at(100, "exec")),
+            ],
+        }];
+        let r = rows(&items, 60, &Folds::new());
         let lines = r.plain();
-        let row = r.cards.iter().find(|(_, s)| **s == 100).map(|(r, _)| *r).unwrap();
-        assert!(lines[row].contains("grep"), "{:?}", lines[row]);
+        let row = lines.iter().position(|l| l.contains("이제 커밋합니다")).expect("메시지 줄");
+        assert!(
+            !r.cards.contains_key(&row),
+            "메시지 줄이 클릭 대상으로 잡혔다: {:?}",
+            lines[row]
+        );
+    }
+
+    /// **메시지·추론·도구가 온 순서 그대로 선다.** 펼친 카드에서 셋이 섞여 보여야
+    /// 무엇을 생각하다 무엇을 말하고 무엇을 했는지 읽힌다.
+    #[test]
+    fn text_thinking_and_tools_interleave_in_the_card() {
+        let items = [Item::Work {
+            seq: 1,
+            title: "커밋하는 중".into(),
+            parts: vec![
+                Part::Think("먼저 상태를 보자".into()),
+                Part::Text("이제 커밋합니다".into()),
+                Part::Step(step_at(100, "exec")),
+            ],
+        }];
+        let folds = Folds::from([(1, Fold { open: true })]);
+        let out = plain(&rows(&items, 60, &folds));
+        let think = out.iter().position(|l| l.contains("먼저 상태를 보자")).unwrap();
+        let text = out.iter().position(|l| l.contains("이제 커밋합니다")).unwrap();
+        let tool = out.iter().position(|l| l.contains("exec")).unwrap();
+        assert!(think < text && text < tool, "온 순서가 어긋났다: {out:?}");
     }
 
     /// **추론 줄도 누를 수 있어야 한다** — 클릭하면 카드가 접히고 펴진다(Ctrl+O와
@@ -1124,27 +1234,45 @@ mod tests {
         assert_eq!(seq, 1, "추론 줄 클릭은 카드를 접고 펴야 한다");
     }
 
-    /// **펼친 도구 상세는 섹션 머리말이 갈라 보인다.** "인자/출력/결과/오류" —
-    /// 무엇이 인자고 무엇이 결과인지 눈이 한 번에 읽혀야 한다.
+    /// **펼친 도구 상세는 박스로 갈라 보인다.** "인자/출력/결과/오류" 머리말이
+    /// 색·마커로 또렷하게, 본문은 그 아래로. 무엇이 인자고 무엇이 결과인지
+    /// 눈이 한 번에 읽혀야 한다.
     #[test]
     fn tool_detail_lines_label_their_sections() {
-        let out = tool_detail_lines("인자\n{\"cmd\": \"git push\"}\n\n출력\nUp to date", 60);
+        let out = tool_detail_lines("인자\n{\"cmd\": \"git push\"}\n\n출력\nUp to date", 60, false);
         let plain: Vec<String> = out
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect();
-        assert!(plain[0].contains("⎿ 인자"), "첫 줄이 머리말이어야 한다: {plain:?}");
+        assert!(plain[0].starts_with('┌'), "위 테두리가 있어야 한다: {plain:?}");
+        assert!(plain.last().unwrap().starts_with('└'), "아래 테두리가 있어야 한다: {plain:?}");
+        assert!(plain.iter().any(|l| l.contains("⎿ 인자")), "인자 머리말이 없다: {plain:?}");
         assert!(plain.iter().any(|l| l.contains("⎿ 출력")), "출력 머리말이 없다: {plain:?}");
         assert!(plain.iter().any(|l| l.contains("git push")), "인자 본문이 없다: {plain:?}");
         assert!(plain.iter().any(|l| l.contains("Up to date")), "출력 본문이 없다: {plain:?}");
 
         // 오류 섹션은 위험색으로 칠한다.
-        let err = tool_detail_lines("오류\nboom", 60);
+        let err = tool_detail_lines("오류\nboom", 60, false);
         assert!(
             err.iter().any(|l| {
                 l.spans.iter().any(|s| s.content == "boom" && s.style.fg == Some(theme::DANGER))
             }),
             "오류 본문이 위험색이 아니다: {err:?}"
+        );
+    }
+
+    /// **실패한 도구의 상세는 테두리까지 위험색이다.** 성공한 것과 다르게 보여야
+    /// 무엇이 잘못됐는지 훑을 때 잡힌다.
+    #[test]
+    fn a_failed_tools_detail_box_is_red() {
+        let out = tool_detail_lines("인자\n{}", 60, true);
+        assert!(
+            out[0].spans[0].style.fg == Some(theme::DANGER),
+            "위 테두리가 위험색이 아니다"
+        );
+        assert!(
+            out.last().unwrap().spans[0].style.fg == Some(theme::DANGER),
+            "아래 테두리가 위험색이 아니다"
         );
     }
 
