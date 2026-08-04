@@ -3500,4 +3500,25 @@ mod tests {
         assert!(s.queued.is_empty(), "대기열이 남았다: {:?}", s.queued);
         assert!(!s.flush_queue, "flush 신호가 남았다");
     }
+
+    /// **새 쓰레드에서 보낸 말은 앞 세션의 턴에 엮이지 않는다.** 앞 세션의 턴 상태를
+    /// 치웠으므로(`leave_session`) 여기서 친 말은 대기열로 새지 않고 곧바로 보낸
+    /// 기록에 들어간다. 안 치우면 `running`이 남아 이 말까지 대기열로 들어가고,
+    /// 새 세션은 스트림이 없어 아무도 그 대기열을 비우지 못한다.
+    #[test]
+    fn a_fresh_thread_does_not_queue_messages_behind_the_old_turn() {
+        let mut s = state();
+        s.running = true; // 앞 세션의 턴이 도는 중
+        apply(&mut s, &Action::Submit("앞 턴에 담아 둔 말".into()));
+        assert_eq!(s.queued, vec!["앞 턴에 담아 둔 말"]);
+
+        // 새 쓰레드를 열었다 — 앞 세션의 턴 상태가 치워진다.
+        leave_session(&mut s);
+        assert!(s.queued.is_empty(), "앞 턴의 대기열이 새 화면에 남았다: {:?}", s.queued);
+
+        // 새 쓰레드에서 보낸 말은 대기로 새지 않고 보낸 기록에 바로 들어간다.
+        apply(&mut s, &Action::Submit("새 쓰레드에서 보낸 말".into()));
+        assert!(s.queued.is_empty(), "새 쓰레드의 말이 대기로 갔다: {:?}", s.queued);
+        assert_eq!(s.sent, vec!["새 쓰레드에서 보낸 말"]);
+    }
 }
