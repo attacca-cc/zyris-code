@@ -1927,6 +1927,8 @@ async fn pick(
             // **서버에 지금 만들지 않는다.** 첫 메시지를 보낼 때 만든다 — 열어만 보고 마는
             // 빈 세션이 계정에 쌓이면 안 된다. 여기서는 어느 프로젝트에 만들지만 기억한다.
             session.stage_new(project_id);
+            // 앞 세션의 턴은 이 화면의 것이 아니다 — 상태줄과 대기열을 치운다.
+            leave_session(state);
             // 새 세션은 아직 제목이 없다.
             state.title = "Zyris Code".into();
             state.sidebar.clear();
@@ -1962,6 +1964,21 @@ async fn pick(
     Ok(())
 }
 
+/// 화면이 이 세션을 떠나는 자리에서 부른다. 앞 세션의 턴 상태를 치운다.
+///
+/// 턴 자체는 서버에서 계속 돈다 — 여기서 끊으면 서버의 일을 죽이는 셈이다. 화면만
+/// 그 세션의 것이 아니게 되므로 그 턴의 표시(`running`·`stopping`)와 대기열을
+/// 비운다. **안 비우면 상태줄이 "작업 중"에 얼어붙는다**: 새 세션은 아직 스트림이
+/// 없어 아무도 `running`을 false로 되돌려 주지 않는데, 낡은 세션의 프레임은
+/// `frame_is_current`가 버리므로 거기서도 안 온다. 대기열도 그대로 두면 담아 둔
+/// 말이 이 세션이나 다음 세션의 턴 끝에 엉뚱하게 나간다.
+fn leave_session(state: &mut State) {
+    state.running = false;
+    state.stopping = false;
+    state.queued.clear();
+    state.flush_queue = false;
+}
+
 /// 다른 세션으로 갈아탄다. 지난 기록을 되읽어 화면을 채우고 라이브 스트림을 다시 연다.
 async fn switch(
     api: &Arc<AttaccaApiClient>,
@@ -1974,6 +1991,9 @@ async fn switch(
     let events = crate::conn::history(api, &id).await?;
 
     // 앞 세션의 화면을 지우고 다시 쌓는다. 안 지우면 두 세션이 섞인다.
+    // 턴 상태도 그 세션의 것이다 — "작업 중"을 이어 보여 주면 이 세션에서 아무것도
+    // 안 도는데도 줄이 서고, 담아 둔 말은 이 세션으로 나간다.
+    leave_session(state);
     state.timeline = Timeline::new();
     state.folds = Folds::new();
     state.asking = None;
@@ -2053,6 +2073,8 @@ async fn finish_command(
                 // 방금 만든 것 말고 다른 데서 일을 시작하는 사고가 난다.
                 session.enter_project(id);
                 session.stage_new_default();
+                // 앞 세션의 턴 상태를 치운다 — 새 프로젝트로 갔는데 "작업 중"이 남으면 안 된다.
+                leave_session(state);
                 state.picker = None;
                 let said = state.lang.project_created(&name);
                 state.timeline.say(said);
@@ -2118,6 +2140,8 @@ async fn switch_agent(
             // (`ZNewSession.agent_id`). 그래서 새 세션을 예약한다 — 서버에는 아직
             // 아무것도 만들지 않고, 다음 메시지에서 열린다.
             session.stage_new_default();
+            // 앞 세션의 턴은 화면 밖으로 간다 — 상태줄이 "작업 중"에 얼어붙지 않게 치운다.
+            leave_session(state);
             state.timeline.say(format!(
                 "에이전트: **{name}** · 다음 메시지에서 새 thread가 열립니다. \
                  앞 thread는 ←의 목록에 그대로 있습니다."
@@ -3456,5 +3480,24 @@ mod tests {
         // 아직 첫 메시지를 안 보낸 세션은 서버에 없다. 멈추라고 할 대상도 없다.
         apply(&mut s, &Action::Frame(Frame::Status { running: true }));
         assert_eq!(turn_to_stop(&s, &Session::new(None)), None);
+    }
+
+    /// **세션을 떠날 때 앞 세션의 턴 상태를 치운다.** 안 치우면 상태줄이 "작업 중"에
+    /// 얼어붙고(새 세션은 스트림이 없어 아무도 false로 되돌려 주지 않는다) 담아 둔
+    /// 말이 엉뚱한 세션으로 나간다.
+    #[test]
+    fn leaving_a_session_clears_the_old_turn_state() {
+        let mut s = state();
+        s.running = true;
+        s.stopping = true;
+        s.queued.push("나중에 보낼 말".into());
+        s.flush_queue = true;
+
+        leave_session(&mut s);
+
+        assert!(!s.running, "running이 남았다");
+        assert!(!s.stopping, "stopping이 남았다");
+        assert!(s.queued.is_empty(), "대기열이 남았다: {:?}", s.queued);
+        assert!(!s.flush_queue, "flush 신호가 남았다");
     }
 }
