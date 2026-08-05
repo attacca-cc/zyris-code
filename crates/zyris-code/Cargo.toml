@@ -51,3 +51,8 @@ sha2 = "0.10"
 [dev-dependencies]
 # Tool tests write real files. A mock filesystem can't catch path-resolution mistakes.
 tempfile = "3"
+# Installs the commit hook into `.git/hooks` the first time `cargo test` runs
+# (Rust counterpart of simple-git-hooks). Hook scripts live in `.cargo-husky/hooks/`;
+# the `commit-msg` one enforces Conventional Commits. Set
+# CARGO_HUSKY_DONT_INSTALL_HOOKS=true to skip installation.
+cargo-husky = { version = "1", default-features = false, features = ["user-hooks"] }
