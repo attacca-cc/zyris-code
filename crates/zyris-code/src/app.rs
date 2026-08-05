@@ -374,6 +374,10 @@ impl Default for State {
 /// Ctrl+C를 한 번 누른 뒤 이 안에 또 누르면 종료다.
 pub const QUIT_WINDOW: Duration = Duration::from_millis(1500);
 
+/// 붙여넣기 폭주 판정 간격. bracketed paste를 지원하지 않는 터미널은 붙여넣기를
+/// 키가 수 ms 간격으로 연달아 오는 것으로 흘려보낸다 — 사람이 칠 수 없는 속도다.
+const PASTE_BURST: Duration = Duration::from_millis(25);
+
 /// 알림이 화면에 남아 있는 시간. 한 문장을 읽기에 넉넉하다.
 pub const STATUS_WINDOW: Duration = Duration::from_secs(6);
 
@@ -469,6 +473,7 @@ pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
     }
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
 
     // **등록 코드 창이 제일 위다.** 코드를 보는 중에 다른 키가 엉뚱한 일을 하면
     // 안 된다 — Esc로만 닫고, Ctrl+C(끄기)만 통과한다. 등록 자체는 배경에서
@@ -584,10 +589,11 @@ pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
         // 선택 중이면 Esc가 선택을 푼다. 실행 중 취소보다 앞이다 — 눈앞의 것이 먼저다.
         KeyCode::Esc if state.selection.is_some() => vec![Action::ClearSelection],
         KeyCode::Esc if state.running => vec![Action::Cancel],
-        // **Alt+Enter는 줄바꿈이다.** 터미널은 Shift+Enter를 Enter와 구분하지
-        // 못한다(둘 다 \r 한 바이트). crossterm이 ESC+\r을 Enter+ALT로 해석하므로
-        // 모든 터미널에서 줄바꿈을 넣을 수 있다 — 전송 arm보다 앞에 있어야 한다.
-        KeyCode::Enter if alt => vec![Action::Insert('\n')],
+        // **Shift+Enter·Alt+Enter는 줄바꿈이다.** 키티 키보드 프로토콜을 켜면
+        // (아래 `run()`의 `PushKeyboardEnhancementFlags`) Shift+Enter가 Enter+SHIFT로
+        // 따로 도착한다. Alt+Enter(ESC+\r)는 프로토콜 없는 터미널의 구원책이다 —
+        // 전송 arm보다 앞에 있어야 한다.
+        KeyCode::Enter if alt || shift => vec![Action::Insert('\n')],
         KeyCode::Enter if !state.input.text.is_empty() => {
             vec![Action::Submit(state.input.text.clone())]
         }
@@ -1349,6 +1355,12 @@ pub async fn run(
         // 첫 줄이 그대로 전송돼 버린다. 켜면 ESC[200~…ESC[201~로 감싸져
         // `Event::Paste` 한 건으로 온다.
         crossterm::event::EnableBracketedPaste,
+        // **Shift+Enter를 Enter와 구분할 수 있게 한다.** 키티 키보드 프로토콜을
+        // 켜면 수정된 키가 CSI-u 시퀀스로 따로 온다. 모르는 터미널은 그냥
+        // 무시하므로 켜 두는 것으로 아무 해가 없다.
+        crossterm::event::PushKeyboardEnhancementFlags(
+            crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
+        ),
         // **줄 넘김을 끈다.** 우리가 센 글자 폭과 터미널이 그리는 폭이 한 칸이라도
         // 어긋나면(`●`·`·`·`─` 같은 글자는 터미널 설정에 따라 두 칸이 된다) 줄 끝이
         // 넘쳐 **아랫줄로 흘러내리고**, 그 아래가 통째로 밀린다. 꺼 두면 넘친 글자는
@@ -1363,6 +1375,7 @@ pub async fn run(
         crossterm::event::DisableMouseCapture,
         crossterm::event::DisableFocusChange,
         crossterm::event::DisableBracketedPaste,
+        crossterm::event::PopKeyboardEnhancementFlags,
         // 줄 넘김은 셸이 쓰는 것이다. 안 되돌리면 셸에서 긴 명령이 잘려 보인다.
         crossterm::terminal::EnableLineWrap,
     );
@@ -1568,6 +1581,9 @@ async fn run_inner(
     let mut keys = EventStream::new();
     let mut ticker = tokio::time::interval(frame_interval());
     let mut poll = tokio::time::interval(POLL_INTERVAL);
+    // 마지막 키 이벤트 시각 — bracketed paste 없는 터미널의 붙여넣기 폭주를
+    // 감지하는 기준이다.
+    let mut last_key_at: Option<Instant> = None;
     // 끄면 영영 안 오는 타이머로 둔다. `select!`의 가지를 늘리지 않으려는 것이다.
     let mut heal = tokio::time::interval(heal_interval().unwrap_or(Duration::from_secs(86400)));
     let healing = heal_interval().is_some();
@@ -1609,7 +1625,28 @@ async fn run_inner(
         tokio::select! {
             Some(Ok(ev)) = keys.next() => {
                 let actions = match ev {
-                    TermEvent::Key(k) => on_key(&state, k),
+                    TermEvent::Key(k) => {
+                        // **붙여넣기 폭주를 줄바꿈으로 살린다.** bracketed paste를
+                        // 지원하지 않는 터미널(Termius 모바일 등)은 붙여넣기를 키가
+                        // 빠르게 연달아 오는 것으로 흘려보낸다. 사람이 칠 수 없는
+                        // 간격(< PASTE_BURST)으로 키가 오면 그 사이의 Enter는 전송이
+                        // 아니라 줄바꿈이다 — 안 그러면 여러 줄 프롬프트의 첫 줄이
+                        // 그대로 나가 버린다.
+                        let now = Instant::now();
+                        let in_burst = last_key_at
+                            .is_some_and(|t| now.duration_since(t) < PASTE_BURST);
+                        last_key_at = Some(now);
+                        if in_burst
+                            && k.code == KeyCode::Enter
+                            && k.modifiers.is_empty()
+                            && !state.input.text.is_empty()
+                        {
+                            // 폭주 중에 온 Enter는 줄바꿈이다.
+                            vec![Action::Insert('\n')]
+                        } else {
+                            on_key(&state, k)
+                        }
+                    }
                     // 붙여넣기는 키가 아니다 — Enter로 쪼개지 않고 한 덩어리로 넣는다.
                     TermEvent::Paste(text) => vec![Action::Paste(text)],
                     TermEvent::Mouse(m) => match m.kind {
@@ -1994,9 +2031,14 @@ fn shutdown_signals() -> mpsc::Receiver<()> {
                 // 안 끝나면 화면을 되돌리고 강제로 끝낸다 — `kill`이 언제나
                 // 통하게. 정상 종료는 그 전에 끝나므로 이 줄이 먼저 도는 일은 없다.
                 tokio::time::sleep(SHUTDOWN_FORCE).await;
-                // 강제 종료라도 bracketed paste는 되돌리고 간다 — 안 하면 셸이
-                // 붙여넣기를 계속 한 덩어리로 감싼다.
-                let _ = execute!(io::stdout(), crossterm::event::DisableBracketedPaste);
+                // 강제 종료라도 bracketed paste와 키티 키보드 프로토콜은
+                // 되돌리고 간다 — 안 하면 셸이 붙여넣기를 계속 한 덩어리로
+                // 감싸고 Shift+Enter가 CSI-u로 남는다.
+                let _ = execute!(
+                    io::stdout(),
+                    crossterm::event::DisableBracketedPaste,
+                    crossterm::event::PopKeyboardEnhancementFlags,
+                );
                 ratatui::restore();
                 std::process::exit(0);
             });
@@ -2614,14 +2656,19 @@ mod tests {
         assert_eq!(s.verdict_out, Some((7, Verdict::Allow)));
     }
 
-    /// Alt+Enter는 줄바꿈이지 전송이 아니다. Shift+Enter는 터미널이 Enter와
-    /// 구분해 주지 않으므로 이 키가 정본이다.
+    /// Shift+Enter·Alt+Enter는 줄바꿈이지 전송이 아니다. 키티 키보드 프로토콜을
+    /// 켜면 Shift+Enter가 Enter+SHIFT로 따로 도착하고, Alt+Enter(ESC+\r)는
+    /// 프로토콜 없는 터미널의 구원책이다.
     #[test]
-    fn alt_enter_inserts_a_newline_instead_of_submitting() {
+    fn shift_enter_and_alt_enter_insert_a_newline_instead_of_submitting() {
         let mut s = state();
         apply(&mut s, &Action::Insert('a'));
         assert_eq!(
             on_key(&s, key(KeyCode::Enter, KeyModifiers::ALT)),
+            vec![Action::Insert('\n')]
+        );
+        assert_eq!(
+            on_key(&s, key(KeyCode::Enter, KeyModifiers::SHIFT)),
             vec![Action::Insert('\n')]
         );
         assert_eq!(
