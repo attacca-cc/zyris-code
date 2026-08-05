@@ -18,7 +18,14 @@
 //! **Only what people read.** Tool descriptions read by the agent are always English (the doc
 //! comments in `tools/`), and code comments and test names are always Korean. What this file divides is only the screen.
 
+use std::path::Path;
 use std::sync::atomic::{AtomicU8, Ordering};
+
+use crate::instructions::Found;
+use crate::plugin::Plugin;
+use crate::tools::gate::Grants;
+use crate::tools::skill::SkillInfo;
+use crate::undo::Changed;
 
 /// **The default is English.** This repo is written in Korean, but the people receiving the app
 /// aren't — a screen in a language they can't read makes it unusable. Korean comes from the locale or a person's choice.
@@ -511,6 +518,752 @@ impl Lang {
             Lang::En => format!("Cannot tell what `{given}` means. Use `ko` or `en`."),
         }
     }
+
+    // ── Shell notice · no screen (notice.rs · main.rs · the connection bails in app.rs)
+    pub fn connection_lost(self) -> &'static str {
+        self.pick("연결이 끊겼습니다.", "Connection lost.")
+    }
+    pub fn connect_failed(self, why: &str) -> String {
+        match self {
+            Lang::Ko => format!("연결에 실패했습니다: {why}"),
+            Lang::En => format!("Failed to connect: {why}"),
+        }
+    }
+    pub fn previous_error(self, why: &str) -> String {
+        match self {
+            Lang::Ko => format!("직전 오류: {why}"),
+            Lang::En => format!("Previous error: {why}"),
+        }
+    }
+    pub fn log_location(self, path: &str) -> String {
+        match self {
+            Lang::Ko => format!("자세한 것은 로그에 있습니다: {path}"),
+            Lang::En => format!("See the log for details: {path}"),
+        }
+    }
+    pub fn waiting_for_approval(self) -> &'static str {
+        self.pick(
+            "브라우저에서 승인하면 저절로 이어집니다. 그만두려면 Ctrl+C를 누르세요.",
+            "Approve in the browser and it continues on its own. Press Ctrl+C to quit.",
+        )
+    }
+    pub fn server_unreachable(self, secs: u64, why: &str) -> String {
+        match self {
+            Lang::Ko => format!("서버에 연결하지 못했습니다 ({secs}초째): {why}"),
+            Lang::En => format!("Couldn't reach the server ({secs}s in): {why}"),
+        }
+    }
+    /// Another window already holding this credential. **The approval window may be in that window** —
+    /// saying only \"connected elsewhere\" would send the person looking for the code in the wrong place.
+    pub fn another_window_notice(self) -> &'static str {
+        self.pick(
+            "다른 zyris-code 창이 이미 같은 자격으로 붙어 있습니다. 승인 창이 그 창에 떠 있을 수 있습니다.",
+            "Another zyris-code window is already using the same credential. The approval window may be there.",
+        )
+    }
+
+    // ── Commands (`/clear` · `/cwd` · `/grants` · `/agent` · `/undo` · `/changes`)
+    pub fn clear_done(self) -> &'static str {
+        self.pick(
+            "화면을 지웠습니다. thread의 기록은 그대로입니다.",
+            "Screen cleared. The thread's history is untouched.",
+        )
+    }
+    pub fn cwd_text(self, cwd: &Path, node: &str, slug: &str, cred: &str) -> String {
+        match self {
+            Lang::Ko => format!(
+                "도구는 `{}`에서 돕니다.\n\n\
+                 이 노드는 **{node}**로 등록돼 있습니다 — 도구 이름은 `zyris__{slug}__…`입니다. \
+                 `ZYRIS_NODE_NAME`으로 바꿉니다.\n\n\
+                 자격은 `{cred}`에 있습니다.",
+                cwd.display(),
+            ),
+            Lang::En => format!(
+                "Tools run in `{}`.\n\n\
+                 This node is registered as **{node}** — tool names are `zyris__{slug}__…`. \
+                 Change it with `ZYRIS_NODE_NAME`.\n\n\
+                 Credentials live in `{cred}`.",
+                cwd.display(),
+            ),
+        }
+    }
+    pub fn grants_none_closed(self) -> &'static str {
+        self.pick("열어 둔 곳이 없었습니다.", "Nothing was open.")
+    }
+    pub fn grants_closed(self, n: usize) -> String {
+        match self {
+            Lang::Ko => format!("{n}곳을 닫았습니다. 이제 그 밖을 만지려면 다시 물어봅니다."),
+            Lang::En => format!("Closed {n}. Touching anything else outside asks again."),
+        }
+    }
+    pub fn grants_text(self, grants: &Grants) -> String {
+        let roots = grants.roots();
+        if roots.is_empty() {
+            return match self {
+                Lang::Ko => "작업 디렉터리 밖으로 열어 둔 곳이 없습니다.\n\n\
+                             승인 화면에서 `a`를 누르면 그 디렉터리가 이 thread 동안 열립니다."
+                    .into(),
+                Lang::En => "Nothing is open outside the working directory.\n\n\
+                             Pressing `a` on the approval screen opens that directory for this thread."
+                    .into(),
+            };
+        }
+        let mut s = match self {
+            Lang::Ko => format!("작업 디렉터리 밖으로 {}곳이 열려 있습니다.\n", roots.len()),
+            Lang::En => {
+                format!("{} directories are open outside the working directory.\n", roots.len())
+            }
+        };
+        for root in roots {
+            s.push_str(&format!("\n- `{}`", root.display()));
+        }
+        // **끄면 잊는다는 것을 같이 말한다.** 디스크에 남는 줄 알면 필요 이상으로 겁을 낸다.
+        s.push_str(match self {
+            Lang::Ko => {
+                "\n\n여기와 그 아래는 묻지 않고 만집니다. `/grants close`로 전부 닫습니다 — \
+                         앱을 끄면 어차피 잊습니다."
+            }
+            Lang::En => {
+                "\n\nEverything here and below is touched without asking. `/grants close` \
+                         shuts them all — the app forgets them on quit anyway."
+            }
+        });
+        s
+    }
+    pub fn agent_staged(self, name: &str) -> String {
+        match self {
+            Lang::Ko => format!(
+                "에이전트: **{name}** · 다음 메시지에서 새 thread가 열립니다. \
+                 앞 thread는 ←의 목록에 그대로 있습니다."
+            ),
+            Lang::En => format!(
+                "Agent: **{name}** · a new thread opens with your next message. \
+                 The previous thread stays in the ← list."
+            ),
+        }
+    }
+    pub fn agent_list_error(self, e: &str) -> String {
+        match self {
+            Lang::Ko => format!("에이전트 목록을 읽지 못했습니다: {e}"),
+            Lang::En => format!("Couldn't read the agent list: {e}"),
+        }
+    }
+    pub fn agent_cannot_send(self) -> &'static str {
+        self.pick("에이전트를 찾지 못해 보낼 수 없습니다.", "No agent — can't send.")
+    }
+    pub fn send_failed(self, e: &str) -> String {
+        match self {
+            Lang::Ko => format!("전송하지 못했습니다: {e}"),
+            Lang::En => format!("Couldn't send: {e}"),
+        }
+    }
+    pub fn stopping_turn(self) -> &'static str {
+        self.pick("진행 중인 턴을 멈추는 중입니다…", "Stopping the running turn…")
+    }
+    pub fn undo_log_not_ready(self) -> &'static str {
+        self.pick("되돌림 기록을 아직 열지 못했습니다.", "Undo history isn't ready yet.")
+    }
+    pub fn reverted(self, path: &str) -> String {
+        match self {
+            Lang::Ko => format!("되돌렸습니다: `{path}`"),
+            Lang::En => format!("Reverted: `{path}`"),
+        }
+    }
+    pub fn nothing_to_undo(self) -> &'static str {
+        self.pick("되돌릴 편집이 없습니다.", "Nothing to undo.")
+    }
+    pub fn undo_failed(self, e: &str) -> String {
+        match self {
+            Lang::Ko => format!("되돌리지 못했습니다: {e}"),
+            Lang::En => format!("Couldn't revert: {e}"),
+        }
+    }
+    pub fn changes_text(self, changed: &[Changed], cwd: &Path) -> String {
+        if changed.is_empty() {
+            return self
+                .pick(
+                    "이 디렉터리에서 바꾼 파일이 없습니다.",
+                    "No files were changed in this directory.",
+                )
+                .to_string();
+        }
+        let mut s = match self {
+            Lang::Ko => {
+                format!("바꾼 파일 {}개입니다. 최근에 손댄 것이 위입니다.\n", changed.len())
+            }
+            Lang::En => format!("{} files changed. Most recent first.\n", changed.len()),
+        };
+        for c in changed {
+            let shown = c.path.strip_prefix(cwd).unwrap_or(&c.path);
+            // 만든 파일이라는 것이 +N보다 먼저다 — 되돌리면 지워진다는 뜻이라 무게가 다르다.
+            let note = if c.created {
+                self.pick(" · 새로 만든 것", " · created").to_string()
+            } else if c.edits > 1 {
+                match self {
+                    Lang::Ko => format!(" · {}번 고침", c.edits),
+                    Lang::En => format!(" · edited {} times", c.edits),
+                }
+            } else {
+                String::new()
+            };
+            s.push_str(&format!("\n- `{}`  +{} −{}{note}", shown.display(), c.added, c.removed));
+        }
+        // **되돌릴 수 있는 범위와 같다는 것을 말해 둔다.** 이 목록을 보고 `/undo`를 누르므로,
+        // 둘의 범위가 다르면 눌러 보고서야 안다.
+        s.push_str(self.pick(
+            "\n\n`/undo`가 이 기록을 뒤에서부터 되돌립니다. 앱을 껐다 켜도 남습니다.",
+            "\n\n`/undo` reverts this log from the end. It survives an app restart.",
+        ));
+        s
+    }
+    pub fn mcp_report_text(self, report: &[(String, Result<usize, String>)]) -> String {
+        if report.is_empty() {
+            return self
+                .pick(
+                    "붙은 MCP 서버가 없습니다. `.mcp.json`이나 \
+                     `~/.config/zyris-code/mcp.json`에 적습니다.",
+                    "No MCP servers are attached. Write one in `.mcp.json` or \
+                     `~/.config/zyris-code/mcp.json`.",
+                )
+                .to_string();
+        }
+        let mut s = String::from(self.pick("MCP 서버입니다.\n", "MCP servers:\n"));
+        for (name, outcome) in report {
+            s.push_str(&match outcome {
+                Ok(n) => match self {
+                    Lang::Ko => format!("\n- `{name}` — 도구 {n}개"),
+                    Lang::En => format!("\n- `{name}` — {n} tools"),
+                },
+                Err(why) => match self {
+                    Lang::Ko => format!("\n- `{name}` — 못 띄웠습니다: {why}"),
+                    Lang::En => format!("\n- `{name}` — couldn't start it: {why}"),
+                },
+            });
+        }
+        s
+    }
+    pub fn rules_text(self, found: &[Found]) -> String {
+        if found.is_empty() {
+            return self
+                .pick(
+                    "이 디렉터리와 그 위쪽에 `CLAUDE.md`도 `AGENTS.md`도 없습니다.",
+                    "No `CLAUDE.md` or `AGENTS.md` in this directory or above it.",
+                )
+                .to_string();
+        }
+        let mut s = String::from(self.pick(
+            "이 thread에 실린 지침입니다. 아래로 갈수록 구체적입니다.\n",
+            "Instructions loaded into this thread. The later ones are more specific.\n",
+        ));
+        for f in found {
+            let count = f.text.chars().count();
+            s.push_str(&match self {
+                Lang::Ko => format!("\n- `{}` — {count}자", f.path.display()),
+                Lang::En => format!("\n- `{}` — {count} chars", f.path.display()),
+            });
+        }
+        s.push_str(self.pick(
+            "\n\n파일을 고쳤으면 `/agent`이나 ←의 목록으로 새 thread를 열어야 반영됩니다.",
+            "\n\nAfter editing the files, open a new thread with `/agent` or the ← list for it \
+             to take effect.",
+        ));
+        s
+    }
+    pub fn skills_text(self, skills: &[SkillInfo]) -> String {
+        if skills.is_empty() {
+            return self
+                .pick(
+                    "쓸 수 있는 스킬이 없습니다. `.zyris-code/skills/`나 \
+                     `~/.config/zyris-code/skills/`에 둡니다.",
+                    "No skills available. Put them in `.zyris-code/skills/` or \
+                     `~/.config/zyris-code/skills/`.",
+                )
+                .to_string();
+        }
+        let mut s = String::from(self.pick("쓸 수 있는 스킬입니다.\n", "Skills available:\n"));
+        for skill in skills {
+            s.push_str(&format!("\n- **{}** — {}", skill.name, skill.description));
+        }
+        s
+    }
+
+    // ── Plugin (`/plugin`)
+    pub fn plugin_added(self, p: &Plugin, contents: &str) -> String {
+        match self {
+            Lang::Ko => format!(
+                "**{}**을 받았습니다.{}\n\n{contents}\n\n\
+                 다음에 zyris-code를 다시 띄우면 붙습니다 — 도구도 스킬도 시작할 때 읽습니다.",
+                p.name,
+                if p.description.is_empty() { String::new() } else { format!(" {}", p.description) },
+            ),
+            Lang::En => format!(
+                "Installed **{}**.{}\n\n{contents}\n\n\
+                 It attaches on the next launch of zyris-code — tools and skills are read at startup.",
+                p.name,
+                if p.description.is_empty() { String::new() } else { format!(" {}", p.description) },
+            ),
+        }
+    }
+    pub fn plugin_removed(self, name: &str) -> String {
+        match self {
+            Lang::Ko => format!("`{name}`을 지웠습니다. 다시 띄우면 빠집니다."),
+            Lang::En => format!("Removed `{name}`. It drops out on the next launch."),
+        }
+    }
+    pub fn plugin_update_text(self, done: &[(String, Result<String, String>)]) -> String {
+        if done.is_empty() {
+            return self.pick("받아 둔 플러그인이 없습니다.", "No fetched plugins.").to_string();
+        }
+        let mut s = String::from(self.pick("갱신했습니다.\n", "Updated.\n"));
+        for (name, outcome) in done {
+            s.push_str(&match outcome {
+                Ok(out) if out.contains("up to date") || out.contains("최신") => match self {
+                    Lang::Ko => format!("\n- `{name}` — 이미 최신입니다"),
+                    Lang::En => format!("\n- `{name}` — already up to date"),
+                },
+                Ok(_) => match self {
+                    Lang::Ko => format!("\n- `{name}` — 새로 받았습니다"),
+                    Lang::En => format!("\n- `{name}` — fetched the update"),
+                },
+                Err(why) => format!("\n- `{name}` — {why}"),
+            });
+        }
+        s.push_str(
+            self.pick("\n\n다시 띄우면 반영됩니다.", "\n\nIt takes effect on the next launch."),
+        );
+        s
+    }
+    pub fn plugin_unknown(self, why: &str) -> String {
+        match self {
+            Lang::Ko => format!(
+                "`/plugin {why}`\n\n             - `/plugin` — 받아 둔 것 보기\n\
+                 \x20            - `/plugin add owner/repo` — 받기\n\
+                 \x20            - `/plugin remove 이름` — 지우기\n\
+                 \x20            - `/plugin update [이름]` — 갱신"
+            ),
+            Lang::En => format!(
+                "`/plugin {why}`\n\n             - `/plugin` — list what's fetched\n\
+                 \x20            - `/plugin add owner/repo` — install\n\
+                 \x20            - `/plugin remove name` — remove\n\
+                 \x20            - `/plugin update [name]` — update"
+            ),
+        }
+    }
+    pub fn plugin_no_git(self) -> &'static str {
+        self.pick(
+            "git이 없습니다. 플러그인은 git으로 받아 옵니다.",
+            "git is missing. Plugins are fetched with git.",
+        )
+    }
+    pub fn plugin_git_error(self, e: &str) -> String {
+        match self {
+            Lang::Ko => format!("git을 돌리지 못했습니다: {e}"),
+            Lang::En => format!("Couldn't run git: {e}"),
+        }
+    }
+    pub fn plugin_git_failed(self) -> &'static str {
+        self.pick("git이 실패했습니다", "git failed")
+    }
+    pub fn plugin_source_unclear(self, text: &str) -> String {
+        match self {
+            Lang::Ko => format!(
+                "`{text}`에서 받을 곳을 못 찾았습니다. `owner/repo`나 clone할 수 있는 주소를 주세요."
+            ),
+            Lang::En => format!(
+                "Couldn't find a source in `{text}`. Give an `owner/repo` or a clonable address."
+            ),
+        }
+    }
+    pub fn plugin_already_there(self, name: &str) -> String {
+        match self {
+            Lang::Ko => format!("`{name}`은 이미 있습니다. 갱신은 `/plugin update {name}`입니다."),
+            Lang::En => {
+                format!("`{name}` is already installed. Update with `/plugin update {name}`.")
+            }
+        }
+    }
+    pub fn plugin_dir_error(self, e: &str) -> String {
+        match self {
+            Lang::Ko => format!("플러그인 자리를 못 만들었습니다: {e}"),
+            Lang::En => format!("Couldn't create the plugin directory: {e}"),
+        }
+    }
+    pub fn plugin_no_manifest(self, name: &str) -> String {
+        match self {
+            Lang::Ko => {
+                format!("`{name}`에 plugin.json이 없어 플러그인이 아닙니다. 받은 것은 지웠습니다.")
+            }
+            Lang::En => format!(
+                "`{name}` has no plugin.json, so it isn't a plugin. The fetched copy was removed."
+            ),
+        }
+    }
+    pub fn plugin_manifest_unreadable(self, name: &str) -> String {
+        match self {
+            Lang::Ko => format!("`{name}`의 plugin.json을 읽지 못했습니다."),
+            Lang::En => format!("Couldn't read `{name}`'s plugin.json."),
+        }
+    }
+    pub fn plugin_remove_error(self, e: &str) -> String {
+        match self {
+            Lang::Ko => format!("지우지 못했습니다: {e}"),
+            Lang::En => format!("Couldn't remove it: {e}"),
+        }
+    }
+    pub fn plugin_not_found(self, name: &str) -> String {
+        match self {
+            Lang::Ko => format!("받아 둔 플러그인 중에 `{name}`이 없습니다."),
+            Lang::En => format!("`{name}` isn't among the fetched plugins."),
+        }
+    }
+    pub fn plugin_contents_text(self, p: &Plugin) -> String {
+        let mut s = String::new();
+        for spec in &p.mcp {
+            s.push_str(&match self {
+                Lang::Ko => {
+                    format!("- MCP `{}` — 다음 실행 때 `{}`을 돌립니다\n", spec.slug, spec.command)
+                }
+                Lang::En => {
+                    format!("- MCP `{}` — runs `{}` on the next launch\n", spec.slug, spec.command)
+                }
+            });
+        }
+        if p.skills.is_some() {
+            s.push_str(self.pick("- 스킬이 딸려 있습니다\n", "- ships a skill\n"));
+        }
+        if s.is_empty() {
+            s.push_str(self.pick("- 얹는 것이 없습니다\n", "- adds nothing\n"));
+        }
+        s
+    }
+    pub fn plugin_list_text(self, found: &[Plugin]) -> String {
+        if found.is_empty() {
+            return self
+                .pick(
+                    "플러그인이 없습니다. `/plugin add owner/repo`로 받습니다.",
+                    "No plugins. Install one with `/plugin add owner/repo`.",
+                )
+                .to_string();
+        }
+        let mut s = String::from(self.pick("플러그인입니다.\n", "Plugins:\n"));
+        for p in found {
+            s.push_str(&format!(
+                "\n- **{}**{}{}",
+                p.name,
+                if p.fetched() { "" } else { self.pick(" (직접 둔 것)", " (hand-placed)") },
+                if p.description.is_empty() {
+                    String::new()
+                } else {
+                    format!(" — {}", p.description)
+                },
+            ));
+        }
+        s
+    }
+
+    // ── Question screen actions
+    pub fn action_back(self) -> &'static str {
+        self.pick("← 이전", "← back")
+    }
+    pub fn action_next(self) -> &'static str {
+        self.pick("다음 →", "next →")
+    }
+    pub fn action_skip(self) -> &'static str {
+        self.pick("건너뛰기 →", "skip →")
+    }
+    pub fn action_submit(self) -> &'static str {
+        self.pick("제출", "submit")
+    }
+    pub fn action_edit(self) -> &'static str {
+        self.pick("고치기", "edit")
+    }
+    pub fn action_reject(self) -> &'static str {
+        self.pick("답하지 않기", "decline to answer")
+    }
+    pub fn question_refused(self) -> &'static str {
+        self.pick("이 질문에는 답하지 않겠습니다.", "I won't answer this question.")
+    }
+    pub fn all_skipped(self) -> &'static str {
+        self.pick("모두 건너뛰었습니다.", "Skipped them all.")
+    }
+    /// The marker that flags a typed-in answer. **Must match between the composed answer
+    /// (`question::answer_text`) and the timeline's detection (`rows`)** — both use the same lang.
+    pub fn free_mark(self) -> &'static str {
+        self.pick("직접 입력:", "Typed:")
+    }
+
+    // ── Tool detail (event.rs writes the text · rows.rs styles it)
+    pub fn detail_args(self) -> &'static str {
+        self.pick("인자", "Args")
+    }
+    pub fn detail_output(self) -> &'static str {
+        self.pick("출력", "Output")
+    }
+    pub fn detail_result(self) -> &'static str {
+        self.pick("결과", "Result")
+    }
+    pub fn detail_error(self) -> &'static str {
+        self.pick("오류", "Error")
+    }
+    /// The section heads in the order `tool_detail` writes them. **rows.rs styles by these names,
+    /// so the writer and the reader must agree** — both sides use the same lang.
+    pub fn tool_sections(self) -> [&'static str; 4] {
+        [self.detail_args(), self.detail_output(), self.detail_result(), self.detail_error()]
+    }
+    pub fn detail_timed_out(self) -> &'static str {
+        self.pick("시간이 다 됐습니다", "Timed out")
+    }
+    pub fn detail_exit_code(self, code: i64) -> String {
+        match self {
+            Lang::Ko => format!("종료 코드 {code}"),
+            Lang::En => format!("Exit code {code}"),
+        }
+    }
+    pub fn detail_no_output(self) -> &'static str {
+        self.pick("(출력 없음)", "(no output)")
+    }
+    pub fn detail_clipped(self) -> &'static str {
+        self.pick("… (잘렸습니다)", "… (clipped)")
+    }
+    pub fn default_shell(self) -> &'static str {
+        self.pick("기본 셸", "default shell")
+    }
+    pub fn tool_count(self, n: usize) -> String {
+        match self {
+            Lang::Ko => format!("도구 {n}개"),
+            Lang::En => format!("{n} tools"),
+        }
+    }
+    pub fn step_count(self, n: usize) -> String {
+        match self {
+            Lang::Ko => format!("{n}단계"),
+            Lang::En => format!("{n} steps"),
+        }
+    }
+    pub fn diff_skip(self, n: u32) -> String {
+        match self {
+            Lang::Ko => format!(" … {n}줄 생략"),
+            Lang::En => format!(" … {n} lines skipped"),
+        }
+    }
+    pub fn diff_omitted(self, n: u32) -> String {
+        match self {
+            Lang::Ko => format!("@@ {n}줄 생략 @@"),
+            Lang::En => format!("@@ {n} lines omitted @@"),
+        }
+    }
+
+    // ── Lists (picker)
+    pub fn pick_more(self, up: bool, n: usize) -> String {
+        let arrow = if up { "↑" } else { "↓" };
+        match self {
+            Lang::Ko => format!("  {arrow} {n}개 더"),
+            Lang::En => format!("  {arrow} {n} more"),
+        }
+    }
+    pub fn picker_close(self) -> &'static str {
+        self.pick("← 닫기", "← close")
+    }
+    pub fn loading(self) -> &'static str {
+        self.pick("불러오는 중…", "Loading…")
+    }
+    pub fn picker_back(self) -> &'static str {
+        self.pick("← 뒤로", "← back")
+    }
+    pub fn picker_esc_close(self) -> &'static str {
+        self.pick("Esc 닫기", "Esc close")
+    }
+    pub fn picker_keys(self, back: &str) -> String {
+        match self {
+            Lang::Ko => format!("↑↓ 이동 · Enter 고르기 · {back}"),
+            Lang::En => format!("↑↓ move · Enter choose · {back}"),
+        }
+    }
+    pub fn cannot_choose(self) -> &'static str {
+        self.pick("지금은 고를 수 없습니다", "Can't choose right now")
+    }
+
+    // ── Conn (errors that surface in the status bar · timeline)
+    pub fn server_timeout(self, secs: u64) -> String {
+        match self {
+            Lang::Ko => format!("서버가 {secs}초 안에 답하지 않았습니다"),
+            Lang::En => format!("The server didn't answer within {secs}s"),
+        }
+    }
+    pub fn no_credential_dir(self) -> &'static str {
+        self.pick(
+            "자격을 둘 디렉터리를 찾지 못했습니다",
+            "Couldn't find a directory for credentials",
+        )
+    }
+    pub fn missing_scopes(self, missing: &str) -> String {
+        match self {
+            Lang::Ko => format!(
+                "**권한이 모자랍니다: {missing}**. 승인할 때 정해진 권한은 나중에 넓어지지 않습니다.\n\n\
+                 다시 연결되면 등록 코드 창이 뜨니, 승인 화면에서 권한을 **모두** 체크해 주세요."
+            ),
+            Lang::En => format!(
+                "**Not enough permissions: {missing}**. Permissions fixed at approval time \
+                 never widen.\n\nA fresh enrollment-code window appears on reconnect — check \
+                 **every** scope there."
+            ),
+        }
+    }
+    pub fn scopes_asked_again(self, missing: &str) -> String {
+        match self {
+            Lang::Ko => format!(
+                "**권한이 모자랍니다: {missing}**. 다시 승인받을 수 있도록 이 컴퓨터의 자격을 비웠습니다.\n\n\
+                 다시 연결되면 등록 코드 창이 뜨니, 승인 화면에서 권한을 **모두** 체크해 주세요. \
+                 지금 연결은 그대로 쓸 수 있습니다."
+            ),
+            Lang::En => format!(
+                "**Not enough permissions: {missing}**. Dropped this machine's credentials so \
+                 you can be approved again.\n\nA fresh enrollment-code window appears on reconnect \
+                 — check **every** scope there. The current connection keeps working."
+            ),
+        }
+    }
+    pub fn agent_not_found(self, name: &str) -> String {
+        match self {
+            Lang::Ko => {
+                format!("'{name}' 에이전트가 계정에 없습니다. /agent으로 목록을 볼 수 있습니다.")
+            }
+            Lang::En => {
+                format!("No agent named '{name}' on this account. See the list with /agent.")
+            }
+        }
+    }
+    pub fn thread_create_error(self, e: &str) -> String {
+        match self {
+            Lang::Ko => format!("thread를 만들지 못했습니다: {e}"),
+            Lang::En => format!("Couldn't create the thread: {e}"),
+        }
+    }
+    pub fn job_create_error(self, e: &str) -> String {
+        match self {
+            Lang::Ko => format!("job을 걸지 못했습니다: {e}"),
+            Lang::En => format!("Couldn't queue the job: {e}"),
+        }
+    }
+    pub fn job_no_session(self, id: &str) -> String {
+        match self {
+            Lang::Ko => format!(
+                "job **{id}**은 걸렸는데 세션이 아직 없어 여기서 못 봅니다. \
+                 attacca에서 열어 보세요."
+            ),
+            Lang::En => format!(
+                "Job **{id}** was queued but has no session yet, so it can't be watched here. \
+                 Open it in attacca."
+            ),
+        }
+    }
+    pub fn work_create_error(self, e: &str) -> String {
+        match self {
+            Lang::Ko => format!("work를 만들지 못했습니다: {e}"),
+            Lang::En => format!("Couldn't create the work: {e}"),
+        }
+    }
+    pub fn project_create_error(self, e: &str) -> String {
+        match self {
+            Lang::Ko => format!("프로젝트를 만들지 못했습니다: {e}"),
+            Lang::En => format!("Couldn't create the project: {e}"),
+        }
+    }
+    pub fn project_list_error(self, e: &str) -> String {
+        match self {
+            Lang::Ko => format!("프로젝트 목록을 읽지 못했습니다: {e}"),
+            Lang::En => format!("Couldn't read the project list: {e}"),
+        }
+    }
+    pub fn thread_list_error(self, e: &str) -> String {
+        match self {
+            Lang::Ko => format!("thread 목록을 읽지 못했습니다: {e}"),
+            Lang::En => format!("Couldn't read the thread list: {e}"),
+        }
+    }
+    pub fn history_error(self, e: &str) -> String {
+        match self {
+            Lang::Ko => format!("지난 기록을 읽지 못했습니다: {e}"),
+            Lang::En => format!("Couldn't read the past history: {e}"),
+        }
+    }
+    pub fn untitled(self) -> &'static str {
+        self.pick("제목 없음", "untitled")
+    }
+
+    // ── Edit tool errors (returned to the agent, shown in the timeline)
+    pub fn edit_mkdir_error(self, e: &str) -> String {
+        match self {
+            Lang::Ko => format!("상위 디렉터리를 만들지 못했습니다: {e}"),
+            Lang::En => format!("Couldn't create the parent directory: {e}"),
+        }
+    }
+    pub fn edit_changed_after_read(self, path: &str, base: &str, now: &str) -> String {
+        match self {
+            Lang::Ko => format!(
+                "'{path}'이(가) 읽은 뒤 바뀌었습니다 (base_version {base} ≠ 지금 {now}). \
+                 file_io.read로 지금 내용을 다시 읽고, 새 버전 토큰을 base_version으로 다시 시도하세요."
+            ),
+            Lang::En => format!(
+                "'{path}' changed after it was read (base_version {base} ≠ current {now}). \
+                 Re-read the current content with file_io.read and retry with the new version \
+                 token as base_version."
+            ),
+        }
+    }
+    pub fn edit_exists_no_base(self, path: &str) -> String {
+        match self {
+            Lang::Ko => format!(
+                "'{path}'은(는) 이미 있는 파일입니다 — 덮어쓰려면 base_version을 주세요. \
+                 읽은 응답의 stat.modified_unix_ms:stat.size 또는 code_edit.version의 version을 \
+                 그대로 넘기세요."
+            ),
+            Lang::En => format!(
+                "'{path}' already exists — pass base_version to overwrite it. Use the \
+                 stat.modified_unix_ms:stat.size of the read response or code_edit.version's \
+                 version as-is."
+            ),
+        }
+    }
+    pub fn edit_write_error(self, e: &str) -> String {
+        match self {
+            Lang::Ko => format!("쓰지 못했습니다: {e}"),
+            Lang::En => format!("Couldn't write: {e}"),
+        }
+    }
+    pub fn edit_not_found(self, needle: &str) -> String {
+        match self {
+            Lang::Ko => format!(
+                "'{needle}'을(를) 파일에서 찾지 못했습니다. file_io.read로 지금 내용을 다시 읽으세요."
+            ),
+            Lang::En => format!(
+                "'{needle}' wasn't found in the file. Read the current content with file_io.read."
+            ),
+        }
+    }
+    pub fn edit_ambiguous(self, n: usize) -> String {
+        match self {
+            Lang::Ko => format!(
+                "앞뒤를 더 붙여 한 곳만 가리키거나 replace_all을 켜세요. (파일에 {n}번 나옵니다)"
+            ),
+            Lang::En => format!(
+                "Add more context to point at one spot, or turn replace_all on. (It appears \
+                 {n} times in the file)"
+            ),
+        }
+    }
+    pub fn edit_read_error(self, path: &str, e: &str) -> String {
+        match self {
+            Lang::Ko => format!("'{path}'을(를) 읽지 못했습니다: {e}"),
+            Lang::En => format!("Couldn't read '{path}': {e}"),
+        }
+    }
+    pub fn edit_stat_error(self, path: &str, e: &str) -> String {
+        match self {
+            Lang::Ko => format!("'{path}'을(를) 확인하지 못했습니다: {e}"),
+            Lang::En => format!("Couldn't stat '{path}': {e}"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -591,6 +1344,37 @@ mod tests {
             (ko.enroll_lapsed(), en.enroll_lapsed()),
             (ko.enroll_denied(), en.enroll_denied()),
             (ko.enroll_keys(), en.enroll_keys()),
+            (ko.clear_done(), en.clear_done()),
+            (ko.grants_none_closed(), en.grants_none_closed()),
+            (ko.agent_cannot_send(), en.agent_cannot_send()),
+            (ko.undo_log_not_ready(), en.undo_log_not_ready()),
+            (ko.nothing_to_undo(), en.nothing_to_undo()),
+            (ko.action_back(), en.action_back()),
+            (ko.action_next(), en.action_next()),
+            (ko.action_skip(), en.action_skip()),
+            (ko.action_submit(), en.action_submit()),
+            (ko.action_edit(), en.action_edit()),
+            (ko.action_reject(), en.action_reject()),
+            (ko.question_refused(), en.question_refused()),
+            (ko.all_skipped(), en.all_skipped()),
+            (ko.detail_args(), en.detail_args()),
+            (ko.detail_output(), en.detail_output()),
+            (ko.detail_result(), en.detail_result()),
+            (ko.detail_error(), en.detail_error()),
+            (ko.detail_timed_out(), en.detail_timed_out()),
+            (ko.detail_no_output(), en.detail_no_output()),
+            (ko.detail_clipped(), en.detail_clipped()),
+            (ko.default_shell(), en.default_shell()),
+            (ko.picker_close(), en.picker_close()),
+            (ko.picker_back(), en.picker_back()),
+            (ko.picker_esc_close(), en.picker_esc_close()),
+            (ko.cannot_choose(), en.cannot_choose()),
+            (ko.untitled(), en.untitled()),
+            (ko.no_credential_dir(), en.no_credential_dir()),
+            (ko.connection_lost(), en.connection_lost()),
+            (ko.waiting_for_approval(), en.waiting_for_approval()),
+            (ko.another_window_notice(), en.another_window_notice()),
+            (ko.free_mark(), en.free_mark()),
         ];
         for (k, e) in pairs {
             assert_ne!(k, e, "번역이 안 된 문구가 있다: {k}");
@@ -633,8 +1417,114 @@ mod tests {
             en.project_description_placeholder(),
             en.project_form_keys(),
             en.project_name_required(),
+            en.connection_lost(),
+            en.waiting_for_approval(),
+            en.another_window_notice(),
+            en.clear_done(),
+            en.grants_none_closed(),
+            en.agent_cannot_send(),
+            en.undo_log_not_ready(),
+            en.nothing_to_undo(),
+            en.action_back(),
+            en.action_next(),
+            en.action_skip(),
+            en.action_submit(),
+            en.action_edit(),
+            en.action_reject(),
+            en.question_refused(),
+            en.all_skipped(),
+            en.free_mark(),
+            en.detail_args(),
+            en.detail_output(),
+            en.detail_result(),
+            en.detail_error(),
+            en.detail_timed_out(),
+            en.detail_no_output(),
+            en.detail_clipped(),
+            en.default_shell(),
+            en.picker_close(),
+            en.picker_back(),
+            en.picker_esc_close(),
+            en.cannot_choose(),
+            en.untitled(),
+            en.no_credential_dir(),
         ];
         for text in said {
+            assert!(
+                !text.chars().any(|c| ('가'..='힣').contains(&c)),
+                "영어 문구에 한글이 남았다: {text}"
+            );
+        }
+        // **Arguments-filled phrases.** These take data, so they can't sit in the array above —
+        // the call itself is the check.
+        let with_args = [
+            en.agent_list_error("x"),
+            en.connect_failed("x"),
+            en.previous_error("x"),
+            en.log_location("/tmp/zyris-code.log"),
+            en.server_unreachable(5, "x"),
+            en.cwd_text(std::path::Path::new("/home/ruma"), "node", "slug", "cred"),
+            en.grants_closed(2),
+            en.agent_staged("Main Agent"),
+            en.reverted("src/x.rs"),
+            en.undo_failed("x"),
+            en.server_timeout(15),
+            en.missing_scopes("a, b"),
+            en.scopes_asked_again("a"),
+            en.agent_not_found("x"),
+            en.thread_create_error("x"),
+            en.job_create_error("x"),
+            en.job_no_session("j1"),
+            en.work_create_error("x"),
+            en.project_create_error("x"),
+            en.project_list_error("x"),
+            en.thread_list_error("x"),
+            en.history_error("x"),
+            en.edit_mkdir_error("x"),
+            en.edit_write_error("x"),
+            en.edit_not_found("abc"),
+            en.edit_ambiguous(3),
+            en.edit_read_error("p", "x"),
+            en.edit_stat_error("p", "x"),
+            en.plugin_removed("x"),
+            en.plugin_unknown("x"),
+            en.detail_exit_code(1),
+            en.tool_count(3),
+            en.diff_skip(2),
+            en.diff_omitted(2),
+            en.pick_more(true, 3),
+            en.picker_keys("← close"),
+            en.changes_text(&[], std::path::Path::new("/")),
+            en.mcp_report_text(&[]),
+            en.rules_text(&[]),
+            en.skills_text(&[]),
+            en.plugin_list_text(&[]),
+            en.plugin_update_text(&[]),
+            en.grants_text(&Grants::default()),
+            en.plugin_contents_text(&Plugin {
+                name: "x".into(),
+                description: String::new(),
+                mcp: vec![crate::mcp::bridge::ServerSpec {
+                    slug: "m".into(),
+                    command: "cmd".into(),
+                    args: vec![],
+                    env: Default::default(),
+                }],
+                skills: None,
+                root: "/tmp".into(),
+            }),
+            en.plugin_added(
+                &Plugin {
+                    name: "x".into(),
+                    description: String::new(),
+                    mcp: vec![],
+                    skills: None,
+                    root: "/tmp".into(),
+                },
+                "contents",
+            ),
+        ];
+        for text in with_args {
             assert!(
                 !text.chars().any(|c| ('가'..='힣').contains(&c)),
                 "영어 문구에 한글이 남았다: {text}"

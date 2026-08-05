@@ -150,13 +150,12 @@ async fn main() -> ExitCode {
     // You only need to know one thing: judgment (plan mode · open directory) and the approval window
     // belong to **the window that received the call**; if the two windows are in different modes, the server decides which rules apply.
     if let Some(dir) = zyris_code::conn::credential_dir() {
-        let profile = std::env::var("ZYRIS_PROFILE")
-            .unwrap_or_else(|_| zyris_code::conn::APP.to_string());
+        let profile =
+            std::env::var("ZYRIS_PROFILE").unwrap_or_else(|_| zyris_code::conn::APP.to_string());
         if zyris_code::conn::another_instance_alive(&dir, &profile) {
             tracing::warn!("다른 zyris-code 창이 같은 자격으로 붙어 있습니다. 도구 호출은 서버가 고른 창으로 갑니다.");
             bridge.frame(zyris_code::app::Frame::Notice(
-                "다른 zyris-code 창이 이미 같은 자격으로 붙어 있습니다. 승인 창이 그 창에 떠 있을 수 있습니다."
-                    .to_string(),
+                zyris_code::lang::current().another_window_notice().to_string(),
             ));
         } else {
             // Hold the lock for as long as we live — Drop removes it when the window ends.

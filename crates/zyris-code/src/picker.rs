@@ -256,7 +256,9 @@ impl Picker {
         let row = self.rows.get(self.cursor)?;
         if !row.enabled {
             return Some(Pick::Unavailable(
-                row.note.clone().unwrap_or_else(|| "지금은 고를 수 없습니다".into()),
+                row.note
+                    .clone()
+                    .unwrap_or_else(|| crate::lang::current().cannot_choose().to_string()),
             ));
         }
         match (&self.level, &row.id) {
@@ -498,10 +500,7 @@ mod tests {
             crate::lang::Lang::Ko,
         );
         s.down();
-        assert_eq!(
-            s.pick(),
-            Some(Pick::OpenSession { id: "s1".into(), project_id: "p1".into() })
-        );
+        assert_eq!(s.pick(), Some(Pick::OpenSession { id: "s1".into(), project_id: "p1".into() }));
         assert_eq!(s.rows[1].note.as_deref(), Some("작업 중"));
     }
 

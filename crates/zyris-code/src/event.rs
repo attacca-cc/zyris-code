@@ -116,10 +116,12 @@ fn tool_summary(payload: &Value, name: &str) -> String {
         "exec" => pick("command"),
         "glob" | "grep" => pick("pattern"),
         "load" => pick("name"),
-        "open" | "open_stream" => pick("shell").or(Some("기본 셸")),
+        "open" | "open_stream" => pick("shell").or(Some(crate::lang::current().default_shell())),
         // For things that keep a PTY going, which shell it is is everything.
         "read" | "write" | "screen" | "resize" | "close" if pick("pty").is_some() => pick("pty"),
-        "edit" | "multi_edit" | "write" | "version" | "stat" | "list" | "read_stream" => pick("path"),
+        "edit" | "multi_edit" | "write" | "version" | "stat" | "list" | "read_stream" => {
+            pick("path")
+        }
         // For unknown tools (server built-ins · MCP), look through the common names first, and fall back to the first string.
         _ => ["path", "name", "query", "title", "content", "url", "id"]
             .into_iter()
@@ -177,9 +179,11 @@ fn exec_detail(name: &str, result: Option<&Value>) -> Option<String> {
 
     let mut s = String::new();
     if r.get("timed_out").and_then(Value::as_bool) == Some(true) {
-        s.push_str("시간이 다 됐습니다\n");
+        s.push_str(crate::lang::current().detail_timed_out());
+        s.push('\n');
     } else if let Some(code) = r.get("exit_code").and_then(Value::as_i64).filter(|c| *c != 0) {
-        s.push_str(&format!("종료 코드 {code}\n"));
+        s.push_str(&crate::lang::current().detail_exit_code(code));
+        s.push('\n');
     }
     if !out.is_empty() {
         s.push_str(out);
@@ -196,7 +200,7 @@ fn exec_detail(name: &str, result: Option<&Value>) -> Option<String> {
     }
     // **If nothing is said, the tool looks broken.** Quiet commands that succeed are common.
     if s.is_empty() {
-        s.push_str("(출력 없음)");
+        s.push_str(crate::lang::current().detail_no_output());
     }
     Some(s)
 }
@@ -209,18 +213,20 @@ fn exec_detail(name: &str, result: Option<&Value>) -> Option<String> {
 const DETAIL_LIMIT: usize = 4000;
 
 fn tool_detail(payload: &Value, name: &str) -> String {
+    let lang = crate::lang::current();
     let mut out = String::new();
     if let Some(args) = payload.get("arguments").filter(|v| !v.is_null()) {
-        out.push_str("인자\n");
+        out.push_str(lang.detail_args());
+        out.push('\n');
         out.push_str(&flatten(args));
     }
     if let Some(err) = payload.get("error").filter(|v| !v.is_null()) {
-        push_section(&mut out, "오류", err);
+        push_section(&mut out, lang.detail_error(), err);
     } else if let Some(res) = payload.get("result").filter(|v| !v.is_null()) {
         // What the shell spat out is prose, not JSON.
         match exec_detail(name, Some(res)) {
-            Some(text) => push_section(&mut out, "출력", &Value::String(text)),
-            None => push_section(&mut out, "결과", res),
+            Some(text) => push_section(&mut out, lang.detail_output(), &Value::String(text)),
+            None => push_section(&mut out, lang.detail_result(), res),
         }
     }
     clip(out)
@@ -248,7 +254,7 @@ fn clip(s: String) -> String {
         return s;
     }
     let cut: String = s.chars().take(DETAIL_LIMIT).collect();
-    format!("{cut}\n… (잘렸습니다)")
+    format!("{cut}\n{}", crate::lang::current().detail_clipped())
 }
 
 #[cfg(test)]
@@ -336,6 +342,7 @@ mod tests {
     /// A failed command must show its exit code. If 0 and 3 can't be told apart, the log has to be read again.
     #[test]
     fn a_failed_command_shows_its_exit_code() {
+        crate::lang::set(crate::lang::Lang::Ko);
         let got = exec_detail(
             &wire("exec"),
             Some(&exec_json(3, "", "error[E0308]: mismatched\n", false)),
@@ -348,6 +355,7 @@ mod tests {
     /// Timing out and producing nothing are different things.
     #[test]
     fn a_timed_out_command_says_so() {
+        crate::lang::set(crate::lang::Lang::Ko);
         let got = exec_detail(&wire("exec"), Some(&exec_json(-1, "", "", true))).unwrap();
         assert!(got.contains("시간이 다 됐습니다"), "{got:?}");
     }

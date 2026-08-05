@@ -142,7 +142,7 @@ pub fn draw(frame: &mut Frame, area: Rect, a: &Answering, lang: crate::lang::Lan
                 lines.push(Line::from(vec![
                     caret,
                     Span::styled(
-                        act.label().to_string(),
+                        act.label(lang).to_string(),
                         Style::default().fg(colour).add_modifier(Modifier::BOLD),
                     ),
                 ]));
@@ -196,7 +196,7 @@ fn draw_review(
         lang.answered().to_string(),
         Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD),
     )));
-    for (q, ans) in a.summary() {
+    for (q, ans) in a.summary(lang) {
         let skipped = ans == lang.skipped();
         lines.push(Line::from(truncate_spans(
             vec![
@@ -223,7 +223,7 @@ fn draw_review(
         lines.push(Line::from(vec![
             Span::styled(if on { "❯ " } else { "  " }, Style::default().fg(theme::ACCENT)),
             Span::styled(
-                act.label().to_string(),
+                act.label(lang).to_string(),
                 Style::default().fg(colour).add_modifier(Modifier::BOLD),
             ),
         ]));

@@ -90,7 +90,10 @@ impl Diff {
                 DiffLine::Add(s) => out.push_str(&format!("+{s}\n")),
                 DiffLine::Del(s) => out.push_str(&format!("-{s}\n")),
                 DiffLine::Keep(s) => out.push_str(&format!(" {s}\n")),
-                DiffLine::Skip(n) => out.push_str(&format!("@@ {n}줄 생략 @@\n")),
+                DiffLine::Skip(n) => {
+                    out.push_str(&crate::lang::current().diff_omitted(*n));
+                    out.push('\n');
+                }
             }
         }
         out

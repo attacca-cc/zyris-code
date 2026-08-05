@@ -16,8 +16,8 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut State) {
     let skip = state.asking.as_ref().map(|(seq, _)| *seq);
     {
         // Borrow the fields separately — `timeline` and `rows_cache` must be held at the same time.
-        let State { timeline, rows_cache, folds, .. } = &mut *state;
-        rows_cache.layout(timeline.items(), area.width, folds, skip);
+        let State { timeline, rows_cache, folds, lang, .. } = &mut *state;
+        rows_cache.layout(timeline.items(), area.width, folds, skip, *lang);
     }
 
     let total = state.rows_cache.total();

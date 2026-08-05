@@ -44,7 +44,7 @@ pub fn draw(frame: &mut Frame, area: Rect, picker: &Picker, lang: crate::lang::L
     let mut lines: Vec<Line<'static>> = Vec::new();
     if picker.loading {
         lines
-            .push(Line::from(Span::styled("불러오는 중…", Style::default().fg(theme::TEXT_MUTED))));
+            .push(Line::from(Span::styled(lang.loading(), Style::default().fg(theme::TEXT_MUTED))));
     }
 
     // **The pure side decides** where each row goes (`picker::slots`). Here we just draw.
@@ -59,7 +59,7 @@ pub fn draw(frame: &mut Frame, area: Rect, picker: &Picker, lang: crate::lang::L
                 Line::from(Span::styled("─".repeat(width), Style::default().fg(theme::BORDER)))
             }
             Slot::More { count, up } => Line::from(Span::styled(
-                format!("  {} {count}개 더", if up { "↑" } else { "↓" }),
+                lang.pick_more(up, count),
                 Style::default().fg(theme::TEXT_MUTED),
             )),
         });
@@ -67,15 +67,15 @@ pub fn draw(frame: &mut Frame, area: Rect, picker: &Picker, lang: crate::lang::L
 
     // The meaning of ← changes with the level. Say it plainly.
     let back = match picker.level {
-        crate::picker::Level::Projects => "← 닫기",
-        crate::picker::Level::Sessions { .. } => "← 뒤로",
+        crate::picker::Level::Projects => lang.picker_close(),
+        crate::picker::Level::Sessions { .. } => lang.picker_back(),
         // These two are outside the project hierarchy, so there's nowhere to go back to.
         crate::picker::Level::Agents
         | crate::picker::Level::Commands
-        | crate::picker::Level::Languages => "Esc 닫기",
+        | crate::picker::Level::Languages => lang.picker_esc_close(),
     };
     lines.push(Line::from(Span::styled(
-        format!("↑↓ 이동 · Enter 고르기 · {back}"),
+        lang.picker_keys(back),
         Style::default().fg(theme::TEXT_MUTED),
     )));
 

@@ -32,7 +32,7 @@ pub(crate) async fn within<T>(
                 CALL_TIMEOUT.as_secs()
             );
             api.handle().connection().close("call timed out");
-            Err(anyhow!("서버가 {}초 안에 답하지 않았습니다", CALL_TIMEOUT.as_secs()))
+            Err(anyhow!(crate::lang::current().server_timeout(CALL_TIMEOUT.as_secs())))
         }
     }
 }
@@ -121,7 +121,7 @@ pub const LEGACY_APP: &str = "zyris";
 pub fn credential_home() -> String {
     credential_dir()
         .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "자격을 둘 디렉터리를 찾지 못했습니다".to_string())
+        .unwrap_or_else(|| crate::lang::current().no_credential_dir().to_string())
 }
 
 /// Where credentials go. **We compute it.**
@@ -287,11 +287,7 @@ pub fn needs_reenrollment(granted: &[String], already_tried: bool) -> bool {
 /// **"Not enough" alone gives no path.** Permissions fixed at approval time don't widen when the token
 /// refreshes, so the only thing to do is drop the credentials and get approved again. That method is written here.
 pub fn missing_scopes_message(missing: &[&str]) -> String {
-    format!(
-        "**권한이 모자랍니다: {}**. 승인할 때 정해진 권한은 나중에 넓어지지 않습니다.\n\n\
-         다시 연결되면 등록 코드 창이 뜨니, 승인 화면에서 권한을 **모두** 체크해 주세요.",
-        missing.join(", ")
-    )
+    crate::lang::current().missing_scopes(&missing.join(", "))
 }
 
 /// What to say when credentials were dropped because permissions were short.
@@ -300,12 +296,7 @@ pub fn missing_scopes_message(missing: &[&str]) -> String {
 /// credentials sent the code to stdout where the screen hid it, so we said "turn it off and on"; now the
 /// `EnrollmentUi` hook draws the code on screen (`enroll.rs`) — the window appears on reconnect.
 pub fn scopes_will_be_asked_again(missing: &[&str]) -> String {
-    format!(
-        "**권한이 모자랍니다: {}**. 다시 승인받을 수 있도록 이 컴퓨터의 자격을 비웠습니다.\n\n\
-         다시 연결되면 등록 코드 창이 뜨니, 승인 화면에서 권한을 **모두** 체크해 주세요. \
-         지금 연결은 그대로 쓸 수 있습니다.",
-        missing.join(", ")
-    )
+    crate::lang::current().scopes_asked_again(&missing.join(", "))
 }
 
 /// The agent to attach to. Overridable with `ZYRIS_CODE_AGENT`.
@@ -415,7 +406,9 @@ pub fn claim_instance_lock(config_dir: &std::path::Path, profile: &str) -> Optio
 
 #[cfg(unix)]
 fn process_alive(pid: &str) -> bool {
-    let Ok(pid) = pid.trim().parse::<u32>() else { return false; };
+    let Ok(pid) = pid.trim().parse::<u32>() else {
+        return false;
+    };
     // PID 0 means "my process group", so kill(0, 0) always succeeds — treat it as an impossible value.
     if pid == 0 {
         return false;
@@ -591,10 +584,12 @@ impl Session {
     pub async fn agent_id_named(api: &AttaccaApiClient, wanted: &str) -> Result<String> {
         let agents = within(api, api.list_agents())
             .await
-            .map_err(|e| anyhow!("에이전트 목록을 읽지 못했습니다: {e}"))?;
-        agents.into_iter().find(|a| a.name == wanted).map(|a| a.id).ok_or_else(|| {
-            anyhow!("'{wanted}' 에이전트가 계정에 없습니다. /agent으로 목록을 볼 수 있습니다.")
-        })
+            .map_err(|e| anyhow!(crate::lang::current().agent_list_error(&e.to_string())))?;
+        agents
+            .into_iter()
+            .find(|a| a.name == wanted)
+            .map(|a| a.id)
+            .ok_or_else(|| anyhow!(crate::lang::current().agent_not_found(wanted)))
     }
 
     /// Returns the session id, creating it now if absent.
@@ -616,7 +611,7 @@ impl Session {
             }),
         )
         .await
-        .map_err(|e| anyhow!("thread를 만들지 못했습니다: {e}"))?;
+        .map_err(|e| anyhow!(crate::lang::current().thread_create_error(&e.to_string())))?;
         self.id = Some(session.id.clone());
         Ok(session.id)
     }
@@ -682,15 +677,12 @@ impl Session {
             }),
         )
         .await
-        .map_err(|e| anyhow!("job을 걸지 못했습니다: {e}"))?;
+        .map_err(|e| anyhow!(crate::lang::current().job_create_error(&e.to_string())))?;
 
-        let id = job.session_id.clone().ok_or_else(|| {
-            anyhow!(
-                "job **{}**은 걸렸는데 세션이 아직 없어 여기서 못 봅니다. \
-                 attacca에서 열어 보세요.",
-                job.id
-            )
-        })?;
+        let id = job
+            .session_id
+            .clone()
+            .ok_or_else(|| anyhow!(crate::lang::current().job_no_session(&job.id)))?;
         self.id = Some(id.clone());
         Ok(Opened { id, sent: true, announced: Some((Route::Job, job.id)) })
     }
@@ -713,7 +705,7 @@ impl Session {
             }),
         )
         .await
-        .map_err(|e| anyhow!("work를 만들지 못했습니다: {e}"))?;
+        .map_err(|e| anyhow!(crate::lang::current().work_create_error(&e.to_string())))?;
 
         let id = planner_session(api, &work).await?;
         self.id = Some(id.clone());
@@ -775,7 +767,7 @@ pub async fn create_project(
 ) -> Result<(String, String)> {
     let name = name.trim();
     if name.is_empty() {
-        return Err(anyhow!("프로젝트 이름을 적어 주세요."));
+        return Err(anyhow!(crate::lang::current().project_name_required()));
     }
     let p = within(
         api,
@@ -785,7 +777,7 @@ pub async fn create_project(
         }),
     )
     .await
-    .map_err(|e| anyhow!("프로젝트를 만들지 못했습니다: {e}"))?;
+    .map_err(|e| anyhow!(crate::lang::current().project_create_error(&e.to_string())))?;
     Ok((p.id, p.name))
 }
 
@@ -793,7 +785,7 @@ pub async fn create_project(
 pub async fn projects(api: &AttaccaApiClient) -> Result<Vec<(String, String, bool)>> {
     let items = within(api, api.list_projects())
         .await
-        .map_err(|e| anyhow!("프로젝트 목록을 읽지 못했습니다: {e}"))?;
+        .map_err(|e| anyhow!(crate::lang::current().project_list_error(&e.to_string())))?;
     Ok(items.into_iter().map(|p| (p.id, p.name, p.is_default)).collect())
 }
 
@@ -810,12 +802,14 @@ pub async fn sessions(
         }),
     )
     .await
-    .map_err(|e| anyhow!("thread 목록을 읽지 못했습니다: {e}"))?;
+    .map_err(|e| anyhow!(crate::lang::current().thread_list_error(&e.to_string())))?;
     Ok(items
         .into_iter()
         .map(|s| {
-            let title =
-                s.title.filter(|t| !t.trim().is_empty()).unwrap_or_else(|| "제목 없음".into());
+            let title = s
+                .title
+                .filter(|t| !t.trim().is_empty())
+                .unwrap_or_else(|| crate::lang::current().untitled().to_string());
             (s.id, title, s.running)
         })
         .collect())
@@ -830,7 +824,7 @@ pub async fn history(
 ) -> Result<Vec<zyris_attacca::ZSessionEvent>> {
     within(api, api.session_history(session_id.to_string(), ZHistoryQuery::default()))
         .await
-        .map_err(|e| anyhow!("지난 기록을 읽지 못했습니다: {e}"))
+        .map_err(|e| anyhow!(crate::lang::current().history_error(&e.to_string())))
 }
 
 /// Finds a session that's awaiting an answer.
@@ -841,9 +835,10 @@ pub async fn history(
 ///
 /// A blocked session has `running` set, so the list alone narrows it down. History is read only for those few.
 pub async fn session_awaiting_answer(api: &AttaccaApiClient) -> Option<String> {
-    let sessions = within(api, api.list_sessions(ZSessionFilter { project_id: None, limit: Some(50) }))
-        .await
-        .ok()?;
+    let sessions =
+        within(api, api.list_sessions(ZSessionFilter { project_id: None, limit: Some(50) }))
+            .await
+            .ok()?;
     for s in sessions.into_iter().filter(|s| s.running).take(5) {
         let events = history(api, &s.id).await.ok()?;
         // If there's at least one question awaiting an answer, that's the session.
@@ -874,9 +869,10 @@ pub async fn usage(api: &AttaccaApiClient, session_id: &str) -> Option<crate::si
 
 /// This session's title. `None` when not yet present — it attaches after the first message.
 pub async fn session_title(api: &AttaccaApiClient, session_id: &str) -> Option<String> {
-    let sessions = within(api, api.list_sessions(ZSessionFilter { project_id: None, limit: Some(100) }))
-        .await
-        .ok()?;
+    let sessions =
+        within(api, api.list_sessions(ZSessionFilter { project_id: None, limit: Some(100) }))
+            .await
+            .ok()?;
     sessions
         .into_iter()
         .find(|s| s.id == session_id)
@@ -1040,10 +1036,7 @@ mod tests {
     /// The slug truncates at 16 characters, so it only survives in the display name.
     #[test]
     fn the_node_name_carries_the_working_directory() {
-        assert_eq!(
-            compose_name("arch", Some("zyris-daemon")),
-            "arch zyris-code · zyris-daemon"
-        );
+        assert_eq!(compose_name("arch", Some("zyris-daemon")), "arch zyris-code · zyris-daemon");
         assert_eq!(slug_of("arch zyris-code · zyris-daemon"), "arch-zyris-code");
         // A directory equal to the app name isn't appended — it's a duplicate.
         assert_eq!(compose_name("arch", Some("zyris-code")), "arch zyris-code");
@@ -1068,10 +1061,7 @@ mod tests {
         assert!(!another_instance_alive(dir.path(), "test"));
         let lock = claim_instance_lock(dir.path(), "test").expect("첫 창은 주인이다");
         assert!(another_instance_alive(dir.path(), "test"));
-        assert!(
-            claim_instance_lock(dir.path(), "test").is_none(),
-            "둘째 창은 주인이 될 수 없다"
-        );
+        assert!(claim_instance_lock(dir.path(), "test").is_none(), "둘째 창은 주인이 될 수 없다");
         drop(lock);
         assert!(!another_instance_alive(dir.path(), "test"), "풀렸는데 남아 있다");
     }
@@ -1083,10 +1073,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(instance_lock_path(dir.path(), "test"), "4000000000").unwrap();
         assert!(!another_instance_alive(dir.path(), "test"));
-        assert!(
-            claim_instance_lock(dir.path(), "test").is_some(),
-            "죽은 창의 잠금은 치워야 한다"
-        );
+        assert!(claim_instance_lock(dir.path(), "test").is_some(), "죽은 창의 잠금은 치워야 한다");
     }
 
     /// Changing the agent **opens a new session at the next message.** A session's agent is fixed at

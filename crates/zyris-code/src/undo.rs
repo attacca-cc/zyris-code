@@ -105,7 +105,7 @@ impl Undo {
         let _guard = self.0.lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut log = self.read_log();
         let Some(last) = log.pop() else {
-            return Err("되돌릴 편집이 없습니다.".into());
+            return Err(crate::lang::current().nothing_to_undo().to_string());
         };
         let path = PathBuf::from(&last.path);
         let backup = self.0.dir.join(&last.backup);
@@ -124,7 +124,7 @@ impl Undo {
         // would hit the same one and never reach the edits before it.
         let _ = std::fs::remove_file(&backup);
         let _ = self.write_log(&log);
-        outcome.map(|()| path).map_err(|e| format!("되돌리지 못했습니다: {e}"))
+        outcome.map(|()| path).map_err(|e| crate::lang::current().undo_failed(&e.to_string()))
     }
 
     /// Whether there is anything to revert.

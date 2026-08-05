@@ -144,14 +144,19 @@ async fn git(args: &[&str], at: Option<&Path>) -> Result<String, String> {
         cmd.current_dir(at);
     }
     let out = cmd.output().await.map_err(|e| match e.kind() {
-        std::io::ErrorKind::NotFound => "git이 없습니다. 플러그인은 git으로 받아 옵니다.".into(),
-        _ => format!("git을 돌리지 못했습니다: {e}"),
+        std::io::ErrorKind::NotFound => crate::lang::current().plugin_no_git().to_string(),
+        _ => crate::lang::current().plugin_git_error(&e.to_string()),
     })?;
     if out.status.success() {
         return Ok(String::from_utf8_lossy(&out.stdout).trim().to_string());
     }
     let why = String::from_utf8_lossy(&out.stderr);
-    Err(why.lines().last().unwrap_or("git이 실패했습니다").trim().to_string())
+    Err(why
+        .lines()
+        .last()
+        .unwrap_or_else(|| crate::lang::current().plugin_git_failed())
+        .trim()
+        .to_string())
 }
 
 /// Fetches and puts it in place. If it's already there, it isn't fetched — overwriting would silently erase local edits.
@@ -166,30 +171,27 @@ pub async fn install(text: &str) -> Result<Plugin, String> {
 /// environment variables need to be shaken.
 pub async fn install_into(dir: &Path, text: &str) -> Result<Plugin, String> {
     let Some((url, name)) = source(text) else {
-        return Err(format!(
-            "`{text}`에서 받을 곳을 못 찾았습니다. `owner/repo`나 clone할 수 있는 주소를 주세요."
-        ));
+        return Err(crate::lang::current().plugin_source_unclear(text));
     };
     let at = dir.join(&name);
     if at.exists() {
-        return Err(format!("`{name}`은 이미 있습니다. 갱신은 `/plugin update {name}`입니다."));
+        return Err(crate::lang::current().plugin_already_there(&name));
     }
-    std::fs::create_dir_all(dir).map_err(|e| format!("플러그인 자리를 못 만들었습니다: {e}"))?;
+    std::fs::create_dir_all(dir)
+        .map_err(|e| crate::lang::current().plugin_dir_error(&e.to_string()))?;
 
     // History isn't needed. A shallow clone is several times faster on big repos.
     git(&["clone", "--depth", "1", &url, &at.to_string_lossy()], None).await?;
 
     if !at.join("plugin.json").exists() {
         let _ = std::fs::remove_dir_all(&at);
-        return Err(format!(
-            "`{name}`에 plugin.json이 없어 플러그인이 아닙니다. 받은 것은 지웠습니다."
-        ));
+        return Err(crate::lang::current().plugin_no_manifest(&name));
     }
     let wanted = manifest_name(&at, &name);
     discover_in(std::slice::from_ref(&dir.to_path_buf()))
         .into_iter()
         .find(|p| p.name == wanted)
-        .ok_or_else(|| format!("`{name}`의 plugin.json을 읽지 못했습니다."))
+        .ok_or_else(|| crate::lang::current().plugin_manifest_unreadable(&name))
 }
 
 /// The name the manifest states. Without one, the directory name — same rule as `discover_in`.
@@ -209,7 +211,8 @@ pub fn remove(name: &str) -> Result<(), String> {
 
 pub fn remove_from(dir: &Path, name: &str) -> Result<(), String> {
     let at = installed_path(dir, name)?;
-    std::fs::remove_dir_all(&at).map_err(|e| format!("지우지 못했습니다: {e}"))
+    std::fs::remove_dir_all(&at)
+        .map_err(|e| crate::lang::current().plugin_remove_error(&e.to_string()))
 }
 
 /// Updates one, or everything fetched. Failures are returned along with their reasons.
@@ -267,7 +270,7 @@ fn installed_path(dir: &Path, name: &str) -> Result<PathBuf, String> {
         .into_iter()
         .find(|p| p.name == name)
         .map(|p| p.root)
-        .ok_or_else(|| format!("받아 둔 플러그인 중에 `{name}`이 없습니다."))
+        .ok_or_else(|| crate::lang::current().plugin_not_found(name))
 }
 
 /// **If one breaks, the rest survive.** An unreadable plugin is skipped with a log entry left behind.

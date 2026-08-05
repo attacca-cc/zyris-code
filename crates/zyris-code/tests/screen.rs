@@ -217,18 +217,22 @@ fn a_heal_frame_forces_every_cell_to_be_resent() {
     let frame = term.draw(|f| widgets::draw(f, &mut s)).unwrap();
     assert!(!s.force_update, "강제 플래그는 한 프레임이면 풀려야 한다");
     assert!(
-        frame.buffer.content.iter().all(|c| {
-            c.diff_option == ratatui::buffer::CellDiffOption::AlwaysUpdate
-        }),
+        frame
+            .buffer
+            .content
+            .iter()
+            .all(|c| { c.diff_option == ratatui::buffer::CellDiffOption::AlwaysUpdate }),
         "모든 칸이 강제 재출력이어야 한다"
     );
 
     // The next draw goes back to a normal diff — the flag was cleared, so no AlwaysUpdate remains.
     let frame2 = term.draw(|f| widgets::draw(f, &mut s)).unwrap();
     assert!(
-        frame2.buffer.content.iter().all(|c| {
-            c.diff_option == ratatui::buffer::CellDiffOption::None
-        }),
+        frame2
+            .buffer
+            .content
+            .iter()
+            .all(|c| { c.diff_option == ratatui::buffer::CellDiffOption::None }),
         "한 프레임 뒤에는 일반 diff로 돌아와야 한다"
     );
 }
@@ -1066,6 +1070,7 @@ fn the_picker_box_stays_inside_the_screen_with_wide_text_behind() {
 #[test]
 fn typed_answers_look_different_from_chosen_ones_in_history() {
     let mut s = State::new();
+    s.lang = zyris_code::lang::Lang::Ko;
     apply(
         &mut s,
         &Action::Frame(AppFrame::Event {
@@ -1620,6 +1625,7 @@ fn long_session_list(n: usize) -> zyris_code::picker::Picker {
 #[test]
 fn a_long_list_shows_how_many_are_left() {
     let mut s = State::new();
+    s.lang = zyris_code::lang::Lang::Ko;
     s.picker = Some(long_session_list(40));
     let screen = dump(&mut s, 80, 16);
     assert!(screen.contains("개 더"), "남은 개수가 없다:\n{screen}");

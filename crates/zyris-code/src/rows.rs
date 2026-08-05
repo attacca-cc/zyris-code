@@ -47,8 +47,8 @@ pub struct Fold {
 
 pub type Folds = HashMap<i64, Fold>;
 
-/// The prefix in the answer text that marks a "direct input". `question::answer_text` attaches it.
-pub const FREE_MARK: &str = "직접 입력:";
+/// The prefix in the answer text that marks a "direct input". `question::answer_text` attaches it
+/// with `lang::free_mark()` — `make` detects it with the same lang.
 
 /// The rendered result. Along with the lines it gives **which line is the head of which work card**.
 ///
@@ -74,8 +74,8 @@ pub struct Active<'a> {
     pub answering: &'a crate::question::Answering,
 }
 
-pub fn rows(items: &[Item], width: u16, folds: &Folds) -> Rendered {
-    rows_with(items, width, folds, None)
+pub fn rows(items: &[Item], width: u16, folds: &Folds, lang: crate::lang::Lang) -> Rendered {
+    rows_with(items, width, folds, None, lang)
 }
 
 /// Lays out all items at once. Used by tests and small screens.
@@ -87,9 +87,10 @@ pub fn rows_with(
     width: u16,
     folds: &Folds,
     active: Option<Active<'_>>,
+    lang: crate::lang::Lang,
 ) -> Rendered {
     let mut cache = Cache::new();
-    cache.layout(items, width, folds, active.map(|a| a.seq));
+    cache.layout(items, width, folds, active.map(|a| a.seq), lang);
     Rendered { lines: cache.window(0, cache.total()), cards: cache.cards().clone() }
 }
 
@@ -179,7 +180,14 @@ impl Cache {
     ///
     /// `skip` is the seq of the question currently being answered in the lower panel — drawing it again
     /// in the transcript would show the same question twice.
-    pub fn layout(&mut self, items: &[Item], width: u16, folds: &Folds, skip: Option<i64>) {
+    pub fn layout(
+        &mut self,
+        items: &[Item],
+        width: u16,
+        folds: &Folds,
+        skip: Option<i64>,
+        lang: crate::lang::Lang,
+    ) {
         // A width change moves every wrap point. Throw it all away.
         if self.width != width {
             self.width = width;
@@ -200,7 +208,7 @@ impl Cache {
                 None => false,
             };
             if !fresh {
-                let made = make(item, width, folds);
+                let made = make(item, width, folds, lang);
                 self.made.insert(seq, (item.clone(), now, made));
                 self.renders += 1;
             }
@@ -263,7 +271,7 @@ fn blank() -> Line<'static> {
 }
 
 /// Lays one item out into lines. This is the only place markdown is parsed.
-fn make(item: &Item, width: u16, folds: &Folds) -> Made {
+fn make(item: &Item, width: u16, folds: &Folds, lang: crate::lang::Lang) -> Made {
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut heads: Vec<(usize, i64)> = Vec::new();
     let fold = folds.get(&item.seq()).copied().unwrap_or_default();
@@ -275,8 +283,9 @@ fn make(item: &Item, width: u16, folds: &Folds) -> Made {
                 // Answer lines come in the form `  - 직접 입력: …` — the list marker must be stripped first
                 // for the prefix to show.
                 let bare = raw.trim_start().trim_start_matches("- ").trim_start();
-                let typed = bare.starts_with(FREE_MARK);
-                let body = if typed { bare.trim_start_matches(FREE_MARK).trim() } else { raw };
+                let typed = bare.starts_with(lang.free_mark());
+                let body =
+                    if typed { bare.trim_start_matches(lang.free_mark()).trim() } else { raw };
                 let style = if typed {
                     Style::default().fg(theme::ACCENT_HOVER).add_modifier(Modifier::ITALIC)
                 } else {
@@ -331,7 +340,7 @@ fn make(item: &Item, width: u16, folds: &Folds) -> Made {
         }
         // The question being answered doesn't come here — `layout` filters it out.
         Item::Question { steps, answered, .. } => {
-            out.extend(question_rows(steps, *answered, width));
+            out.extend(question_rows(steps, *answered, width, lang));
         }
         // What the app said. It's a third voice that is neither person nor agent, so it gets its own marker.
         Item::System { text, .. } => {
@@ -353,7 +362,7 @@ fn make(item: &Item, width: u16, folds: &Folds) -> Made {
         Item::Work { seq, title, parts } => {
             let marker = if fold.open { "▾ " } else { "▸ " };
             // The title is empty when the run starts and a small model fills it in later.
-            let head = if title.is_empty() { "작업 중…" } else { title.as_str() };
+            let head = if title.is_empty() { lang.working() } else { title.as_str() };
             // Pressing this line folds and unfolds this card. Which screen line it is
             // is decided by `layout`, which knows the layout.
             heads.push((0, *seq));
@@ -365,7 +374,7 @@ fn make(item: &Item, width: u16, folds: &Folds) -> Made {
                     Style::default().fg(theme::TEXT_MUTED).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
-                    format!("  ·  도구 {tools}개"),
+                    format!("  ·  {}", lang.tool_count(tools)),
                     Style::default().fg(theme::TEXT_MUTED),
                 ),
             ];
@@ -396,18 +405,13 @@ fn make(item: &Item, width: u16, folds: &Folds) -> Made {
                         // as Ctrl+O — a click toggles the card fold, it doesn't open tool detail.
                         for line in markdown::render(text, body_width(width)) {
                             heads.push((out.len(), *seq));
-                            let mut spans = vec![Span::styled(
-                                "┊ ",
-                                Style::default().fg(theme::BORDER_LIGHT),
-                            )];
+                            let mut spans =
+                                vec![Span::styled("┊ ", Style::default().fg(theme::BORDER_LIGHT))];
                             // The whole body is repainted dim. At the same brightness as the answer,
                             // the conclusion wouldn't be visible — losing emphasis and inline
                             // code colours inside reasoning is the price paid for that.
                             spans.extend(line.spans.into_iter().map(|s| {
-                                Span::styled(
-                                    s.content.to_string(),
-                                    s.style.fg(theme::TEXT_MUTED),
-                                )
+                                Span::styled(s.content.to_string(), s.style.fg(theme::TEXT_MUTED))
                             }));
                             out.push(Line::from(spans));
                         }
@@ -477,7 +481,7 @@ fn make(item: &Item, width: u16, folds: &Folds) -> Made {
                                 // just doubles the screen length, and what the person reads is the diff.
                                 Some(d) => {
                                     for line in &d.lines {
-                                        out.push(diff_line(line, body_width(width) as usize));
+                                        out.push(diff_line(line, body_width(width) as usize, lang));
                                     }
                                 }
                                 // Detail is drawn **per section**. `event::tool_detail` assembles it with
@@ -489,6 +493,7 @@ fn make(item: &Item, width: u16, folds: &Folds) -> Made {
                                         &step.detail,
                                         body_width(width),
                                         step.failed,
+                                        lang,
                                     ));
                                 }
                             }
@@ -519,13 +524,17 @@ fn counts(added: u32, removed: u32) -> Vec<Span<'static>> {
 /// record looked different, the person wouldn't know they're the same. That's why it's `pub(crate)`.
 ///
 /// `width` is the width text can use (`body_width`); the two-space indent is subtracted here.
-pub(crate) fn diff_line(line: &crate::tools::diff::DiffLine, width: usize) -> Line<'static> {
+pub(crate) fn diff_line(
+    line: &crate::tools::diff::DiffLine,
+    width: usize,
+    lang: crate::lang::Lang,
+) -> Line<'static> {
     use crate::tools::diff::DiffLine;
     let (text, colour) = match line {
         DiffLine::Add(s) => (format!("+{s}"), theme::DIFF_ADD),
         DiffLine::Del(s) => (format!("-{s}"), theme::DIFF_DEL),
         DiffLine::Keep(s) => (format!(" {s}"), theme::TEXT_MUTED),
-        DiffLine::Skip(n) => (format!(" … {n}줄 생략"), theme::BORDER_LIGHT),
+        DiffLine::Skip(n) => (lang.diff_skip(*n), theme::BORDER_LIGHT),
     };
     Line::from(vec![
         Span::styled("  ", Style::default().fg(theme::BORDER_LIGHT)),
@@ -580,16 +589,18 @@ fn wrap_plain(text: &str, width: u16) -> Vec<String> {
     out
 }
 
-/// Section heads of tool detail. `event::tool_detail` assembles them under these names.
-const TOOL_SECTIONS: [&str; 4] = ["인자", "출력", "결과", "오류"];
-
-/// Draws the tool detail ("인자\n…\n\n출력\n…") **as a box**.
+/// Draws the tool detail ("Args\n…\n\nOutput\n…") **as a box**.
 ///
 /// Laid out as plain text, JSON dumps and shell output wouldn't be told apart. The whole detail is
 /// wrapped in a border to separate it from the space below the tool row, and the "인자/출력/결과/오류" heads are
 /// painted separately in colour and markers. A failed tool is danger-coloured down to its border. Not parsing
 /// it as markdown is as before — if JSON's `*`·`_` got eaten as emphasis, the original text would break.
-fn tool_detail_lines(detail: &str, width: u16, failed: bool) -> Vec<Line<'static>> {
+fn tool_detail_lines(
+    detail: &str,
+    width: u16,
+    failed: bool,
+    lang: crate::lang::Lang,
+) -> Vec<Line<'static>> {
     let border = if failed { theme::DANGER } else { theme::BORDER_LIGHT };
     // Inner width after removing the "│ " gutter. Together with the borders it equals the screen width.
     let inner = width.saturating_sub(2).max(8);
@@ -605,30 +616,33 @@ fn tool_detail_lines(detail: &str, width: u16, failed: bool) -> Vec<Line<'static
     let mut prev_blank = true;
     for raw in detail.lines() {
         let trimmed = raw.trim();
-        // A head picks a `TOOL_SECTIONS` element verbatim — storing a slice borrowed from `detail`
-        // would let `section` outlive `detail`.
-        let head = TOOL_SECTIONS.iter().copied().find(|s| *s == trimmed);
+        // A head picks a `lang.tool_sections()` element verbatim — storing a slice borrowed from
+        // `detail` would let `section` outlive `detail`.
+        let head = lang.tool_sections().iter().copied().find(|s| *s == trimmed);
         if let (Some(head), true) = (head, prev_blank) {
             section = Some(head);
             let (mark, color) = match head {
-                "인자" => ("⎿ 인자", theme::TOOL_ARG),
-                "출력" => ("⎿ 출력", theme::ACCENT),
-                "결과" => ("⎿ 결과", theme::BORDER_LIGHT),
-                _ => ("⎿ 오류", theme::DANGER),
+                h if h == lang.detail_args() => {
+                    (format!("⎿ {}", lang.detail_args()), theme::TOOL_ARG)
+                }
+                h if h == lang.detail_output() => {
+                    (format!("⎿ {}", lang.detail_output()), theme::ACCENT)
+                }
+                h if h == lang.detail_result() => {
+                    (format!("⎿ {}", lang.detail_result()), theme::BORDER_LIGHT)
+                }
+                _ => (format!("⎿ {}", lang.detail_error()), theme::DANGER),
             };
             out.push(Line::from(vec![
                 Span::styled("│ ", Style::default().fg(border)),
-                Span::styled(
-                    mark.to_string(),
-                    Style::default().fg(color).add_modifier(Modifier::BOLD),
-                ),
+                Span::styled(mark, Style::default().fg(color).add_modifier(Modifier::BOLD)),
             ]));
             prev_blank = false;
             continue;
         }
         let color = match section {
-            Some("오류") => theme::DANGER,
-            Some("출력") => theme::TEXT,
+            Some(h) if h == lang.detail_error() => theme::DANGER,
+            Some(h) if h == lang.detail_output() => theme::TEXT,
             _ => theme::TEXT_MUTED,
         };
         for line in wrap_plain(raw, inner).into_iter() {
@@ -652,6 +666,7 @@ fn question_rows(
     steps: &[crate::question::Step],
     answered: bool,
     width: u16,
+    lang: crate::lang::Lang,
 ) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     let Some(step) = steps.first() else {
@@ -670,7 +685,7 @@ fn question_rows(
     ));
     if steps.len() > 1 {
         head.push(Span::styled(
-            format!("  ·  {}단계", steps.len()),
+            format!("  ·  {}", lang.step_count(steps.len())),
             Style::default().fg(theme::TEXT_MUTED),
         ));
     }
@@ -722,7 +737,7 @@ mod tests {
     #[test]
     fn a_folded_card_hides_thinking_but_shows_tools() {
         let folds = Folds::from([(1, Fold::default())]);
-        let out = plain(&rows(&[work()], 40, &folds));
+        let out = plain(&rows(&[work()], 40, &folds, crate::lang::Lang::Ko));
         assert!(out[0].contains("스크롤 계산 위치를 찾는 중"), "머리줄이 없다: {out:?}");
         assert!(out.iter().any(|l| l.contains("grep")), "접혀도 도구는 보여야 한다: {out:?}");
         assert!(
@@ -735,7 +750,7 @@ mod tests {
     #[test]
     fn an_open_card_interleaves_thinking_with_tools() {
         let folds = Folds::from([(1, Fold { open: true })]);
-        let out = plain(&rows(&[work()], 40, &folds));
+        let out = plain(&rows(&[work()], 40, &folds, crate::lang::Lang::Ko));
         let think = out.iter().position(|l| l.contains("먼저 구조를 보자")).expect("생각이 없다");
         let tool = out.iter().position(|l| l.contains("grep")).expect("도구가 없다");
         assert!(think < tool, "생각이 도구보다 앞에 있어야 한다: {out:?}");
@@ -744,7 +759,7 @@ mod tests {
     #[test]
     fn an_open_card_shows_reasoning_and_steps() {
         let folds = Folds::from([(1, Fold { open: true })]);
-        let out = plain(&rows(&[work()], 40, &folds));
+        let out = plain(&rows(&[work()], 40, &folds, crate::lang::Lang::Ko));
         assert!(out.iter().any(|l| l.contains("먼저 구조를 보자")), "{out:?}");
         assert!(out.iter().any(|l| l.contains("grep")), "{out:?}");
     }
@@ -753,7 +768,7 @@ mod tests {
     /// so the "steps" suffix doesn't point at them.
     #[test]
     fn a_card_head_counts_tools_not_steps() {
-        let out = plain(&rows(&[work()], 60, &Folds::new()));
+        let out = plain(&rows(&[work()], 60, &Folds::new(), crate::lang::Lang::Ko));
         assert!(out[0].contains("도구 1개"), "{out:?}");
         assert!(!out[0].contains("단계"), "{out:?}");
     }
@@ -762,7 +777,7 @@ mod tests {
     /// (Tool rows still stand on that screen.)
     #[test]
     fn a_card_with_no_fold_state_defaults_to_folded() {
-        let out = plain(&rows(&[work()], 40, &Folds::new()));
+        let out = plain(&rows(&[work()], 40, &Folds::new(), crate::lang::Lang::Ko));
         assert!(out[0].contains("스크롤 계산 위치를 찾는 중"), "{out:?}");
         assert!(!out.iter().any(|l| l.contains("먼저 구조를 보자")), "추론이 보인다: {out:?}");
         assert!(out.iter().any(|l| l.contains("grep")), "도구가 안 보인다: {out:?}");
@@ -770,7 +785,12 @@ mod tests {
 
     #[test]
     fn a_user_message_is_marked_with_the_accent_bar() {
-        let out = plain(&rows(&[Item::User { seq: 1, text: "안녕".into() }], 40, &Folds::new()));
+        let out = plain(&rows(
+            &[Item::User { seq: 1, text: "안녕".into() }],
+            40,
+            &Folds::new(),
+            crate::lang::Lang::Ko,
+        ));
         assert!(out[0].starts_with('▌'), "{out:?}");
     }
 
@@ -780,7 +800,7 @@ mod tests {
     fn a_tool_row_shows_the_short_name() {
         let items = [work_at(1)];
         let folds = Folds::from([(1, Fold { open: true })]);
-        let out = plain(&rows(&items, 60, &folds));
+        let out = plain(&rows(&items, 60, &folds, crate::lang::Lang::Ko));
         let row = out.iter().find(|l| l.contains("grep")).expect("{out:?}");
         assert!(!row.contains("zyris__"), "와이어 이름이 그대로 나온다: {row:?}");
     }
@@ -791,7 +811,7 @@ mod tests {
     fn a_tool_row_stands_out_from_the_reasoning_around_it() {
         let items = [work_at(1)];
         let folds = Folds::from([(1, Fold { open: true })]);
-        let r = rows(&items, 60, &folds);
+        let r = rows(&items, 60, &folds, crate::lang::Lang::Ko);
         let row = r
             .lines
             .iter()
@@ -807,7 +827,7 @@ mod tests {
     fn the_name_and_its_summary_are_coloured_apart() {
         let items = [work_at(1)];
         let folds = Folds::from([(1, Fold { open: true })]);
-        let r = rows(&items, 60, &folds);
+        let r = rows(&items, 60, &folds, crate::lang::Lang::Ko);
         let row = r
             .lines
             .iter()
@@ -833,7 +853,7 @@ mod tests {
                 diff: Some(d),
             })],
         }];
-        let out = plain(&rows(&items, 60, &Folds::new()));
+        let out = plain(&rows(&items, 60, &Folds::new(), crate::lang::Lang::Ko));
         assert!(out[0].contains("+12"), "머리줄에 수치가 없다: {out:?}");
         assert!(out[0].contains("−3"), "머리줄에 수치가 없다: {out:?}");
         assert!(
@@ -845,7 +865,7 @@ mod tests {
     /// Sticking `+0 −0` on a card that changed nothing is its own kind of noise.
     #[test]
     fn a_card_that_changed_nothing_gets_no_counts() {
-        let out = plain(&rows(&[work()], 60, &Folds::new()));
+        let out = plain(&rows(&[work()], 60, &Folds::new(), crate::lang::Lang::Ko));
         assert!(!out[0].contains('+'), "{out:?}");
     }
 
@@ -854,7 +874,7 @@ mod tests {
     #[test]
     fn the_band_never_leaks_trailing_spaces_into_the_copy() {
         let items = [Item::User { seq: 1, text: "안녕".into() }];
-        for line in plain(&rows(&items, 60, &Folds::new())) {
+        for line in plain(&rows(&items, 60, &Folds::new(), crate::lang::Lang::Ko)) {
             assert_eq!(line, line.trim_end(), "꼬리 공백이 붙었다: {line:?}");
         }
     }
@@ -863,7 +883,7 @@ mod tests {
     #[test]
     fn the_user_band_rides_on_the_line_not_the_spans() {
         let items = [Item::User { seq: 1, text: "안녕".into() }];
-        let r = rows(&items, 60, &Folds::new());
+        let r = rows(&items, 60, &Folds::new(), crate::lang::Lang::Ko);
         assert_eq!(r.lines[0].style.bg, Some(theme::USER_BG));
         assert!(r.lines[0].spans.iter().all(|s| s.style.bg.is_none()), "span에 배경이 칠해졌다");
     }
@@ -872,7 +892,7 @@ mod tests {
     #[test]
     fn the_user_bar_runs_down_every_line() {
         let items = [Item::User { seq: 1, text: "첫 줄\n둘째 줄".into() }];
-        let out = plain(&rows(&items, 40, &Folds::new()));
+        let out = plain(&rows(&items, 40, &Folds::new(), crate::lang::Lang::Ko));
         assert!(out.len() >= 2, "{out:?}");
         assert!(out.iter().all(|l| l.starts_with('▌')), "{out:?}");
     }
@@ -882,7 +902,7 @@ mod tests {
     fn the_user_bar_also_runs_down_wrapped_lines() {
         let long = "아주 긴 문장을 하나 적어서 좁은 폭에서 반드시 여러 줄로 접히게 만든다";
         let items = [Item::User { seq: 1, text: long.into() }];
-        let out = plain(&rows(&items, 24, &Folds::new()));
+        let out = plain(&rows(&items, 24, &Folds::new(), crate::lang::Lang::Ko));
         assert!(out.len() >= 2, "안 접혔다: {out:?}");
         assert!(out.iter().all(|l| l.starts_with('▌')), "{out:?}");
     }
@@ -892,7 +912,7 @@ mod tests {
     #[test]
     fn an_agent_answer_is_marked_too() {
         let items = [Item::Agent { seq: 1, text: "그건 rows.rs가 정합니다.".into() }];
-        let out = plain(&rows(&items, 40, &Folds::new()));
+        let out = plain(&rows(&items, 40, &Folds::new(), crate::lang::Lang::Ko));
         assert!(out[0].starts_with('◆'), "{out:?}");
         assert!(out[0].contains("rows.rs가 정합니다"), "{out:?}");
     }
@@ -901,7 +921,7 @@ mod tests {
     #[test]
     fn only_the_first_line_of_an_answer_is_marked() {
         let items = [Item::Agent { seq: 1, text: "첫 줄\n\n둘째 문단".into() }];
-        let out = plain(&rows(&items, 40, &Folds::new()));
+        let out = plain(&rows(&items, 40, &Folds::new(), crate::lang::Lang::Ko));
         assert_eq!(out.iter().filter(|l| l.starts_with('◆')).count(), 1, "{out:?}");
     }
 
@@ -910,7 +930,7 @@ mod tests {
     #[test]
     fn reasoning_does_not_use_the_code_block_gutter() {
         let folds = Folds::from([(1, Fold { open: true })]);
-        let out = plain(&rows(&[work()], 40, &folds));
+        let out = plain(&rows(&[work()], 40, &folds, crate::lang::Lang::Ko));
         let think = out.iter().find(|l| l.contains("먼저 구조를 보자")).expect("추론 줄이 없다");
         assert!(think.starts_with('┊'), "{think:?}");
     }
@@ -919,7 +939,7 @@ mod tests {
     #[test]
     fn reasoning_is_dimmer_than_the_answer() {
         let folds = Folds::from([(1, Fold { open: true })]);
-        let r = rows(&[work()], 40, &folds);
+        let r = rows(&[work()], 40, &folds, crate::lang::Lang::Ko);
         // Markdown splits words into several spans — searching a single span won't find it.
         let joined =
             |l: &Line<'static>| -> String { l.spans.iter().map(|s| s.content.as_ref()).collect() };
@@ -944,7 +964,7 @@ mod tests {
     #[test]
     fn an_error_is_always_visible_and_red() {
         let items = [Item::Error { seq: 1, message: "크레딧이 부족합니다".into() }];
-        let r = rows(&items, 40, &Folds::new());
+        let r = rows(&items, 40, &Folds::new(), crate::lang::Lang::Ko);
         assert!(plain(&r).iter().any(|l| l.contains("크레딧이 부족합니다")));
         assert!(
             r.lines.iter().flat_map(|l| &l.spans).any(|s| s.style.fg == Some(crate::theme::DANGER)),
@@ -972,9 +992,9 @@ mod tests {
     fn the_cache_draws_exactly_what_the_plain_path_draws() {
         let items = mixed();
         for folds in [Folds::new(), Folds::from([(2, Fold { open: true })])] {
-            let want = rows(&items, 40, &folds);
+            let want = rows(&items, 40, &folds, crate::lang::Lang::Ko);
             let mut cache = Cache::new();
-            cache.layout(&items, 40, &folds, None);
+            cache.layout(&items, 40, &folds, None, crate::lang::Lang::Ko);
 
             assert_eq!(cache.total(), want.lines.len(), "줄 수가 같아야 한다");
             assert_eq!(cache.plain(), want.plain(), "내용이 같아야 한다");
@@ -987,10 +1007,10 @@ mod tests {
     fn a_window_gives_back_only_that_slice() {
         let items = mixed();
         let folds = Folds::new();
-        let all = rows(&items, 40, &folds).plain();
+        let all = rows(&items, 40, &folds, crate::lang::Lang::Ko).plain();
 
         let mut cache = Cache::new();
-        cache.layout(&items, 40, &folds, None);
+        cache.layout(&items, 40, &folds, None, crate::lang::Lang::Ko);
         for (from, to) in [(0usize, 3usize), (2, 5), (1, cache.total()), (0, cache.total())] {
             let got: Vec<String> = cache
                 .window(from, to)
@@ -1010,18 +1030,18 @@ mod tests {
         let folds = Folds::new();
         let mut cache = Cache::new();
 
-        cache.layout(&items, 40, &folds, None);
+        cache.layout(&items, 40, &folds, None, crate::lang::Lang::Ko);
         let first = cache.renders();
         assert_eq!(first, items.len() as u64, "처음에는 전부 그린다");
 
-        cache.layout(&items, 40, &folds, None);
+        cache.layout(&items, 40, &folds, None, crate::lang::Lang::Ko);
         assert_eq!(cache.renders(), first, "안 바뀌었으면 한 줄도 다시 그리지 않는다");
 
         // A delta was appended to the answer — only that item should be redrawn.
         if let Item::Agent { text, .. } = &mut items[2] {
             text.push_str("| c | 3 |\n");
         }
-        cache.layout(&items, 40, &folds, None);
+        cache.layout(&items, 40, &folds, None, crate::lang::Lang::Ko);
         assert_eq!(cache.renders(), first + 1, "바뀐 하나만 다시 그린다");
     }
 
@@ -1030,11 +1050,11 @@ mod tests {
     fn folding_a_card_redraws_only_that_card() {
         let items = mixed();
         let mut cache = Cache::new();
-        cache.layout(&items, 40, &Folds::new(), None);
+        cache.layout(&items, 40, &Folds::new(), None, crate::lang::Lang::Ko);
         let before = cache.renders();
 
         let opened = Folds::from([(2, Fold { open: true })]);
-        cache.layout(&items, 40, &opened, None);
+        cache.layout(&items, 40, &opened, None, crate::lang::Lang::Ko);
         assert_eq!(cache.renders(), before + 1, "펼친 카드 하나만 다시 그린다");
         assert!(
             cache.plain().iter().any(|l| l.contains("먼저 구조를 보자")),
@@ -1048,12 +1068,12 @@ mod tests {
         let items = mixed();
         let folds = Folds::new();
         let mut cache = Cache::new();
-        cache.layout(&items, 40, &folds, None);
+        cache.layout(&items, 40, &folds, None, crate::lang::Lang::Ko);
         let before = cache.renders();
 
-        cache.layout(&items, 80, &folds, None);
+        cache.layout(&items, 80, &folds, None, crate::lang::Lang::Ko);
         assert_eq!(cache.renders(), before + items.len() as u64);
-        assert_eq!(cache.plain(), rows(&items, 80, &folds).plain());
+        assert_eq!(cache.plain(), rows(&items, 80, &folds, crate::lang::Lang::Ko).plain());
     }
 
     /// The question being answered isn't drawn in the transcript — it's in the lower panel.
@@ -1070,14 +1090,14 @@ mod tests {
             Item::Question { seq: 2, steps, answered: false },
         ];
         let mut cache = Cache::new();
-        cache.layout(&items, 40, &Folds::new(), Some(2));
+        cache.layout(&items, 40, &Folds::new(), Some(2), crate::lang::Lang::Ko);
         assert!(
             !cache.plain().iter().any(|l| l.contains("어느 쪽으로 갈까요")),
             "답하는 중인 질문이 두 벌로 보이면 안 된다: {:?}",
             cache.plain()
         );
 
-        cache.layout(&items, 40, &Folds::new(), None);
+        cache.layout(&items, 40, &Folds::new(), None, crate::lang::Lang::Ko);
         assert!(
             cache.plain().iter().any(|l| l.contains("어느 쪽으로 갈까요")),
             "답이 끝나면 대화에 남아야 한다"
@@ -1090,7 +1110,7 @@ mod tests {
         let items = [work_at(1)];
         let card_open = Folds::from([(1, Fold { open: true })]);
 
-        let shut = plain(&rows(&items, 60, &card_open));
+        let shut = plain(&rows(&items, 60, &card_open, crate::lang::Lang::Ko));
         assert!(shut.iter().any(|l| l.contains("grep")), "{shut:?}");
         assert!(
             !shut.iter().any(|l| l.contains("viewport\"}")),
@@ -1103,7 +1123,7 @@ mod tests {
 
         let mut both = card_open.clone();
         both.insert(100, Fold { open: true });
-        let open = plain(&rows(&items, 60, &both));
+        let open = plain(&rows(&items, 60, &both, crate::lang::Lang::Ko));
         assert!(open.iter().any(|l| l.contains("인자")), "상세가 안 나온다: {open:?}");
         assert!(open.iter().any(|l| l.contains("viewport")), "{open:?}");
     }
@@ -1113,7 +1133,7 @@ mod tests {
     fn a_tool_row_is_clickable_on_its_own() {
         let items = [work_at(1)];
         let folds = Folds::from([(1, Fold { open: true })]);
-        let r = rows(&items, 60, &folds);
+        let r = rows(&items, 60, &folds, crate::lang::Lang::Ko);
 
         // Since thinking lines also toggle the card fold, the same seq spans several lines — what we check is
         // "which seqs are clickable", not the number of lines.
@@ -1133,7 +1153,7 @@ mod tests {
     #[test]
     fn folded_tool_rows_are_not_clickable() {
         let items = [work_at(1)];
-        let r = rows(&items, 60, &Folds::new());
+        let r = rows(&items, 60, &Folds::new(), crate::lang::Lang::Ko);
         let mut by_seq: Vec<i64> = r.cards.values().copied().collect();
         by_seq.sort();
         assert_eq!(by_seq, vec![1], "접힌 카드에서는 머리만 눌려야 한다");
@@ -1147,12 +1167,9 @@ mod tests {
         let items = [work_at(1)];
         // The tool detail is open, but the card is folded.
         let folds = Folds::from([(100, Fold { open: true })]);
-        let out = plain(&rows(&items, 60, &folds));
+        let out = plain(&rows(&items, 60, &folds, crate::lang::Lang::Ko));
         assert!(out.iter().any(|l| l.contains("grep")), "도구 줄은 보여야 한다: {out:?}");
-        assert!(
-            !out.iter().any(|l| l.contains("인자")),
-            "접힌 카드에 도구 상세가 보인다: {out:?}"
-        );
+        assert!(!out.iter().any(|l| l.contains("인자")), "접힌 카드에 도구 상세가 보인다: {out:?}");
     }
 
     /// **Run-time messages show even when folded** — folding a card hides reasoning, not the whole
@@ -1162,12 +1179,9 @@ mod tests {
         let items = [Item::Work {
             seq: 1,
             title: "커밋하는 중".into(),
-            parts: vec![
-                Part::Text("이제 커밋합니다".into()),
-                Part::Step(step_at(100, "exec")),
-            ],
+            parts: vec![Part::Text("이제 커밋합니다".into()), Part::Step(step_at(100, "exec"))],
         }];
-        let out = plain(&rows(&items, 60, &Folds::new()));
+        let out = plain(&rows(&items, 60, &Folds::new(), crate::lang::Lang::Ko));
         assert!(
             out.iter().any(|l| l.contains("이제 커밋합니다")),
             "접혀도 메시지는 보여야 한다: {out:?}"
@@ -1182,19 +1196,12 @@ mod tests {
         let items = [Item::Work {
             seq: 1,
             title: "커밋하는 중".into(),
-            parts: vec![
-                Part::Text("이제 커밋합니다".into()),
-                Part::Step(step_at(100, "exec")),
-            ],
+            parts: vec![Part::Text("이제 커밋합니다".into()), Part::Step(step_at(100, "exec"))],
         }];
-        let r = rows(&items, 60, &Folds::new());
+        let r = rows(&items, 60, &Folds::new(), crate::lang::Lang::Ko);
         let lines = r.plain();
         let row = lines.iter().position(|l| l.contains("이제 커밋합니다")).expect("메시지 줄");
-        assert!(
-            !r.cards.contains_key(&row),
-            "메시지 줄이 클릭 대상으로 잡혔다: {:?}",
-            lines[row]
-        );
+        assert!(!r.cards.contains_key(&row), "메시지 줄이 클릭 대상으로 잡혔다: {:?}", lines[row]);
     }
 
     /// **Messages, thinking, and tools stand in the order they came.** In an open card the three must interleave
@@ -1211,7 +1218,7 @@ mod tests {
             ],
         }];
         let folds = Folds::from([(1, Fold { open: true })]);
-        let out = plain(&rows(&items, 60, &folds));
+        let out = plain(&rows(&items, 60, &folds, crate::lang::Lang::Ko));
         let think = out.iter().position(|l| l.contains("먼저 상태를 보자")).unwrap();
         let text = out.iter().position(|l| l.contains("이제 커밋합니다")).unwrap();
         let tool = out.iter().position(|l| l.contains("exec")).unwrap();
@@ -1223,7 +1230,7 @@ mod tests {
     #[test]
     fn a_thinking_line_maps_to_the_card_fold() {
         let items = [work_at(1)];
-        let r = rows(&items, 60, &Folds::from([(1, Fold { open: true })]));
+        let r = rows(&items, 60, &Folds::from([(1, Fold { open: true })]), crate::lang::Lang::Ko);
         let lines = r.plain();
         let row = lines.iter().position(|l| l.contains("먼저 구조를 보자")).expect("추론 줄");
         let seq = r.cards.get(&row).copied().expect("추론 줄이 클릭 대상이어야 한다");
@@ -1234,11 +1241,14 @@ mod tests {
     /// colour and markers, with the body below. The eye must read at a glance what's an argument and what's a result.
     #[test]
     fn tool_detail_lines_label_their_sections() {
-        let out = tool_detail_lines("인자\n{\"cmd\": \"git push\"}\n\n출력\nUp to date", 60, false);
-        let plain: Vec<String> = out
-            .iter()
-            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
-            .collect();
+        let out = tool_detail_lines(
+            "인자\n{\"cmd\": \"git push\"}\n\n출력\nUp to date",
+            60,
+            false,
+            crate::lang::Lang::Ko,
+        );
+        let plain: Vec<String> =
+            out.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect()).collect();
         assert!(plain[0].starts_with('┌'), "위 테두리가 있어야 한다: {plain:?}");
         assert!(plain.last().unwrap().starts_with('└'), "아래 테두리가 있어야 한다: {plain:?}");
         assert!(plain.iter().any(|l| l.contains("⎿ 인자")), "인자 머리말이 없다: {plain:?}");
@@ -1247,7 +1257,7 @@ mod tests {
         assert!(plain.iter().any(|l| l.contains("Up to date")), "출력 본문이 없다: {plain:?}");
 
         // The error section is painted in the danger colour.
-        let err = tool_detail_lines("오류\nboom", 60, false);
+        let err = tool_detail_lines("오류\nboom", 60, false, crate::lang::Lang::Ko);
         assert!(
             err.iter().any(|l| {
                 l.spans.iter().any(|s| s.content == "boom" && s.style.fg == Some(theme::DANGER))
@@ -1260,11 +1270,8 @@ mod tests {
     /// one so a skim catches what went wrong.
     #[test]
     fn a_failed_tools_detail_box_is_red() {
-        let out = tool_detail_lines("인자\n{}", 60, true);
-        assert!(
-            out[0].spans[0].style.fg == Some(theme::DANGER),
-            "위 테두리가 위험색이 아니다"
-        );
+        let out = tool_detail_lines("인자\n{}", 60, true, crate::lang::Lang::Ko);
+        assert!(out[0].spans[0].style.fg == Some(theme::DANGER), "위 테두리가 위험색이 아니다");
         assert!(
             out.last().unwrap().spans[0].style.fg == Some(theme::DANGER),
             "아래 테두리가 위험색이 아니다"
@@ -1287,7 +1294,7 @@ mod tests {
             })],
         }];
         let folds = Folds::from([(1, Fold { open: true })]);
-        let r = rows(&items, 60, &folds);
+        let r = rows(&items, 60, &folds, crate::lang::Lang::Ko);
         assert_eq!(
             r.cards.values().copied().collect::<Vec<_>>(),
             vec![1],
@@ -1307,12 +1314,12 @@ mod tests {
         let items = [work_at(1)];
         let card_open = Folds::from([(1, Fold { open: true })]);
         let mut cache = Cache::new();
-        cache.layout(&items, 60, &card_open, None);
+        cache.layout(&items, 60, &card_open, None, crate::lang::Lang::Ko);
         let before = cache.renders();
 
         let mut both = card_open.clone();
         both.insert(100, Fold { open: true });
-        cache.layout(&items, 60, &both, None);
+        cache.layout(&items, 60, &both, None, crate::lang::Lang::Ko);
         assert_eq!(cache.renders(), before + 1, "도구를 폈는데 다시 안 그렸다");
         assert!(cache.plain().iter().any(|l| l.contains("인자")), "{:?}", cache.plain());
     }
@@ -1321,7 +1328,7 @@ mod tests {
     #[test]
     fn a_work_card_without_a_title_yet_says_it_is_working() {
         let items = [Item::Work { seq: 1, title: String::new(), parts: vec![] }];
-        let out = plain(&rows(&items, 40, &Folds::new()));
+        let out = plain(&rows(&items, 40, &Folds::new(), crate::lang::Lang::Ko));
         assert!(out[0].contains("작업 중"), "{out:?}");
     }
 }

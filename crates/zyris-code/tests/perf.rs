@@ -50,12 +50,12 @@ const HEIGHT: usize = 45;
 
 /// The old way — rebuilds everything every frame.
 fn frame_all(t: &mut Timeline, folds: &Folds) -> usize {
-    rows(t.items(), WIDTH, folds).lines.len()
+    rows(t.items(), WIDTH, folds, zyris_code::lang::Lang::En).lines.len()
 }
 
 /// The current way — rebuilds only changed items and lays out just the visible window.
 fn frame_cached(t: &mut Timeline, cache: &mut Cache, folds: &Folds) -> usize {
-    cache.layout(t.items(), WIDTH, folds, None);
+    cache.layout(t.items(), WIDTH, folds, None, zyris_code::lang::Lang::En);
     let top = cache.total().saturating_sub(HEIGHT);
     cache.window(top, top + HEIGHT).len()
 }

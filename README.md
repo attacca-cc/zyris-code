@@ -9,7 +9,8 @@ editing files, searching the tree, running shell commands, and exposing the tool
 of any local MCP server you configure. The agent runs on Attacca; the tools run
 here.
 
-> The interface itself is currently Korean-only. Mode names and prompts are given
+> The interface is bilingual (Korean and English), switchable with `/lang` — English is the
+> default, and Korean follows the locale or your choice. Mode names and prompts are given
 > in both languages below where it matters.
 
 ```

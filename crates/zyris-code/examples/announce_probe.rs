@@ -201,7 +201,7 @@ fn check_the_diff_paints(events: &[zyris_attacca::ZSessionEvent]) {
             timeline.upsert(entry);
         }
     }
-    let drawn = rows(timeline.items(), 100, &folds);
+    let drawn = rows(timeline.items(), 100, &folds, zyris_code::lang::Lang::En);
     let coloured = |want: ratatui::style::Color| -> Vec<String> {
         drawn
             .lines

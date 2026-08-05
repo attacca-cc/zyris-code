@@ -155,36 +155,32 @@ impl LocalEdit {
                     Ok(v) => v,
                     Err(e) => e.to_string(),
                 };
-                return Err(WireError::invalid_params(format!(
-                    "'{}'이(가) 읽은 뒤 바뀌었습니다 (base_version {base} ≠ 지금 {now_s}). \
-                     file_io.read로 지금 내용을 다시 읽고, 새 버전 토큰을 base_version으로 다시 시도하세요.",
-                    clip(path)
-                )));
+                return Err(WireError::invalid_params(
+                    crate::lang::current().edit_changed_after_read(&clip(path), base, &now_s),
+                ));
             }
         }
         // Whole-file writes default to new files only — to overwrite an existing file you must
         // present proof via base_version that you've seen the file.
         if require_base_for_existing && existed && base_version.is_none() {
-            return Err(WireError::invalid_params(format!(
-                "'{}'은(는) 이미 있는 파일입니다 — 덮어쓰려면 base_version을 주세요. \
-                 읽은 응답의 stat.modified_unix_ms:stat.size 또는 code_edit.version의 version을 그대로 넘기세요.",
-                clip(path)
-            )));
+            return Err(WireError::invalid_params(
+                crate::lang::current().edit_exists_no_base(&clip(path)),
+            ));
         }
 
         let new = change(&old)?;
         if let Some(parent) = full.parent() {
             tokio::fs::create_dir_all(parent).await.map_err(|e| {
-                WireError::internal(format!("상위 디렉터리를 만들지 못했습니다: {e}"))
+                WireError::internal(crate::lang::current().edit_mkdir_error(&e.to_string()))
             })?;
         }
         // **Snapshot right before writing.** All three tools meet here, so there's a single spot.
         // A failure doesn't block the edit — if a missing safety net stopped work,
         // you'd end up with files that can't be fixed (see `undo::snapshot`'s comment).
         self.undo.snapshot(&full);
-        atomic_write(&full, new.as_bytes())
-            .await
-            .map_err(|e| WireError::internal(format!("쓰지 못했습니다: {e}")))?;
+        atomic_write(&full, new.as_bytes()).await.map_err(|e| {
+            WireError::internal(crate::lang::current().edit_write_error(&e.to_string()))
+        })?;
         let shown = full.to_string_lossy().to_string();
         let d = diff(&old, &new, &shown);
         let version = current_version(&full).unwrap_or_else(|_| "?".into());
@@ -249,17 +245,12 @@ async fn atomic_write(full: &Path, content: &[u8]) -> std::io::Result<()> {
 fn substitute(body: &str, spec: &EditSpec) -> Result<String, WireError> {
     let hits = body.matches(&spec.old_string).count();
     match hits {
-        0 => Err(WireError::invalid_params(format!(
-            "'{}'을(를) 파일에서 찾지 못했습니다. file_io.read로 지금 내용을 다시 읽으세요.",
-            clip(&spec.old_string)
-        ))),
+        0 => Err(WireError::invalid_params(
+            crate::lang::current().edit_not_found(&clip(&spec.old_string)),
+        )),
         1 => Ok(body.replacen(&spec.old_string, &spec.new_string, 1)),
         _ if spec.replace_all => Ok(body.replace(&spec.old_string, &spec.new_string)),
-        n => Err(WireError::invalid_params(format!(
-            "'{}'이(가) 파일에 {n}번 나옵니다. 앞뒤를 더 붙여 한 곳만 가리키거나 \
-             replace_all을 켜세요.",
-            clip(&spec.old_string)
-        ))),
+        n => Err(WireError::invalid_params(crate::lang::current().edit_ambiguous(n))),
     }
 }
 
@@ -318,10 +309,14 @@ impl CodeEdit for LocalEdit {
     async fn version(&self, path: String) -> zyris::Result<FileVersion> {
         let full = resolve_under(&self.root, &path);
         let content = tokio::fs::read(&full).await.map_err(|e| {
-            WireError::invalid_params(format!("'{}'을(를) 읽지 못했습니다: {e}", clip(&path)))
+            WireError::invalid_params(
+                crate::lang::current().edit_read_error(&clip(&path), &e.to_string()),
+            )
         })?;
         let md = tokio::fs::metadata(&full).await.map_err(|e| {
-            WireError::invalid_params(format!("'{}'을(를) 확인하지 못했습니다: {e}", clip(&path)))
+            WireError::invalid_params(
+                crate::lang::current().edit_stat_error(&clip(&path), &e.to_string()),
+            )
         })?;
         let mtime_ms = mtime_ms(&md);
         let size = md.len();

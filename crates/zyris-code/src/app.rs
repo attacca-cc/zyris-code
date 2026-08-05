@@ -647,7 +647,11 @@ pub fn apply(state: &mut State, action: &Action) {
     // 잃는다 — 되살린 말을 고쳐 보내는 것이 이 기능의 목적인데 그걸 막는 셈이 된다.
     if matches!(
         action,
-        Action::Insert(_) | Action::Paste(_) | Action::Backspace | Action::Delete | Action::DeleteWord
+        Action::Insert(_)
+            | Action::Paste(_)
+            | Action::Backspace
+            | Action::Delete
+            | Action::DeleteWord
     ) {
         state.recall = None;
     }
@@ -833,16 +837,16 @@ pub fn apply(state: &mut State, action: &Action) {
                 Some(RowKind::Action(Act::Reject)) => {
                     state.asking = None;
                     state.input = Input::new();
-                    state.input.insert_str("이 질문에는 답하지 않겠습니다.");
+                    state.input.insert_str(state.lang.question_refused());
                     state.submit_now = true;
                 }
                 // 제출은 곧바로다. 답을 입력란에 실어 두면 I/O가 그대로 보낸다.
                 Some(RowKind::Action(Act::Submit)) => {
                     if let Some((_, a)) = state.asking.take() {
                         state.input = Input::new();
-                        let text = a.answer_text();
+                        let text = a.answer_text(state.lang);
                         state.input.insert_str(if text.is_empty() {
-                            "모두 건너뛰었습니다."
+                            state.lang.all_skipped()
                         } else {
                             &text
                         });
@@ -1149,30 +1153,26 @@ pub fn run_command(state: &mut State, text: &str) -> Option<crate::command::Comm
             // 흔하다) 서버의 노드 목록에서 둘을 가릴 방법이 이것뿐이다.
             // **줄 앞에 공백을 넣지 않는다.** 마크다운은 네 칸 들여쓴 줄을 코드 블록으로
             // 읽는다 — 문자열을 보기 좋게 접어 쓰면 화면에서는 상자가 되어 나온다.
-            state.timeline.say(format!(
-                "도구는 `{}`에서 돕니다.\n\n\
-                 이 노드는 **{}**로 등록돼 있습니다 — 도구 이름은 `zyris__{}__…`입니다. \
-                 `ZYRIS_NODE_NAME`으로 바꿉니다.\n\n\
-                 자격은 `{}`에 있습니다.",
-                state.cwd.display(),
-                crate::conn::node_name(),
-                crate::conn::node_slug(),
-                crate::conn::credential_home(),
+            state.timeline.say(state.lang.cwd_text(
+                &state.cwd,
+                &crate::conn::node_name(),
+                &crate::conn::node_slug(),
+                &crate::conn::credential_home(),
             ));
         }
         Command::Clear => {
             state.timeline.clear();
             // **서버의 기록은 그대로다.** 지웠다고 세션이 없어진 줄 알면 안 된다.
-            state.timeline.say("화면을 지웠습니다. thread의 기록은 그대로입니다.");
+            state.timeline.say(state.lang.clear_done());
         }
-        Command::Grants => state.timeline.say(grants_text(&state.grants)),
+        Command::Grants => state.timeline.say(state.lang.grants_text(&state.grants)),
         Command::GrantsClose => {
             let closed = state.grants.close_all();
             // **게이트에도 알려야 한다.** 여기서 지우고 마는 것은 화면만 닫는 것이다 —
             // 그 일은 I/O 자리가 `bridge.sync`로 한다(`finish_command`).
             state.timeline.say(match closed {
-                0 => "열어 둔 곳이 없었습니다.".to_string(),
-                n => format!("{n}곳을 닫았습니다. 이제 그 밖을 만지려면 다시 물어봅니다."),
+                0 => state.lang.grants_none_closed().to_string(),
+                n => state.lang.grants_closed(n),
             });
         }
         // 화면을 끄는 것은 I/O다. 깃발만 세운다.
@@ -1194,29 +1194,6 @@ pub fn run_command(state: &mut State, text: &str) -> Option<crate::command::Comm
         | Command::Undo => {}
     }
     Some(cmd)
-}
-
-/// `/grants`가 찍는 글.
-///
-/// **여는 길은 승인 화면의 `a` 하나뿐이다.** 여기서 열 수 있게 하면 승인 화면을 우회하는
-/// 두 번째 길이 생긴다 — 보는 것과 닫는 것만 둔다.
-fn grants_text(grants: &crate::tools::gate::Grants) -> String {
-    let roots = grants.roots();
-    if roots.is_empty() {
-        return "작업 디렉터리 밖으로 열어 둔 곳이 없습니다.\n\n\
-                승인 화면에서 `a`를 누르면 그 디렉터리가 이 thread 동안 열립니다."
-            .into();
-    }
-    let mut s = format!("작업 디렉터리 밖으로 {}곳이 열려 있습니다.\n", roots.len());
-    for root in roots {
-        s.push_str(&format!("\n- `{}`", root.display()));
-    }
-    // **끄면 잊는다는 것을 같이 말한다.** 디스크에 남는 줄 알면 필요 이상으로 겁을 낸다.
-    s.push_str(
-        "\n\n여기와 그 아래는 묻지 않고 만집니다. `/grants close`로 전부 닫습니다 — \
-         앱을 끄면 어차피 잊습니다.",
-    );
-    s
 }
 
 // ---------------------------------------------------------------------------
@@ -1455,14 +1432,14 @@ async fn run_inner(
             break api;
         }
         if *die.borrow() {
-            anyhow::bail!("연결이 끊겼습니다.");
+            anyhow::bail!(crate::lang::current().connection_lost());
         }
         tokio::select! {
             result = api_rx.changed() => {
                 // 보내는 쪽이 사라졌다 — 러너가 끝났다. `die`가 아닌 길로도
                 // 멈춰야 조용히 닫힌다.
                 if result.is_err() {
-                    anyhow::bail!("연결이 끊겼습니다.");
+                    anyhow::bail!(crate::lang::current().connection_lost());
                 }
             }
             _ = die.changed() => {}
@@ -1694,7 +1671,7 @@ async fn run_inner(
                         Action::Submit(_) if state.running => {}
                         Action::Submit(text) => {
                             if agent_id.is_empty() {
-                                state.set_status("에이전트를 찾지 못해 보낼 수 없습니다.");
+                                state.set_status(state.lang.agent_cannot_send());
                             } else {
                                 send_and_tell(&api, &mut state, &mut session, &agent_id, text, &tx)
                                     .await;
@@ -1984,7 +1961,7 @@ async fn run_inner(
         // 종료 예고를 먼저 내린다. 활동 줄은 그것을 무엇보다 위에 두므로(`activity.rs`),
         // 안 내리면 방금 누른 Ctrl+C의 안내가 이 마지막 한 줄을 덮는다.
         state.quit_armed_at = None;
-        state.set_status("진행 중인 턴을 멈추는 중입니다…");
+        state.set_status(state.lang.stopping_turn());
         let _ = terminal.draw(|f| widgets::draw(f, &mut state));
         // **못 멈춰도 창은 닫힌다.** 서버가 답하지 않는데 여기서 마냥 기다리면,
         // 끄려던 사람이 끌 수도 없는 화면 앞에 남는다.
@@ -2191,15 +2168,15 @@ async fn finish_command(
     use crate::command::Command;
     let Some(cmd) = run_command(state, text) else { return };
     match cmd {
-        Command::Mcp => state.timeline.say(mcp_report_text(&bridge.mcp_report())),
+        Command::Mcp => state.timeline.say(state.lang.mcp_report_text(&bridge.mcp_report())),
         Command::Skills => {
             let skills = crate::tools::skill::Skills::discover(&state.cwd);
-            state.timeline.say(skills_text(&skills.list()));
+            state.timeline.say(state.lang.skills_text(&skills.list()));
         }
         // **preamble은 안 보이는 자리다.** 조용히 안 실렸을 때 알 방법이 이것뿐이다.
         Command::Rules => {
             let found = crate::instructions::collect(&state.cwd);
-            state.timeline.say(rules_text(&found));
+            state.timeline.say(state.lang.rules_text(&found));
         }
         Command::Agent(None) => match crate::conn::within(api, api.list_agents()).await {
             Ok(agents) => {
@@ -2214,7 +2191,7 @@ async fn finish_command(
                     .collect();
                 state.picker = Some(crate::picker::Picker::agents(rows));
             }
-            Err(e) => state.timeline.say(format!("에이전트 목록을 읽지 못했습니다: {e}")),
+            Err(e) => state.timeline.say(state.lang.agent_list_error(&e.to_string())),
         },
         Command::Agent(Some(name)) => switch_agent(api, state, session, agent_id, &name).await,
         Command::Plugin(what) => {
@@ -2232,8 +2209,8 @@ async fn finish_command(
         }
         Command::Changes => {
             let said = match bridge.undo() {
-                Some(undo) => changes_text(&undo.changed(), &state.cwd),
-                None => "되돌림 기록을 아직 열지 못했습니다.".into(),
+                Some(undo) => state.lang.changes_text(&undo.changed(), &state.cwd),
+                None => state.lang.undo_log_not_ready().to_string(),
             };
             state.timeline.say(said);
         }
@@ -2245,11 +2222,11 @@ async fn finish_command(
                         // **에이전트에게는 알리지 않는다.** 도는 턴 한가운데에 "네가 한
                         // 걸 물렸다"를 끼워 넣으면 같은 편집을 다시 시도한다. 다음 턴에
                         // 파일을 읽으면 어차피 바뀐 것이 보인다.
-                        format!("되돌렸습니다: `{}`", shown.display())
+                        state.lang.reverted(&shown.display().to_string())
                     }
                     Err(why) => why,
                 },
-                None => "되돌림 기록을 아직 열지 못했습니다.".into(),
+                None => state.lang.undo_log_not_ready().to_string(),
             };
             state.timeline.say(said);
         }
@@ -2278,56 +2255,10 @@ async fn switch_agent(
             session.stage_new_default();
             // 앞 세션의 턴은 화면 밖으로 간다 — 상태줄이 "작업 중"에 얼어붙지 않게 치운다.
             leave_session(state);
-            state.timeline.say(format!(
-                "에이전트: **{name}** · 다음 메시지에서 새 thread가 열립니다. \
-                 앞 thread는 ←의 목록에 그대로 있습니다."
-            ));
+            state.timeline.say(state.lang.agent_staged(name));
         }
         Err(e) => state.timeline.say(format!("{e}")),
     }
-}
-
-/// `/changes`가 찍는 글.
-///
-/// **경로는 작업 디렉터리 기준으로 줄인다.** 절대경로 열 줄은 어느 것이 어느 것인지
-/// 눈으로 가려내기 어렵고, 정작 다른 것은 뒤쪽 몇 글자뿐이다.
-fn changes_text(changed: &[crate::undo::Changed], cwd: &std::path::Path) -> String {
-    if changed.is_empty() {
-        return "이 디렉터리에서 바꾼 파일이 없습니다.".into();
-    }
-    let mut s = format!("바꾼 파일 {}개입니다. 최근에 손댄 것이 위입니다.\n", changed.len());
-    for c in changed {
-        let shown = c.path.strip_prefix(cwd).unwrap_or(&c.path);
-        // 만든 파일이라는 것이 +N보다 먼저다 — 되돌리면 지워진다는 뜻이라 무게가 다르다.
-        let note = if c.created {
-            " · 새로 만든 것".to_string()
-        } else if c.edits > 1 {
-            format!(" · {}번 고침", c.edits)
-        } else {
-            String::new()
-        };
-        s.push_str(&format!("\n- `{}`  +{} −{}{note}", shown.display(), c.added, c.removed));
-    }
-    // **되돌릴 수 있는 범위와 같다는 것을 말해 둔다.** 이 목록을 보고 `/undo`를 누르므로,
-    // 둘의 범위가 다르면 눌러 보고서야 안다.
-    s.push_str("\n\n`/undo`가 이 기록을 뒤에서부터 되돌립니다. 앱을 껐다 켜도 남습니다.");
-    s
-}
-
-fn mcp_report_text(report: &[(String, Result<usize, String>)]) -> String {
-    if report.is_empty() {
-        return "붙은 MCP 서버가 없습니다. `.mcp.json`이나 \
-                `~/.config/zyris-code/mcp.json`에 적습니다."
-            .into();
-    }
-    let mut s = String::from("MCP 서버입니다.\n");
-    for (name, outcome) in report {
-        s.push_str(&match outcome {
-            Ok(n) => format!("\n- `{name}` — 도구 {n}개"),
-            Err(why) => format!("\n- `{name}` — 못 띄웠습니다: {why}"),
-        });
-    }
-    s
 }
 
 /// `/plugin`. **받는 것은 남의 코드를 이 컴퓨터에 놓는 일이다** — 그 사실을 말해 준다.
@@ -2336,109 +2267,24 @@ async fn run_plugin(state: &mut State, what: crate::command::Plugin) -> String {
     use crate::plugin;
 
     match what {
-        P::List => plugin_list_text(&plugin::discover(&state.cwd)),
+        P::List => state.lang.plugin_list_text(&plugin::discover(&state.cwd)),
         P::Add(source) => match plugin::install(&source).await {
-            Ok(p) => format!(
-                "**{}**을 받았습니다.{}\n\n{}\n\n\
-                 다음에 zyris-code를 다시 띄우면 붙습니다 — 도구도 스킬도 시작할 때 읽습니다.",
-                p.name,
-                if p.description.is_empty() { String::new() } else { format!(" {}", p.description) },
-                plugin_contents_text(&p),
-            ),
+            Ok(p) => {
+                let contents = state.lang.plugin_contents_text(&p);
+                state.lang.plugin_added(&p, &contents)
+            }
             Err(why) => why,
         },
         P::Remove(name) => match plugin::remove(&name) {
-            Ok(()) => format!("`{name}`을 지웠습니다. 다시 띄우면 빠집니다."),
+            Ok(()) => state.lang.plugin_removed(&name),
             Err(why) => why,
         },
         P::Update(name) => {
             let done = plugin::update(name.as_deref()).await;
-            if done.is_empty() {
-                return "받아 둔 플러그인이 없습니다.".into();
-            }
-            let mut s = String::from("갱신했습니다.\n");
-            for (name, outcome) in done {
-                s.push_str(&match outcome {
-                    Ok(out) if out.contains("up to date") || out.contains("최신") => {
-                        format!("\n- `{name}` — 이미 최신입니다")
-                    }
-                    Ok(_) => format!("\n- `{name}` — 새로 받았습니다"),
-                    Err(why) => format!("\n- `{name}` — {why}"),
-                });
-            }
-            s.push_str("\n\n다시 띄우면 반영됩니다.");
-            s
+            state.lang.plugin_update_text(&done)
         }
-        P::Unknown(why) => format!(
-            "`/plugin {why}`\n\n             - `/plugin` — 받아 둔 것 보기\n             - `/plugin add owner/repo` — 받기\n             - `/plugin remove 이름` — 지우기\n             - `/plugin update [이름]` — 갱신"
-        ),
+        P::Unknown(why) => state.lang.plugin_unknown(&why),
     }
-}
-
-/// 이 플러그인이 무엇을 얹는가. **받자마자 보여준다** — 남의 코드가 무슨 명령을 돌릴지
-/// 모르는 채로 두면 안 된다.
-fn plugin_contents_text(p: &crate::plugin::Plugin) -> String {
-    let mut s = String::new();
-    for spec in &p.mcp {
-        s.push_str(&format!(
-            "- MCP `{}` — 다음 실행 때 `{}`을 돌립니다\n",
-            spec.slug, spec.command
-        ));
-    }
-    if p.skills.is_some() {
-        s.push_str("- 스킬이 딸려 있습니다\n");
-    }
-    if s.is_empty() {
-        s.push_str("- 얹는 것이 없습니다\n");
-    }
-    s
-}
-
-fn plugin_list_text(found: &[crate::plugin::Plugin]) -> String {
-    if found.is_empty() {
-        return "플러그인이 없습니다. `/plugin add owner/repo`로 받습니다.".into();
-    }
-    let mut s = String::from("플러그인입니다.\n");
-    for p in found {
-        s.push_str(&format!(
-            "\n- **{}**{}{}",
-            p.name,
-            // 받아 온 것과 손으로 둔 것을 갈라 준다 — 지울 수 있는 것은 받아 온 쪽뿐이다.
-            if p.fetched() { "" } else { " (직접 둔 것)" },
-            if p.description.is_empty() {
-                String::new()
-            } else {
-                format!(" — {}", p.description)
-            },
-        ));
-    }
-    s
-}
-
-fn rules_text(found: &[crate::instructions::Found]) -> String {
-    if found.is_empty() {
-        return "이 디렉터리와 그 위쪽에 `CLAUDE.md`도 `AGENTS.md`도 없습니다.".into();
-    }
-    let mut s = String::from("이 thread에 실린 지침입니다. 아래로 갈수록 구체적입니다.\n");
-    for f in found {
-        // **세션을 만들 때 실린 것이지 지금 파일이 아니다.** 고쳤으면 새 세션이 필요하다.
-        s.push_str(&format!("\n- `{}` — {}자", f.path.display(), f.text.chars().count()));
-    }
-    s.push_str("\n\n파일을 고쳤으면 `/agent`이나 ←의 목록으로 새 thread를 열어야 반영됩니다.");
-    s
-}
-
-fn skills_text(skills: &[crate::tools::skill::SkillInfo]) -> String {
-    if skills.is_empty() {
-        return "쓸 수 있는 스킬이 없습니다. `.zyris-code/skills/`나 \
-                `~/.config/zyris-code/skills/`에 둡니다."
-            .into();
-    }
-    let mut s = String::from("쓸 수 있는 스킬입니다.\n");
-    for skill in skills {
-        s.push_str(&format!("\n- **{}** — {}", skill.name, skill.description));
-    }
-    s
 }
 
 async fn flush_queue(
@@ -2452,7 +2298,7 @@ async fn flush_queue(
         return;
     }
     if agent_id.is_empty() {
-        state.set_status("에이전트를 찾지 못해 보낼 수 없습니다.");
+        state.set_status(state.lang.agent_cannot_send());
         return;
     }
     while let Some(text) = state.queued.first().cloned() {
@@ -2557,7 +2403,7 @@ async fn send(
     if !opened.sent {
         crate::conn::within(api, api.send_message(id.clone(), text.to_string(), vec![]))
             .await
-            .map_err(|e| anyhow::anyhow!("전송하지 못했습니다: {e}"))?;
+            .map_err(|e| anyhow::anyhow!(crate::lang::current().send_failed(&e.to_string())))?;
     }
 
     // **`after`를 비우면 안 된다.** 비우면 "지금부터의 라이브 프레임만" 오는데, 방금 보낸
@@ -2663,10 +2509,7 @@ mod tests {
     fn shift_enter_and_alt_enter_insert_a_newline_instead_of_submitting() {
         let mut s = state();
         apply(&mut s, &Action::Insert('a'));
-        assert_eq!(
-            on_key(&s, key(KeyCode::Enter, KeyModifiers::ALT)),
-            vec![Action::Insert('\n')]
-        );
+        assert_eq!(on_key(&s, key(KeyCode::Enter, KeyModifiers::ALT)), vec![Action::Insert('\n')]);
         assert_eq!(
             on_key(&s, key(KeyCode::Enter, KeyModifiers::SHIFT)),
             vec![Action::Insert('\n')]
@@ -2757,11 +2600,8 @@ mod tests {
             vec![Action::Insert('x')],
             "press는 입력이어야 한다"
         );
-        let release = KeyEvent::new_with_kind(
-            KeyCode::Char('x'),
-            KeyModifiers::NONE,
-            KeyEventKind::Release,
-        );
+        let release =
+            KeyEvent::new_with_kind(KeyCode::Char('x'), KeyModifiers::NONE, KeyEventKind::Release);
         assert_eq!(
             on_key(&s, release),
             vec![],
@@ -3051,7 +2891,8 @@ mod tests {
     /// 바꾼 것이 없으면 그렇게 말한다.
     #[test]
     fn the_changes_list_says_when_nothing_was_touched() {
-        let said = changes_text(&[], std::path::Path::new("/home/ruma/zyris-code"));
+        let said =
+            crate::lang::Lang::Ko.changes_text(&[], std::path::Path::new("/home/ruma/zyris-code"));
         assert!(said.contains("없습니다"), "{said}");
     }
 
@@ -3059,7 +2900,7 @@ mod tests {
     #[test]
     fn the_changes_list_shows_counts_and_marks_new_files() {
         let cwd = std::path::Path::new("/home/ruma/zyris-code");
-        let said = changes_text(
+        let said = crate::lang::Lang::Ko.changes_text(
             &[
                 crate::undo::Changed {
                     path: cwd.join("src/app.rs"),

@@ -54,14 +54,14 @@ pub enum Act {
 }
 
 impl Act {
-    pub fn label(self) -> &'static str {
+    pub fn label(self, lang: crate::lang::Lang) -> &'static str {
         match self {
-            Act::Back => "← 이전",
-            Act::Next => "다음 →",
-            Act::Skip => "건너뛰기 →",
-            Act::Submit => "제출",
-            Act::Edit => "고치기",
-            Act::Reject => "답하지 않기",
+            Act::Back => lang.action_back(),
+            Act::Next => lang.action_next(),
+            Act::Skip => lang.action_skip(),
+            Act::Submit => lang.action_submit(),
+            Act::Edit => lang.action_edit(),
+            Act::Reject => lang.action_reject(),
         }
     }
 }
@@ -190,7 +190,7 @@ impl Answering {
     }
 
     /// Everything answered so far, made human-readable. The review screen shows it.
-    pub fn summary(&self) -> Vec<(String, String)> {
+    pub fn summary(&self, lang: crate::lang::Lang) -> Vec<(String, String)> {
         self.steps
             .iter()
             .enumerate()
@@ -205,7 +205,7 @@ impl Answering {
                     picks.push(format!("✎ {free}"));
                 }
                 let answer =
-                    if picks.is_empty() { "건너뜀".to_string() } else { picks.join(", ") };
+                    if picks.is_empty() { lang.skipped().to_string() } else { picks.join(", ") };
                 (step.question.clone(), answer)
             })
             .collect()
@@ -326,7 +326,7 @@ impl Answering {
     /// **Don't just throw the labels.** The model must reconstruct what was asked from the answer alone, so the question is
     /// carried verbatim and even the descriptions of picked items are attached. Free text is flagged as such — the fact that
     /// the answer wasn't among the options is itself information.
-    pub fn answer_text(&self) -> String {
+    pub fn answer_text(&self, lang: crate::lang::Lang) -> String {
         let mut out = Vec::new();
         for (i, step) in self.steps.iter().enumerate() {
             let mut picked: Vec<usize> = self.chosen[i].iter().copied().collect();
@@ -344,7 +344,7 @@ impl Answering {
 
             let free = self.free[i].trim();
             if !free.is_empty() {
-                parts.push(format!("직접 입력: {free}"));
+                parts.push(format!("{} {free}", lang.free_mark()));
             }
             if parts.is_empty() {
                 continue;
@@ -474,7 +474,7 @@ mod tests {
         a.toggle();
         a.advance();
         assert!(a.in_review());
-        let s = a.summary();
+        let s = a.summary(crate::lang::Lang::Ko);
         assert_eq!(s[0].1, "건너뜀");
         assert_ne!(s[1].1, "건너뜀");
     }
@@ -561,7 +561,7 @@ mod tests {
         a.toggle(); // Metrics
         assert!(a.confirm(), "마지막 단계 확정이면 끝이다");
 
-        let text = a.answer_text();
+        let text = a.answer_text(crate::lang::Lang::Ko);
         assert!(text.contains("[방식] 어느 쪽으로 갈까요?"), "질문을 그대로 실어야 한다:\n{text}");
         assert!(text.contains("A안 (빠르다)"), "설명까지 실어야 한다:\n{text}");
         assert!(text.contains("- 로그"), "여러 개는 줄로 나눠야 한다:\n{text}");
@@ -576,7 +576,7 @@ mod tests {
             a.input.insert(c);
         }
         a.confirm();
-        let text = a.answer_text();
+        let text = a.answer_text(crate::lang::Lang::Ko);
         assert!(text.contains("직접 입력: 그냥요"), "직접 쓴 것임을 밝혀야 한다: {text}");
         assert_eq!(a.free_answers(), vec!["그냥요".to_string()]);
     }

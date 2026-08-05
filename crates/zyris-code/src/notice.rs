@@ -73,15 +73,15 @@ impl Notice {
     /// when the server actually died, "check this machine's clock" came in, yet
     /// the clock was fine; the real cause was the earlier "couldn't send refresh".
     pub fn fatal(&self, why: &str) {
-        red(&format!("연결에 실패했습니다: {why}"));
+        let lang = crate::lang::current();
+        red(&lang.connect_failed(why));
         if let Some(before) = self.0.last.lock().unwrap().as_deref() {
             if before != why {
-                plain(&format!("직전 오류: {before}"));
+                plain(&lang.previous_error(before));
             }
         }
-        plain(&format!(
-            "자세한 것은 로그에 있습니다: {}",
-            std::env::var("ZYRIS_CODE_LOG").unwrap_or_else(|_| "/tmp/zyris-code.log".into())
+        plain(&lang.log_location(
+            &std::env::var("ZYRIS_CODE_LOG").unwrap_or_else(|_| "/tmp/zyris-code.log".into()),
         ));
     }
 
@@ -136,10 +136,7 @@ impl Notice {
                     }
                     if waited >= FIRST && !said_waiting {
                         said_waiting = true;
-                        plain(
-                            "\n브라우저에서 승인하면 저절로 이어집니다. \
-                             그만두려면 Ctrl+C를 누르세요.",
-                        );
+                        plain(&format!("\n{}", crate::lang::current().waiting_for_approval()));
                     }
                     continue;
                 };
@@ -150,7 +147,7 @@ impl Notice {
                     None => false,
                 };
                 if speak {
-                    red(&format!("서버에 연결하지 못했습니다 ({waited}초째): {why}"));
+                    red(&crate::lang::current().server_unreachable(waited, &why));
                 }
             }
         });
