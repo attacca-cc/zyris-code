@@ -642,6 +642,34 @@ fn ask_key(a: &crate::question::Answering, key: KeyEvent, ctrl: bool) -> Vec<Act
     }
 }
 
+/// 폭주 중에 온 Enter를 줄바꿈으로 바꿔도 되는가.
+///
+/// **Enter가 그 자리에서 실제로 "보내기"일 때만 바꾼다.** 폭주 판정만 보고 바꾸면,
+/// 승인 창·목록·양식·질문이 열려 있을 때 그 자리의 확정 키(Enter)가 삼켜지고 줄바꿈이
+/// 보이지 않는 입력란에 들어간다 — 명령 목록을 내리고 ↓→Enter를 재빠르게 누르면
+/// 고르기 대신 줄바꿈이 남는 그런 자리다.
+///
+/// 질문의 자유 입력을 치는 중이면 그 입력이 보내기다 — 폭주로 여러 줄을 붙여넣으면
+/// 첫 줄에서 확정되지 않게 여기서도 줄바꿈으로 바꾼다.
+fn enter_becomes_newline(state: &State, key: &KeyEvent, in_burst: bool) -> bool {
+    // Windows는 press와 release를 각각 보낸다. release를 줄바꿈으로 만들면 Enter를
+    // 눌렀다 뗀 것만으로 줄바꿈이 두 번 들어간다 — `on_key`와 같은 걸러냄이다.
+    if key.kind == KeyEventKind::Release {
+        return false;
+    }
+    if !(in_burst && key.code == KeyCode::Enter && key.modifiers.is_empty()) {
+        return false;
+    }
+    if let Some((_, a)) = &state.asking {
+        return a.typing && !a.input.text.is_empty();
+    }
+    state.enroll.is_none()
+        && state.pending.is_none()
+        && state.new_project.is_none()
+        && state.picker.is_none()
+        && !state.input.text.is_empty()
+}
+
 pub fn apply(state: &mut State, action: &Action) {
     // 글자를 고치는 순간 되살리기에서 빠져나온다. 안 그러면 고쳐 놓은 것을 ↓ 한 번에
     // 잃는다 — 되살린 말을 고쳐 보내는 것이 이 기능의 목적인데 그걸 막는 셈이 된다.
@@ -1636,12 +1664,10 @@ async fn run_inner(
                         let in_burst = last_key_at
                             .is_some_and(|t| now.duration_since(t) < PASTE_BURST);
                         last_key_at = Some(now);
-                        if in_burst
-                            && k.code == KeyCode::Enter
-                            && k.modifiers.is_empty()
-                            && !state.input.text.is_empty()
-                        {
-                            // 폭주 중에 온 Enter는 줄바꿈이다.
+                        if enter_becomes_newline(&state, &k, in_burst) {
+                            // 폭주 중에 온 Enter는 줄바꿈이다. 판정은
+                            // `enter_becomes_newline`이 한다 — 승인·목록·양식·질문이
+                            // 열려 있으면 그 자리의 확정 키를 삼키지 않는다.
                             vec![Action::Insert('\n')]
                         } else {
                             on_key(&state, k)
@@ -2698,6 +2724,116 @@ mod tests {
         assert_eq!(s.input.text, "가나\n라다");
     }
 
+    /// **폭주 중의 Enter는 줄바꿈이다** — bracketed paste 없는 터미널의 붙여넣기
+    /// 보호다. 하지만 그 자리에서 Enter가 진짜 "보내기"일 때만이다.
+    #[test]
+    fn a_burst_enter_while_typing_becomes_a_newline() {
+        let mut s = state();
+        apply(&mut s, &Action::Insert('a'));
+        assert!(
+            enter_becomes_newline(&s, &key(KeyCode::Enter, KeyModifiers::NONE), true),
+            "폭주 중 Enter는 줄바꿈이어야 한다"
+        );
+    }
+
+    /// 폭주가 아니면 Enter는 전송이다 — 판정은 키 사이의 시각 간격이 한다.
+    #[test]
+    fn a_lone_enter_is_not_a_paste_newline() {
+        let mut s = state();
+        apply(&mut s, &Action::Insert('a'));
+        assert!(!enter_becomes_newline(&s, &key(KeyCode::Enter, KeyModifiers::NONE), false));
+    }
+
+    /// Windows의 key-release도 줄바꿈이 되면 안 된다 — on_key와 같은 걸러냄이다.
+    #[test]
+    fn a_burst_release_enter_is_not_a_newline() {
+        let mut s = state();
+        apply(&mut s, &Action::Insert('a'));
+        let release =
+            KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::NONE, KeyEventKind::Release);
+        assert!(!enter_becomes_newline(&s, &release, true));
+    }
+
+    /// 명령 목록이 떠 있으면 Enter는 고르기다. 입력란에 `/m`이 남아 있어 폭주
+    /// 판정이 걸려도 고르기를 삼키면 안 된다 — ↓→Enter를 재빠르게 누르면
+    /// 고르기 대신 줄바꿈이 입력란에 남던 버그다.
+    #[test]
+    fn a_burst_enter_does_not_swallow_the_pickers_confirm() {
+        let mut s = state();
+        for c in "/m".chars() {
+            apply(&mut s, &Action::Insert(c));
+        }
+        // 슬래시로 시작하므로 `follow_the_slash`가 이미 명령 목록을 열었다.
+        // `/m`은 /mode·/mcp가 남아 목록이 빈 채로 닫히지 않는다.
+        assert!(s.picker.is_some(), "명령 목록이 열려 있어야 한다");
+        assert!(!enter_becomes_newline(&s, &key(KeyCode::Enter, KeyModifiers::NONE), true));
+    }
+
+    /// 새 프로젝트 양식이 떠 있으면 Enter는 확정이다 — 폭주 판정에 삼켜지면 안 된다.
+    #[test]
+    fn a_burst_enter_does_not_swallow_the_form_confirm() {
+        let mut s = state();
+        s.new_project = Some(crate::newproject::Form::new());
+        assert!(!enter_becomes_newline(&s, &key(KeyCode::Enter, KeyModifiers::NONE), true));
+    }
+
+    /// 승인 창이 떠 있으면 Enter는 일부러 아무 일도 하지 않는다 — 그 뜻을 폭주
+    /// 판정이 줄바꿈으로 바꾸면 보이지 않는 입력란에 글이 새어 들어간다.
+    #[test]
+    fn a_burst_enter_does_not_leak_behind_an_approval() {
+        let mut s = state();
+        apply(&mut s, &Action::Frame(Frame::Ask(ask(1))));
+        apply(&mut s, &Action::Insert('a'));
+        assert!(!enter_becomes_newline(&s, &key(KeyCode::Enter, KeyModifiers::NONE), true));
+    }
+
+    /// 질문을 고르는 중이면 Enter는 확정이다 — 목록과 같은 자리다.
+    #[test]
+    fn a_burst_enter_does_not_swallow_the_questions_confirm() {
+        let mut s = state();
+        s.asking = Some((
+            7,
+            crate::question::Answering::new(vec![crate::question::Step {
+                header: None,
+                question: "어느 쪽?".into(),
+                multi: false,
+                options: vec![
+                    crate::question::Opt { label: "A".into(), description: None },
+                    crate::question::Opt { label: "B".into(), description: None },
+                ],
+            }]),
+        ));
+        assert!(!enter_becomes_newline(&s, &key(KeyCode::Enter, KeyModifiers::NONE), true));
+    }
+
+    /// 질문의 자유 입력을 치는 중이면 그 입력이 보내기다 — 여러 줄을 붙여넣으면
+    /// 첫 줄에서 확정되지 않게 여기서도 줄바꿈으로 바꾼다.
+    #[test]
+    fn a_burst_enter_keeps_multiline_pastes_in_the_free_answer() {
+        let mut s = state();
+        s.asking = Some((
+            7,
+            crate::question::Answering::new(vec![crate::question::Step {
+                header: None,
+                question: "하고 싶은 말?".into(),
+                multi: false,
+                options: vec![],
+            }]),
+        ));
+        {
+            let (_, a) = s.asking.as_mut().unwrap();
+            a.typing = true;
+            a.input.insert_str("한 줄");
+        }
+        assert!(enter_becomes_newline(&s, &key(KeyCode::Enter, KeyModifiers::NONE), true));
+        // 칸이 비어 있으면 바꿀 것이 없다 — 그대로 확정이다.
+        {
+            let (_, a) = s.asking.as_mut().unwrap();
+            a.input.take();
+        }
+        assert!(!enter_becomes_newline(&s, &key(KeyCode::Enter, KeyModifiers::NONE), true));
+    }
+
     /// **`a`는 그 디렉터리째로 연다.** 파일 하나하나를 다시 묻는 것은 쓸 수 없다.
     #[test]
     fn always_allow_opens_the_whole_directory() {
@@ -2757,11 +2893,8 @@ mod tests {
             vec![Action::Insert('x')],
             "press는 입력이어야 한다"
         );
-        let release = KeyEvent::new_with_kind(
-            KeyCode::Char('x'),
-            KeyModifiers::NONE,
-            KeyEventKind::Release,
-        );
+        let release =
+            KeyEvent::new_with_kind(KeyCode::Char('x'), KeyModifiers::NONE, KeyEventKind::Release);
         assert_eq!(
             on_key(&s, release),
             vec![],
