@@ -1361,6 +1361,25 @@ fn title_for_osc(title: &str) -> String {
     title.chars().filter(|c| !c.is_control()).take(120).collect()
 }
 
+/// 터미널 기능 하나를 켜거나 끈다. **실패해도 죽지 않는다.**
+///
+/// 기능은 어디까지나 덤이라, 하나가 실패하면 그 기능만 잃고 이어간다. 사유는
+/// 로그에만 남긴다 — 그래야 화면이 왜 그 기능 없이 떴는지 나중에 찾을 수 있다.
+///
+/// **왜 전부 하나씩인가:** Windows에서 crossterm 0.29의 키티 키보드 프로토콜
+/// 명령(`PushKeyboardEnhancementFlags`·`PopKeyboardEnhancementFlags`)은 ANSI
+/// 경로를 막아 두어(`is_ansi_code_supported() == false`) 실행하면 `Unsupported`
+/// 오류로 죽는다. 한 덩어리 `execute!`로 묶으면 그 한 명령이 **화면 전체를**
+/// 죽인다 — 화면이 안 뜨면 첫 등록의 코드 창(화면) 대신 셸의 대기 문구
+/// ("브라우저에서 승인하면 저절로 이어집니다…")만 보였다(2026-08-07 Windows
+/// 리포트). 되돌림도 한 덩어리면 뒤따르는 `EnableLineWrap`이 안 나가, 셸의 줄
+/// 넘김이 꺼진 채 남는다.
+fn terminal_feature(label: &'static str, command: impl crossterm::Command) {
+    if let Err(e) = execute!(io::stdout(), command) {
+        tracing::warn!(label, error = %e, "터미널 기능 변경에 실패했다 — 그 기능만 꺼진 채로 이어간다");
+    }
+}
+
 /// 유일한 I/O 자리.
 ///
 /// `ratatui::init()`이 raw 모드와 대체 화면을 함께 잡는다 — 직접 또 잡지 않는다.
@@ -1372,41 +1391,48 @@ pub async fn run(
     die: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let mut terminal = ratatui::init();
-    execute!(
-        io::stdout(),
-        crossterm::event::EnableMouseCapture,
-        // 다른 창에 갔다 오면 터미널이 화면을 되살려 주지 않는 경우가 있다. 포커스가
-        // 돌아온 것을 알아야 통째로 다시 그릴 수 있다.
-        crossterm::event::EnableFocusChange,
-        // **붙여넣기를 한 덩어리로 받는다.** 꺼져 있으면 터미널이 붙여넣기를 치는
-        // 것처럼 흘려보내고, 내용의 줄바꿈이 Enter로 해석되어 여러 줄 프롬프트의
-        // 첫 줄이 그대로 전송돼 버린다. 켜면 ESC[200~…ESC[201~로 감싸져
-        // `Event::Paste` 한 건으로 온다.
-        crossterm::event::EnableBracketedPaste,
-        // **Shift+Enter를 Enter와 구분할 수 있게 한다.** 키티 키보드 프로토콜을
-        // 켜면 수정된 키가 CSI-u 시퀀스로 따로 온다. 모르는 터미널은 그냥
-        // 무시하므로 켜 두는 것으로 아무 해가 없다.
+    // 터미널 기능을 **하나씩** 켠다 — 어느 하나가 실패해도 화면은 뜬다
+    // (`terminal_feature` 참고). Windows에서 키티 키보드 프로토콜은 언제나
+    // 실패하므로, 그 아래 줄넘김 끄기도 반드시 여기까지는 도달해야 한다.
+    terminal_feature("mouse capture", crossterm::event::EnableMouseCapture);
+    // 다른 창에 갔다 오면 터미널이 화면을 되살려 주지 않는 경우가 있다. 포커스가
+    // 돌아온 것을 알아야 통째로 다시 그릴 수 있다.
+    terminal_feature("focus change", crossterm::event::EnableFocusChange);
+    // **붙여넣기를 한 덩어리로 받는다.** 꺼져 있으면 터미널이 붙여넣기를 치는
+    // 것처럼 흘려보내고, 내용의 줄바꿈이 Enter로 해석되어 여러 줄 프롬프트의
+    // 첫 줄이 그대로 전송돼 버린다. 켜면 ESC[200~…ESC[201~로 감싸져
+    // `Event::Paste` 한 건으로 온다.
+    terminal_feature("bracketed paste", crossterm::event::EnableBracketedPaste);
+    // **Shift+Enter를 Enter와 구분할 수 있게 한다.** 키티 키보드 프로토콜을
+    // 켜면 수정된 키가 CSI-u 시퀀스로 따로 온다. 모르는 터미널은 그냥
+    // 무시하므로 켜 두는 것으로 아무 해가 없다. Windows에서는 crossterm이 이
+    // 명령을 막아 두어 실패한다(위 `terminal_feature` 주석) — 그때는
+    // Shift+Enter가 줄바꿈 대신 전송이 되는 것만 다르고, Alt+Enter 줄바꿈과
+    // 붙여넣기 폭주 감지가 그 자리를 메운다.
+    terminal_feature(
+        "kitty keyboard protocol",
         crossterm::event::PushKeyboardEnhancementFlags(
             crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
         ),
-        // **줄 넘김을 끈다.** 우리가 센 글자 폭과 터미널이 그리는 폭이 한 칸이라도
-        // 어긋나면(`●`·`·`·`─` 같은 글자는 터미널 설정에 따라 두 칸이 된다) 줄 끝이
-        // 넘쳐 **아랫줄로 흘러내리고**, 그 아래가 통째로 밀린다. 꺼 두면 넘친 글자는
-        // 그 줄에서 잘릴 뿐이라 피해가 한 줄에 머문다.
-        crossterm::terminal::DisableLineWrap,
-    )?;
+    );
+    // **줄 넘김을 끈다.** 우리가 센 글자 폭과 터미널이 그리는 폭이 한 칸이라도
+    // 어긋나면(`●`·`·`·`─` 같은 글자는 터미널 설정에 따라 두 칸이 된다) 줄 끝이
+    // 넘쳐 **아랫줄로 흘러내리고**, 그 아래가 통째로 밀린다. 꺼 두면 넘친 글자는
+    // 그 줄에서 잘릴 뿐이라 피해가 한 줄에 머문다.
+    terminal_feature("line wrap off", crossterm::terminal::DisableLineWrap);
 
     let result = run_inner(&mut terminal, api_rx, bridge, die).await;
 
-    let _ = execute!(
-        io::stdout(),
-        crossterm::event::DisableMouseCapture,
-        crossterm::event::DisableFocusChange,
-        crossterm::event::DisableBracketedPaste,
-        crossterm::event::PopKeyboardEnhancementFlags,
-        // 줄 넘김은 셸이 쓰는 것이다. 안 되돌리면 셸에서 긴 명령이 잘려 보인다.
-        crossterm::terminal::EnableLineWrap,
-    );
+    // 끈 것을 **하나씩** 되돌린다. 되돌림도 실패를 견딘다 — 한 명령이 죽었다고
+    // 뒤를 놓치면, 줄 넘김 같은 것은 셸에 남아 망가진다(Windows에서
+    // `PopKeyboardEnhancementFlags`가 실패하는데 그 뒤 `EnableLineWrap`이 안
+    // 나가면 셸의 긴 줄이 잘린 채 남는다).
+    terminal_feature("mouse capture off", crossterm::event::DisableMouseCapture);
+    terminal_feature("focus change off", crossterm::event::DisableFocusChange);
+    terminal_feature("bracketed paste off", crossterm::event::DisableBracketedPaste);
+    terminal_feature("kitty keyboard protocol off", crossterm::event::PopKeyboardEnhancementFlags);
+    // 줄 넘김은 셸이 쓰는 것이다. 안 되돌리면 셸에서 긴 명령이 잘려 보인다.
+    terminal_feature("line wrap on", crossterm::terminal::EnableLineWrap);
     ratatui::restore();
     result
 }
@@ -2059,10 +2085,12 @@ fn shutdown_signals() -> mpsc::Receiver<()> {
                 tokio::time::sleep(SHUTDOWN_FORCE).await;
                 // 강제 종료라도 bracketed paste와 키티 키보드 프로토콜은
                 // 되돌리고 간다 — 안 하면 셸이 붙여넣기를 계속 한 덩어리로
-                // 감싸고 Shift+Enter가 CSI-u로 남는다.
-                let _ = execute!(
-                    io::stdout(),
-                    crossterm::event::DisableBracketedPaste,
+                // 감싸고 Shift+Enter가 CSI-u로 남는다. 되돌림도 실패를 견딘다
+                // (Windows의 키티 프로토콜 명령은 언제나 실패한다 — 위
+                // `terminal_feature` 참고).
+                terminal_feature("bracketed paste off", crossterm::event::DisableBracketedPaste);
+                terminal_feature(
+                    "kitty keyboard protocol off",
                     crossterm::event::PopKeyboardEnhancementFlags,
                 );
                 ratatui::restore();
@@ -3878,5 +3906,31 @@ mod tests {
         apply(&mut s, &Action::Submit("새 쓰레드에서 보낸 말".into()));
         assert!(s.queued.is_empty(), "새 쓰레드의 말이 대기로 갔다: {:?}", s.queued);
         assert_eq!(s.sent, vec!["새 쓰레드에서 보낸 말"]);
+    }
+
+    /// **터미널 기능 하나가 실패해도 죽지 않는다.** Windows에서 crossterm 0.29의
+    /// 키티 키보드 프로토콜 명령(`PushKeyboardEnhancementFlags`)은 `Unsupported`
+    /// 오류로 죽는다. 이전에는 그것을 한 덩어리 `execute!`에 넣어서 그 한 명령이
+    /// 화면 전체를 죽였고, 화면이 안 뜨니 첫 등록의 코드 창 대신 셸의 대기 문구
+    /// ("브라우저에서 승인하면 저절로 이어집니다…")만 보였다 — 2026-08-07
+    /// Windows 리포트. 헬퍼는 실패를 삼키고 이어간다.
+    #[test]
+    fn a_failing_terminal_feature_does_not_kill_the_screen() {
+        // Windows에서 `PushKeyboardEnhancementFlags`가 내는 것과 같은 실패.
+        struct Unsupported;
+        impl crossterm::Command for Unsupported {
+            fn write_ansi(&self, _f: &mut impl std::fmt::Write) -> std::fmt::Result {
+                Ok(())
+            }
+            #[cfg(windows)]
+            fn execute_winapi(&self) -> std::io::Result<()> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "키티 키보드 프로토콜은 Windows에서 지원하지 않는다",
+                ))
+            }
+        }
+        // 패닉 없이 조용히 지나가야 한다 — 실패한 기능만 잃고 화면은 뜬다.
+        terminal_feature("unsupported", Unsupported);
     }
 }
