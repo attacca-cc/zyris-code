@@ -284,6 +284,10 @@ pub struct State {
     /// 자가치유 틱이 세운다. 다음 draw가 **모든 칸을 강제로 다시 내보낸다** —
     /// `AlwaysUpdate` 플래그로 diff를 우회해 덮어쓴다. 지우지 않으므로 깜빡이지 않는다.
     pub force_update: bool,
+    /// 턴이 도는 동안의 자가치유. **빈 칸만** 강제로 다시 내보낸다 — 잔상은 빈 칸에만
+    /// 남으므로 내용 칸까지 덮어쓸 필요가 없고, 공백은 무엇과도 겹쳐도 안전하다.
+    /// 느린 SSH 링크에서 스트리밍 프레임과 겹쳐도 글이 두 번 보일 수 없다.
+    pub force_update_blank: bool,
     /// 화면 말. `/lang`이 바꾸고 `lang::current()`와 함께 움직인다.
     pub lang: crate::lang::Lang,
 }
@@ -366,6 +370,7 @@ impl Default for State {
             grants: crate::tools::gate::Grants::default(),
             running_exec: None,
             force_update: false,
+            force_update_blank: false,
             lang: crate::lang::current(),
         }
     }
@@ -1291,7 +1296,8 @@ fn frame_interval() -> Duration {
 /// | 아무 변화 없음 | 32 B |
 /// | 글자 하나 침 | 64 B |
 /// | 스트리밍 한 조각 | 3.4 KB |
-/// | 통째로 다시 그리기 | 21 KB |
+/// | 빈 칸만 다시 그리기(턴 중 치유) | 10 KB |
+/// | 통째로 다시 그리기(쉬는 동안 치유) | 27 KB |
 ///
 /// 그래서 **전부를 느리게 하지 않는다.** 키 입력은 누른 자리에서 바로 그리고(64 B),
 /// 답이 흘러 들어오는 동안만 이 간격으로 묶는다. 사람 손보다 스트리밍이 훨씬 빠르므로
@@ -1307,7 +1313,7 @@ const POLL_INTERVAL: Duration = Duration::from_secs(3);
 const LOOP_WATCHDOG_INTERVAL: Duration = Duration::from_secs(10);
 const LOOP_WATCHDOG_STALL: Duration = Duration::from_secs(60);
 
-/// 화면을 통째로 다시 그려 **스스로 고치는** 간격(밀리초). 0이면 끄고, 기본은 2초다.
+/// 화면을 다시 그려 **스스로 고치는** 간격(밀리초). 0이면 끄고, 기본은 2초다.
 ///
 /// ratatui는 **전각 글자 뒤 칸에 아무것도 쓰지 않는다.** 재 보면 선로에 이렇게 나간다
 /// (`tests/perf.rs::measure_what_goes_out_behind_a_wide_character`):
@@ -1322,15 +1328,27 @@ const LOOP_WATCHDOG_STALL: Duration = Duration::from_secs(60);
 /// 있던 옛 글자가 그대로 비쳐 보인다. SSH 화면에 글자 부스러기가 남는 구조적 이유다.
 /// 게다가 그 칸은 우리 버퍼상 "안 바뀐 칸"이라 **영영 다시 그려지지 않는다.**
 ///
-/// 이 모델 안에서 고칠 방법은 **지우고 처음부터 다시 그리는 것**뿐이다. 그래서 가끔 한다.
-/// 사람이 Ctrl+L을 몰라도 몇 초 뒤 제자리로 온다. 화면에 아무 변화가 없었다면 새로 깨질
-/// 일도 없으니 건너뛴다. 한 번에 21KB이니 자주 해도 부담은 크지 않다 — 부스러기가 거슬리면
-/// `ZYRIS_CODE_HEAL_MS=300`처럼 줄이고, 깜박여 보이면 늘린다.
+/// 이 모델 안에서 고칠 방법은 **지우지 않고 덮어써서** 그 칸을 다시 내보내는 것뿐이다.
+/// 그래서 가끔 한다. 사람이 Ctrl+L을 몰라도 몇 초 뒤 제자리로 온다. 화면에 아무 변화가
+/// 없었다면 새로 깨질 일도 없으니 건너뛴다.
+///
+/// **두 가지 모드로 나뉜다:**
+///
+/// - 쉬는 동안: **모든 칸**을 덮어쓴다(`force_update`, 27KB). 스트리밍이 없으므로
+///   겹칠 일이 없다.
+/// - 턴이 도는 동안: **빈 칸만** 덮어쓴다(`force_update_blank`, 10KB). 잔상은 항상
+///   빈 칸에 남고(내용 칸은 바뀔 때마다 다시 그려진다), 공백은 무엇과 겹쳐도 안전해서
+///   느린 SSH에서 스트리밍 프레임과 섞여도 **같은 단어가 두 번 보이지 않는다** —
+///   통째 덮어쓰기가 스트리밍과 겹쳐 단어가 두 번 보이던(Termius 실측) 사고가
+///   구조적으로 일어날 수 없다. 전각 글자 바로 뒤 칸은 diff가 항상 건너뛰므로 지워질
+///   일도 없다.
+///
+/// 부스러기가 거슬리면 `ZYRIS_CODE_HEAL_MS=300`처럼 줄이고, 깜박여 보이면 늘린다.
 fn heal_interval() -> Option<Duration> {
     // **기본은 2초다.** 터미널이 자기 배경을 쓰게 두는 정책이면(`theme::page_bg`),
     // ratatui diff가 전각 글자 뒤 trailing 칸을 지워 주는 보호(`previous.bg != Reset`)가
     // 발동하지 않는다 — 그래서 그 칸은 우리 버퍼상 "안 바뀐 칸"으로 남아 영영 안
-    // 지워진다. 주기적으로 화면 전체를 **덮어써서**(`force_update`) 그 잔상을 치운다.
+    // 지워진다. 주기적으로 덮어써서 그 잔상을 치운다.
     //
     // 예전에는 2초마다 **지우고** 다시 그렸는데, 그게 느린 SSH 링크에서 주기적인
     // 깜빡임으로 보였다. `AlwaysUpdate`는 지우지 않고 같은 내용을 다시 내보내므로
@@ -2003,15 +2021,24 @@ async fn run_inner(
             // 스스로 고치기. 마지막 치유 뒤로 그린 적이 있을 때만 한다 — 가만히 있는
             // 화면은 깨질 일이 없고, 쉬는 세션이 SSH로 계속 바이트를 밀 이유도 없다.
             _ = heal.tick(), if healing => {
-                // **턴이 도는 동안은 치유하지 않는다.** 스트리밍이 이미 매 프레임 화면을
-                // 다시 그리므로 부스러기가 쌓일 틈이 없고, 무엇보다 SSH처럼 느린 링크에서
-                // 전체 덮어쓰기(~21KB)가 스트리밍 프레임과 겹쳐 그려진 화면 위에 어긋난
-                // 위치로 다시 그려져 **같은 단어가 두 번 보인다**(Termius 실측).
-                if drew_since_heal && !state.running {
-                    // **지우지 않고 모든 칸을 강제로 다시 내보낸다.** clear는 깜빡임의
-                    // 원인이다 — `force_update`가 diff를 우회해 전 칸을 덮어써서 전각
-                    // 글자 뒤 trailing 칸의 잔상을 치운다. 다음 draw는 일반 diff로 돌아간다.
-                    state.force_update = true;
+                // **턴이 도는 동안은 빈 칸만 치유한다.** 스트리밍은 매 프레임 화면을
+                // 다시 그리지만 그 diff는 빈 칸을 건드리지 않는다 — 전각 글자가 좁은
+                // 글자로 바뀌면 그 trailing 칸이 "양쪽 버퍼에서 빈 칸"이라 영영 안
+                // 지워지고, SSH 화면에 글자 부스러기로 남는다(잔상). 통째 덮어쓰기
+                // (~21KB)로 치우면 느린 링크에서 스트리밍 프레임과 겹쳐 **같은 단어가
+                // 두 번 보이던**(Termius 실측) 사고가 난다. 빈 칸만 덮어쓰는 것은
+                // 선로 부담이 몇 KB에 그치고, 공백은 무엇과 겹쳐도 안전해서 글이 두 번
+                // 보일 수 없다. 전각 글자 바로 뒤 칸은 diff가 항상 건너뛰므로 지워질
+                // 일도 없다.
+                if drew_since_heal {
+                    if state.running {
+                        state.force_update_blank = true;
+                    } else {
+                        state.force_update = true;
+                    }
+                    // **지우지 않고 덮어쓴다.** clear는 깜빡임의 원인이다 —
+                    // `AlwaysUpdate`가 diff를 우회해 전각 글자 뒤 trailing 칸의 잔상을
+                    // 치운다. 다음 draw는 일반 diff로 돌아간다.
                     terminal.draw(|f| widgets::draw(f, &mut state))?;
                     dirty = false;
                     drew_since_heal = false;

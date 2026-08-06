@@ -148,14 +148,35 @@ pub fn draw(frame: &mut Frame, state: &mut State) {
         }
     }
 
-    // **자가치유 프레임: 모든 칸을 강제로 다시 내보낸다.** 지우지 않고 덮어써서 전각
-    // 글자 뒤 trailing 칸의 잔상을 치운다 — clear가 없으므로 깜빡이지 않는다.
-    // `AlwaysUpdate`는 diff의 동등 비교를 우회해 이번 한 프레임의 모든 칸을 선로에
-    // 실리게 한다. 다음 draw는 새 버퍼(옵션 `None`)로 돌아가 일반 diff가 된다.
+    // **자가치유 프레임.** 지우지 않고 덮어써서 전각 글자 뒤 trailing 칸의 잔상을
+    // 치운다 — clear가 없으므로 깜빡이지 않는다. `AlwaysUpdate`는 diff의 동등 비교를
+    // 우회해 이번 한 프레임의 칸들을 선로에 실리게 한다. 다음 draw는 새 버퍼(옵션
+    // `None`)로 돌아가 일반 diff가 된다.
+    //
+    // 두 가지 모드가 있다:
+    // - `force_update`: **모든 칸**을 다시 내보낸다. 쉬는 화면에서 쓴다 — 그때는
+    //   스트리밍이 없어 21KB를 보내도 겹칠 일이 없다.
+    // - `force_update_blank`: **빈 칸만** 다시 내보낸다. 턴이 도는 동안 쓴다. 잔상은
+    //   항상 빈 칸에 남는다(내용 칸은 바뀔 때마다 다시 그려지므로). 공백은 무엇과도
+    //   겹쳐도 안전해서 느린 SSH에서 스트리밍 프레임과 섞여도 글이 두 번 보이지
+    //   않는다 — 통째 덮어쓰기가 스트리밍과 겹쳐 단어가 두 번 보이던 그 사고가
+    //   구조적으로 여기서는 일어날 수 없다.
+    //
+    // **전각 글자 바로 뒤 칸은 diff가 항상 건너뛴다**(`cell_width > 1` 분기). 빈 칸
+    // 모드로 그 칸에 `AlwaysUpdate`를 심어도 선로에는 나가지 않으므로 전각 글자의
+    // 오른쪽 반쪽을 지워 버릴 위험이 없다.
     if std::mem::take(&mut state.force_update) {
         use ratatui::buffer::CellDiffOption;
         for cell in frame.buffer_mut().content.iter_mut() {
             cell.set_diff_option(CellDiffOption::AlwaysUpdate);
+        }
+    }
+    if std::mem::take(&mut state.force_update_blank) {
+        use ratatui::buffer::CellDiffOption;
+        for cell in frame.buffer_mut().content.iter_mut() {
+            if cell.symbol() == " " {
+                cell.set_diff_option(CellDiffOption::AlwaysUpdate);
+            }
         }
     }
 }

@@ -268,12 +268,31 @@ fn measure_bytes_on_the_wire() {
     let mut fresh = wire_terminal(wire2.clone());
     let heal = draw_bytes(&mut fresh, &wire2, &mut state);
 
+    // 5) 빈 칸만 다시 그리기 — 턴 중 자가 치유의 값. 직전 프레임을 일반 diff로
+    //    고정해 두고 끼워 넣어 **증분**으로 잰다(새 터미널 첫 프레임은 전부를
+    //    내보내므로 비교가 안 된다). 치유 프레임 뒤의 다음 일반 프레임도 잰다 —
+    //    prev 버퍼에 AlwaysUpdate가 남아 빈 칸을 한 번 더 내보낸다.
+    apply(
+        &mut state,
+        &Action::Frame(AppFrame::Delta {
+            kind: zyris_attacca::ZDeltaKind::Assistant,
+            text: "마지막 조각. ".into(),
+        }),
+    );
+    draw_bytes(&mut term, &wire, &mut state); // prev를 일반 프레임으로 고정
+    wire.take();
+    state.force_update_blank = true;
+    term.draw(|f| widgets::draw(f, &mut state)).unwrap();
+    let blank_heal = wire.take();
+    let blank_next = draw_bytes(&mut term, &wire, &mut state);
+
     println!("\n화면 {W}×{H} = {}칸", W as usize * H as usize);
     println!("  첫 프레임          {first:>8} B");
     println!("  아무 변화 없음      {idle:>8} B");
     println!("  글자 하나 침        {typing:>8} B");
     println!("  스트리밍 한 조각    {avg:>8} B  (평균, {}개)", stream.len());
     println!("  통째로 다시 그리기  {heal:>8} B");
+    println!("  빈 칸만 다시 그리기 {blank_heal:>8} B  (+다음 프레임 {blank_next} B)");
     println!("\n스트리밍 중 초당:");
     for fps in [10, 20] {
         println!("  {fps:>2}fps  {:>9} B/s", avg * fps);

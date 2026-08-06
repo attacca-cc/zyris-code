@@ -233,6 +233,73 @@ fn a_heal_frame_forces_every_cell_to_be_resent() {
     );
 }
 
+/// **턴 중 자가치유는 빈 칸만 강제로 다시 내보낸다.** 잔상은 항상 빈 칸에 남는다 —
+/// 내용 칸은 바뀔 때마다 다시 그려지므로 옛 글자가 비칠 틈이 없다. 내용 칸까지
+/// 덮어쓰는 통째 치유는 느린 SSH 링크에서 스트리밍 프레임과 겹쳐 단어가 두 번
+/// 보이던 그 사고의 원인이었다. 공백만 다시 보내는 것은 무엇과 겹쳐도 안전하다.
+///
+/// 전각 글자 바로 뒤 칸(빈 칸)에도 `AlwaysUpdate`가 심기지만 diff는 그 칸을 항상
+/// 건너뛴다(`cell_width > 1` 분기) — 전각 글자의 오른쪽 반쪽을 지워 버릴 위험이
+/// 없다. 그 점은 `a_blank_heal_never_writes_under_a_wide_char`가 고정한다.
+#[test]
+fn a_blank_heal_forces_only_blank_cells_to_be_resent() {
+    let mut s = State::new();
+    s.sidebar_on = false;
+    said(&mut s, 1, EntryKind::Agent("안녕하세요".into()));
+    s.force_update_blank = true;
+
+    let mut term = Terminal::new(TestBackend::new(60, 12)).unwrap();
+    let frame = term.draw(|f| widgets::draw(f, &mut s)).unwrap();
+    assert!(!s.force_update_blank, "강제 플래그는 한 프레임이면 풀려야 한다");
+    let blank_count = frame.buffer.content.iter().filter(|c| c.symbol() == " ").count();
+    assert!(blank_count > 0, "화면에 빈 칸이 하나도 없다 — 테스트가 헛돈다");
+    assert!(
+        frame.buffer.content.iter().all(|c| {
+            c.diff_option == ratatui::buffer::CellDiffOption::AlwaysUpdate || c.symbol() != " "
+        }),
+        "빈 칸은 강제 재출력, 내용 칸은 그대로여야 한다"
+    );
+
+    // 다음 draw는 일반 diff로 돌아간다 — 플래그가 풀렸으니 AlwaysUpdate가 안 남는다.
+    let frame2 = term.draw(|f| widgets::draw(f, &mut s)).unwrap();
+    assert!(
+        frame2
+            .buffer
+            .content
+            .iter()
+            .all(|c| { c.diff_option == ratatui::buffer::CellDiffOption::None }),
+        "한 프레임 뒤에는 일반 diff로 돌아와야 한다"
+    );
+}
+
+/// **빈 칸 치유는 전각 글자 자체를 건드리지 않는다.** 전각 글자 뒤 trailing 칸이
+/// 빈 칸이라 `AlwaysUpdate`가 심기기는 하지만, diff는 전각 글자를 내보낼 때 그
+/// trailing 칸을 항상 건너뛴다 — 거기에 공백을 쓰면 글자의 오른쪽 반쪽이 지워진다.
+/// 치유는 **빈 칸에만** 심으므로 전각 글자 칸은 처음부터 대상이 아니다.
+#[test]
+fn a_blank_heal_never_marks_a_wide_char_itself() {
+    let mut s = State::new();
+    s.sidebar_on = false;
+    said(&mut s, 1, EntryKind::Agent("안녕".into()));
+    s.force_update_blank = true;
+
+    let mut term = Terminal::new(TestBackend::new(60, 12)).unwrap();
+    let frame = term.draw(|f| widgets::draw(f, &mut s)).unwrap();
+
+    let mut wide_chars = 0;
+    for c in frame.buffer.content.iter() {
+        let w = c.symbol().chars().next().map(unicode_width::UnicodeWidthChar::width);
+        if w.is_some_and(|w| w.unwrap_or(0) > 1) {
+            wide_chars += 1;
+            assert!(
+                c.diff_option != ratatui::buffer::CellDiffOption::AlwaysUpdate,
+                "전각 글자 자체에 강제 재출력을 심으면 안 된다"
+            );
+        }
+    }
+    assert!(wide_chars > 0, "전각 글자가 하나도 없다 — 테스트가 헛돈다");
+}
+
 /// **배경이 있으면 전각이 좁은 글자로 바뀔 때 trailing 칸이 선로에 나간다.**
 /// 'a' 뒤에 공백 하나가 실제로 쓰여야 한다 — 그 공백이 전각의 오른쪽 반쪽을 지운다.
 /// (커서가 이미 그 자리에 서 있으므로 커서 이동 없이 space만 나간다.)
