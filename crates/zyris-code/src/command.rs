@@ -42,8 +42,17 @@ pub enum Command {
     Jobs(Option<String>),
     /// Quits. **If a turn is running, it stops on the server too** (`turn_to_stop` in `app.rs`).
     Quit,
+    /// Shows who this node is attached as (`/account`), or logs out (`/account logout`).
+    Account(Option<AccountAction>),
     /// Something unknown. **Not sent to the server; tells what's available instead.**
     Unknown(String),
+}
+
+/// What `/account` can do after the command word.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccountAction {
+    /// Forgets the stored credentials. The next launch asks for approval again.
+    Logout,
 }
 
 /// What `/plugin` does.
@@ -127,6 +136,11 @@ pub fn parse(text: &str) -> Option<Command> {
             }
             _ => Command::Unknown(format!("jobs {arg}")),
         },
+        "account" => match arg {
+            "" => Command::Account(None),
+            "logout" | "log out" | "로그아웃" => Command::Account(Some(AccountAction::Logout)),
+            other => return Some(Command::Unknown(format!("account {other}"))),
+        },
         "quit" | "exit" | "q" => Command::Quit,
         other => Command::Unknown(other.to_string()),
     })
@@ -184,6 +198,7 @@ pub fn catalogue(lang: crate::lang::Lang) -> Vec<(&'static str, &'static str)> {
             ("/plugin", "플러그인을 받고 지웁니다 (add·remove·update)"),
             ("/rules", "이 쓰레드에 실린 CLAUDE.md·AGENTS.md"),
             ("/cwd", "도구가 상대경로를 푸는 자리"),
+            ("/account", "계정 정보를 보고, 로그아웃합니다 (logout)"),
             ("/grants", "밖으로 열어 둔 디렉터리 (close로 전부 닫습니다)"),
             ("/jobs", "배경에서 도는 작업 (stop <id>로 멈춥니다)"),
             ("/changes", "이 디렉터리에서 바꾼 파일"),
@@ -201,6 +216,7 @@ pub fn catalogue(lang: crate::lang::Lang) -> Vec<(&'static str, &'static str)> {
             ("/plugin", "Install and remove plugins (add / remove / update)"),
             ("/rules", "The CLAUDE.md and AGENTS.md loaded into this thread"),
             ("/cwd", "Where tools resolve relative paths"),
+            ("/account", "Show account info, or log out (logout)"),
             ("/grants", "Directories opened outside the working directory (close shuts them all)"),
             ("/jobs", "Background jobs (stop <id> kills one)"),
             ("/changes", "Files changed in this directory"),
@@ -440,6 +456,26 @@ mod tests {
     #[test]
     fn an_unknown_grants_argument_does_nothing() {
         assert_eq!(parse("/grants 다열어"), Some(Command::Unknown("grants 다열어".into())));
+    }
+
+    /// `/account` shows by default; only an explicit `logout` forgets the credentials.
+    #[test]
+    fn account_shows_by_default_and_logs_out_only_when_asked() {
+        assert_eq!(parse("/account"), Some(Command::Account(None)));
+        assert_eq!(
+            parse("/account logout"),
+            Some(Command::Account(Some(AccountAction::Logout)))
+        );
+        assert_eq!(
+            parse("/account log out"),
+            Some(Command::Account(Some(AccountAction::Logout)))
+        );
+        assert_eq!(
+            parse("/account 로그아웃"),
+            Some(Command::Account(Some(AccountAction::Logout)))
+        );
+        // An unknown argument never falls into the logging-out side.
+        assert_eq!(parse("/account stop"), Some(Command::Unknown("account stop".into())));
     }
 
     /// The familiar name varies from person to person. Not finding how to quit would be a problem.

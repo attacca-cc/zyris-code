@@ -650,6 +650,85 @@ impl Lang {
             ),
         }
     }
+    // ── Commands (`/account`)
+    /// What `/account` prints — who the connection is: name, email, id, billing, scopes.
+    /// `plan` and `credits` are absent on deployments that don't meter.
+    pub fn account_text(
+        self,
+        name: &str,
+        email: &str,
+        user_id: &str,
+        plan: Option<&str>,
+        credits: Option<&str>,
+        scopes: &[String],
+    ) -> String {
+        let scopes = if scopes.is_empty() {
+            match self {
+                Lang::Ko => "없음".into(),
+                Lang::En => "none".into(),
+            }
+        } else {
+            scopes.join(", ")
+        };
+        match self {
+            Lang::Ko => format!(
+                "**{name}** ({email})\n\n\
+                 아이디: `{user_id}`\n\
+                 {plan_line}\
+                 {credits_line}\
+                 부여된 권한: {scopes}\n\n\
+                 `/account logout` — 이 기기에서 로그아웃합니다. \
+                 다음 실행 때 다시 승인을 받습니다.",
+                plan_line = plan.map(|p| format!("플랜: {p}\n")).unwrap_or_default(),
+                credits_line = credits.map(|c| format!("크레딧: {c}\n")).unwrap_or_default(),
+            ),
+            Lang::En => format!(
+                "**{name}** ({email})\n\n\
+                 User ID: `{user_id}`\n\
+                 {plan_line}\
+                 {credits_line}\
+                 Granted scopes: {scopes}\n\n\
+                 `/account logout` — log out on this device. The next launch asks for approval again.",
+                plan_line = plan.map(|p| format!("Plan: {p}\n")).unwrap_or_default(),
+                credits_line = credits.map(|c| format!("Credits: {c}\n")).unwrap_or_default(),
+            ),
+        }
+    }
+    /// What to say when `/account` couldn't reach the server.
+    pub fn account_error(self, why: &str) -> String {
+        match self {
+            Lang::Ko => format!("계정 정보를 가져오지 못했습니다: {why}"),
+            Lang::En => format!("Could not fetch the account info: {why}"),
+        }
+    }
+    /// What `/account logout` says when the credentials were discarded.
+    ///
+    /// **The connection currently running is left alone** (`enroll::Reauth::discard_once`) —
+    /// the credentials are empty, so the next launch asks cleanly.
+    pub fn account_logged_out(self) -> &'static str {
+        self.pick(
+            "로그아웃했습니다. 저장된 자격을 지웠습니다 — 다음 실행 때 다시 승인 화면이 나옵니다. \
+             지금 연결은 그대로입니다.",
+            "Logged out. The stored credentials are cleared — the next launch shows the approval \
+             screen again. The current connection stays as is.",
+        )
+    }
+    /// What `/account logout` says when there is nothing to discard — a token given directly
+    /// (env/file) is not ours to drop, and there is no one to ask again.
+    pub fn account_logout_nothing(self) -> &'static str {
+        self.pick(
+            "로그아웃할 자격이 없습니다 — 토큰을 직접 줘서 로그인했습니다.",
+            "Nothing to log out — the token was given directly, not enrolled.",
+        )
+    }
+    /// What `/account logout` says when the credentials could not be cleared — already
+    /// discarded this process, or the file refused to be removed.
+    pub fn account_logout_failed(self) -> &'static str {
+        self.pick(
+            "자격을 지우지 못했습니다 — 이미 처리했거나 파일을 지울 수 없었습니다.",
+            "Could not clear the credentials — already done, or the file could not be removed.",
+        )
+    }
     pub fn grants_none_closed(self) -> &'static str {
         self.pick("열어 둔 곳이 없었습니다.", "Nothing was open.")
     }

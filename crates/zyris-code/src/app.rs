@@ -1359,6 +1359,7 @@ pub fn run_command(state: &mut State, text: &str) -> Option<crate::command::Comm
         | Command::Agent(_)
         // Needs the server — `finish_command` finishes it.
         | Command::Plugin(_)
+        | Command::Account(_)
         | Command::Changes
         | Command::Undo => {}
     }
@@ -2613,7 +2614,7 @@ async fn finish_command(
     agent_id: &mut String,
     text: &str,
 ) {
-    use crate::command::Command;
+    use crate::command::{AccountAction, Command};
     let Some(cmd) = run_command(state, text) else { return };
     match cmd {
         Command::Mcp => state.timeline.say(state.lang.mcp_report_text(&bridge.mcp_report())),
@@ -2688,6 +2689,44 @@ async fn finish_command(
                     Err(why) => why,
                 },
                 None => state.lang.undo_log_not_ready().to_string(),
+            };
+            state.timeline.say(said);
+        }
+        // **Who this node is attached as.** `me()` needs no scope of its own, so it answers
+        // even for a grant that came back short — and that is exactly the case where the
+        // account view must still work.
+        Command::Account(None) => match crate::conn::within(api, api.me()).await {
+            Ok(me) => {
+                let name = if me.display_name.trim().is_empty() {
+                    &me.email
+                } else {
+                    &me.display_name
+                };
+                state.timeline.say(state.lang.account_text(
+                    name,
+                    &me.email,
+                    &me.user_id,
+                    me.plan.as_deref(),
+                    me.credits.as_deref(),
+                    &me.scopes,
+                ));
+            }
+            Err(e) => state.timeline.say(state.lang.account_error(&e.to_string())),
+        },
+        // **Logging out drops the stored credentials.** The current connection is left
+        // alone (`discard_once`) — the next launch asks for approval again.
+        Command::Account(Some(AccountAction::Logout)) => {
+            let said = match bridge.reauth() {
+                // Where a token was given directly there is nothing to discard.
+                None => state.lang.account_logout_nothing().to_string(),
+                Some(reauth) => {
+                    if reauth.discard_once().await {
+                        state.lang.account_logged_out().to_string()
+                    } else {
+                        // Already discarded this process, or the file could not be cleared.
+                        state.lang.account_logout_failed().to_string()
+                    }
+                }
             };
             state.timeline.say(said);
         }

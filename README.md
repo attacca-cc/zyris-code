@@ -164,13 +164,14 @@ them; `status` and `list` are reads and go through.
 
 ## Slash commands
 
-Type `/` and the command list opens; it narrows as you type. Commands are handled
-locally and never reach the server.
+Type `/` and the command list opens; it narrows as you type. Commands run locally;
+only `/agent` and `/account` ask the server, for exactly what they need.
 
 | Command | Does |
 |---|---|
 | `/help` | List these |
 | `/mode [normal\|plan]` | Show or change the mode |
+| `/account [logout]` | Who this node is attached as (email, plan, granted scopes); `logout` clears the stored credentials |
 | `/agent [name]` | Pick an agent (see below) |
 | `/mcp` | Connected MCP servers, and why any failed |
 | `/skills` | Available skills |
