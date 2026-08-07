@@ -25,10 +25,45 @@ here.
   lines, so the count and the draw can never disagree.
 ```
 
+## Installing
+
+**macOS / Linux**
+
+```sh
+curl -fsSL https://github.com/attacca-cc/zyris-code/releases/latest/download/install.sh | sh
+```
+
+**Windows (PowerShell)**
+
+```powershell
+irm https://github.com/attacca-cc/zyris-code/releases/latest/download/install.ps1 | iex
+```
+
+Both install under your own account and need no administrator rights —
+`~/.local/bin` on macOS and Linux, `%LOCALAPPDATA%\Programs\zyris-code` on
+Windows — and put that directory on your PATH for bash, zsh, fish or PowerShell.
+Open a new terminal and the command is:
+
+```sh
+zyris
+```
+
+`zyris-code` is the same program under its full name. Set
+`ZYRIS_CODE_INSTALL_DIR` to install elsewhere, `--no-modify-path`
+(`-NoModifyPath` on Windows) to leave your shell startup files alone, and
+`--version <tag>` to pin a release. Each archive is listed in the release's
+`SHA256SUMS`, which the installers check before unpacking anything.
+
+To build it yourself instead:
+
+```sh
+cargo install --git https://github.com/attacca-cc/zyris-code zyris-code
+```
+
 ## Running
 
 ```bash
-cargo run -p zyris-code
+zyris          # or, from a checkout: cargo run -p zyris-code
 ```
 
 On first launch an 8-digit enrollment code is shown in a panel with the URL to

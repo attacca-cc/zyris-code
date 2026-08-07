@@ -1,0 +1,210 @@
+name: release
+
+# Cutting a release is pushing a tag. Everything below follows from that one act, so there is
+# nothing to remember and no button to press in the right order.
+#
+# `workflow_dispatch` exists so the whole thing can be rehearsed against an existing tag without
+# inventing a new version — a release workflow that can only ever be tried in production is a
+# release workflow nobody dares change.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and (re)publish"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+  # Backtraces cost nothing here and turn a bare "build failed" into something readable.
+  RUST_BACKTRACE: 1
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    # **One target failing must not take the others down.** A missing platform is worth shipping
+    # late; a release with nothing in it is not. The publish job below uploads whatever arrived.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 22.04, not the newest runner: the binary then needs only glibc 2.35 rather than
+          # whatever the latest image happens to carry, which is the difference between running
+          # on an ordinary server and not.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04
+            # rustls pulls in C (ring, aws-lc-rs), so cross-compiling needs a cross C toolchain,
+            # not just the Rust target.
+            apt: gcc-aarch64-linux-gnu
+            linker: aarch64-linux-gnu-gcc
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-13
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Install the target
+        shell: bash
+        run: |
+          rustup target add "${{ matrix.target }}"
+          if [ -n "${{ matrix.apt }}" ]; then
+            sudo apt-get update
+            sudo apt-get install -y "${{ matrix.apt }}"
+          fi
+
+      - name: Build
+        shell: bash
+        env:
+          # Both spellings: cargo wants one, the `cc` crate the other.
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
+          CC_aarch64_unknown_linux_gnu: ${{ matrix.linker }}
+        # `--locked` because a release must be built from the versions that were reviewed, not
+        # whatever resolved on the day.
+        run: cargo build --release --locked --target "${{ matrix.target }}" -p zyris-code
+
+      - name: Package
+        shell: bash
+        # **The archive name carries no version.** That is what makes
+        # `releases/latest/download/zyris-code-<target>.tar.gz` a stable address, which is the
+        # address the install scripts use.
+        run: |
+          set -eu
+          name="zyris-code-${{ matrix.target }}"
+          mkdir -p dist
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            7z a "dist/$name.zip" "./target/${{ matrix.target }}/release/zyris-code.exe" LICENSE-MIT LICENSE-APACHE README.md
+          else
+            staging="$(mktemp -d)"
+            cp "target/${{ matrix.target }}/release/zyris-code" "$staging/"
+            cp LICENSE-MIT LICENSE-APACHE README.md "$staging/"
+            tar -czf "dist/$name.tar.gz" -C "$staging" .
+          fi
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    # **Runs even when a target failed**, so one broken platform does not withhold the rest.
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: build-*
+          merge-multiple: true
+          path: dist
+
+      - name: Collect and checksum
+        id: collect
+        shell: bash
+        run: |
+          set -eu
+          # The install scripts are shipped as assets so that `curl -fsSL .../install.sh` has one
+          # address that always points at the newest release.
+          cp install.sh install.ps1 dist/
+          cd dist
+          # Nothing at all means every build failed; publishing an empty release would look like
+          # a release that simply does not work on your machine.
+          count="$(find . -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' \) | wc -l)"
+          if [ "$count" -eq 0 ]; then
+            echo "every build failed — refusing to publish an empty release" >&2
+            exit 1
+          fi
+          sha256sum ./* > SHA256SUMS
+          # `sha256sum -c` wants the names it was given, and `./x` reads badly in release notes.
+          sed -i 's| \./| |' SHA256SUMS
+          cat SHA256SUMS
+          echo "tag=${{ inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
+
+      - name: Write the release notes
+        shell: bash
+        env:
+          TAG: ${{ steps.collect.outputs.tag }}
+        run: |
+          set -eu
+          # The notes carry the install commands themselves. Someone landing on the release page
+          # should not have to go and find the README to learn what to paste.
+          {
+            printf '## Install\n\n'
+            printf '**macOS / Linux**\n\n'
+            printf '```sh\n'
+            printf 'curl -fsSL https://github.com/%s/releases/latest/download/install.sh | sh\n' "$GITHUB_REPOSITORY"
+            printf '```\n\n'
+            printf '**Windows (PowerShell)**\n\n'
+            printf '```powershell\n'
+            printf 'irm https://github.com/%s/releases/latest/download/install.ps1 | iex\n' "$GITHUB_REPOSITORY"
+            printf '```\n\n'
+            printf 'Both install under your own account and need no administrator rights:\n'
+            printf '`~/.local/bin` on macOS and Linux, `%%LOCALAPPDATA%%\\Programs\\zyris-code` on\n'
+            printf 'Windows. **Your PATH is set up for you** — bash, zsh, fish and PowerShell — so\n'
+            printf 'after opening a new terminal the command is simply:\n\n'
+            printf '```sh\n'
+            printf 'zyris\n'
+            printf '```\n\n'
+            printf '`zyris-code` works too; they are the same program.\n\n'
+            printf 'Set `ZYRIS_CODE_INSTALL_DIR` to install elsewhere, or `--no-modify-path`\n'
+            printf '(`-NoModifyPath` on Windows) to leave your shell alone. To pin a version:\n'
+            printf '`... | sh -s -- --version %s`.\n\n' "$TAG"
+            printf 'Run it in the directory you want to work in. It prints an enrollment code the\n'
+            printf 'first time; approve it in the browser and it attaches.\n\n'
+            printf '### Building instead\n\n'
+            printf '```sh\n'
+            printf 'cargo install --git https://github.com/%s --tag %s zyris-code\n' "$GITHUB_REPOSITORY" "$TAG"
+            printf '```\n\n'
+            printf '### Verifying a download\n\n'
+            printf 'Every archive is listed in `SHA256SUMS`, which the install scripts check before\n'
+            printf 'unpacking anything. By hand:\n\n'
+            printf '```sh\n'
+            printf 'sha256sum -c SHA256SUMS --ignore-missing\n'
+            printf '```\n\n'
+            printf '### Files\n\n'
+            printf '| Platform | Archive |\n|---|---|\n'
+            printf '| Linux x86_64 | `zyris-code-x86_64-unknown-linux-gnu.tar.gz` |\n'
+            printf '| Linux aarch64 | `zyris-code-aarch64-unknown-linux-gnu.tar.gz` |\n'
+            printf '| macOS Apple silicon | `zyris-code-aarch64-apple-darwin.tar.gz` |\n'
+            printf '| macOS Intel | `zyris-code-x86_64-apple-darwin.tar.gz` |\n'
+            printf '| Windows x86_64 | `zyris-code-x86_64-pc-windows-msvc.zip` |\n\n'
+            printf 'A platform missing from the release means its build failed; the others are\n'
+            printf 'published regardless.\n'
+          } > notes.md
+          cat notes.md
+
+      - name: Publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.collect.outputs.tag }}
+        # `gh` is on the runner already, so the release needs no third-party action. Re-running
+        # against a tag that already has a release replaces the assets rather than failing.
+        run: |
+          set -eu
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* \
+              --title "$TAG" \
+              --notes-file notes.md \
+              --verify-tag
+          fi
