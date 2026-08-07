@@ -25,11 +25,24 @@ pub struct Panel {
     pub lines: Vec<Line<'static>>,
     /// Rows scrolled off the top. The widget clamps it to what fits.
     pub scroll: usize,
+    /// An action button the panel offers, drawn as its own row above the hint.
+    /// Only the account panel carries one so far.
+    pub button: Option<PanelButton>,
+    /// Whether the button has focus. Tab moves it; Enter/Space then activates.
+    pub button_focused: bool,
+}
+
+/// A button a panel can offer. The widget draws it; `app.rs` turns activation
+/// into the same path as the matching slash command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PanelButton {
+    /// Log out on this device — the same as `/account logout`.
+    Logout,
 }
 
 impl Panel {
     fn new(title: String, lines: Vec<Line<'static>>) -> Self {
-        Self { title, lines, scroll: 0 }
+        Self { title, lines, scroll: 0, button: None, button_focused: false }
     }
 
     /// How far the body can scroll. `visible` is the number of body rows the box
@@ -170,7 +183,8 @@ pub fn plugins(lang: Lang, found: &[Plugin]) -> Panel {
     Panel::new(lang.title_plugins().into(), lines)
 }
 
-/// The `/account` panel — who this node is attached as.
+/// The `/account` panel — who this node is attached as. Carries a logout button
+/// so the action is one Tab + Enter away instead of remembering the command.
 pub fn account(
     lang: Lang,
     name: &str,
@@ -199,9 +213,11 @@ pub fn account(
         kv(lang.credits(), credits.unwrap_or_else(|| lang.panel_dash()).to_string()),
         kv(lang.acc_scopes(), scopes_text),
         blank(),
-        muted(lang.acc_logout_hint().to_string()),
+        muted(lang.acc_logout_note().to_string()),
     ];
-    Panel::new(lang.title_account().into(), lines)
+    let mut panel = Panel::new(lang.title_account().into(), lines);
+    panel.button = Some(PanelButton::Logout);
+    panel
 }
 
 /// The `/status` panel — the current session's picture, the same facts `status_text`
@@ -362,6 +378,16 @@ mod tests {
         assert!(joined.contains("프로젝트-1"), "{joined}");
         assert!(joined.contains("Main Agent"), "{joined}");
         assert!(joined.contains("claude-opus-5-1m"), "{joined}");
+    }
+
+    /// The account panel carries a logout button — the one thing worth doing there —
+    /// while the other panels carry none, so Tab does nothing on them.
+    #[test]
+    fn the_account_panel_carries_a_logout_button() {
+        let p = account(Lang::Ko, "루마", "me@standoor.org", "user-1", None, None, &[]);
+        assert_eq!(p.button, Some(PanelButton::Logout));
+        let p = mode(Lang::Ko, Mode::Normal);
+        assert_eq!(p.button, None, "a panel without an action must not show a button");
     }
 
     /// Scrolling never goes below zero, and `max_scroll` says when the end is reached.

@@ -165,6 +165,11 @@ pub enum Action {
     PanelClose,
     /// Scroll the popup panel. Positive scrolls toward the top.
     PanelScroll(i32),
+    /// Move focus between the panel body and its button (Tab). No-op without one.
+    PanelFocus,
+    /// Activate the focused panel button (Enter/Space while it is focused).
+    /// `apply` turns it into the same path as the matching slash command.
+    PanelActivate,
     CycleMode,
     Approve,
     Deny,
@@ -609,12 +614,19 @@ pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
         };
     }
 
-    // **The popup panel is modal.** While it is up, keys only scroll or close it —
-    // typing must not leak into the input behind it. Esc or Enter closes; ↑↓ · j·k
-    // scroll by one row, PageUp·PageDown by a page. Only quitting always works.
+    // **The popup panel is modal.** While it is up, keys only scroll, focus its
+    // button (Tab) or close it — typing must not leak into the input behind it.
+    // Esc closes; Enter activates the button when it is focused, otherwise closes.
+    // ↑↓ · j·k scroll by one row, PageUp·PageDown by a page. Only quitting always works.
     if state.panel.is_some() && !(ctrl && matches!(key.code, KeyCode::Char('c'))) {
+        let has_button = state.panel.as_ref().is_some_and(|p| p.button.is_some());
+        let button_focused = state.panel.as_ref().is_some_and(|p| p.button_focused);
         return match key.code {
-            KeyCode::Esc | KeyCode::Enter => vec![Action::PanelClose],
+            KeyCode::Esc => vec![Action::PanelClose],
+            KeyCode::Tab | KeyCode::BackTab if has_button => vec![Action::PanelFocus],
+            KeyCode::Enter if button_focused => vec![Action::PanelActivate],
+            KeyCode::Char(' ') if button_focused => vec![Action::PanelActivate],
+            KeyCode::Enter => vec![Action::PanelClose],
             KeyCode::Up | KeyCode::Char('k') => vec![Action::PanelScroll(1)],
             KeyCode::Down | KeyCode::Char('j') => vec![Action::PanelScroll(-1)],
             KeyCode::PageUp => vec![Action::PanelScroll(10)],
@@ -1047,6 +1059,25 @@ pub fn apply(state: &mut State, action: &Action) {
             }
         }
         Action::PanelClose => state.panel = None,
+        Action::PanelFocus => {
+            if let Some(p) = &mut state.panel {
+                if p.button.is_some() {
+                    p.button_focused = !p.button_focused;
+                }
+            }
+        }
+        // **The button's work is I/O, so `apply` only notes it down.** It closes the
+        // panel and queues the same command the button stands for — the loop below
+        // runs `finish_command`, which is where the credentials actually drop.
+        Action::PanelActivate => {
+            let logout = state.panel.as_ref().is_some_and(|p| {
+                p.button == Some(crate::panel::PanelButton::Logout)
+            });
+            state.panel = None;
+            if logout {
+                state.command_out = Some("/account logout".to_string());
+            }
+        }
         Action::PanelScroll(by) => {
             if let Some(p) = &mut state.panel {
                 if *by > 0 {
@@ -3440,6 +3471,46 @@ mod tests {
         assert_eq!(s.panel.as_ref().unwrap().scroll, 0);
         // While the panel is open the wheel must not move the transcript.
         assert_eq!(s.scroll.top, 0, "the transcript scroll moved");
+    }
+
+    /// Tab moves focus onto the account panel's logout button, and Enter activates
+    /// it — the same path as typing `/account logout`, not a second logout flow.
+    #[test]
+    fn the_account_button_focuses_with_tab_and_activates_with_enter() {
+        let mut s = State::new();
+        s.panel = Some(crate::panel::account(
+            crate::lang::Lang::Ko,
+            "루마",
+            "me@standoor.org",
+            "user-1",
+            None,
+            None,
+            &[],
+        ));
+        // Tab: focus moves to the button.
+        for a in on_key(&s, key(KeyCode::Tab, KeyModifiers::NONE)) {
+            apply(&mut s, &a);
+        }
+        assert!(s.panel.as_ref().unwrap().button_focused, "Tab must focus the button");
+        // Enter: the button activates — the logout command is queued, the panel closes.
+        for a in on_key(&s, key(KeyCode::Enter, KeyModifiers::NONE)) {
+            apply(&mut s, &a);
+        }
+        assert_eq!(s.command_out.as_deref(), Some("/account logout"));
+        assert!(s.panel.is_none(), "the panel closes when the button activates");
+    }
+
+    /// A panel without a button keeps the old keys — Tab does nothing, Enter closes.
+    #[test]
+    fn a_buttonless_panel_ignores_tab_and_enter_closes() {
+        let mut s = State::new();
+        run_command(&mut s, "/mode");
+        let actions = on_key(&s, key(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(actions.is_empty(), "no button: Tab must not focus anything: {actions:?}");
+        for a in on_key(&s, key(KeyCode::Enter, KeyModifiers::NONE)) {
+            apply(&mut s, &a);
+        }
+        assert!(s.panel.is_none(), "Enter still closes a panel without a button");
     }
 
     /// **A window to pick the screen language comes up.** There are only two, so the list is

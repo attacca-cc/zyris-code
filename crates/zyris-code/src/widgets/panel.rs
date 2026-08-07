@@ -16,7 +16,11 @@ use crate::theme;
 
 pub fn draw(frame: &mut Frame, area: Rect, panel: &mut Panel, lang: crate::lang::Lang) {
     // The box grows with the content, never taller than four fifths of the screen.
-    let want_h = (panel.lines.len() as u16).saturating_add(3).max(5);
+    // A button adds its own row between the body and the hint.
+    let has_button = panel.button.is_some();
+    let want_h = (panel.lines.len() as u16)
+        .saturating_add(3 + u16::from(has_button))
+        .max(5);
     let h = want_h.min(area.height.saturating_mul(4) / 5).max(3);
     let w = 72.min(area.width.saturating_sub(4)).max(20);
     let box_area = Rect {
@@ -42,8 +46,10 @@ pub fn draw(frame: &mut Frame, area: Rect, panel: &mut Panel, lang: crate::lang:
     frame.render_widget(block, box_area);
 
     let width = inner.width as usize;
-    // The last row is the hint line; everything above it is body.
-    let body_rows = inner.height.saturating_sub(1) as usize;
+    // The last row is the hint line; the button (when present) sits above it;
+    // everything above that is body.
+    let fixed = 1 + u16::from(has_button);
+    let body_rows = inner.height.saturating_sub(fixed) as usize;
 
     // Clamp the scroll to what actually fits, then draw that window.
     let max = panel.max_scroll(body_rows);
@@ -57,12 +63,42 @@ pub fn draw(frame: &mut Frame, area: Rect, panel: &mut Panel, lang: crate::lang:
     while lines.len() < body_rows {
         lines.push(Line::from(""));
     }
-    lines.push(Line::from(Span::styled(
-        lang.panel_keys(),
-        Style::default().fg(theme::TEXT_MUTED),
-    )));
+    if let Some(button) = panel.button {
+        lines.push(button_line(button, panel.button_focused, lang, width));
+    }
+    let keys = match (has_button, panel.button_focused) {
+        (true, true) => lang.panel_keys_button_focused(),
+        (true, false) => lang.panel_keys_button(),
+        (false, _) => lang.panel_keys(),
+    };
+    lines.push(Line::from(Span::styled(keys, Style::default().fg(theme::TEXT_MUTED))));
 
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The button row — `[ 로그아웃 ]` when resting, marked `▶ … ◀` and accented
+/// when focused. Centered, like a dialog's button.
+fn button_line(
+    button: crate::panel::PanelButton,
+    focused: bool,
+    lang: crate::lang::Lang,
+    width: usize,
+) -> Line<'static> {
+    let label = match button {
+        crate::panel::PanelButton::Logout => lang.acc_logout_button(),
+    };
+    let text = if focused {
+        format!("▶ [ {label} ] ◀")
+    } else {
+        format!("[ {label} ]")
+    };
+    let pad = " ".repeat(width.saturating_sub(display_width(&text)) / 2);
+    let style = if focused {
+        Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme::DANGER)
+    };
+    Line::from(Span::styled(format!("{pad}{text}"), style))
 }
 
 /// Cuts a line to the box width, keeping each span's style. A wide character that

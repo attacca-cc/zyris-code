@@ -1334,11 +1334,29 @@ impl Lang {
     pub fn acc_none(self) -> &'static str {
         self.pick("없음", "none")
     }
-    pub fn acc_logout_hint(self) -> &'static str {
+    pub fn acc_logout_note(self) -> &'static str {
         self.pick(
-            "`/account logout` — 이 기기에서 로그아웃합니다. 다음 실행 때 다시 승인을 받습니다.",
-            "`/account logout` — log out on this device. The next launch asks for approval again.",
+            "로그아웃하면 저장된 자격이 지워지고, 다음 실행 때 다시 승인을 받습니다.",
+            "Logging out clears the stored credentials — the next launch asks for approval again.",
         )
+    }
+    /// The label of the account panel's logout button.
+    pub fn acc_logout_button(self) -> &'static str {
+        self.pick("로그아웃", "Log out")
+    }
+    /// The hint line when the panel carries a button — Tab moves focus onto it.
+    pub fn panel_keys_button(self) -> String {
+        match self {
+            Lang::Ko => "↑↓ 스크롤 · Tab 버튼 · Esc 닫기".into(),
+            Lang::En => "↑↓ scroll · Tab button · Esc close".into(),
+        }
+    }
+    /// The hint line when the panel's button is focused — Enter activates it.
+    pub fn panel_keys_button_focused(self) -> String {
+        match self {
+            Lang::Ko => "Enter 실행 · Esc 닫기".into(),
+            Lang::En => "Enter activate · Esc close".into(),
+        }
     }
 
     // ── Status panel
