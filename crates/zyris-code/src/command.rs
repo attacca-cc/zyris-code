@@ -44,6 +44,8 @@ pub enum Command {
     Quit,
     /// Shows who this node is attached as (`/account`), or logs out (`/account logout`).
     Account(Option<AccountAction>),
+    /// The current session's picture — thread, project, agent, mode, and usage.
+    Status,
     /// Something unknown. **Not sent to the server; tells what's available instead.**
     Unknown(String),
 }
@@ -141,6 +143,7 @@ pub fn parse(text: &str) -> Option<Command> {
             "logout" | "log out" | "로그아웃" => Command::Account(Some(AccountAction::Logout)),
             other => return Some(Command::Unknown(format!("account {other}"))),
         },
+        "status" | "info" => Command::Status,
         "quit" | "exit" | "q" => Command::Quit,
         other => Command::Unknown(other.to_string()),
     })
@@ -199,6 +202,7 @@ pub fn catalogue(lang: crate::lang::Lang) -> Vec<(&'static str, &'static str)> {
             ("/rules", "이 쓰레드에 실린 CLAUDE.md·AGENTS.md"),
             ("/cwd", "도구가 상대경로를 푸는 자리"),
             ("/account", "계정 정보를 보고, 로그아웃합니다 (logout)"),
+            ("/status", "지금 세션·에이전트·모드·사용량을 한눈에"),
             ("/grants", "밖으로 열어 둔 디렉터리 (close로 전부 닫습니다)"),
             ("/jobs", "배경에서 도는 작업 (stop <id>로 멈춥니다)"),
             ("/changes", "이 디렉터리에서 바꾼 파일"),
@@ -217,6 +221,7 @@ pub fn catalogue(lang: crate::lang::Lang) -> Vec<(&'static str, &'static str)> {
             ("/rules", "The CLAUDE.md and AGENTS.md loaded into this thread"),
             ("/cwd", "Where tools resolve relative paths"),
             ("/account", "Show account info, or log out (logout)"),
+            ("/status", "Session, agent, mode and usage at a glance"),
             ("/grants", "Directories opened outside the working directory (close shuts them all)"),
             ("/jobs", "Background jobs (stop <id> kills one)"),
             ("/changes", "Files changed in this directory"),
@@ -462,18 +467,9 @@ mod tests {
     #[test]
     fn account_shows_by_default_and_logs_out_only_when_asked() {
         assert_eq!(parse("/account"), Some(Command::Account(None)));
-        assert_eq!(
-            parse("/account logout"),
-            Some(Command::Account(Some(AccountAction::Logout)))
-        );
-        assert_eq!(
-            parse("/account log out"),
-            Some(Command::Account(Some(AccountAction::Logout)))
-        );
-        assert_eq!(
-            parse("/account 로그아웃"),
-            Some(Command::Account(Some(AccountAction::Logout)))
-        );
+        assert_eq!(parse("/account logout"), Some(Command::Account(Some(AccountAction::Logout))));
+        assert_eq!(parse("/account log out"), Some(Command::Account(Some(AccountAction::Logout))));
+        assert_eq!(parse("/account 로그아웃"), Some(Command::Account(Some(AccountAction::Logout))));
         // An unknown argument never falls into the logging-out side.
         assert_eq!(parse("/account stop"), Some(Command::Unknown("account stop".into())));
     }
@@ -490,5 +486,14 @@ mod tests {
     fn changes_answers_to_diff_too() {
         assert_eq!(parse("/changes"), Some(Command::Changes));
         assert_eq!(parse("/diff"), Some(Command::Changes));
+    }
+
+    /// `/status` is the one command; `/info` is the familiar alias. Arguments are ignored —
+    /// there is only one picture to show.
+    #[test]
+    fn status_answers_to_info_too() {
+        assert_eq!(parse("/status"), Some(Command::Status));
+        assert_eq!(parse("/info"), Some(Command::Status));
+        assert_eq!(parse("/status 지금"), Some(Command::Status));
     }
 }
