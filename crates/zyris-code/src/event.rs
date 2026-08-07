@@ -321,6 +321,10 @@ mod tests {
             stdout: "   Compiling zyris-code\n    Finished dev\n".into(),
             stderr: String::new(),
             timed_out: false,
+            // capkit v3 says separately whether it had to cut the output. **This test is the
+            // seam that caught the shape change** when the pin moved to upstream `main`.
+            stdout_truncated: false,
+            stderr_truncated: false,
         };
         let got = exec_detail(&wire("exec"), Some(&serde_json::to_value(&out).unwrap()))
             .expect("did not recognise the exec result");

@@ -14,8 +14,8 @@ members = ["crates/zyris-code"]
 # `cargo metadata` failed. At the time zyris-code leaned on code **only we knew about**, and with a
 # single copy there was nothing to recover with. Open a PR, merge it, and write that commit here — never attach by path.
 [workspace.dependencies]
-zyris = { git = "https://github.com/attacca-cc/zyris", rev = "8f25c021d282e5be98ed90cf80fbd61c9e645c8f", features = ["enroll"] }
-zyris-attacca = { git = "https://github.com/attacca-cc/zyris", rev = "8f25c021d282e5be98ed90cf80fbd61c9e645c8f" }
+zyris = { git = "https://github.com/attacca-cc/zyris", rev = "31a2ae616957522ccbcb49c485854de62a89d333", features = ["enroll"] }
+zyris-attacca = { git = "https://github.com/attacca-cc/zyris", rev = "31a2ae616957522ccbcb49c485854de62a89d333" }
 # The capability declarations (caps) and their implementation (capkit). **Must be the same rev** —
 # otherwise the same crate gets linked twice, causing a "same type but the types differ" error.
 #
@@ -24,16 +24,33 @@ zyris-attacca = { git = "https://github.com/attacca-cc/zyris", rev = "8f25c021d2
 #
 # capkit's default features are only `file-io` and `terminal`, so no display dependencies come along.
 # Enabling `desktop` makes xcap require X11/Wayland dev packages, blocking the build on this machine.
-zyris-caps = { git = "https://github.com/attacca-cc/zyris", rev = "8f25c021d282e5be98ed90cf80fbd61c9e645c8f" }
-zyris-capkit = { git = "https://github.com/attacca-cc/zyris", rev = "8f25c021d282e5be98ed90cf80fbd61c9e645c8f" }
+zyris-caps = { git = "https://github.com/attacca-cc/zyris", rev = "31a2ae616957522ccbcb49c485854de62a89d333" }
+zyris-capkit = { git = "https://github.com/attacca-cc/zyris", rev = "31a2ae616957522ccbcb49c485854de62a89d333" }
 
-# The `rev` above (8f25c02) is a commit on the `feat/enrollment-ui` branch (PR #6). The `EnrollmentUi`
-# hook lives there — the way `Enroller::with_ui` lets the screen draw the enrollment code itself.
-# The `register_node`/`list_nodes` calls and the `nodes:write` scope were already in the earlier
-# `main` (3a21c93, PR #3).
+# The `rev` above (31a2ae6) is a commit on `main`. It used to be 8f25c02 on the `feat/enrollment-ui`
+# branch, held there for the `EnrollmentUi` hook (`Enroller::with_ui`, PR #6) — that merged, so this
+# is now the ordinary `main` tip.
 #
-# Once PR #6 merges, bump to `main`'s merge commit. Even before that, this commit really exists on
-# GitHub, so the build works.
+# **The bump is what fixed "tool calls just sit there pending".** Two defects lived in the pinned
+# rev, and both are gone on `main`:
+#
+# - `run_writer` used to leave the loop on the first write error without setting `close_tx`. The
+#   reader stayed alive, so calls kept arriving and running while every reply was dropped into a
+#   `let _ =`, and `closed()` never resolved — the runner had no idea to reconnect. It now calls
+#   `shutdown` on that path (PR #8).
+# - The server advertises a heartbeat in `HelloAck` and the dialer threw it away; there was no
+#   ping/pong anywhere in the tree. A half-open or silent socket was indistinguishable from a
+#   healthy one, forever. `spawn_heartbeat`/`spawn_watchdog` now send at the negotiated interval
+#   and shut down when no frame arrives inside the timeout (PR #8).
+#
+# What the heartbeat still cannot see is a socket that is alive **and** answering while attacca has
+# routed the node elsewhere — its registry is `insert(node_id, connection)`, so a second window
+# displaces the first. `/reconnect` is the way back from that: it drops the socket, and the redial
+# re-announces.
+#
+# The bump also brings capkit v3 (PR #7), which added a fourth `file_io` writer (`edit`);
+# `tools::readonly` withholds it, and the test there now fails on any tool upstream grows that this
+# node has not classified.
 #
 # **What's not in `main`, we do ourselves.** The per-app credential directory is set by us filling
 # `$ZYRIS_CONFIG_DIR` rather than `RunConfig::app` (`conn::credential_home`), and the scope check

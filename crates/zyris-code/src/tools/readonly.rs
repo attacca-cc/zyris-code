@@ -18,6 +18,18 @@ use zyris_caps::FileIoServer;
 /// The four that are exposed. The rest are filtered out.
 const READ_ONLY: &[&str] = &["stat", "list", "read", "read_stream"];
 
+/// The ones deliberately withheld, written down so upstream cannot grow a writer unnoticed.
+///
+/// **Every tool capkit offers has to appear in one of these two lists**, and the test below fails
+/// the moment that stops being true. Without it, a new upstream tool simply lands on the filtered
+/// side by default — silently, with nobody having decided anything. capkit v3 really did add
+/// `edit` this way, and the test that was supposed to guard this went on passing.
+///
+/// It is a test-only list because `READ_ONLY` alone decides what runs; this one exists to force a
+/// human to classify what upstream adds, not to gate anything at runtime.
+#[cfg(test)]
+const WITHHELD: &[&str] = &["write", "edit", "remove", "mkdir"];
+
 pub struct ReadOnlyFileIo(FileIoServer<LocalFileIo>);
 
 impl ReadOnlyFileIo {
@@ -49,13 +61,59 @@ mod tests {
     use super::*;
 
     /// With two write paths, the agent picks a full overwrite and the diff spreads over the whole file.
+    ///
+    /// **Every tool capkit offers must be classified here, by hand.**
+    ///
+    /// This used to name `write`·`remove`·`mkdir` inline, and capkit v3 then added a fourth writer
+    /// (`edit`). The allowlist did hold — a new name simply lands on the filtered side — but that
+    /// is the problem: it lands there *by default*, with nobody having looked at it. So the test
+    /// demands a decision instead of a safe accident, and fails until one is written down.
     #[test]
-    fn the_announced_file_io_cannot_write() {
+    fn every_tool_upstream_offers_is_classified() {
+        let all = FileIoServer(LocalFileIo::rooted(PathBuf::from("/tmp"))).descriptor();
+        let offered: Vec<&str> = all.tools.iter().map(|t| t.name.as_str()).collect();
+
+        for name in &offered {
+            assert!(
+                READ_ONLY.contains(name) || WITHHELD.contains(name),
+                "capkit offers `{name}`, which this node has never decided about. Put it in \
+                 READ_ONLY if it only reads, or in WITHHELD if it changes anything."
+            );
+        }
+        for name in READ_ONLY {
+            assert!(!WITHHELD.contains(name), "`{name}` is in both lists — decide which it is");
+            assert!(offered.contains(name), "`{name}` is announced but upstream no longer has it");
+        }
+    }
+
+    /// The announced list is exactly `READ_ONLY` — nothing withheld leaks into it.
+    #[test]
+    fn the_announced_file_io_is_exactly_the_reads() {
         let cap = ReadOnlyFileIo::new(PathBuf::from("/tmp")).descriptor();
-        let names: Vec<&str> = cap.tools.iter().map(|t| t.name.as_str()).collect();
-        assert!(names.contains(&"read"), "reading must be there: {names:?}");
-        for banned in ["write", "remove", "mkdir"] {
-            assert!(!names.contains(&banned), "{banned} must not be announced: {names:?}");
+        let mut announced: Vec<&str> = cap.tools.iter().map(|t| t.name.as_str()).collect();
+        announced.sort_unstable();
+        let mut want: Vec<&str> = READ_ONLY.to_vec();
+        want.sort_unstable();
+        assert_eq!(announced, want);
+    }
+
+    /// **Every tool capkit offers that is not a read is refused when called**, not merely hidden.
+    /// Filtering the list alone leaves the name callable by anyone who knows it.
+    #[tokio::test]
+    async fn no_writer_capkit_offers_can_be_called() {
+        let all = FileIoServer(LocalFileIo::rooted(PathBuf::from("/tmp"))).descriptor();
+        let cap = ReadOnlyFileIo::new(PathBuf::from("/tmp"));
+        for tool in all.tools.iter().filter(|t| !READ_ONLY.contains(&t.name.as_str())) {
+            let call = IncomingCall {
+                tool: tool.name.clone(),
+                params: zyris::Payload::from_json(serde_json::json!({"path": "a"})),
+                serialization: zyris::Serialization::Json,
+            };
+            assert!(
+                cap.dispatch(call).await.is_err(),
+                "{} is callable — the only way to change a file must stay `code_edit`",
+                tool.name
+            );
         }
     }
 
