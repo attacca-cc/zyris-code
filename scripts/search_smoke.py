@@ -107,7 +107,7 @@ def main():
     total = 5
 
     try:
-        if not read_until(primary, "기본", buf, time.time() + 30, "첫 프레임"):
+        if not read_until(primary, "일반", buf, time.time() + 30, "첫 프레임"):
             return finish(proc, primary, checks, total, False)
         print("  ✓ 떴다")
         checks += 1

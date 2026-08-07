@@ -97,7 +97,11 @@ def main():
         # We used to look for the header ("zyris-code") but removed that line. The mode in the
         # bottom bar is always drawn whether connected or not, so it is the better target — the
         # status line text swings between "connecting…" and "idle" depending on the connection.
-        if read_until(primary, "기본", buf, deadline, "첫 프레임"):
+        #
+        # **It is the mode label, so it moves when the wording does.** This looked for "기본"
+        # long after `lang::mode_normal` had become "일반", and the check had been failing on a
+        # perfectly healthy app ever since.
+        if read_until(primary, "일반", buf, deadline, "첫 프레임"):
             print("  ✓ 첫 프레임이 그려진다")
             checks += 1
         else:

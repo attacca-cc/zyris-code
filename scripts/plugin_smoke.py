@@ -33,6 +33,7 @@ for a in (["init","-q","-b","main"],["add","-A"],["commit","-qm","first"]):
 env = dict(os.environ, ZYRIS_PROFILE="zyris-code",
            ZYRIS_CODE_LOG="/tmp/zyris-code-plugin.log")
 p, r = pty.openpty()
+p_fd = p
 fcntl.ioctl(r, termios.TIOCSWINSZ, struct.pack("HHHH", 44, 120, 0, 0))
 proc = subprocess.Popen([BIN], stdin=r, stdout=r, stderr=r, env=env, cwd=WORK, close_fds=True)
 os.close(r)
@@ -48,22 +49,70 @@ def check(c, label):
     global ok, n
     if c: print(f"  ✓ {label}"); n += 1
     else: print(f"  ✗ {label}"); ok = False
+def drain(secs):
+    """Sleeps while keeping the pty drained.
+
+    **Never sleep without reading.** The buffer fills, the app blocks part-way through a draw,
+    and the keys already sent sit unprocessed — which looks exactly like "the command did
+    nothing". CLAUDE.md records the same trap taking out two other scripts at once.
+    """
+    end = time.time() + secs
+    while time.time() < end:
+        rr, _, _ = select.select([p_fd], [], [], 0.1)
+        if rr:
+            buf.append(os.read(p_fd, 262144).decode("utf-8", "replace"))
+
 def send(t):
-    os.write(p, t.encode()); time.sleep(0.6); os.write(p, b"\r"); time.sleep(1.5)
+    os.write(p_fd, t.encode()); drain(0.6); os.write(p_fd, b"\r"); drain(1.5)
+
+def snapshot(secs=2.0):
+    """Forces a full frame and returns the whole screen.
+
+    **ratatui only puts changed cells on the wire.** A word can therefore arrive split across
+    several writes with cursor jumps between them, and a needle searched in the raw stream is
+    found or missed depending on timing — `시험플러그인` really did come through as `…그인` and
+    failed a check on a working install. Ctrl+L (`Action::Repaint`) redraws everything and
+    changes no state, so what comes back is a screen rather than a diff.
+
+    **Only with nothing modal open.** With a panel or the command list up, `on_key` takes the
+    keystroke as input instead.
+    """
+    buf.clear()
+    os.write(p_fd, b"\x0c")
+    end = time.time() + secs
+    while time.time() < end:
+        rr, _, _ = select.select([p_fd], [], [], 0.2)
+        if rr:
+            buf.append(os.read(p_fd, 262144).decode("utf-8", "replace"))
+    return ANSI.sub("", "".join(buf))
+
+
+def close_panel():
+    """**A listing is a popup panel now, and it is modal.**
+
+    `/plugin` with no argument opens `panel::plugins`, which swallows every key but Esc — so the
+    next command typed with one still up goes nowhere at all. This script was written before the
+    panels existed and silently fed `/plugin add` to the list panel.
+    """
+    os.write(p, b"\x1b"); time.sleep(0.6)
 
 try:
-    if not until("기본", 30, "첫 프레임"): sys.exit(1)
+    if not until("일반", 30, "첫 프레임"): sys.exit(1)
     print("  ✓ 떴다"); n += 1
     time.sleep(2)
     buf.clear(); send("/plugin")
     check(until("플러그인이 없습니다", 8, "빈 목록"), "처음엔 비어 있다고 말한다")
+    close_panel()
     buf.clear(); send(f"/plugin add {ORIGIN}")
-    check(until("시험플러그인", 25, "설치"), "로컬 리포에서 받는다")
-    check("npx" in ANSI.sub("","".join(buf)), "무슨 명령을 돌릴지 알려준다")
-    check("스킬" in ANSI.sub("","".join(buf)), "스킬이 딸린 것을 알려준다")
+    until("받았습니다", 25, "설치")
+    shown = snapshot()
+    check("시험플러그인" in shown, "로컬 리포에서 받는다")
+    check("npx" in shown, "무슨 명령을 돌릴지 알려준다")
+    check("스킬" in shown, "스킬이 딸린 것을 알려준다")
     check(os.path.exists(f"{HOME}/.config/zyris-code/plugins/원본플러그인/plugin.json"), "디스크에 실제로 놓인다")
     buf.clear(); send("/plugin")
     check(until("시험플러그인", 8, "목록"), "목록에 나온다")
+    close_panel()
     buf.clear(); send("/plugin update")
     check(until("최신", 20, "갱신"), "갱신하면 이미 최신이라고 말한다")
     buf.clear(); send("/plugin remove 시험플러그인")
