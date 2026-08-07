@@ -42,6 +42,8 @@ pub enum Command {
     Jobs(Option<String>),
     /// Quits. **If a turn is running, it stops on the server too** (`turn_to_stop` in `app.rs`).
     Quit,
+    /// The current session's picture — thread, project, agent, mode, and usage.
+    Status,
     /// Something unknown. **Not sent to the server; tells what's available instead.**
     Unknown(String),
 }
@@ -127,6 +129,7 @@ pub fn parse(text: &str) -> Option<Command> {
             }
             _ => Command::Unknown(format!("jobs {arg}")),
         },
+        "status" | "info" => Command::Status,
         "quit" | "exit" | "q" => Command::Quit,
         other => Command::Unknown(other.to_string()),
     })
@@ -184,6 +187,7 @@ pub fn catalogue(lang: crate::lang::Lang) -> Vec<(&'static str, &'static str)> {
             ("/plugin", "플러그인을 받고 지웁니다 (add·remove·update)"),
             ("/rules", "이 쓰레드에 실린 CLAUDE.md·AGENTS.md"),
             ("/cwd", "도구가 상대경로를 푸는 자리"),
+            ("/status", "지금 세션·에이전트·모드·사용량을 한눈에"),
             ("/grants", "밖으로 열어 둔 디렉터리 (close로 전부 닫습니다)"),
             ("/jobs", "배경에서 도는 작업 (stop <id>로 멈춥니다)"),
             ("/changes", "이 디렉터리에서 바꾼 파일"),
@@ -201,6 +205,7 @@ pub fn catalogue(lang: crate::lang::Lang) -> Vec<(&'static str, &'static str)> {
             ("/plugin", "Install and remove plugins (add / remove / update)"),
             ("/rules", "The CLAUDE.md and AGENTS.md loaded into this thread"),
             ("/cwd", "Where tools resolve relative paths"),
+            ("/status", "Session, agent, mode and usage at a glance"),
             ("/grants", "Directories opened outside the working directory (close shuts them all)"),
             ("/jobs", "Background jobs (stop <id> kills one)"),
             ("/changes", "Files changed in this directory"),
@@ -454,5 +459,14 @@ mod tests {
     fn changes_answers_to_diff_too() {
         assert_eq!(parse("/changes"), Some(Command::Changes));
         assert_eq!(parse("/diff"), Some(Command::Changes));
+    }
+
+    /// `/status` is the one command; `/info` is the familiar alias. Arguments are ignored —
+    /// there is only one picture to show.
+    #[test]
+    fn status_answers_to_info_too() {
+        assert_eq!(parse("/status"), Some(Command::Status));
+        assert_eq!(parse("/info"), Some(Command::Status));
+        assert_eq!(parse("/status 지금"), Some(Command::Status));
     }
 }

@@ -1360,7 +1360,9 @@ pub fn run_command(state: &mut State, text: &str) -> Option<crate::command::Comm
         // Needs the server — `finish_command` finishes it.
         | Command::Plugin(_)
         | Command::Changes
-        | Command::Undo => {}
+        | Command::Undo
+        // `/status` only touches the session, which lives on the I/O side (`finish_command`).
+        | Command::Status => {}
     }
     Some(cmd)
 }
@@ -1378,6 +1380,21 @@ fn jobs_text(jobs: &[JobRow], lang: crate::lang::Lang) -> String {
     }
     out.push_str(lang.jobs_hint());
     out
+}
+
+/// What `/status` shows, built from state and session. **Pure so tests can pin it** —
+/// the I/O side only says it.
+fn status_said(state: &State, session: &Session) -> String {
+    let info = crate::lang::StatusInfo {
+        session_id: session.id(),
+        project: session.project(),
+        agent: &state.agent,
+        mode: state.mode.label(state.lang),
+        cwd: &state.cwd,
+        usage: &state.usage,
+        pending: session.pending_open(),
+    };
+    state.lang.status_text(&info)
 }
 
 // ---------------------------------------------------------------------------
@@ -2675,6 +2692,10 @@ async fn finish_command(
             };
             state.timeline.say(said);
         }
+        // **Needs no server call** — but the session (id, project) only lives on the I/O side.
+        Command::Status => {
+            state.timeline.say(status_said(state, session));
+        }
         Command::Undo => {
             let said = match bridge.undo() {
                 Some(undo) => match undo.revert_last() {
@@ -3316,6 +3337,35 @@ mod tests {
         let mut s = State::new();
         run_command(&mut s, "/nope");
         assert!(last_system(&mut s).contains("/help"), "{}", last_system(&mut s));
+    }
+
+    /// `/status` paints the whole picture — thread, project, agent, mode, usage, cwd — in
+    /// both languages, and a session-less state says so honestly.
+    #[test]
+    fn status_shows_the_session_picture() {
+        let mut s = State::new();
+        s.lang = crate::lang::Lang::Ko;
+        let mut session = Session::new(None);
+        session.switch_to("세션-1".into(), Some("프로젝트-1".into()));
+        s.agent = "Main Agent".into();
+        s.usage.model = Some("claude-opus-5-1m".into());
+        s.usage.context_tokens = Some(500_000);
+        s.usage.credits_used = Some("1.23".into());
+        let said = status_said(&s, &session);
+        assert!(said.contains("세션-1"), "{said}");
+        assert!(said.contains("프로젝트-1"), "{said}");
+        assert!(said.contains("Main Agent"), "{said}");
+        assert!(said.contains("claude-opus-5-1m"), "{said}");
+        assert!(said.contains("1.23"), "{said}");
+
+        // The English screen says the same things, and a session-less state says so honestly.
+        let mut s = State::new();
+        s.lang = crate::lang::Lang::En;
+        s.agent = "Main Agent".into();
+        let session = Session::new(None);
+        let said = status_said(&s, &session);
+        assert!(said.contains("none yet"), "{said}");
+        assert!(said.contains("Main Agent"), "{said}");
     }
 
     /// `/clear` empties **only the screen.** Clearing must not read as the session being gone.

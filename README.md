@@ -177,6 +177,7 @@ locally and never reach the server.
 | `/plugin [add\|remove\|update]` | Install and manage plugins |
 | `/rules` | Which `CLAUDE.md` / `AGENTS.md` files this session loaded |
 | `/cwd` | Where tools resolve relative paths |
+| `/status` | Session, agent, mode and usage at a glance |
 | `/grants` | Directories opened outside the fence; `/grants close` shuts them all |
 | `/changes` | Files changed in this directory, with `+N −N` |
 | `/undo` | Revert the last edit |

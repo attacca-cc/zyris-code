@@ -22,6 +22,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use crate::instructions::Found;
+use crate::mode::Route;
 use crate::plugin::Plugin;
 use crate::tools::gate::Grants;
 use crate::tools::skill::SkillInfo;
@@ -142,6 +143,18 @@ pub fn save(lang: Lang) {
 // ─────────────────────────────────────────────────────────────────────────────
 // Screen phrases
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// The pieces `/status` shows, gathered in one place so the wording function stays
+/// under clippy's argument budget.
+pub struct StatusInfo<'a> {
+    pub session_id: Option<&'a str>,
+    pub project: Option<&'a str>,
+    pub agent: &'a str,
+    pub mode: &'a str,
+    pub cwd: &'a Path,
+    pub usage: &'a crate::usage::Usage,
+    pub pending: Option<Route>,
+}
 
 impl Lang {
     // ── Bottom bar · activity line
@@ -649,6 +662,90 @@ impl Lang {
                 cwd.display(),
             ),
         }
+    }
+    /// What `/status` shows — the current session's picture. **Every line earns its place:**
+    /// the thread id is how the server names this conversation, the project decides where new
+    /// work lands, the agent answers who is listening, and the usage numbers tell how much
+    /// this thread has cost so far.
+    pub fn status_text(self, info: &StatusInfo) -> String {
+        let StatusInfo { session_id, project, agent, mode, cwd, usage, pending } = info;
+        let mut s = String::new();
+
+        let thread = match session_id {
+            Some(id) => format!("**thread** `{id}`"),
+            None => match self {
+                Lang::Ko => "**thread** 아직 없음 — 첫 메시지에서 만들어집니다".to_string(),
+                Lang::En => "**thread** none yet — your first message creates it".to_string(),
+            },
+        };
+        let project = match project {
+            Some(p) => match self {
+                Lang::Ko => format!("프로젝트 **{p}**"),
+                Lang::En => format!("project **{p}**"),
+            },
+            None => match self {
+                Lang::Ko => "프로젝트 기본 (안 고름)".to_string(),
+                Lang::En => "project default (not picked)".to_string(),
+            },
+        };
+        s.push_str(&format!("{thread} · {project}\n"));
+        s.push_str(&match self {
+            Lang::Ko => format!("에이전트 **{agent}** · 모드 **{mode}**\n"),
+            Lang::En => format!("agent **{agent}** · mode **{mode}**\n"),
+        });
+
+        if let Some(model) = &usage.model {
+            s.push_str(&match self {
+                Lang::Ko => format!("모델 {model}\n"),
+                Lang::En => format!("model {model}\n"),
+            });
+        }
+
+        // The same numbers the bottom bar shows — one picture, two places to read it.
+        let mut segs: Vec<String> = Vec::new();
+        if let Some(credits) = &usage.credits_used {
+            segs.push(format!("{} {credits}", self.credits()));
+        }
+        if let Some(used) = usage.context_tokens {
+            let text = match crate::usage::context_limit(usage.model.as_deref()) {
+                Some(max) => {
+                    let pct = if max > 0 { used.saturating_mul(100) / max } else { 0 };
+                    format!(
+                        "{}% ({}/{})",
+                        pct,
+                        crate::usage::compact(used),
+                        crate::usage::compact(max)
+                    )
+                }
+                None => crate::usage::compact(used),
+            };
+            segs.push(format!("{} {text}", self.context()));
+        }
+        if let Some(tokens) = usage.total_tokens {
+            segs.push(format!("{} {}", self.total_tokens(), crate::usage::compact(tokens)));
+        }
+        if !segs.is_empty() {
+            s.push_str(&format!("\n{}\n", segs.join(" · ")));
+        }
+
+        s.push_str(&match self {
+            Lang::Ko => format!("도구는 `{}`에서 돕니다.\n", cwd.display()),
+            Lang::En => format!("Tools run in `{}`.\n", cwd.display()),
+        });
+
+        // Say in advance where the next message goes — work·job open something new.
+        match pending {
+            Some(Route::Work) => s.push_str(match self {
+                Lang::Ko => "다음 메시지가 **새 work**를 엽니다.\n",
+                Lang::En => "Your next message opens a **new work**.\n",
+            }),
+            Some(Route::Job) => s.push_str(match self {
+                Lang::Ko => "다음 메시지가 **새 job**을 엽니다.\n",
+                Lang::En => "Your next message opens a **new job**.\n",
+            }),
+            _ => {}
+        }
+        s
     }
     pub fn grants_none_closed(self) -> &'static str {
         self.pick("열어 둔 곳이 없었습니다.", "Nothing was open.")
