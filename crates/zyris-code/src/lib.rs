@@ -9,6 +9,7 @@
 pub mod app;
 pub mod clipboard;
 pub mod command;
+pub mod config;
 pub mod conn;
 pub mod enroll;
 pub mod event;
@@ -28,9 +29,9 @@ pub mod repo;
 pub mod rows;
 pub mod scroll;
 pub mod selection;
-pub mod usage;
 pub mod theme;
 pub mod timeline;
 pub mod tools;
 pub mod undo;
+pub mod usage;
 pub mod widgets;

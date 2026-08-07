@@ -3,7 +3,8 @@
 //! **The moment we announce, every agent in every session of that account sees this node.** Sessions
 //! running in other windows can touch this computer too, and capkit's path resolution isn't a jail,
 //! so (`path.rs`: "the root is a default, not a jail") absolute paths escape the working directory.
-//! **Catching that escape is `Gate`'s job** — anything outside the working directory is asked of a human.
+//! **Catching that escape is `Gate`'s job** — anything outside the working directory follows
+//! the `/config` directory-access setting (deny by default; `allow` runs it without asking).
 
 pub mod bridge;
 pub mod diff;
@@ -32,7 +33,7 @@ use readonly::ReadOnlyFileIo;
 /// The base from which tools resolve relative paths — where the process was launched.
 ///
 /// **The screen and the tools must see the same thing.** If the strip above the input points at A
-/// while the tool runs in B, you can't tell which file the `src/app.rs` on the approval screen
+/// while the tool runs in B, you can't tell which file the `src/app.rs` on a tool line
 /// means. So there's one definition here.
 pub fn working_dir() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
@@ -43,8 +44,8 @@ pub fn working_dir() -> PathBuf {
 /// `cwd` is the process's working directory. Relative paths resolve against it, but **it is not a
 /// jail** — absolute paths go straight through. What stops them is `Gate`.
 ///
-/// **Every single one is wrapped in `Gate`.** If even one goes out bare, that capability becomes a
-/// back door that skips approval.
+/// **Every single one is wrapped in `Gate`.** If even one goes out bare, that capability
+/// becomes a back door around the fence.
 pub fn announce(
     runner: Runner,
     cwd: PathBuf,

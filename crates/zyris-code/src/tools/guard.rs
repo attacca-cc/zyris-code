@@ -3,8 +3,8 @@
 //! The moment it announces, every session of that account sees this node, and path resolution isn't a jail, so
 //! absolute paths escape the working directory.
 //!
-//! **There is only one place we ask: outside the working directory.** Nothing inside is asked, and
-//! going outside asks a human regardless of mode (`gate::escaping_path`).
+//! **There is no asking anymore.** Outside the working directory, the `/config` directory-access
+//! setting decides: `deny` (the default) refuses the call, `allow` runs it (`gate::decide`).
 
 use std::time::Duration;
 
@@ -15,7 +15,6 @@ use zyris::{
 };
 
 use crate::app::Frame;
-use crate::app::Verdict;
 use crate::tools::bridge::Bridge;
 use crate::tools::gate::{escaping_path, target_of, Call, Decision};
 
@@ -46,8 +45,8 @@ impl<C: ServeCapability> ServeCapability for Gate<C> {
     }
 
     async fn dispatch(&self, call: IncomingCall) -> Result<Outgoing> {
-        // If the args can't be read, the target is unknown, and without the target it's unknown what's being approved.
-        // Then leave it as the empty value and take the decision — don't pass it through.
+        // If the args can't be read, the target is unknown, and without the target it's unknown
+        // what is running. Then leave it as the empty value and take the decision.
         let args = call.params.to_json().unwrap_or(Value::Null);
         let target = target_of(&self.capability, &call.tool, &args);
         let outside = escaping_path(&self.bridge.root(), &self.capability, &call.tool, &args);
@@ -56,7 +55,6 @@ impl<C: ServeCapability> ServeCapability for Gate<C> {
         match self.bridge.decide(&gated) {
             Decision::Run => {}
             Decision::Refuse(why) => return Err(WireError::invalid_params(why)),
-            Decision::Ask => self.ask_and_wait(&gated).await?,
         }
 
         let (call, cut) = self.clamp_exec(call, &args, wire_deadline());
@@ -82,54 +80,6 @@ impl<C: ServeCapability> ServeCapability for Gate<C> {
 }
 
 impl<C: ServeCapability> Gate<C> {
-    /// Asks a human and waits for the answer. **No limit on the wait** — the window stays
-    /// on screen until the human answers. Only the wire carries a deadline.
-    async fn ask_and_wait(&self, call: &Call) -> Result<()> {
-        // **Records why it asked.** To someone who never saw the approval window, only the agent's
-        // "couldn't, no approval" remains, and alone that can't say what crossed the fence.
-        let outside = call.outside.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
-        tracing::info!(
-            capability = %call.capability,
-            tool = %call.tool,
-            path = %outside,
-            "outside the working directory, so a human is asked"
-        );
-
-        let Some((id, wait)) = self.bridge.ask(call.clone(), summarize(call)) else {
-            // With no screen there's nowhere to ask. **Passing it through sneaks outside.**
-            return Err(WireError::invalid_params(format!(
-                "`{outside}`은 작업 디렉터리 밖이라 사람의 승인이 필요한데, 이 노드에 화면이 \
-                 붙어 있지 않아 물을 곳이 없습니다. 작업 디렉터리 안에서 되는 길을 찾아 주세요."
-            )));
-        };
-
-        let answer = match wire_deadline() {
-            Some(d) => match tokio::time::timeout(d, wait).await {
-                Ok(v) => v.ok(),
-                // **Answers the wire only and keeps the window.** attacca cuts node calls at 60 seconds,
-                // so we speak first, before that.
-                Err(_) => {
-                    self.bridge.expire(id);
-                    return Err(WireError::invalid_params(format!(
-                        "`{outside}`은 작업 디렉터리 밖이라 사람에게 물었는데 아직 답이 \
-                         없습니다. 승인 창은 화면에 그대로 있으니, 같은 인자로 다시 호출하면 \
-                         그때의 답이 반영됩니다. 창이 여럿이면 다른 창에 떠 있을 수 있습니다.",
-                    )));
-                }
-            },
-            None => wait.await.ok(),
-        };
-
-        match answer {
-            Some(Verdict::Allow | Verdict::AllowAlways) => Ok(()),
-            Some(Verdict::Deny) => Err(WireError::invalid_params(format!(
-                "사용자가 `{outside}`을 거부했습니다. 작업 디렉터리 안에서 할 수 있는 길을 \
-                 찾거나, 무엇이 필요한지 물어보세요."
-            ))),
-            None => Err(WireError::invalid_params("승인을 받지 못했습니다.")),
-        }
-    }
-
     /// Tells the screen what's running for `terminal.exec`. Does nothing otherwise.
     ///
     /// What's returned is the number to clear when done. **Only `exec`** — the other tools finish
@@ -199,14 +149,6 @@ impl<C: ServeCapability> Gate<C> {
     }
 }
 
-/// One line for a human to read. **What's going outside** is all this approval is about.
-fn summarize(call: &Call) -> String {
-    match &call.outside {
-        Some(path) => path.to_string_lossy().into_owned(),
-        None => call.target.clone(),
-    }
-}
-
 /// Identifier of the opened PTY. Same spot in a unary response or a stream head.
 fn pty_id_of(out: &Outgoing) -> Option<String> {
     let payload = match out {
@@ -245,10 +187,7 @@ const EXEC_HEADROOM: Duration = Duration::from_secs(5);
 /// A deadline that only applies to the wire. **Not the tool's deadline.**
 ///
 /// attacca cuts node calls at `ZYRIS_CALL_TIMEOUT_SECS` (default 60) and we can't read that value.
-/// So we answer in time within it and keep the window on screen.
-///
-/// **When the other side is fixed, turn it off with `ZYRIS_CODE_WIRE_DEADLINE_SECS=0`** — then we
-/// don't answer first and just wait for the human. No code to change.
+/// So we answer in time within it.
 ///
 /// `wait.until` reads the same value. **Only one place may know the deadline** — with two, fixing
 /// one of them leaves one tool answering while the other gets cut off.
@@ -348,7 +287,8 @@ mod tests {
         }
     }
 
-    /// **Inside work just runs even with no screen.** The only asking spot is outside.
+    /// **Inside work just runs with no screen attached** — the policy only looks at paths,
+    /// and a path inside the tree is never refused.
     #[tokio::test]
     async fn a_tool_inside_the_tree_runs_with_no_screen_attached() {
         let (fake, ran) = Fake::new("code_edit");
@@ -359,44 +299,38 @@ mod tests {
         assert!(ran.load(Ordering::SeqCst));
     }
 
-    /// **Leaving with nowhere to ask must not run.** Passing it through sneaks outside.
+    /// **Leaving with the default (deny) refuses — nothing runs outside.**
     #[tokio::test]
-    async fn leaving_the_tree_with_no_screen_refuses_instead_of_passing() {
+    async fn leaving_the_tree_refuses_when_denied() {
         let (fake, ran) = Fake::new("code_edit");
         let bridge = Bridge::new();
         bridge.set_root(std::path::PathBuf::from("/tmp/여기"));
         let gate = Gate::new(fake, bridge);
 
         let Err(e) = gate.dispatch(incoming("edit", json!({"path": "/etc/passwd"}))).await else {
-            panic!("it left the tree with no approval")
+            panic!("it left the tree with the policy set to deny")
         };
         assert!(!ran.load(Ordering::SeqCst), "the tool ran anyway");
         assert!(e.message.contains("작업 디렉터리 밖"), "{}", e.message);
     }
 
-    /// Leaving sends **a question to the screen.**
+    /// **`allow` runs it** — that is the whole point of the setting. No window, no waiting.
     #[tokio::test]
-    async fn leaving_the_tree_asks_the_screen() {
+    async fn leaving_runs_when_allowed() {
         let (fake, ran) = Fake::new("code_edit");
         let bridge = Bridge::new();
         bridge.set_root(std::path::PathBuf::from("/tmp/여기"));
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        bridge.attach(tx);
-        let gate = Gate::new(fake, bridge.clone());
+        bridge.sync(
+            Mode::Normal,
+            &crate::config::Config {
+                dir_access: crate::config::DirAccess::Allow,
+                ..Default::default()
+            },
+        );
+        let gate = Gate::new(fake, bridge);
 
-        // No answer is given, so it comes back on the deadline. Only checks the question went out before that.
-        std::env::set_var("ZYRIS_CODE_WIRE_DEADLINE_SECS", "1");
-        let _ = gate.dispatch(incoming("edit", json!({"path": "/etc/passwd"}))).await;
-        std::env::remove_var("ZYRIS_CODE_WIRE_DEADLINE_SECS");
-
-        match rx.try_recv().expect("it must ask the screen") {
-            (_, crate::app::Action::Frame(Frame::Ask(ask))) => {
-                assert_eq!(ask.summary, "/etc/passwd");
-                assert_eq!(ask.call.outside, Some(std::path::PathBuf::from("/etc/passwd")));
-            }
-            other => panic!("it must be an approval question: {other:?}"),
-        }
-        assert!(!ran.load(Ordering::SeqCst), "it ran before anyone answered");
+        assert!(gate.dispatch(incoming("edit", json!({"path": "/etc/passwd"}))).await.is_ok());
+        assert!(ran.load(Ordering::SeqCst), "the tool did not run");
     }
 
     /// The normal mode runs without asking.
@@ -404,7 +338,7 @@ mod tests {
     async fn the_normal_mode_runs_without_asking() {
         let (fake, ran) = Fake::new("code_edit");
         let bridge = Bridge::new();
-        bridge.sync(Mode::Job, &Default::default());
+        bridge.sync(Mode::Job, &crate::config::Config::default());
         let gate = Gate::new(fake, bridge);
 
         assert!(gate.dispatch(incoming("edit", json!({"path": "a"}))).await.is_ok());
@@ -416,7 +350,7 @@ mod tests {
     async fn a_refusal_says_what_to_do_instead() {
         let (fake, ran) = Fake::new("code_edit");
         let bridge = Bridge::new();
-        bridge.sync(Mode::Plan, &Default::default());
+        bridge.sync(Mode::Plan, &crate::config::Config::default());
         let gate = Gate::new(fake, bridge);
 
         let Err(e) = gate.dispatch(incoming("edit", json!({"path": "a"}))).await else {
@@ -431,7 +365,7 @@ mod tests {
     async fn reading_is_never_gated() {
         let (fake, ran) = Fake::new("file_io");
         let bridge = Bridge::new();
-        bridge.sync(Mode::Job, &Default::default());
+        bridge.sync(Mode::Job, &crate::config::Config::default());
         let gate = Gate::new(fake, bridge);
 
         assert!(gate.dispatch(incoming("read", json!({"path": "a"}))).await.is_ok());
@@ -444,7 +378,7 @@ mod tests {
         let (mut fake, _) = Fake::new("terminal");
         fake.reply = Some(json!({"pty": "p1"}));
         let bridge = Bridge::new();
-        bridge.sync(Mode::Job, &Default::default());
+        bridge.sync(Mode::Job, &crate::config::Config::default());
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         bridge.attach(tx);
         let gate = Gate::new(fake, bridge.clone());
@@ -464,7 +398,7 @@ mod tests {
     async fn a_long_exec_is_cut_to_fit_the_wire_deadline() {
         let (fake, _) = Fake::new("terminal");
         let bridge = Bridge::new();
-        bridge.sync(Mode::Job, &Default::default());
+        bridge.sync(Mode::Job, &crate::config::Config::default());
         let gate = Gate::new(fake, bridge);
 
         let args = json!({"command": "cargo build", "timeout_ms": 600_000u64});

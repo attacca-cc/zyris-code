@@ -25,9 +25,11 @@
 
 use ratatui::style::Color;
 
+use serde::{Deserialize, Serialize};
+
 use crate::theme;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum Mode {
     /// Runs without asking. The default. Talks in one plain session.
     #[default]

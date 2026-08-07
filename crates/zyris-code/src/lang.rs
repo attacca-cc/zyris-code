@@ -24,7 +24,6 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use crate::instructions::Found;
 use crate::mode::{Mode, Route};
 use crate::plugin::Plugin;
-use crate::tools::gate::Grants;
 use crate::tools::skill::SkillInfo;
 use crate::undo::Changed;
 
@@ -159,19 +158,19 @@ pub struct StatusInfo<'a> {
 impl Lang {
     // ── Bottom bar · activity line
     pub fn mode_normal(self) -> &'static str {
-        self.pick("기본", "normal")
+        self.pick("일반", "normal")
     }
     pub fn mode_plan(self) -> &'static str {
         self.pick("계획", "plan")
     }
-    /// **Not translated.** These two must stay exactly the names attacca uses on its own screen, so
-    /// what's opened here can be found in that list — same reason sessions are written as `thread`.
-    /// Moved to the Korean for "work", it would blend with the "working…" just above in the activity line and blur what each points at.
+    /// The natural Korean words — **일** (work) and **작업** (job), chosen with the user on
+    /// 2026-08-07. The English names still work on the input side (`mode_named`), and attacca's
+    /// own screen keeps using `work`·`job`, so the two stay findable there.
     pub fn mode_work(self) -> &'static str {
-        "work"
+        self.pick("일", "work")
     }
     pub fn mode_job(self) -> &'static str {
-        "job"
+        self.pick("작업", "job")
     }
     pub fn working(self) -> &'static str {
         self.pick("작업 중…", "Working…")
@@ -289,7 +288,7 @@ impl Lang {
         match self {
             Lang::Ko => format!(
                 "지금은 **{mode}** 모드입니다. Shift+Tab으로 돌리거나 \
-                 `/mode 기본`·`/mode 계획`·`/mode work`·`/mode job`으로 바꿉니다."
+                 `/mode 일반`·`/mode 계획`·`/mode 일`·`/mode 작업`으로 바꿉니다."
             ),
             Lang::En => format!(
                 "Mode is **{mode}**. Cycle it with Shift+Tab, or set it with \
@@ -489,47 +488,6 @@ impl Lang {
         self.pick("건너뜀", "skipped")
     }
 
-    // ── Approval screen
-    pub fn approve_keys(self) -> &'static str {
-        self.pick(
-            "  y 허용 / n 거부 / a 이 디렉터리는 이번 쓰레드 내내 허용",
-            "  y allow / n deny / a allow this directory for the whole thread",
-        )
-    }
-    pub fn approve_head(self) -> &'static str {
-        self.pick(
-            "작업 디렉터리 밖입니다. 승인이 필요합니다",
-            "Outside the working directory. This needs your approval",
-        )
-    }
-    pub fn approve_root(self, cwd: &str) -> String {
-        match self {
-            Lang::Ko => format!("여기서 도는 곳은 {cwd}"),
-            Lang::En => format!("Tools run in {cwd}"),
-        }
-    }
-    pub fn approve_more_waiting(self, n: usize) -> String {
-        match self {
-            Lang::Ko => format!("  뒤에 {n}개가 더 기다립니다"),
-            Lang::En => format!("  {n} more waiting behind this"),
-        }
-    }
-    pub fn approve_gave_up(self) -> &'static str {
-        self.pick("  기다리다 돌아갔습니다", "  The server gave up waiting")
-    }
-    pub fn approve_next_time(self) -> &'static str {
-        self.pick(
-            "  허용하면 다음 시도에 바로 실행됩니다",
-            "  Allowing it runs on the next attempt",
-        )
-    }
-    pub fn approve_expired(self) -> &'static str {
-        self.pick(
-            "서버가 이 호출을 포기했습니다. 허용하면 다음 호출부터 적용됩니다.",
-            "The server gave up on this call. Allowing it applies from the next one.",
-        )
-    }
-
     // ── Enrollment code window
     pub fn enroll_title(self) -> &'static str {
         self.pick("Attacca 연결", "Connect to Attacca")
@@ -629,16 +587,17 @@ impl Lang {
             Lang::En => format!("Couldn't reach the server ({secs}s in): {why}"),
         }
     }
-    /// Another window already holding this credential. **The approval window may be in that window** —
-    /// saying only \"connected elsewhere\" would send the person looking for the code in the wrong place.
+    /// Another window already holding this credential. **The enrollment-code window may be
+    /// in that window** — saying only "connected elsewhere" would send the person looking
+    /// for the code in the wrong place.
     pub fn another_window_notice(self) -> &'static str {
         self.pick(
-            "다른 zyris-code 창이 이미 같은 자격으로 붙어 있습니다. 승인 창이 그 창에 떠 있을 수 있습니다.",
-            "Another zyris-code window is already using the same credential. The approval window may be there.",
+            "다른 zyris-code 창이 이미 같은 자격으로 붙어 있습니다. 등록 코드 창이 그 창에 떠 있을 수 있습니다.",
+            "Another zyris-code window is already using the same credential. The enrollment-code window may be there.",
         )
     }
 
-    // ── Commands (`/clear` · `/cwd` · `/grants` · `/agent` · `/undo` · `/changes`)
+    // ── Commands (`/clear` · `/cwd` · `/config` · `/agent` · `/undo` · `/changes`)
     pub fn clear_done(self) -> &'static str {
         self.pick(
             "화면을 지웠습니다. thread의 기록은 그대로입니다.",
@@ -824,50 +783,6 @@ impl Lang {
             }),
             _ => {}
         }
-        s
-    }
-    pub fn grants_none_closed(self) -> &'static str {
-        self.pick("열어 둔 곳이 없었습니다.", "Nothing was open.")
-    }
-    pub fn grants_closed(self, n: usize) -> String {
-        match self {
-            Lang::Ko => format!("{n}곳을 닫았습니다. 이제 그 밖을 만지려면 다시 물어봅니다."),
-            Lang::En => format!("Closed {n}. Touching anything else outside asks again."),
-        }
-    }
-    pub fn grants_text(self, grants: &Grants) -> String {
-        let roots = grants.roots();
-        if roots.is_empty() {
-            return match self {
-                Lang::Ko => "작업 디렉터리 밖으로 열어 둔 곳이 없습니다.\n\n\
-                             승인 화면에서 `a`를 누르면 그 디렉터리가 이 thread 동안 열립니다."
-                    .into(),
-                Lang::En => "Nothing is open outside the working directory.\n\n\
-                             Pressing `a` on the approval screen opens that directory for this thread."
-                    .into(),
-            };
-        }
-        let mut s = match self {
-            Lang::Ko => format!("작업 디렉터리 밖으로 {}곳이 열려 있습니다.\n", roots.len()),
-            Lang::En => {
-                format!("{} directories are open outside the working directory.\n", roots.len())
-            }
-        };
-        for root in roots {
-            s.push_str(&format!("\n- `{}`", root.display()));
-        }
-        // **Say that quitting forgets them.** Thinking they land on disk makes people
-        // more wary than they need to be.
-        s.push_str(match self {
-            Lang::Ko => {
-                "\n\n여기와 그 아래는 묻지 않고 만집니다. `/grants close`로 전부 닫습니다 — \
-                         앱을 끄면 어차피 잊습니다."
-            }
-            Lang::En => {
-                "\n\nEverything here and below is touched without asking. `/grants close` \
-                         shuts them all — the app forgets them on quit anyway."
-            }
-        });
         s
     }
     pub fn agent_staged(self, name: &str) -> String {
@@ -1233,6 +1148,85 @@ impl Lang {
     pub fn title_status(self) -> &'static str {
         self.pick("상태", "Status")
     }
+    pub fn title_config(self) -> &'static str {
+        self.pick("설정", "Settings")
+    }
+
+    // ── Config panel
+    /// The row label for the directory-access policy.
+    pub fn cfg_dir_access(self) -> &'static str {
+        self.pick("다른 디렉토리 접근", "Directory access")
+    }
+    pub fn cfg_dir_allow(self) -> &'static str {
+        self.pick("허용", "allow")
+    }
+    pub fn cfg_dir_deny(self) -> &'static str {
+        self.pick("거부", "deny")
+    }
+    /// The row label for the default-mode setting.
+    pub fn cfg_default_mode(self) -> &'static str {
+        self.pick("기본 모드", "Default mode")
+    }
+    /// The "unset" value of the default-mode row — the app then opens in normal.
+    pub fn cfg_off(self) -> &'static str {
+        self.pick("안 씀", "off")
+    }
+    /// The hint line of the `/config` panel — everything here is settable by command too.
+    pub fn config_keys(self) -> String {
+        match self {
+            Lang::Ko => "`/config dir allow·deny` · `/config lang ko·en` · \
+                 `/config mode 일반·계획·일·작업·off`"
+                .into(),
+            Lang::En => "`/config dir allow|deny` · `/config lang ko|en` · \
+                 `/config mode normal|plan|work|job|off`"
+                .into(),
+        }
+    }
+    /// What `/config dir …` says it changed.
+    pub fn config_dir_changed(self, access: crate::config::DirAccess) -> String {
+        match (self, access) {
+            (Lang::Ko, crate::config::DirAccess::Allow) => {
+                "다른 디렉토리 접근을 **허용**으로 바꿨습니다. 작업 디렉터리 밖도 묻지 않고 \
+                 만집니다. 다음에 켤 때도 이대로입니다."
+                    .into()
+            }
+            (Lang::En, crate::config::DirAccess::Allow) => {
+                "Directory access is now **allow** — tools may touch outside the working \
+                 directory without asking. It stays this way next time."
+                    .into()
+            }
+            (Lang::Ko, crate::config::DirAccess::Deny) => {
+                "다른 디렉토리 접근을 **거부**로 바꿨습니다. 작업 디렉터리 밖은 만질 수 \
+                 없습니다. 다음에 켤 때도 이대로입니다."
+                    .into()
+            }
+            (Lang::En, crate::config::DirAccess::Deny) => {
+                "Directory access is now **deny** — tools may not touch outside the working \
+                 directory. It stays this way next time."
+                    .into()
+            }
+        }
+    }
+    /// What `/config mode …` says it changed. `None` is the off state.
+    pub fn config_mode_changed(self, mode: Option<Mode>) -> String {
+        match self {
+            Lang::Ko => match mode {
+                Some(m) => {
+                    format!("기본 모드: **{}**. 다음에 켜면 이 모드로 시작합니다.", m.label(self))
+                }
+                None => "기본 모드를 껐습니다. 다음에 켜면 **일반** 모드로 시작합니다.".into(),
+            },
+            Lang::En => match mode {
+                Some(m) => {
+                    format!(
+                        "Default mode is now **{}** — the app opens in it next time.",
+                        m.label(self)
+                    )
+                }
+                None => "Default mode is off — the app opens in **normal** next time.".into(),
+            },
+        }
+    }
 
     // ── Mode panel
     pub fn current_mode(self) -> &'static str {
@@ -1240,7 +1234,7 @@ impl Lang {
     }
     pub fn mode_cycle_hint(self) -> &'static str {
         self.pick(
-            "Shift+Tab으로 돌리거나 `/mode 기본`·`/mode 계획`·`/mode work`·`/mode job`으로 바꿉니다.",
+            "Shift+Tab으로 돌리거나 `/mode 일반`·`/mode 계획`·`/mode 일`·`/mode 작업`으로 바꿉니다.",
             "Cycle with Shift+Tab, or set it with `/mode normal`, `/mode plan`, `/mode work`, `/mode job`.",
         )
     }
@@ -1257,11 +1251,11 @@ impl Lang {
                 "Does not run tools — lays out what to do first.",
             ),
             Mode::Work => self.pick(
-                "다음 말이 attacca의 work 목표가 됩니다. 계획을 태스크로 쪼갭니다.",
+                "다음 말이 attacca의 **일**(work) 목표가 됩니다. 계획을 태스크로 쪼갭니다.",
                 "The next message becomes a work goal. Attacca plans it into tasks.",
             ),
             Mode::Job => self.pick(
-                "다음 말을 하나의 job으로 넘깁니다. 되묻는 것이 있어도 끝까지 해냅니다.",
+                "다음 말을 하나의 **작업**(job)으로 넘깁니다. 되묻는 것이 있어도 끝까지 해냅니다.",
                 "Hands the next message off as one job that runs to the end.",
             ),
         }
@@ -1771,7 +1765,6 @@ mod tests {
             (ko.commands(), en.commands()),
             (ko.mode_normal(), en.mode_normal()),
             (ko.mode_plan(), en.mode_plan()),
-            (ko.approve_keys(), en.approve_keys()),
             (ko.esc_stops(), en.esc_stops()),
             (ko.enroll_title(), en.enroll_title()),
             (ko.enroll_steps(), en.enroll_steps()),
@@ -1779,7 +1772,6 @@ mod tests {
             (ko.enroll_denied(), en.enroll_denied()),
             (ko.enroll_keys(), en.enroll_keys()),
             (ko.clear_done(), en.clear_done()),
-            (ko.grants_none_closed(), en.grants_none_closed()),
             (ko.agent_cannot_send(), en.agent_cannot_send()),
             (ko.undo_log_not_ready(), en.undo_log_not_ready()),
             (ko.nothing_to_undo(), en.nothing_to_undo()),
@@ -1830,8 +1822,6 @@ mod tests {
             en.commands(),
             en.mode_work(),
             en.mode_job(),
-            en.approve_keys(),
-            en.approve_expired(),
             en.esc_stops(),
             en.quit_armed(),
             en.lang_changed(),
@@ -1855,7 +1845,6 @@ mod tests {
             en.waiting_for_approval(),
             en.another_window_notice(),
             en.clear_done(),
-            en.grants_none_closed(),
             en.agent_cannot_send(),
             en.undo_log_not_ready(),
             en.nothing_to_undo(),
@@ -1899,7 +1888,6 @@ mod tests {
             en.log_location("/tmp/zyris-code.log"),
             en.server_unreachable(5, "x"),
             en.cwd_text(std::path::Path::new("/home/ruma"), "node", "slug", "cred"),
-            en.grants_closed(2),
             en.agent_staged("Main Agent"),
             en.reverted("src/x.rs"),
             en.undo_failed("x"),
@@ -1935,7 +1923,6 @@ mod tests {
             en.skills_text(&[]),
             en.plugin_list_text(&[]),
             en.plugin_update_text(&[]),
-            en.grants_text(&Grants::default()),
             en.plugin_contents_text(&Plugin {
                 name: "x".into(),
                 description: String::new(),
@@ -1974,6 +1961,5 @@ mod tests {
     fn thread_reads_as_sseurede_in_korean() {
         assert!(Lang::Ko.new_thread().contains("쓰레드"), "{}", Lang::Ko.new_thread());
         assert!(Lang::Ko.threads_in("proj").contains("쓰레드"));
-        assert!(Lang::Ko.approve_keys().contains("쓰레드"));
     }
 }

@@ -605,9 +605,7 @@ fn counts(added: u32, removed: u32) -> Vec<Span<'static>> {
 }
 
 /// One diff line. **Only colour, no background** — a background would fight the selection.
-///
-/// The approval screen (`widgets/approve.rs`) uses this too. If the pre-run preview and the post-run
-/// record looked different, the person wouldn't know they're the same. That's why it's `pub(crate)`.
+/// `pub(crate)` because the preview and the record must draw the same way.
 ///
 /// `width` is the width text can use (`body_width`); the two-space indent is subtracted here.
 pub(crate) fn diff_line(

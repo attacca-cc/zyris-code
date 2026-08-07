@@ -1,22 +1,22 @@
 //! Connects the tool-running side and the screen side.
 //!
 //! The two run on different tasks — tools on the zyris `Runner`, the screen in `app::run`.
-//! The screen holds what's needed to decide (mode, granted list) and is the only place to ask, so everything passing
+//! The screen holds what's needed to decide (mode, the `/config` settings) and everything passing
 //! between them is gathered here in one place.
 //!
 //! **The constraint that `apply` must stay pure shaped this file.** Moving screen state here
 //! is done by the I/O site (`run_inner`); the only thing going from here to the screen is `Action`.
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
-use crate::app::{Action, AppMsg, Frame, ToolAsk, Verdict};
+use crate::app::{Action, AppMsg, Frame};
+use crate::config::Config;
 use crate::mode::Mode;
-use crate::tools::gate::{decide, Call, Decision, Grants};
+use crate::tools::gate::{decide, Call, Decision};
 
 #[derive(Clone, Default)]
 pub struct Bridge(Arc<Inner>);
@@ -25,8 +25,8 @@ pub struct Bridge(Arc<Inner>);
 struct Inner {
     /// The current mode. When the screen changes it, the I/O site carries it over.
     mode: Mutex<Mode>,
-    /// Outside directories the human has opened. A copy of the screen-side list.
-    granted: Mutex<Grants>,
+    /// The current settings. Same — the screen is the only place they change.
+    config: Mutex<Config>,
     /// The working directory. **It's the yardstick for whether something leaves it.**
     root: Mutex<PathBuf>,
     /// What goes to the screen. Empty before the screen is up.
@@ -37,8 +37,6 @@ struct Inner {
     /// A signal that wakes when the screen attaches. Used when `main` waits for the screen to attach
     /// before the first enrollment so the enrollment code can reach the screen.
     screen_ready: tokio::sync::Notify,
-    /// Questions waiting for an answer.
-    waiting: Mutex<HashMap<u64, oneshot::Sender<Verdict>>>,
     /// The skill list to load when creating a session. `tools::announce` decides it and the screen picks it up.
     ///
     /// **Fixed for the session's lifetime** — attacca's `preamble` is set once when the session is created
@@ -68,7 +66,8 @@ impl Bridge {
         Bridge::default()
     }
 
-    /// Plugs in its handle once the screen is up. Questions arriving before that have nowhere to go and become refusals.
+    /// Plugs in its handle once the screen is up. Frames arriving before that have nowhere
+    /// to go and are dropped.
     pub fn attach(&self, to_app: mpsc::UnboundedSender<AppMsg>) {
         *self.0.to_app.lock().unwrap() = Some(to_app);
         // The first enrollment can start before the screen is up (`main` launches the app before running the runner).
@@ -92,10 +91,11 @@ impl Bridge {
         notified.await;
     }
 
-    /// Copies over the screen-side decision material. Called whenever the I/O site touches state.
-    pub fn sync(&self, mode: Mode, granted: &Grants) {
+    /// Copies over the screen-side decision material (mode + settings). Called whenever the
+    /// I/O site touches state.
+    pub fn sync(&self, mode: Mode, config: &Config) {
         *self.0.mode.lock().unwrap() = mode;
-        *self.0.granted.lock().unwrap() = granted.clone();
+        *self.0.config.lock().unwrap() = *config;
     }
 
     /// Records the working directory. `tools::announce` calls it once.
@@ -119,29 +119,8 @@ impl Bridge {
 
     pub fn decide(&self, call: &Call) -> Decision {
         let mode = *self.0.mode.lock().unwrap();
-        decide(mode, &self.0.granted.lock().unwrap(), call)
-    }
-
-    /// Produces a handle to ask and wait for an answer. `None` if there's no screen.
-    pub fn ask(&self, call: Call, summary: String) -> Option<(u64, oneshot::Receiver<Verdict>)> {
-        let id = self.next_id();
-        let (tx, rx) = oneshot::channel();
-        self.0.waiting.lock().unwrap().insert(id, tx);
-        let ask = ToolAsk { id, call, summary, expired: false };
-        match self.send(Action::Frame(Frame::Ask(ask))) {
-            Some(()) => Some((id, rx)),
-            None => {
-                self.0.waiting.lock().unwrap().remove(&id);
-                None
-            }
-        }
-    }
-
-    /// The human answered. The I/O site picks up `State.verdict_out` and hands it here.
-    pub fn answer(&self, id: u64, verdict: Verdict) {
-        if let Some(tx) = self.0.waiting.lock().unwrap().remove(&id) {
-            let _ = tx.send(verdict);
-        }
+        let config = *self.0.config.lock().unwrap();
+        decide(mode, &config, call)
     }
 
     /// Whether the screen is attached.
@@ -157,12 +136,6 @@ impl Bridge {
         self.send(Action::Frame(frame)).is_some()
     }
 
-    /// The wire deadline arrived before the human. **Leaves the window on screen** and only announces the fact.
-    pub fn expire(&self, id: u64) {
-        self.0.waiting.lock().unwrap().remove(&id);
-        self.frame(Frame::Expired(id));
-    }
-
     /// Records one MCP server's outcome. A tool count means success; a reason means failure.
     pub fn note_mcp(&self, slug: &str, outcome: Result<usize, String>) {
         let mut all = self.0.mcp.lock().unwrap();
@@ -172,8 +145,7 @@ impl Bridge {
         }
     }
 
-    /// A number for showing something on screen and clearing it later. Shares the same pool as approval questions —
-    /// the two must never overlap so what to clear isn't confused.
+    /// A number for showing something on screen and clearing it later.
     pub fn next_id(&self) -> u64 {
         self.0.next_id.fetch_add(1, Ordering::Relaxed) + 1
     }
@@ -225,6 +197,7 @@ impl Bridge {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::gate::Call;
 
     fn edit_call() -> Call {
         Call::new("code_edit", "edit", "/tmp/a".into())
@@ -236,42 +209,27 @@ mod tests {
     fn the_gate_sees_the_mode_the_screen_is_in() {
         let b = Bridge::new();
         assert_eq!(b.decide(&edit_call()), Decision::Run, "the default just runs");
-        b.sync(Mode::Plan, &Default::default());
+        b.sync(Mode::Plan, &Config::default());
         assert!(matches!(b.decide(&edit_call()), Decision::Refuse(_)));
-        b.sync(Mode::Job, &Default::default());
+        b.sync(Mode::Job, &Config::default());
         assert_eq!(b.decide(&edit_call()), Decision::Run);
     }
 
-    /// **Without a screen there's nowhere to ask.** Passing it quietly would let it leave without anyone knowing.
+    /// The directory policy travels the same way — **if the screen's `/config dir allow` never
+    /// reached the bridge, the tools keep refusing.**
     #[test]
-    fn asking_before_the_screen_exists_fails_instead_of_passing() {
+    fn the_gate_sees_the_directory_policy_the_screen_sets() {
         let b = Bridge::new();
         let leaving = edit_call().leaving(Some(PathBuf::from("/etc/passwd")));
-        assert!(b.ask(leaving, "/etc/passwd".into()).is_none());
-    }
-
-    /// When the answer arrives, the waiting side wakes.
-    #[tokio::test]
-    async fn an_answer_reaches_the_call_that_is_waiting() {
-        let b = Bridge::new();
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        b.attach(tx);
-        let (id, wait) = b.ask(edit_call(), "x".into()).expect("the screen is attached");
-        assert!(rx.try_recv().is_ok(), "the question must reach the screen");
-        b.answer(id, Verdict::Allow);
-        assert_eq!(wait.await.unwrap(), Verdict::Allow);
-    }
-
-    /// Past the deadline, the waiting handle is dropped — a late answer must not run in secret.
-    #[tokio::test]
-    async fn expiring_drops_the_waiter_so_a_late_answer_runs_nothing() {
-        let b = Bridge::new();
-        let (tx, _rx) = mpsc::unbounded_channel();
-        b.attach(tx);
-        let (id, wait) = b.ask(edit_call(), "x".into()).unwrap();
-        b.expire(id);
-        b.answer(id, Verdict::Allow);
-        assert!(wait.await.is_err(), "a call that gave up must not receive an answer");
+        assert!(matches!(b.decide(&leaving), Decision::Refuse(_)), "the default is deny");
+        b.sync(
+            Mode::Normal,
+            &crate::config::Config {
+                dir_access: crate::config::DirAccess::Allow,
+                ..Config::default()
+            },
+        );
+        assert_eq!(b.decide(&leaving), Decision::Run, "allow must run it");
     }
 
     /// Without a screen yet, a frame has nowhere to go. **Dropped, not fatal.**

@@ -60,8 +60,8 @@ not silent.
 
 In the same directory that changes nothing worth guarding against — whichever
 window the agent reaches, the files it edits are the same. Across different
-directories it matters, and so does this: **the approval prompt and the plan/edit
-mode that judge a call belong to the window that received it.**
+directories it matters, and so does this: **the directory-access policy and the
+plan/edit mode that judge a call belong to the window that received it.**
 
 An earlier design had each window register a sibling node of its own
 (`register_node`), which would have split the routing per window. The server does
@@ -87,23 +87,17 @@ fence described below.
 
 ## The working directory is a fence
 
-Everything inside the directory you launched from runs without interruption.
-Anything that reaches outside it — reads included — stops and asks you:
-
-```
-Outside the working directory. Approval required
-  /home/you/other-project/Cargo.toml
-  file_io.read · running in /home/you/my-app
-  y allow / n deny / a allow this directory for the session
-```
+Everything inside the directory you launched from runs without interruption. For
+anything that reaches outside it — reads included — **one setting decides**
+(`/config`): `deny` (the default) refuses the call with a message, `allow` runs
+it without asking.
 
 - **Reads count too.** The point is to keep the agent from wandering across your
-  whole disk.
-- **`a` opens the whole directory**, not just that one file. Approving a
-  neighbouring repo and then being asked about each file in it would be useless.
-  Grants are never written to disk; quitting forgets them. `/grants` lists what
-  is open and `/grants close` shuts it again — an approval that lasts all
-  session and cannot be seen is worth little.
+  whole disk, so the policy covers them as well.
+- **The policy is persistent.** `deny` is the default; `/config dir allow` opens
+  the whole disk to tools, `/config dir deny` closes it again. There is no
+  per-directory asking anymore — that window was removed because it only broke
+  the flow. `/config` shows the current value.
 - **A shell command cannot be fenced completely.** `terminal.exec` runs an
   arbitrary program, and no amount of reading the command text tells you where it
   will go — `sh -c` alone can do anything. Absolute paths and `../` in the command
@@ -117,10 +111,10 @@ things: whether tools may run, and where your next message goes.
 
 | Mode | Tools | Your next message |
 |---|---|---|
-| **normal** (기본) | Run. The fence above still applies. | Goes to the conversation you are already having. |
+| **normal** (일반) | Run. The fence above still applies. | Goes to the conversation you are already having. |
 | **plan** (계획) | Nothing is changed and no command runs; the agent has to describe its plan first. Reading still works — you cannot plan what you cannot see. | Same as normal. |
-| **work** | Run, same as normal. | Opens an Attacca **work**: it is planned into a task graph, each task running in its own git worktree. Two gates need a person to open them. |
-| **job** | Run, same as normal. | Opens an Attacca **job** — hand it over and it runs to the end. If it asks something back, answer right here. |
+| **work** (일) | Run, same as normal. | Opens an Attacca **work**: it is planned into a task graph, each task running in its own git worktree. Two gates need a person to open them. |
+| **job** (작업) | Run, same as normal. | Opens an Attacca **job** — hand it over and it runs to the end. If it asks something back, answer right here. |
 
 `normal` and `plan` share one conversation, so you can switch between them mid-thread
 without losing your place. `work` and `job` open something new with your **next message
@@ -171,6 +165,8 @@ only `/agent` and `/account` ask the server, for exactly what they need.
 |---|---|
 | `/help` | List these |
 | `/mode [normal\|plan]` | Show or change the mode |
+| `/lang [ko\|en]` | Interface language (also in `/config`) |
+| `/config [option value]` | Settings panel, or set one: `dir allow|deny`, `lang ko|en`, `mode …|off` |
 | `/account [logout]` | Who this node is attached as (email, plan, granted scopes); `logout` clears the stored credentials |
 | `/agent [name]` | Pick an agent (see below) |
 | `/mcp` | Connected MCP servers, and why any failed |
@@ -179,7 +175,6 @@ only `/agent` and `/account` ask the server, for exactly what they need.
 | `/rules` | Which `CLAUDE.md` / `AGENTS.md` files this session loaded |
 | `/cwd` | Where tools resolve relative paths |
 | `/status` | Session, agent, mode and usage at a glance |
-| `/grants` | Directories opened outside the fence; `/grants close` shuts them all |
 | `/changes` | Files changed in this directory, with `+N −N` |
 | `/undo` | Revert the last edit |
 | `/clear` | Clear the screen — the session history on the server is untouched |
@@ -315,7 +310,6 @@ Plugins are loaded at startup, so restart to pick up a newly installed one.
 | `↑` / `↓` | Recall previous messages |
 | `Esc` | Cancel the running turn; close the enrollment-code panel (the only key that does) |
 | `Ctrl+C` | Cancel the running turn; press again to arm quitting, once more to quit |
-| `y` / `n` / `a` | Answer an approval prompt |
 | Wheel · drag | Scroll · select and copy |
 
 The second `Ctrl+C` arms quitting even while a turn is still running, so a server

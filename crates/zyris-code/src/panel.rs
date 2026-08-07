@@ -127,7 +127,10 @@ pub fn mcp(lang: Lang, report: &[(String, Result<usize, String>)]) -> Panel {
 /// The `/skills` panel — name and one-line description per skill.
 pub fn skills(lang: Lang, skills: &[SkillInfo]) -> Panel {
     if skills.is_empty() {
-        return Panel::new(lang.title_skills().into(), vec![muted(lang.skills_empty().to_string())]);
+        return Panel::new(
+            lang.title_skills().into(),
+            vec![muted(lang.skills_empty().to_string())],
+        );
     }
     let lines = skills
         .iter()
@@ -149,7 +152,10 @@ pub fn skills(lang: Lang, skills: &[SkillInfo]) -> Panel {
 /// The `/plugin` panel — every fetched plugin, what it ships underneath.
 pub fn plugins(lang: Lang, found: &[Plugin]) -> Panel {
     if found.is_empty() {
-        return Panel::new(lang.title_plugins().into(), vec![muted(lang.plugins_empty().to_string())]);
+        return Panel::new(
+            lang.title_plugins().into(),
+            vec![muted(lang.plugins_empty().to_string())],
+        );
     }
     let mut lines = Vec::new();
     for p in found {
@@ -161,7 +167,10 @@ pub fn plugins(lang: Lang, found: &[Plugin]) -> Panel {
             ),
         ];
         if !p.fetched() {
-            spans.push(Span::styled(lang.plugin_hand_placed(), Style::default().fg(theme::TEXT_MUTED)));
+            spans.push(Span::styled(
+                lang.plugin_hand_placed(),
+                Style::default().fg(theme::TEXT_MUTED),
+            ));
         }
         if !p.description.is_empty() {
             spans.push(Span::styled(" — ", Style::default().fg(theme::BORDER_LIGHT)));
@@ -194,11 +203,8 @@ pub fn account(
     credits: Option<&str>,
     scopes: &[String],
 ) -> Panel {
-    let scopes_text = if scopes.is_empty() {
-        lang.acc_none().to_string()
-    } else {
-        scopes.join(", ")
-    };
+    let scopes_text =
+        if scopes.is_empty() { lang.acc_none().to_string() } else { scopes.join(", ") };
     let lines = vec![
         Line::from(vec![
             Span::styled(
@@ -234,7 +240,10 @@ pub fn status(lang: Lang, info: &crate::lang::StatusInfo) -> Panel {
     let mut lines = vec![
         kv(lang.st_thread(), thread),
         kv(lang.st_project(), project),
-        kv(lang.st_agent(), if info.agent.is_empty() { "-".into() } else { info.agent.to_string() }),
+        kv(
+            lang.st_agent(),
+            if info.agent.is_empty() { "-".into() } else { info.agent.to_string() },
+        ),
         kv(lang.st_mode(), info.mode.to_string()),
     ];
     let u = info.usage;
@@ -248,12 +257,7 @@ pub fn status(lang: Lang, info: &crate::lang::StatusInfo) -> Panel {
         let text = match crate::usage::context_limit(u.model.as_deref()) {
             Some(max) => {
                 let pct = if max > 0 { used.saturating_mul(100) / max } else { 0 };
-                format!(
-                    "{}% ({}/{})",
-                    pct,
-                    crate::usage::compact(used),
-                    crate::usage::compact(max)
-                )
+                format!("{}% ({}/{})", pct, crate::usage::compact(used), crate::usage::compact(max))
             }
             None => crate::usage::compact(used),
         };
@@ -281,6 +285,68 @@ pub fn status(lang: Lang, info: &crate::lang::StatusInfo) -> Panel {
         _ => {}
     }
     Panel::new(lang.title_status().into(), lines)
+}
+
+/// The `/config` panel — every setting with its current value marked ❯.
+///
+/// **It only shows.** Changing a setting is `/config <option> <value>` (or the matching
+/// command, like `/lang`) — same split as the `/mode` panel.
+pub fn config(lang: Lang, config: crate::config::Config) -> Panel {
+    use crate::config::DirAccess;
+    let mut lines = vec![];
+
+    // 다른 디렉토리 접근
+    lines.push(Line::from(Span::styled(
+        lang.cfg_dir_access(),
+        Style::default().fg(theme::TEXT_HEADING).add_modifier(Modifier::BOLD),
+    )));
+    for access in [DirAccess::Allow, DirAccess::Deny] {
+        let label = match access {
+            DirAccess::Allow => lang.cfg_dir_allow(),
+            DirAccess::Deny => lang.cfg_dir_deny(),
+        };
+        lines.push(marked(config.dir_access == access, label));
+    }
+    lines.push(blank());
+
+    // 화면 말
+    lines.push(Line::from(Span::styled(
+        lang.language(),
+        Style::default().fg(theme::TEXT_HEADING).add_modifier(Modifier::BOLD),
+    )));
+    for language in [Lang::Ko, Lang::En] {
+        lines.push(marked(lang == language, language.name()));
+    }
+    lines.push(blank());
+
+    // 기본 모드 — `안 씀` is the unset state, the four modes the choice.
+    lines.push(Line::from(Span::styled(
+        lang.cfg_default_mode(),
+        Style::default().fg(theme::TEXT_HEADING).add_modifier(Modifier::BOLD),
+    )));
+    lines.push(marked(config.default_mode.is_none(), lang.cfg_off()));
+    for m in Mode::ALL {
+        lines.push(marked(config.default_mode == Some(m), m.label(lang)));
+    }
+
+    lines.push(blank());
+    lines.push(muted(lang.config_keys()));
+    Panel::new(lang.title_config().into(), lines)
+}
+
+/// One value row of the config panel — `❯` marks the current one.
+fn marked(on: bool, label: &'static str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(if on { "❯ " } else { "  " }, Style::default().fg(theme::ACCENT)),
+        Span::styled(
+            label,
+            if on {
+                Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme::TEXT_MUTED)
+            },
+        ),
+    ])
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -339,10 +405,7 @@ mod tests {
 
     #[test]
     fn a_mcp_report_lists_servers_with_their_outcome() {
-        let report = vec![
-            ("files".into(), Ok(3)),
-            ("broken".into(), Err("없는 명령".into())),
-        ];
+        let report = vec![("files".into(), Ok(3)), ("broken".into(), Err("없는 명령".into()))];
         let p = mcp(Lang::Ko, &report);
         let joined = text(&p).join("\n");
         assert!(joined.contains("files"), "{joined}");
@@ -354,7 +417,9 @@ mod tests {
     fn the_skills_panel_lists_names_and_descriptions() {
         let p = skills(
             Lang::En,
-            &[SkillInfo { name: "검색".into(), description: "코드에서 무언가를 찾는다".into() }],
+            &[SkillInfo {
+                name: "검색".into(), description: "코드에서 무언가를 찾는다".into()
+            }],
         );
         let joined = text(&p).join("\n");
         assert!(joined.contains("검색"), "{joined}");
@@ -388,6 +453,28 @@ mod tests {
         assert_eq!(p.button, Some(PanelButton::Logout));
         let p = mode(Lang::Ko, Mode::Normal);
         assert_eq!(p.button, None, "a panel without an action must not show a button");
+    }
+
+    /// The config panel lists every setting and marks the current values — a setting
+    /// you can't see the value of might as well not exist.
+    #[test]
+    fn the_config_panel_marks_the_current_settings() {
+        let mut cfg = crate::config::Config::default();
+        cfg.dir_access = crate::config::DirAccess::Allow;
+        cfg.default_mode = Some(Mode::Job);
+        let p = config(Lang::Ko, cfg);
+        let joined = text(&p).join("\n");
+        assert!(joined.contains("다른 디렉토리 접근"), "{joined}");
+        assert!(joined.contains("화면 말"), "{joined}");
+        assert!(joined.contains("기본 모드"), "{joined}");
+        // The current values are exactly the marked ones.
+        let lines = text(&p);
+        let marked: Vec<&String> = lines.iter().filter(|l| l.contains('❯')).collect();
+        let all = marked.iter().map(|l| l.as_str()).collect::<Vec<_>>().join("\n");
+        assert!(all.contains("허용"), "{all}");
+        assert!(all.contains("작업"), "{all}");
+        assert!(!all.contains("거부"), "deny is not current: {all}");
+        assert!(!all.contains("일\n"), "work is not current: {all}");
     }
 
     /// Scrolling never goes below zero, and `max_scroll` says when the end is reached.

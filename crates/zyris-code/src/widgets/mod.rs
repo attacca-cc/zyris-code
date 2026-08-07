@@ -10,8 +10,8 @@
 //! ```
 //!
 //! **That upper divider carries standing context, and only in the ordinary input state.** The
-//! same row belongs to `ask`, which paints it `ACCENT` to say "this is a question", and to
-//! `approve`, which draws no rule at all — context there would blunt a signal doing real work.
+//! same row belongs to `ask`, which paints it `ACCENT` to say "this is a question" — context
+//! there would blunt a signal doing real work.
 //!
 //! **The input box is clamped between lines above and below.** If a blank line separated them, the
 //! status line would read as the box's heading and the bottom bar as its footer — the drawn lines show at a glance how far the box extends.
@@ -23,7 +23,6 @@
 //! reason for them to keep taking space — that is one more line for the conversation.
 
 mod activity;
-mod approve;
 mod ask;
 mod enroll;
 mod input;
@@ -48,19 +47,11 @@ pub fn draw(frame: &mut Frame, state: &mut State) {
     let area = full;
     // The input box grows with its content. It never exceeds half the screen.
     //
-    // **There is only one input slot.** When a question is open the question takes it; when a tool wants to go
-    // out, the approval window takes it — if both showed at once, a person couldn't tell where to answer.
-    // Approval comes first: a tool is stopped waiting for an answer, and over there a deadline is running.
-    let input_h = if state.pending.is_some() {
-        approve::height(state, area.height.saturating_sub(3)).saturating_sub(1)
-    } else {
-        match &state.asking {
-            Some((_, a)) => ask::height(a, area.height.saturating_sub(3)).saturating_sub(1),
-            None => state
-                .input
-                .height(area.width.saturating_sub(2))
-                .min((area.height / 2).max(1))
-                .max(1),
+    // **There is only one input slot.** When a question is open the question takes it.
+    let input_h = match &state.asking {
+        Some((_, a)) => ask::height(a, area.height.saturating_sub(3)).saturating_sub(1),
+        None => {
+            state.input.height(area.width.saturating_sub(2)).min((area.height / 2).max(1)).max(1)
         }
     };
     let chunks = Layout::default()
@@ -76,21 +67,15 @@ pub fn draw(frame: &mut Frame, state: &mut State) {
 
     transcript::draw(frame, chunks[0], state);
     activity::draw(frame, chunks[1], state);
-    if state.pending.is_some() {
-        // The approval window is not operated by clicking — the only answers are the three keys y·n·a.
-        state.ask_area = None;
-        approve::draw(frame, chunks[2], state);
-    } else {
-        match &state.asking {
-            Some((_, a)) => {
-                // Moving a click to a row requires knowing this area.
-                state.ask_area = Some(chunks[2]);
-                ask::draw(frame, chunks[2], a, state.lang);
-            }
-            None => {
-                state.ask_area = None;
-                input::draw(frame, chunks[2], state);
-            }
+    match &state.asking {
+        Some((_, a)) => {
+            // Moving a click to a row requires knowing this area.
+            state.ask_area = Some(chunks[2]);
+            ask::draw(frame, chunks[2], a, state.lang);
+        }
+        None => {
+            state.ask_area = None;
+            input::draw(frame, chunks[2], state);
         }
     }
     input::rule(frame, chunks[3]);

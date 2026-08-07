@@ -152,13 +152,13 @@ def main():
             "`/mcp`가 답한다",
         )
 
-        # 6. Even with nothing open, it must say **how it opens**.
+        # 6. `/config` opens the settings panel — the values are marked there.
         buf.clear()
-        send(primary, "/grants")
+        send(primary, "/config")
         send(primary, "\r")
         check(
-            read_until(primary, "승인 화면", buf, time.time() + 8, "/grants 결과"),
-            "`/grants`가 열린 곳이 없다는 것과 여는 길을 말한다",
+            read_until(primary, "다른 디렉토리 접근", buf, time.time() + 8, "/config 결과"),
+            "`/config`가 설정 창을 연다",
         )
 
         # 7. **`/quit` must really exit.** Only observable here — a shell assertion

@@ -29,10 +29,6 @@ pub enum Command {
     Plugin(Plugin),
     Undo,
     Clear,
-    /// Shows what's been opened outside the working directory.
-    Grants,
-    /// Closes all of them.
-    GrantsClose,
     /// What was changed in this directory.
     Changes,
     /// Jobs running in the background. With no argument, the list; with `stop <id>`, stops that one.
@@ -46,6 +42,8 @@ pub enum Command {
     Account(Option<AccountAction>),
     /// The current session's picture — thread, project, agent, mode, and usage.
     Status,
+    /// The settings — with no argument the panel; with `option value`, sets that one.
+    Config(Option<ConfigAction>),
     /// Something unknown. **Not sent to the server; tells what's available instead.**
     Unknown(String),
 }
@@ -55,6 +53,17 @@ pub enum Command {
 pub enum AccountAction {
     /// Forgets the stored credentials. The next launch asks for approval again.
     Logout,
+}
+
+/// What `/config` can set after the command word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigAction {
+    /// 다른 디렉토리 접근 — whether tools may touch outside the working directory.
+    Dir(crate::config::DirAccess),
+    /// 화면 말.
+    Lang(crate::lang::Lang),
+    /// 기본 모드 — the mode the app opens in. `None` turns the setting off.
+    Mode(Option<crate::mode::Mode>),
 }
 
 /// What `/plugin` does.
@@ -116,17 +125,39 @@ pub fn parse(text: &str) -> Option<Command> {
         "plugin" | "plugins" => Command::Plugin(plugin_action(arg)),
         "undo" => Command::Undo,
         "clear" => Command::Clear,
-        // Only the approval screen's `a` opens them, so here we only view and close.
-        "grants" | "grant" => match arg {
-            "" | "list" => Command::Grants,
-            "close" | "clear" | "닫기" => Command::GrantsClose,
-            other => Command::Unknown(format!("grants {other}")),
-        },
         "lang" | "language" | "언어" => match arg {
             "" => Command::Lang(None),
             given => match crate::lang::Lang::parse(given) {
                 Some(lang) => Command::Lang(Some(lang)),
                 None => Command::LangUnknown(given.to_string()),
+            },
+        },
+        "config" => match arg {
+            "" => Command::Config(None),
+            given => match given.split_once(char::is_whitespace) {
+                Some((option, value)) => match option {
+                    "dir" | "directory" | "디렉토리" | "디렉터리" => {
+                        match crate::config::DirAccess::parse(value) {
+                            Some(access) => Command::Config(Some(ConfigAction::Dir(access))),
+                            None => return Some(Command::Unknown(format!("config dir {value}"))),
+                        }
+                    }
+                    "lang" | "language" | "언어" => match crate::lang::Lang::parse(value) {
+                        Some(lang) => Command::Config(Some(ConfigAction::Lang(lang))),
+                        None => return Some(Command::Unknown(format!("config lang {value}"))),
+                    },
+                    "mode" | "모드" => match mode_named(value) {
+                        Some(mode) => Command::Config(Some(ConfigAction::Mode(Some(mode)))),
+                        // **`off` turns the setting off** — without it there is no way
+                        // back to the launch default.
+                        None if matches!(value, "off" | "끔" | "없음") => {
+                            Command::Config(Some(ConfigAction::Mode(None)))
+                        }
+                        None => return Some(Command::Unknown(format!("config mode {value}"))),
+                    },
+                    other => return Some(Command::Unknown(format!("config {other}"))),
+                },
+                None => return Some(Command::Unknown(format!("config {arg}"))),
             },
         },
         "changes" | "changed" | "diff" => Command::Changes,
@@ -171,18 +202,16 @@ fn plugin_action(arg: &str) -> Plugin {
     }
 }
 
-/// Accepts both the Korean names shown on screen and the English ones — the screen is Korean, but which one is familiar
-/// varies from person to person.
-///
-/// `work`·`job` are **not translated on screen** (`lang::mode_work`) — they must stay exactly as attacca calls them on its own screen
-/// so they can be found in that list. Still, the Korean words for them are also accepted here: **widening the input side is free,
-/// but having two names floating around on screen is not.**
+/// Accepts both the Korean names shown on screen and the English ones — the screen is
+/// Korean, but which one is familiar varies from person to person.
 fn mode_named(s: &str) -> Option<Mode> {
     match s {
-        "기본" | "normal" | "default" => Some(Mode::Normal),
+        // **Both Korean names are accepted** — `일반` is what the screen shows now,
+        // `기본` is what it used to show and still feels natural to type.
+        "일반" | "기본" | "normal" | "default" => Some(Mode::Normal),
         "계획" | "plan" => Some(Mode::Plan),
-        "작업" | "work" => Some(Mode::Work),
-        "잡" | "job" => Some(Mode::Job),
+        "일" | "work" => Some(Mode::Work),
+        "작업" | "잡" | "job" => Some(Mode::Job),
         _ => None,
     }
 }
@@ -193,8 +222,9 @@ pub fn catalogue(lang: crate::lang::Lang) -> Vec<(&'static str, &'static str)> {
     match lang {
         Lang::Ko => vec![
             ("/help", "쓸 수 있는 명령"),
-            ("/mode", "모드를 보거나 바꿉니다 (기본·계획·work·job)"),
+            ("/mode", "모드를 보거나 바꿉니다 (일반·계획·일·작업)"),
             ("/lang", "화면 말을 바꿉니다 (ko·en)"),
+            ("/config", "설정 — 다른 디렉토리 접근(allow·deny)·화면 말·기본 모드"),
             ("/agent", "에이전트를 고릅니다. 다음 메시지에서 새 쓰레드가 열립니다"),
             ("/mcp", "붙은 MCP 서버와 도구 수"),
             ("/skills", "쓸 수 있는 스킬"),
@@ -203,7 +233,6 @@ pub fn catalogue(lang: crate::lang::Lang) -> Vec<(&'static str, &'static str)> {
             ("/cwd", "도구가 상대경로를 푸는 자리"),
             ("/account", "계정 정보를 보고, 로그아웃합니다 (logout)"),
             ("/status", "지금 세션·에이전트·모드·사용량을 한눈에"),
-            ("/grants", "밖으로 열어 둔 디렉터리 (close로 전부 닫습니다)"),
             ("/jobs", "배경에서 도는 작업 (stop <id>로 멈춥니다)"),
             ("/changes", "이 디렉터리에서 바꾼 파일"),
             ("/undo", "마지막 편집을 되돌립니다"),
@@ -214,6 +243,7 @@ pub fn catalogue(lang: crate::lang::Lang) -> Vec<(&'static str, &'static str)> {
             ("/help", "What you can type"),
             ("/mode", "Show or change the mode (normal / plan / work / job)"),
             ("/lang", "Change the interface language (ko / en)"),
+            ("/config", "Settings — directory access (allow / deny), language, default mode"),
             ("/agent", "Pick an agent. A new thread opens with your next message"),
             ("/mcp", "MCP servers that connected, and how many tools each brought"),
             ("/skills", "Skills available here"),
@@ -222,7 +252,6 @@ pub fn catalogue(lang: crate::lang::Lang) -> Vec<(&'static str, &'static str)> {
             ("/cwd", "Where tools resolve relative paths"),
             ("/account", "Show account info, or log out (logout)"),
             ("/status", "Session, agent, mode and usage at a glance"),
-            ("/grants", "Directories opened outside the working directory (close shuts them all)"),
             ("/jobs", "Background jobs (stop <id> kills one)"),
             ("/changes", "Files changed in this directory"),
             ("/undo", "Undo the last edit"),
@@ -240,7 +269,7 @@ pub fn keys(lang: crate::lang::Lang) -> Vec<(&'static str, &'static str)> {
     use crate::lang::Lang;
     match lang {
         Lang::Ko => vec![
-            ("Shift+Tab", "모드 바꾸기 (기본 → 계획 → work → job)"),
+            ("Shift+Tab", "모드 바꾸기 (일반 → 계획 → 일 → 작업)"),
             (
                 "Shift+Enter · Alt+Enter",
                 "줄바꿈 (Shift+Enter는 키티 키보드 프로토콜 지원 터미널에서만)",
@@ -251,7 +280,6 @@ pub fn keys(lang: crate::lang::Lang) -> Vec<(&'static str, &'static str)> {
             ("Ctrl+U", "친 것 모두 지우기"),
             ("Esc", "도는 턴 멈추기"),
             ("Ctrl+C", "멈추기 → 한 번 더 누르면 끝내기"),
-            ("y n a", "승인 화면에서 허락·거절·이 디렉터리 열기"),
             ("드래그", "화면 아무 데나 — 놓는 순간 고른 글이 클립보드로"),
         ],
         Lang::En => vec![
@@ -266,7 +294,6 @@ pub fn keys(lang: crate::lang::Lang) -> Vec<(&'static str, &'static str)> {
             ("Ctrl+U", "Clear what you typed"),
             ("Esc", "Stop the running turn"),
             ("Ctrl+C", "Stop, then press again to quit"),
-            ("y n a", "On the approval screen: allow, deny, open this directory"),
             ("drag", "Drag anywhere — the selected text goes to the clipboard when you let go"),
         ],
     }
@@ -312,9 +339,12 @@ mod tests {
 
     #[test]
     fn mode_takes_the_korean_names_shown_on_screen() {
+        assert_eq!(parse("/mode 일반"), Some(Command::Mode(Some(Mode::Normal))));
         assert_eq!(parse("/mode 기본"), Some(Command::Mode(Some(Mode::Normal))));
-        assert_eq!(parse("/mode 잡"), Some(Command::Mode(Some(Mode::Job))));
         assert_eq!(parse("/mode 계획"), Some(Command::Mode(Some(Mode::Plan))));
+        assert_eq!(parse("/mode 일"), Some(Command::Mode(Some(Mode::Work))));
+        assert_eq!(parse("/mode 작업"), Some(Command::Mode(Some(Mode::Job))));
+        assert_eq!(parse("/mode 잡"), Some(Command::Mode(Some(Mode::Job))));
     }
 
     /// English names are accepted too — the screen is Korean, but what's familiar varies from person to person.
@@ -437,16 +467,46 @@ mod tests {
         }
     }
 
-    /// For `/grants`, viewing and closing are different commands — you shouldn't close while trying to view the list.
+    /// `/config` with no argument opens the panel; `option value` sets that one.
     #[test]
-    fn grants_lists_by_default_and_closes_only_when_asked() {
-        assert_eq!(parse("/grants"), Some(Command::Grants));
-        assert_eq!(parse("/grants list"), Some(Command::Grants));
-        assert_eq!(parse("/grants close"), Some(Command::GrantsClose));
-        assert_eq!(parse("/grants clear"), Some(Command::GrantsClose));
+    fn config_without_an_argument_opens_the_panel() {
+        assert_eq!(parse("/config"), Some(Command::Config(None)));
     }
 
-    /// `/jobs` only looks and stops. **An argument it doesn't know never falls to the stopping side.**
+    #[test]
+    fn config_takes_option_and_value_in_both_languages() {
+        assert_eq!(
+            parse("/config dir allow"),
+            Some(Command::Config(Some(ConfigAction::Dir(crate::config::DirAccess::Allow))))
+        );
+        assert_eq!(
+            parse("/config 디렉토리 거부"),
+            Some(Command::Config(Some(ConfigAction::Dir(crate::config::DirAccess::Deny))))
+        );
+        assert_eq!(
+            parse("/config lang ko"),
+            Some(Command::Config(Some(ConfigAction::Lang(crate::lang::Lang::Ko))))
+        );
+        assert_eq!(
+            parse("/config mode 계획"),
+            Some(Command::Config(Some(ConfigAction::Mode(Some(Mode::Plan)))))
+        );
+        assert_eq!(
+            parse("/config mode off"),
+            Some(Command::Config(Some(ConfigAction::Mode(None))))
+        );
+    }
+
+    /// An unknown option or value must not be swallowed — the user wouldn't know it didn't change.
+    #[test]
+    fn an_unknown_config_argument_is_reported() {
+        assert!(matches!(parse("/config dir 빠르게"), Some(Command::Unknown(_))));
+        assert!(matches!(parse("/config 뭔가 값"), Some(Command::Unknown(_))));
+        assert!(matches!(parse("/config mode"), Some(Command::Unknown(_))));
+        assert!(matches!(parse("/config dir"), Some(Command::Unknown(_))));
+    }
+
+    /// For `/jobs`, looking and stopping are different commands — you shouldn't close while trying to view the list.
     #[test]
     fn jobs_lists_and_stops_but_never_guesses() {
         assert_eq!(parse("/jobs"), Some(Command::Jobs(None)));
@@ -458,12 +518,6 @@ mod tests {
     }
 
     /// When it's unclear what's being asked, **don't pick just anything.** Falling into the closing side would be the worst.
-    #[test]
-    fn an_unknown_grants_argument_does_nothing() {
-        assert_eq!(parse("/grants 다열어"), Some(Command::Unknown("grants 다열어".into())));
-    }
-
-    /// `/account` shows by default; only an explicit `logout` forgets the credentials.
     #[test]
     fn account_shows_by_default_and_logs_out_only_when_asked() {
         assert_eq!(parse("/account"), Some(Command::Account(None)));

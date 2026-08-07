@@ -37,12 +37,6 @@ pub enum Frame {
     ShellClosed {
         id: String,
     },
-    /// A tool is **trying to leave the working directory.** That call is blocked until
-    /// an answer goes back.
-    Ask(ToolAsk),
-    /// attacca gave up on that call. We keep the window and only mark it "already past" —
-    /// clearing the window away leaves the user with no idea what they missed.
-    Expired(u64),
     /// A command started running. **`exec` only reports once, on completion** — saying
     /// nothing in the meantime leaves the user waiting blind for up to 55 seconds.
     ExecStart {
@@ -53,8 +47,7 @@ pub enum Frame {
         id: u64,
     },
     /// A background job started. **If it is invisible the user quits the app unaware and
-    /// the build dies with it** — same lesson as `/grants`: what cannot be seen is as
-    /// dangerous as what is not there.
+    /// the build dies with it** — what cannot be seen is as dangerous as what is not there.
     JobStart {
         id: String,
         label: String,
@@ -171,9 +164,6 @@ pub enum Action {
     /// `apply` turns it into the same path as the matching slash command.
     PanelActivate,
     CycleMode,
-    Approve,
-    Deny,
-    AlwaysAllow,
     /// Wipe everything typed.
     ClearInput,
     /// Walk one step back through what was sent and bring it back.
@@ -322,9 +312,6 @@ pub struct State {
     /// A slash command the user typed. `run()` picks it up and runs it — same trick as
     /// `submit_now`.
     pub command_out: Option<String>,
-    /// The question awaiting an answer. **Only one is up at a time** — with two overlapping
-    /// there is no telling which one is being answered.
-    pub pending: Option<ToolAsk>,
     /// The enrollment code window. **It lands here on its own when re-enrollment starts.**
     ///
     /// `None` is the normal state. If the credential is revoked or refresh fails for good,
@@ -332,12 +319,6 @@ pub struct State {
     /// Closing with Esc puts it back to `None` — enrollment itself keeps running in the
     /// background, and `EnrollDone` closes it once approved.
     pub enroll: Option<EnrollView>,
-    /// Questions waiting behind. Answering the front one brings the next up.
-    pub ask_queue: std::collections::VecDeque<ToolAsk>,
-    /// `run()` picks it up. `apply` is pure, so it cannot send it directly.
-    pub verdict_out: Option<(u64, Verdict)>,
-    /// Outside directories opened for this session. **Nothing is left on disk.**
-    pub grants: crate::tools::gate::Grants,
     /// The command running right now — (id, command, when it started). The activity line
     /// shows this.
     pub running_exec: Option<(u64, String, Instant)>,
@@ -351,26 +332,9 @@ pub struct State {
     pub force_update_blank: bool,
     /// The screen language. `/lang` changes it and it moves together with `lang::current()`.
     pub lang: crate::lang::Lang,
-}
-
-/// One tool call to ask the user about. **It only happens when leaving the working
-/// directory.**
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ToolAsk {
-    /// The id of this question. Used to route the answer back to that call.
-    pub id: u64,
-    pub call: crate::tools::gate::Call,
-    pub summary: String,
-    /// Has attacca already given up on that call? Then answering does not go out on the wire.
-    pub expired: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Verdict {
-    Allow,
-    Deny,
-    /// Opens **the whole directory** for this session, not just this one call.
-    AllowAlways,
+    /// The settings `/config` shows and changes. The gate reads `dir_access` through the
+    /// bridge; `default_mode` decides the mode the next launch opens in.
+    pub config: crate::config::Config,
 }
 
 /// One row for a job running in the background.
@@ -441,15 +405,12 @@ impl Default for State {
             shells: Vec::new(),
             jobs: Vec::new(),
             command_out: None,
-            pending: None,
             enroll: None,
-            ask_queue: std::collections::VecDeque::new(),
-            verdict_out: None,
-            grants: crate::tools::gate::Grants::default(),
             running_exec: None,
             force_update: false,
             force_update_blank: false,
             lang: crate::lang::current(),
+            config: crate::config::Config::default(),
         }
     }
 }
@@ -578,21 +539,6 @@ pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
         if !(ctrl && matches!(key.code, KeyCode::Char('c'))) {
             return ask_key(a, key, ctrl);
         }
-    }
-
-    // **The approval window is topmost.** A tool is stopped waiting on our answer, and with
-    // this arm any lower `a` would leak into the input as a character. Only quitting always
-    // works.
-    //
-    // Enter is left out on purpose — an Enter pressed absent-mindedly while typing a message
-    // must not change a file.
-    if state.pending.is_some() && !(ctrl && matches!(key.code, KeyCode::Char('c'))) {
-        return match key.code {
-            KeyCode::Char('y') => vec![Action::Approve],
-            KeyCode::Char('a') => vec![Action::AlwaysAllow],
-            KeyCode::Char('n') | KeyCode::Esc => vec![Action::Deny],
-            _ => vec![],
-        };
     }
 
     // **The new-project form sits on top of the list.** The list stays open underneath, so
@@ -763,8 +709,8 @@ fn ask_key(a: &crate::question::Answering, key: KeyEvent, ctrl: bool) -> Vec<Act
 /// Whether an Enter that arrived mid-burst may be turned into a newline.
 ///
 /// **Only when Enter really means "send" at that spot.** Looking only at the burst
-/// check would swallow the confirm key of an approval window, list, form or question
-/// and drop a newline into the invisible input behind it — the case where a quick
+/// check would swallow the confirm key of a list, form or question and drop a
+/// newline into the invisible input behind it — the case where a quick
 /// ↓→Enter on the command list inserted a newline into "/m" instead of picking.
 ///
 /// While typing free text in a question, that input is the send target — pasting
@@ -782,7 +728,6 @@ fn enter_becomes_newline(state: &State, key: &KeyEvent, in_burst: bool) -> bool 
         return a.typing && !a.input.text.is_empty();
     }
     state.enroll.is_none()
-        && state.pending.is_none()
         && state.new_project.is_none()
         && state.picker.is_none()
         && !state.input.text.is_empty()
@@ -1070,9 +1015,10 @@ pub fn apply(state: &mut State, action: &Action) {
         // panel and queues the same command the button stands for — the loop below
         // runs `finish_command`, which is where the credentials actually drop.
         Action::PanelActivate => {
-            let logout = state.panel.as_ref().is_some_and(|p| {
-                p.button == Some(crate::panel::PanelButton::Logout)
-            });
+            let logout = state
+                .panel
+                .as_ref()
+                .is_some_and(|p| p.button == Some(crate::panel::PanelButton::Logout));
             state.panel = None;
             if logout {
                 state.command_out = Some("/account logout".to_string());
@@ -1138,26 +1084,6 @@ pub fn apply(state: &mut State, action: &Action) {
                     state.input.take();
                 }
             }
-        }
-        Action::Approve | Action::AlwaysAllow | Action::Deny => {
-            let Some(ask) = state.pending.take() else { return };
-            let verdict = match action {
-                Action::Approve => Verdict::Allow,
-                Action::AlwaysAllow => Verdict::AllowAlways,
-                _ => Verdict::Deny,
-            };
-            // **Open the whole directory.** Allowing someone else's repo once and then
-            // asking again for every single file inside it is unusable.
-            if let (Verdict::AllowAlways, Some(path)) = (verdict, &ask.call.outside) {
-                state.grants.allow_under(path);
-            }
-            // **Do not answer a call that was already given up on.** Answering changes a
-            // file without the agent knowing. Only the grant is recorded, and the next call
-            // uses it.
-            if !ask.expired {
-                state.verdict_out = Some((ask.id, verdict));
-            }
-            state.pending = state.ask_queue.pop_front();
         }
         Action::ArmQuit => state.quit_armed_at = Some(Instant::now()),
         // Sending is the I/O side's job. Here we only note that we asked — the activity
@@ -1229,22 +1155,6 @@ fn apply_frame(state: &mut State, frame: &Frame) {
             }
         }
         Frame::ShellClosed { id } => state.shells.retain(|s| s.id != *id),
-        // **Only one is up at a time.** With two overlapping there is no telling which one
-        // is being answered.
-        Frame::Ask(ask) => match state.pending {
-            None => state.pending = Some(ask.clone()),
-            Some(_) => state.ask_queue.push_back(ask.clone()),
-        },
-        // The window is not cleared away, only what it shows changes. Clearing it leaves the
-        // user with no idea what they missed.
-        Frame::Expired(id) => {
-            if let Some(p) = state.pending.as_mut().filter(|p| p.id == *id) {
-                p.expired = true;
-            }
-            for waiting in state.ask_queue.iter_mut().filter(|p| p.id == *id) {
-                waiting.expired = true;
-            }
-        }
         // The background polling result. No value means the server did not answer — pass
         // over it quietly.
         Frame::Poll { usage, title } => {
@@ -1327,7 +1237,7 @@ fn typed_a_whole_command(state: &State) -> bool {
 /// With a question or an approval open, leave it alone — something else already owns that
 /// spot.
 fn follow_the_slash(state: &mut State) {
-    if state.asking.is_some() || state.pending.is_some() {
+    if state.asking.is_some() {
         return;
     }
     let typed = state.input.text.clone();
@@ -1404,23 +1314,32 @@ pub fn run_command(state: &mut State, text: &str) -> Option<crate::command::Comm
             // being gone.
             state.timeline.say(state.lang.clear_done());
         }
-        Command::Grants => state.timeline.say(state.lang.grants_text(&state.grants)),
         // **Logs are not dumped on screen** — those are for the agent to read, and covering the
         // transcript hides the conversation itself. Here we only give what is running and how to
         // stop it.
         Command::Jobs(None) => state.timeline.say(jobs_text(&state.jobs, state.lang)),
         Command::Jobs(Some(_)) => {}
-        Command::GrantsClose => {
-            let closed = state.grants.close_all();
-            // **The gate has to be told too.** Clearing only here closes it on screen
-            // alone — the I/O side does that part with `bridge.sync` (`finish_command`).
-            state.timeline.say(match closed {
-                0 => state.lang.grants_none_closed().to_string(),
-                n => state.lang.grants_closed(n),
-            });
-        }
         // Shutting the screen down is I/O. Only raise the flag.
         Command::Quit => state.quitting = true,
+        // **The settings panel** — every value marked with the current one, changed by
+        // `option value` below or by the matching slash command (`/config dir …` etc.).
+        Command::Config(None) => {
+            state.panel = Some(crate::panel::config(state.lang, state.config));
+        }
+        Command::Config(Some(action)) => match action {
+            crate::command::ConfigAction::Dir(access) => {
+                state.config.dir_access = *access;
+                state.timeline.say(state.lang.config_dir_changed(*access));
+            }
+            crate::command::ConfigAction::Lang(lang) => {
+                state.lang = *lang;
+                state.timeline.say(lang.lang_changed().to_string());
+            }
+            crate::command::ConfigAction::Mode(mode) => {
+                state.config.default_mode = *mode;
+                state.timeline.say(state.lang.config_mode_changed(*mode));
+            }
+        },
         // Letting an unknown one pass quietly means getting it wrong again next time. Say
         // what does exist alongside.
         Command::Unknown(what) => {
@@ -1860,16 +1779,19 @@ async fn run_inner(
     kitty: bool,
 ) -> anyhow::Result<()> {
     let mut state = State::new();
+    // **The saved settings come in here.** `State::default` keeps the built-in defaults so
+    // tests stay deterministic; this is the one place the disk is read.
+    state.config = crate::config::Config::load();
+    if let Some(mode) = state.config.default_mode {
+        state.mode = mode;
+    }
 
     // **Attach the screen first.** The enrollment code window has to reach it even before
     // the first connection — `enroll::ScreenEnroll` sends `Frame::Enroll` here.
     let (tx, mut rx) = mpsc::unbounded_channel::<AppMsg>();
 
-    // **From here on the tools can ask the screen.** Calls arriving before this are refused
-    // because there is nowhere to ask — letting them through quietly changes files without
-    // approval.
     bridge.attach(tx.clone());
-    bridge.sync(state.mode, &state.grants);
+    bridge.sync(state.mode, &state.config);
 
     // Off means the branch is simply never polled — the strip then shows the path alone.
     let git_every = crate::repo::poll_interval();
@@ -2219,23 +2141,6 @@ async fn run_inner(
                     }
                     apply(&mut state, &action);
 
-                    // **The verdict goes back to the tool here.** `apply` is pure, so it
-                    // only noted it down — same trick as `submit_now`/`flush_queue`.
-                    if let Some((id, verdict)) = state.verdict_out.take() {
-                        bridge.answer(id, verdict);
-                    }
-                    // When the open directories change, what the gate sees has to change
-                    // with them. Without carrying it over, the screen says allowed while
-                    // the tools keep asking.
-                    //
-                    // **The mode is not looked at here.** Shift+Tab and `/mode` come in by
-                    // different paths and are handled together in one place below — when
-                    // they were split, there really was a bug where `/mode` never reached
-                    // the gate.
-                    if matches!(action, Action::Approve | Action::Deny | Action::AlwaysAllow) {
-                        bridge.sync(state.mode, &state.grants);
-                    }
-
                     // **Selected text goes to the clipboard the moment the mouse is
                     // released.** There is no key to press — leaving Ctrl+C as the one stop
                     // key is less confusing when it matters. `apply` sets the range, so
@@ -2297,7 +2202,7 @@ async fn run_inner(
                     // answer a follow-up question.
                     if state.mode != last_mode {
                         last_mode = state.mode;
-                        bridge.sync(state.mode, &state.grants);
+                        bridge.sync(state.mode, &state.config);
                         restage(&mut state, &mut session);
                     }
 
@@ -2765,10 +2670,6 @@ async fn finish_command(
                 }
             }
         }
-        // **The closing has to reach the gate too.** `run_command` only erased it from
-        // state, so without carrying it over here the screen says closed while the tools
-        // keep letting calls through.
-        Command::GrantsClose => bridge.sync(state.mode, &state.grants),
         // **The chosen language goes to two places.** The global that off-screen code (shell
         // notices, tool errors) uses, and the file the next launch reads. `run_command` is
         // pure, so it only changed the state.
@@ -2776,6 +2677,18 @@ async fn finish_command(
             crate::lang::set(lang);
             crate::lang::save(lang);
         }
+        // **A setting change reaches the disk and the gate.** `run_command` only touched
+        // the state; `save` writes the file and `bridge.sync` carries the new policy to the
+        // tools (same lesson as `/mode` forgetting `bridge.sync`).
+        Command::Config(Some(action)) => {
+            state.config.save();
+            bridge.sync(state.mode, &state.config);
+            if let crate::command::ConfigAction::Lang(lang) = action {
+                crate::lang::set(lang);
+                crate::lang::save(lang);
+            }
+        }
+        Command::Config(None) => {}
         Command::Changes => {
             let said = match bridge.undo() {
                 Some(undo) => state.lang.changes_text(&undo.changed(), &state.cwd),
@@ -3088,39 +3001,6 @@ mod tests {
         KeyEvent::new(code, mods)
     }
 
-    fn ask(id: u64) -> ToolAsk {
-        ToolAsk {
-            id,
-            call: crate::tools::gate::Call::new("code_edit", "edit", "x.rs".into())
-                .leaving(Some(std::path::PathBuf::from("/home/ruma/attacca/x.rs"))),
-            summary: "/home/ruma/attacca/x.rs".into(),
-            expired: false,
-        }
-    }
-
-    /// With two approval windows overlapping there is no telling which one is being answered.
-    #[test]
-    fn a_second_ask_waits_behind_the_first() {
-        let mut s = state();
-        apply(&mut s, &Action::Frame(Frame::Ask(ask(1))));
-        apply(&mut s, &Action::Frame(Frame::Ask(ask(2))));
-        assert_eq!(s.pending.as_ref().unwrap().id, 1);
-        assert_eq!(s.ask_queue.len(), 1);
-
-        apply(&mut s, &Action::Deny);
-        assert_eq!(s.pending.as_ref().unwrap().id, 2, "answering should bring the next one up");
-        assert!(s.ask_queue.is_empty());
-    }
-
-    /// The answer has to go back to the tool — otherwise that call is blocked forever.
-    #[test]
-    fn answering_sends_the_verdict_back() {
-        let mut s = state();
-        apply(&mut s, &Action::Frame(Frame::Ask(ask(7))));
-        apply(&mut s, &Action::Approve);
-        assert_eq!(s.verdict_out, Some((7, Verdict::Allow)));
-    }
-
     /// Shift+Enter and Alt+Enter are newlines, not submits. With the kitty keyboard protocol
     /// on, Shift+Enter arrives separately as Enter+SHIFT, and Alt+Enter (ESC+\r) is the
     /// fallback for terminals without the protocol.
@@ -3173,59 +3053,6 @@ mod tests {
         assert_eq!(s.input.text, "가나\n라다");
     }
 
-    /// **`a` opens the whole directory.** Asking again for every single file is unusable.
-    #[test]
-    fn always_allow_opens_the_whole_directory() {
-        let mut s = state();
-        apply(&mut s, &Action::Frame(Frame::Ask(ask(3))));
-        apply(&mut s, &Action::AlwaysAllow);
-        assert_eq!(s.verdict_out, Some((3, Verdict::AllowAlways)));
-        assert!(s.grants.covers(std::path::Path::new("/home/ruma/attacca/다른것.rs")));
-        assert!(!s.grants.covers(std::path::Path::new("/home/ruma/prompts/x.yml")));
-    }
-
-    /// **A call that was already given up on gets no answer.** Answering changes a file
-    /// without the agent knowing — only the grant is recorded, and the next call uses it.
-    #[test]
-    fn approving_an_expired_ask_only_records_the_grant() {
-        let mut s = state();
-        let mut a = ask(9);
-        a.expired = true;
-        apply(&mut s, &Action::Frame(Frame::Ask(a)));
-        apply(&mut s, &Action::AlwaysAllow);
-        assert_eq!(s.verdict_out, None, "must not answer a call already given up on");
-        assert!(s.grants.covers(std::path::Path::new("/home/ruma/attacca/x.rs")));
-    }
-
-    /// **The window stays** even past the deadline. Clearing it away leaves the user with no
-    /// idea what they missed.
-    #[test]
-    fn a_pending_ask_can_go_stale_while_it_waits() {
-        let mut s = state();
-        apply(&mut s, &Action::Frame(Frame::Ask(ask(4))));
-        apply(&mut s, &Action::Frame(Frame::Expired(4)));
-        assert!(
-            s.pending.as_ref().unwrap().expired,
-            "not saying it was given up on leads to a pointless approval"
-        );
-    }
-
-    /// With an approval window up, y/n/a are answers, not characters.
-    #[test]
-    fn the_approval_keys_answer_instead_of_typing() {
-        let mut s = state();
-        apply(&mut s, &Action::Frame(Frame::Ask(ask(1))));
-        assert_eq!(on_key(&s, key(KeyCode::Char('y'), KeyModifiers::NONE)), vec![Action::Approve]);
-        assert_eq!(on_key(&s, key(KeyCode::Char('n'), KeyModifiers::NONE)), vec![Action::Deny]);
-        assert_eq!(
-            on_key(&s, key(KeyCode::Char('a'), KeyModifiers::NONE)),
-            vec![Action::AlwaysAllow]
-        );
-        // **There is no Enter.** A hand pressing it to type the next message must not
-        // approve.
-        assert!(on_key(&s, key(KeyCode::Enter, KeyModifiers::NONE)).is_empty());
-    }
-
     /// Windows sends press and release as separate KeyEvents. Without filtering the release,
     /// one press types twice — the bug where `/exit` becomes `//eexxitit` (ratatui issue
     /// #347). macOS/Linux have no release event, so this test simply guards it there.
@@ -3246,27 +3073,6 @@ mod tests {
         );
     }
 
-    /// With nothing pending they are just characters.
-    #[test]
-    fn those_keys_are_just_letters_when_nothing_is_pending() {
-        let s = state();
-        assert_eq!(
-            on_key(&s, key(KeyCode::Char('a'), KeyModifiers::NONE)),
-            vec![Action::Insert('a')]
-        );
-    }
-
-    /// Quitting has to work even with an approval up. Blocked, there is no way out.
-    #[test]
-    fn ctrl_c_still_works_while_an_approval_is_up() {
-        let mut s = state();
-        apply(&mut s, &Action::Frame(Frame::Ask(ask(1))));
-        assert_eq!(
-            on_key(&s, key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
-            vec![Action::ArmQuit]
-        );
-    }
-
     fn enroll() -> EnrollView {
         EnrollView {
             code: "WXQR-7KBD".into(),
@@ -3277,8 +3083,8 @@ mod tests {
     }
 
     /// **Esc is the only key that closes the enrollment code window.** If another key clears
-    /// it away, the approval step goes by without the code ever being seen — and `y` must
-    /// not be taken by the approval window either.
+    /// it away, the approval step goes by without the code ever being seen — `y` stays a
+    /// plain character here, not an answer to anything.
     #[test]
     fn the_enroll_window_closes_only_with_esc() {
         let mut s = state();
@@ -3583,48 +3389,39 @@ mod tests {
         assert_eq!(s.timeline.items().len(), 1, "after clearing only the one notice remains");
     }
 
-    /// With nothing open it has to say **how they open.** "None" alone gives no idea what
-    /// this command is showing.
+    /// `/config` opens the settings panel — the values are marked there, so looking at
+    /// the settings is looking at the panel.
     #[test]
-    fn listing_grants_with_nothing_open_says_how_they_open() {
+    fn the_config_command_opens_the_settings_panel() {
         let mut s = State::new();
-        run_command(&mut s, "/grants");
-        let said = last_system(&mut s);
-        assert!(said.contains('a'), "{said}");
+        s.lang = crate::lang::Lang::Ko;
+        run_command(&mut s, "/config");
+        assert!(s.panel.is_some(), "the panel must open");
+        assert_eq!(s.panel.as_ref().unwrap().title, "설정");
     }
 
-    /// **One press of `a` lives for the whole session.** It has to be possible to see what
-    /// was left open.
+    /// `option value` changes the setting and says so — the panel only shows.
     #[test]
-    fn listing_grants_names_every_directory_that_is_open() {
+    fn the_config_command_sets_and_reports_settings() {
         let mut s = State::new();
-        s.grants.allow_under(std::path::Path::new("/home/ruma/attacca/Cargo.toml"));
-        s.grants.allow_under(std::path::Path::new("/home/ruma/prompts/x.yml"));
+        s.lang = crate::lang::Lang::Ko;
+        run_command(&mut s, "/config dir allow");
+        assert_eq!(s.config.dir_access, crate::config::DirAccess::Allow);
+        assert!(last_system(&mut s).contains("허용"), "{}", last_system(&mut s));
 
-        run_command(&mut s, "/grants");
-        let said = last_system(&mut s);
-        assert!(said.contains("/home/ruma/attacca"), "{said}");
-        assert!(said.contains("/home/ruma/prompts"), "{said}");
+        run_command(&mut s, "/config mode 계획");
+        assert_eq!(s.config.default_mode, Some(crate::mode::Mode::Plan));
+
+        run_command(&mut s, "/config mode off");
+        assert_eq!(s.config.default_mode, None);
     }
 
-    /// Closing has to really close — saying so while they remain is the worst case.
+    /// `/config lang` changes the screen language the same way `/lang` does.
     #[test]
-    fn closing_grants_actually_closes_them() {
+    fn the_config_command_changes_the_language() {
         let mut s = State::new();
-        s.grants.allow_under(std::path::Path::new("/home/ruma/attacca/Cargo.toml"));
-
-        run_command(&mut s, "/grants close");
-        assert!(s.grants.is_empty(), "said closed, but they are still there");
-        assert!(last_system(&mut s).contains('1'), "{}", last_system(&mut s));
-    }
-
-    /// Looking at the list must not close it.
-    #[test]
-    fn listing_grants_does_not_close_them() {
-        let mut s = State::new();
-        s.grants.allow_under(std::path::Path::new("/home/ruma/attacca/Cargo.toml"));
-        run_command(&mut s, "/grants");
-        assert!(!s.grants.is_empty(), "only looked, but they got closed");
+        run_command(&mut s, "/config lang en");
+        assert_eq!(s.lang, crate::lang::Lang::En);
     }
 
     /// `/quit` only raises the flag. Quitting is the I/O side's job — a running turn is
@@ -4533,16 +4330,6 @@ mod tests {
     fn a_burst_enter_does_not_swallow_the_form_confirm() {
         let mut s = state();
         s.new_project = Some(crate::newproject::Form::new());
-        assert!(!enter_becomes_newline(&s, &key(KeyCode::Enter, KeyModifiers::NONE), true));
-    }
-
-    /// With an approval open, Enter deliberately does nothing — a burst turning it into a
-    /// newline would leak text into the invisible input behind it.
-    #[test]
-    fn a_burst_enter_does_not_leak_behind_an_approval() {
-        let mut s = state();
-        apply(&mut s, &Action::Frame(Frame::Ask(ask(1))));
-        apply(&mut s, &Action::Insert('a'));
         assert!(!enter_becomes_newline(&s, &key(KeyCode::Enter, KeyModifiers::NONE), true));
     }
 

@@ -1285,7 +1285,7 @@ fn usage_is_dropped_when_the_bottom_bar_is_too_narrow() {
     };
     let screen = dump(&mut s, 40, 12);
     let bar = screen.lines().last().unwrap_or_default();
-    assert!(bar.contains("기본"), "mode·agent must stay: {bar:?}");
+    assert!(bar.contains("일반"), "mode·agent must stay: {bar:?}");
     assert!(!bar.contains("크레딧"), "usage leaked onto a line too narrow for it: {bar:?}");
 }
 
@@ -1563,68 +1563,6 @@ fn the_enroll_window_overlays_the_conversation() {
     apply(&mut s, &Action::Frame(AppFrame::Enroll(enroll_view())));
     let screen = dump(&mut s, 80, 24);
     assert!(screen.contains("WXQR-7KBD"), "the code is not visible:\n{screen}");
-}
-
-// ── approval screen ──────────────────────────────────────────────────────────────
-
-fn leaving_ask() -> zyris_code::app::ToolAsk {
-    zyris_code::app::ToolAsk {
-        id: 1,
-        call: zyris_code::tools::gate::Call::new("code_edit", "edit", "x.rs".into())
-            .leaving(Some(std::path::PathBuf::from("/home/ruma/attacca/Cargo.toml"))),
-        summary: "/home/ruma/attacca/Cargo.toml".into(),
-        expired: false,
-    }
-}
-
-/// **Where it touches is the whole point of this approval.** Since nothing about the inner work is asked,
-/// the window appearing at all means "this is outside".
-#[test]
-fn the_approval_screen_leads_with_the_path_that_leaves() {
-    let mut s = State::new();
-    s.lang = zyris_code::lang::Lang::Ko;
-    s.pending = Some(leaving_ask());
-    let screen = dump(&mut s, 90, 24);
-    assert!(screen.contains("작업 디렉터리 밖"), "{screen}");
-    assert!(screen.contains("/home/ruma/attacca/Cargo.toml"), "{screen}");
-    assert!(screen.contains("code_edit.edit"), "{screen}");
-    assert!(screen.contains("y 허용"), "no key to press is offered:\n{screen}");
-}
-
-/// Even past the deadline, the **window stays**; only the situation changes.
-#[test]
-fn an_expired_ask_stays_on_screen_and_says_so() {
-    let mut s = State::new();
-    s.lang = zyris_code::lang::Lang::Ko;
-    let mut a = leaving_ask();
-    a.expired = true;
-    s.pending = Some(a);
-    let screen = dump(&mut s, 90, 24);
-    assert!(screen.contains("기다리다 돌아갔습니다"), "{screen}");
-    assert!(screen.contains("y 허용"), "the way to answer must not disappear:\n{screen}");
-}
-
-/// It must say how many are waiting behind — you shouldn't think answering one is the end.
-#[test]
-fn the_screen_says_how_many_are_waiting() {
-    let mut s = State::new();
-    s.lang = zyris_code::lang::Lang::Ko;
-    s.pending = Some(leaving_ask());
-    s.ask_queue.push_back(leaving_ask());
-    let screen = dump(&mut s, 90, 24);
-    assert!(screen.contains("뒤에 1개"), "{screen}");
-}
-
-/// The approval window takes the input box's place. If both showed, you couldn't tell where to answer.
-#[test]
-fn the_approval_screen_takes_the_place_of_the_input_box() {
-    let mut s = State::new();
-    apply(&mut s, &Action::Insert('안'));
-    assert!(dump(&mut s, 90, 24).contains('안'));
-
-    s.pending = Some(leaving_ask());
-    let screen = dump(&mut s, 90, 24);
-    assert!(!screen.contains('안'), "the input is still shown alongside:\n{screen}");
 }
 
 // ── list window ────────────────────────────────────────────────────────────────

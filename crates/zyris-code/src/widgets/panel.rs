@@ -18,9 +18,7 @@ pub fn draw(frame: &mut Frame, area: Rect, panel: &mut Panel, lang: crate::lang:
     // The box grows with the content, never taller than four fifths of the screen.
     // A button adds its own row between the body and the hint.
     let has_button = panel.button.is_some();
-    let want_h = (panel.lines.len() as u16)
-        .saturating_add(3 + u16::from(has_button))
-        .max(5);
+    let want_h = (panel.lines.len() as u16).saturating_add(3 + u16::from(has_button)).max(5);
     let h = want_h.min(area.height.saturating_mul(4) / 5).max(3);
     let w = 72.min(area.width.saturating_sub(4)).max(20);
     let box_area = Rect {
@@ -87,11 +85,7 @@ fn button_line(
     let label = match button {
         crate::panel::PanelButton::Logout => lang.acc_logout_button(),
     };
-    let text = if focused {
-        format!("▶ [ {label} ] ◀")
-    } else {
-        format!("[ {label} ]")
-    };
+    let text = if focused { format!("▶ [ {label} ] ◀") } else { format!("[ {label} ]") };
     let pad = " ".repeat(width.saturating_sub(display_width(&text)) / 2);
     let style = if focused {
         Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD)

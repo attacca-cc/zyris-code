@@ -1,20 +1,22 @@
-//! Whether to run a tool, ask, or refuse. **The decision is a single pure function.**
+//! Whether to run a tool or refuse. **The decision is a single pure function.**
 //!
 //! Since the executing side is our node, we decide whether to run it — attacca doesn't
 //! know about this decision, so the server doesn't need to be fixed. `mode.rs`'s two get their meaning here.
 //!
-//! **There is only one place we ask: outside the working directory.**
+//! **There is one policy for the outside: `/config`'s directory access.**
 //!
 //! capkit's path resolution is not a jail (`path.rs`: "the root is a default, not a jail"),
 //! so absolute paths simply escape the working directory. If launched from `~/zyris-code`,
-//! only that and below should be touched; anything outside asks a human **regardless of mode**.
-//! Nothing inside is ever asked — asking every time only broke the flow (2026-08-02).
+//! only that and below should be touched; anything outside follows the setting — `deny`
+//! (the default) refuses it, `allow` runs it. The approval window that used to ask a human
+//! per directory is gone (2026-08-07 user decision) — asking broke the flow, and the
+//! setting says the same thing without the interruption.
 
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
+use crate::config::{Config, DirAccess};
 use crate::mode::Mode;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,7 +25,7 @@ pub struct Call {
     pub tool: String,
     /// What it targets. Used to tell the screen what is running.
     pub target: String,
-    /// Path leading outside the working directory. If present, approval is needed.
+    /// Path leading outside the working directory. The policy decides what happens to it.
     pub outside: Option<PathBuf>,
 }
 
@@ -45,59 +47,9 @@ impl Call {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
     Run,
-    /// Asks a human. The call is blocked until the answer arrives.
-    Ask,
     /// **Must be a sentence the agent can read and change its behavior by.** Silently returning an empty result
     /// makes it think the tool is broken and try the same thing another way.
     Refuse(String),
-}
-
-/// Outside directories opened this session.
-///
-/// **Not persisted to disk.** It must not become a blank check to do anything, and the worst state
-/// is not knowing what was allowed. Closing the app forgets it.
-#[derive(Debug, Clone, Default)]
-pub struct Grants {
-    /// **Opens a directory, not a single file.** Once someone's repo is allowed, asking again
-    /// for each file inside it is unusable.
-    roots: HashSet<PathBuf>,
-}
-
-impl Grants {
-    /// Opens the whole directory containing this path. If the path is a directory, opens it itself.
-    pub fn allow_under(&mut self, path: &Path) {
-        let dir = if path.is_dir() { path } else { path.parent().unwrap_or(path) };
-        self.roots.insert(dir.to_path_buf());
-    }
-
-    pub fn covers(&self, path: &Path) -> bool {
-        self.roots.iter().any(|r| path.starts_with(r))
-    }
-
-    /// What is currently open. **An allowance you can't see is as dangerous as none** — once
-    /// an `a` you pressed stays alive all session, you must be able to see what you opened.
-    ///
-    /// Gives a settled order. `HashSet` order varies run to run, so if the same list
-    /// shows rows in a different order twice, it looks like something changed.
-    pub fn roots(&self) -> Vec<&Path> {
-        let mut out: Vec<&Path> = self.roots.iter().map(PathBuf::as_path).collect();
-        out.sort_unstable();
-        out
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.roots.is_empty()
-    }
-
-    /// Closes everything. Returns the number closed.
-    ///
-    /// **Doesn't let you pick one by one.** When several places are open, closing them all
-    /// and re-allowing when needed is faster and safer than choosing which is dangerous.
-    pub fn close_all(&mut self) -> usize {
-        let n = self.roots.len();
-        self.roots.clear();
-        n
-    }
 }
 
 /// The target that marks a `wait.until` call as a probe.
@@ -128,8 +80,8 @@ fn only_reads(call: &Call) -> bool {
     }
 }
 
-pub fn decide(mode: Mode, grants: &Grants, call: &Call) -> Decision {
-    // Plan mode comes first. Asking for approval over something immutable is wasted effort.
+pub fn decide(mode: Mode, config: &Config, call: &Call) -> Decision {
+    // Plan mode comes first. Refusing over something immutable is wasted effort.
     if mode == Mode::Plan && !only_reads(call) {
         return Decision::Refuse(
             "계획 모드입니다. 지금은 파일을 바꾸거나 명령을 돌릴 수 없습니다. \
@@ -137,10 +89,17 @@ pub fn decide(mode: Mode, grants: &Grants, call: &Call) -> Decision {
                 .into(),
         );
     }
-    // **Even reads ask when leaving.** That is the point of setting a working directory.
+    // **Outside the working directory, the setting decides.** `deny` (the default) refuses;
+    // `allow` runs it. Nothing inside is ever refused — refusing every time only broke the
+    // flow (2026-08-02).
     if let Some(path) = &call.outside {
-        if !grants.covers(path) {
-            return Decision::Ask;
+        if config.dir_access == DirAccess::Deny {
+            return Decision::Refuse(format!(
+                "`{}`은(는) 작업 디렉터리 밖이라 만질 수 없습니다 — 설정의 \
+                 '다른 디렉토리 접근'이 거부로 되어 있습니다. `/config dir allow`로 \
+                 허용하거나, 작업 디렉터리 안에서 할 수 있는 길을 찾아 주세요.",
+                path.display()
+            ));
         }
     }
     Decision::Run
@@ -270,13 +229,13 @@ mod tests {
     /// a worktree per task — exactly what plan mode is meant to stop.
     #[test]
     fn planning_mode_may_look_at_works_but_not_start_one() {
-        let grants = Grants::default();
+        let config = Config::default();
         for read in ["status", "list"] {
-            let seen = decide(Mode::Plan, &grants, &call("work", read, ""));
+            let seen = decide(Mode::Plan, &config, &call("work", read, ""));
             assert_eq!(seen, Decision::Run, "looking is allowed in plan mode too: {read}");
         }
         for write in ["start", "say", "stop", "resume"] {
-            let seen = decide(Mode::Plan, &grants, &call("work", write, ""));
+            let seen = decide(Mode::Plan, &config, &call("work", write, ""));
             assert!(matches!(seen, Decision::Refuse(_)), "it passed in plan mode: {write}");
         }
     }
@@ -285,7 +244,7 @@ mod tests {
     /// Leaving it out here makes a back door around the whole fence — wrapping the capability in
     /// `Gate` is not enough. **The gate only sees the tools it knows about.**
     #[test]
-    fn starting_a_job_outside_the_working_dir_asks_the_human() {
+    fn starting_a_job_outside_the_working_dir_is_caught() {
         let args = json!({ "command": "cat /etc/shadow" });
         assert!(escaping_path(root(), "wait", "start", &args).is_some());
         let inside = json!({ "command": "cargo build" });
@@ -306,9 +265,9 @@ mod tests {
     /// Plan mode means "do nothing yet". **Only looking passes.**
     #[test]
     fn planning_mode_refuses_start_but_answers_list() {
-        let g = Grants::default();
+        let config = Config::default();
         let seen = |tool: &str, args: Value| {
-            decide(Mode::Plan, &g, &call("wait", tool, &target_of("wait", tool, &args)))
+            decide(Mode::Plan, &config, &call("wait", tool, &target_of("wait", tool, &args)))
         };
         assert_eq!(seen("list", json!({})), Decision::Run);
         assert_eq!(seen("logs", json!({ "job": "b1" })), Decision::Run);
@@ -337,7 +296,7 @@ mod tests {
     /// be unable to do anything the moment it called this node's tools.
     #[test]
     fn only_planning_mode_holds_tools_back() {
-        let grants = Grants::default();
+        let config = Config::default();
         let calls = [
             call("terminal", "exec", "ls"),
             call("code_edit", "write", "a.rs"),
@@ -346,24 +305,24 @@ mod tests {
         ];
         for mode in [Mode::Job, Mode::Work, Mode::Job] {
             for c in &calls {
-                assert_eq!(decide(mode, &grants, c), Decision::Run, "{mode:?} blocked it: {c:?}");
+                assert_eq!(decide(mode, &config, c), Decision::Run, "{mode:?} blocked it: {c:?}");
             }
         }
         // The comparison spot — plan mode blocks the same call.
         assert!(matches!(
-            decide(Mode::Plan, &grants, &call("code_edit", "write", "a.rs")),
+            decide(Mode::Plan, &config, &call("code_edit", "write", "a.rs")),
             Decision::Refuse(_)
         ));
     }
 
-    /// **The fence is independent of mode.** All four ask outside the working directory — if
-    /// work·job modes were the hole, just switching modes would open the whole computer.
+    /// **The fence is independent of mode.** All four refuse outside when the setting is deny —
+    /// if work·job modes were the hole, just switching modes would open the whole computer.
     #[test]
-    fn every_mode_still_asks_before_leaving_the_working_directory() {
+    fn every_mode_refuses_outside_when_denied() {
         let outside = out("file_io", "read", "/etc/passwd");
         for mode in Mode::ALL {
-            let seen = decide(mode, &Grants::default(), &outside);
-            // Plan mode already refuses (writes) or asks (reads) before that. Just not passing is enough.
+            let seen = decide(mode, &Config::default(), &outside);
+            // Plan mode already refuses before that (writes) or here (reads). Not passing is enough.
             assert_ne!(seen, Decision::Run, "{mode:?} just walked outside");
         }
     }
@@ -372,100 +331,79 @@ mod tests {
     /// this capability has only one decision: the mode.
     #[test]
     fn a_work_call_has_no_path_to_escape_from() {
-        let seen = decide(Mode::Job, &Grants::default(), &call("work", "start", ""));
+        let seen = decide(Mode::Job, &Config::default(), &call("work", "start", ""));
         assert_eq!(seen, Decision::Run);
     }
 
-    /// Nothing inside is ever asked. Asking every time only broke the flow.
+    /// Nothing inside is ever refused. Refusing every time only broke the flow.
     #[test]
-    fn nothing_inside_the_working_directory_is_ever_asked() {
-        let g = Grants::default();
-        for c in [
+    fn nothing_inside_the_working_directory_is_ever_refused() {
+        let c = Config::default();
+        for call in [
             out("code_edit", "edit", "src/app.rs"),
             out("code_edit", "write", &format!("{ROOT}/깊은/곳/새것.rs")),
             out("file_io", "read", "Cargo.toml"),
             out("terminal", "exec", "."),
         ] {
-            assert_eq!(decide(Mode::Job, &g, &c), Decision::Run, "{c:?}");
+            assert_eq!(decide(Mode::Job, &c, &call), Decision::Run, "{call:?}");
         }
     }
 
-    /// **Leaving asks.** That is the point of setting a working directory.
+    /// **Leaving refuses when the setting is deny.** That is the default, and the point of
+    /// setting a working directory.
     #[test]
-    fn leaving_the_working_directory_asks() {
-        let g = Grants::default();
+    fn leaving_the_working_directory_refuses_when_denied() {
+        let c = Config::default();
         for path in ["/home/ruma/attacca/Cargo.toml", "../attacca/x.rs", "/etc/passwd"] {
-            let c = out("code_edit", "edit", path);
-            assert!(c.outside.is_some(), "{path} was not caught as leaving");
-            assert_eq!(decide(Mode::Job, &g, &c), Decision::Ask, "{path}");
+            let call = out("code_edit", "edit", path);
+            assert!(call.outside.is_some(), "{path} was not caught as leaving");
+            assert!(matches!(decide(Mode::Job, &c, &call), Decision::Refuse(_)), "{path}");
         }
     }
 
-    /// **Even reading asks.** What the user wanted to stop was "read everything then touch".
+    /// **Even reading refuses.** What the user wanted to stop was "read everything then touch".
     #[test]
-    fn even_reading_outside_asks() {
-        let c = out("file_io", "read", "/home/ruma/attacca/.env");
-        assert_eq!(decide(Mode::Job, &Grants::default(), &c), Decision::Ask);
+    fn even_reading_outside_refuses_when_denied() {
+        let call = out("file_io", "read", "/home/ruma/attacca/.env");
+        assert!(matches!(decide(Mode::Job, &Config::default(), &call), Decision::Refuse(_)));
     }
 
-    /// **Once opened, the whole directory is open.** Asking again per file is unusable.
+    /// **`allow` runs it** — no per-directory grants, no approval window. That is the whole
+    /// point of the setting.
     #[test]
-    fn allowing_once_opens_the_whole_directory() {
-        let mut g = Grants::default();
-        g.allow_under(Path::new("/home/ruma/attacca/Cargo.toml"));
-        for path in ["/home/ruma/attacca/Cargo.toml", "/home/ruma/attacca/README.md"] {
-            let c = out("file_io", "read", path);
-            assert_eq!(decide(Mode::Job, &g, &c), Decision::Run, "{path}");
+    fn allowing_makes_outside_run() {
+        let c = Config { dir_access: DirAccess::Allow, ..Config::default() };
+        for path in ["/home/ruma/attacca/Cargo.toml", "/etc/passwd"] {
+            let call = out("file_io", "read", path);
+            assert!(call.outside.is_some(), "{path} was not caught as leaving");
+            assert_eq!(decide(Mode::Job, &c, &call), Decision::Run, "{path}");
         }
-        // The neighbor must not open.
-        let c = out("file_io", "read", "/home/ruma/prompts/x.yml");
-        assert_eq!(decide(Mode::Job, &g, &c), Decision::Ask);
     }
 
-    /// **You must be able to see what's open.** The order must be settled too, so that seeing it twice
-    /// doesn't make a reordered list look like something changed.
+    /// Plan mode blocks changes. **Refusing over something immutable is wasted effort.**
     #[test]
-    fn what_is_open_can_be_listed_in_a_settled_order() {
-        let mut g = Grants::default();
-        assert!(g.is_empty());
-        g.allow_under(Path::new("/home/ruma/prompts/x.yml"));
-        g.allow_under(Path::new("/home/ruma/attacca/Cargo.toml"));
-
-        assert_eq!(
-            g.roots(),
-            vec![Path::new("/home/ruma/attacca"), Path::new("/home/ruma/prompts")]
-        );
-    }
-
-    /// After closing, it asks again. If it kept passing after being closed, it wasn't closed.
-    #[test]
-    fn closing_everything_makes_it_ask_again() {
-        let mut g = Grants::default();
-        g.allow_under(Path::new("/home/ruma/attacca/Cargo.toml"));
-        let c = out("file_io", "read", "/home/ruma/attacca/Cargo.toml");
-        assert_eq!(decide(Mode::Job, &g, &c), Decision::Run);
-
-        assert_eq!(g.close_all(), 1);
-        assert!(g.is_empty());
-        assert_eq!(decide(Mode::Job, &g, &c), Decision::Ask);
-    }
-
-    /// Plan mode blocks changes. **Asking over something immutable is wasted effort.**
-    #[test]
-    fn planning_refuses_before_it_would_ask() {
-        let c = out("code_edit", "edit", "/home/ruma/attacca/x.rs");
-        let Decision::Refuse(why) = decide(Mode::Plan, &Grants::default(), &c) else {
+    fn planning_refuses_before_the_directory_policy() {
+        let call = out("code_edit", "edit", "/home/ruma/attacca/x.rs");
+        let Decision::Refuse(why) = decide(Mode::Plan, &Config::default(), &call) else {
             panic!("it passed in plan mode");
         };
         assert!(why.contains("계획"), "{why}");
     }
 
-    /// Reading passes in plan mode too — but asks then when outside.
+    /// Reading passes in plan mode too — but the directory policy still applies outside.
     #[test]
-    fn reading_works_while_planning_but_still_asks_outside() {
-        let g = Grants::default();
-        assert_eq!(decide(Mode::Plan, &g, &out("search", "grep", ".")), Decision::Run);
-        assert_eq!(decide(Mode::Plan, &g, &out("file_io", "read", "/etc/passwd")), Decision::Ask);
+    fn reading_works_while_planning_but_still_respects_the_policy() {
+        let c = Config::default();
+        assert_eq!(decide(Mode::Plan, &c, &out("search", "grep", ".")), Decision::Run);
+        assert!(matches!(
+            decide(Mode::Plan, &c, &out("file_io", "read", "/etc/passwd")),
+            Decision::Refuse(_)
+        ));
+        let allow = Config { dir_access: DirAccess::Allow, ..Config::default() };
+        assert_eq!(
+            decide(Mode::Plan, &allow, &out("file_io", "read", "/etc/passwd")),
+            Decision::Run
+        );
     }
 
     /// Absolute paths inside a shell command are caught too. **A net, not a wall** — catches accidental leaving.
