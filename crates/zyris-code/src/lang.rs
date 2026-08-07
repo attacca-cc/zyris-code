@@ -304,44 +304,6 @@ impl Lang {
         }
     }
 
-    /// When entering `work`·`job`. **It says in advance what the next message becomes** — if you
-    /// think only the mode changed and keep writing your ongoing talk, that becomes the goal.
-    pub fn mode_opens_work(self) -> &'static str {
-        self.pick(
-            "다음에 보내는 말이 **work의 목표**가 됩니다. attacca가 계획을 세워 \
-             태스크로 쪼갭니다 — 관문 둘은 사람이 열어야 합니다.",
-            "Your next message becomes a **work goal**. Attacca plans it into tasks; \
-             the two gates need a person to open them.",
-        )
-    }
-    pub fn mode_opens_job(self) -> &'static str {
-        self.pick(
-            "다음에 보내는 말이 **job**이 됩니다. 시켜 놓으면 끝까지 해냅니다 — \
-             되묻는 것이 있으면 그대로 답하면 됩니다.",
-            "Your next message becomes a **job** — hand it over and it runs to the end. \
-             If it asks something back, just answer here.",
-        )
-    }
-
-    /// When switching to work mode with a session open. **The mode no longer opens new things** —
-    /// the ongoing conversation continues as-is, and a new work opens in a new thread.
-    pub fn mode_continues_work(self) -> &'static str {
-        self.pick(
-            "모드가 **work**입니다. 지금 대화는 그대로 이어갑니다 — \
-             새 work는 ←의 새 쓰레드에서 엽니다.",
-            "Mode is **work**. This conversation continues as-is — \
-             start a new work from a new thread (←).",
-        )
-    }
-    pub fn mode_continues_job(self) -> &'static str {
-        self.pick(
-            "모드가 **job**입니다. 지금 대화는 그대로 이어갑니다 — \
-             새 job은 ←의 새 쓰레드에서 엽니다.",
-            "Mode is **job**. This conversation continues as-is — \
-             start a new job from a new thread (←).",
-        )
-    }
-
     /// After opening. **It says which one opened by id** — that's what's needed to find it on the attacca side.
     pub fn opened_work(self, id: &str) -> String {
         match self {
@@ -1842,8 +1804,6 @@ mod tests {
             en.enroll_keys(),
             en.connected(),
             en.waiting_answer(),
-            en.mode_continues_work(),
-            en.mode_continues_job(),
             en.project_form_title(),
             en.project_name(),
             en.project_name_placeholder(),

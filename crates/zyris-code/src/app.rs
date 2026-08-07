@@ -2298,7 +2298,7 @@ async fn run_inner(
                     if state.mode != last_mode {
                         last_mode = state.mode;
                         bridge.sync(state.mode, &state.grants);
-                        restage(&mut state, &mut session);
+                        restage(&mut session, state.mode.route());
                     }
 
                     // Pressing submit on a question sends right away — putting the answer in
@@ -2939,29 +2939,21 @@ async fn flush_queue(
 /// **With a conversation in progress, the mode does not hijack it.** Switching to work or job
 /// keeps the current session going, and a new work or job opens in a new thread — this used
 /// to stage the moment the mode changed, so the next message quietly opened a new session.
-/// That really was confusing. We tell the user "the current conversation is untouched".
+/// That really was confusing.
 ///
-/// The decision itself is `Mode::route()`'s; here we only carry it to the session and say so.
-fn restage(state: &mut State, session: &mut Session) {
-    let route = state.mode.route();
+/// **Entering `work`·`job` says nothing** — it used to drop an explanatory line into the
+/// conversation ("your next message becomes a work goal…" / "the conversation continues
+/// as-is…"), but the bottom bar already names the mode and the notices only read as noise
+/// (2026-08-07 user request). The decision itself is `Mode::route()`'s; here we only carry
+/// it to the session.
+fn restage(session: &mut Session, route: crate::mode::Route) {
     // With a session in hand, do not stage — `open_for`'s "no staging and an id means append"
     // works as-is, so the next message goes to the current conversation.
     if session.id().is_some() {
         session.set_route(crate::mode::Route::Session);
-        let said = match route {
-            crate::mode::Route::Work => state.lang.mode_continues_work().to_string(),
-            crate::mode::Route::Job => state.lang.mode_continues_job().to_string(),
-            crate::mode::Route::Session => return,
-        };
-        state.timeline.say(said);
         return;
     }
     session.set_route(route);
-    match route {
-        crate::mode::Route::Session => {}
-        crate::mode::Route::Work => state.timeline.say(state.lang.mode_opens_work().to_string()),
-        crate::mode::Route::Job => state.timeline.say(state.lang.mode_opens_job().to_string()),
-    }
 }
 
 /// Sends, and if something new was opened, says so.
@@ -3381,22 +3373,14 @@ mod tests {
     #[test]
     fn restage_keeps_the_active_conversation() {
         let mut s = State::new();
-        s.lang = crate::lang::Lang::Ko;
         let mut session = Session::new(None);
         session.switch_to("지금-세션".into(), None);
         s.mode = crate::mode::Mode::Work;
-        restage(&mut s, &mut session);
+        restage(&mut session, s.mode.route());
         assert_eq!(session.pending_open(), None, "must not hijack the conversation in progress");
-        assert!(last_system(&mut s).contains("이어갑니다"), "{}", last_system(&mut s));
-
-        // The English screen says the same thing — the translation must not be missing.
-        let mut s = State::new();
-        s.lang = crate::lang::Lang::En;
-        let mut session = Session::new(None);
-        session.switch_to("지금-세션".into(), None);
-        s.mode = crate::mode::Mode::Work;
-        restage(&mut s, &mut session);
-        assert!(last_system(&mut s).contains("continues as-is"), "{}", last_system(&mut s));
+        // **Nothing is said.** The bottom bar names the mode; a line in the conversation
+        // about it only reads as noise.
+        assert!(last_system(&mut s).is_empty(), "{}", last_system(&mut s));
     }
 
     /// With no conversation the mode decides what opens — the first message becomes the work
@@ -3406,9 +3390,9 @@ mod tests {
         let mut s = State::new();
         let mut session = Session::new(None);
         s.mode = crate::mode::Mode::Job;
-        restage(&mut s, &mut session);
+        restage(&mut session, s.mode.route());
         assert_eq!(session.pending_open(), Some(crate::mode::Route::Job));
-        assert!(last_system(&mut s).contains("job"), "{}", last_system(&mut s));
+        assert!(last_system(&mut s).is_empty(), "{}", last_system(&mut s));
     }
 
     /// An ordinary message still goes to the server.
