@@ -20,6 +20,7 @@ pub mod mcp;
 pub mod mode;
 pub mod newproject;
 pub mod notice;
+pub mod panel;
 pub mod picker;
 pub mod plugin;
 pub mod question;

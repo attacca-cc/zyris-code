@@ -22,7 +22,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use crate::instructions::Found;
-use crate::mode::Route;
+use crate::mode::{Mode, Route};
 use crate::plugin::Plugin;
 use crate::tools::gate::Grants;
 use crate::tools::skill::SkillInfo;
@@ -1200,6 +1200,181 @@ impl Lang {
             ));
         }
         s
+    }
+
+    // ── Popup panels (/mode · /mcp · /skills · /plugin · /account · /status)
+    /// The hint line at the bottom of every panel.
+    pub fn panel_keys(self) -> String {
+        match self {
+            Lang::Ko => "↑↓ 스크롤 · Esc 닫기".into(),
+            Lang::En => "↑↓ scroll · Esc close".into(),
+        }
+    }
+    /// A missing value in a panel — a dash, never an invented number.
+    pub fn panel_dash(self) -> &'static str {
+        self.pick("—", "—")
+    }
+    /// Panel titles.
+    pub fn title_mode(self) -> &'static str {
+        self.pick("모드", "Mode")
+    }
+    pub fn title_mcp(self) -> &'static str {
+        self.pick("MCP 서버", "MCP servers")
+    }
+    pub fn title_skills(self) -> &'static str {
+        self.pick("스킬", "Skills")
+    }
+    pub fn title_plugins(self) -> &'static str {
+        self.pick("플러그인", "Plugins")
+    }
+    pub fn title_account(self) -> &'static str {
+        self.pick("계정", "Account")
+    }
+    pub fn title_status(self) -> &'static str {
+        self.pick("상태", "Status")
+    }
+
+    // ── Mode panel
+    pub fn current_mode(self) -> &'static str {
+        self.pick("지금 모드", "Current mode")
+    }
+    pub fn mode_cycle_hint(self) -> &'static str {
+        self.pick(
+            "Shift+Tab으로 돌리거나 `/mode 기본`·`/mode 계획`·`/mode work`·`/mode job`으로 바꿉니다.",
+            "Cycle with Shift+Tab, or set it with `/mode normal`, `/mode plan`, `/mode work`, `/mode job`.",
+        )
+    }
+    /// One line on what each mode does, for the `/mode` panel. The words match the
+    /// tool-gate table in `mode.rs`.
+    pub fn mode_desc(self, mode: Mode) -> &'static str {
+        match mode {
+            Mode::Normal => self.pick(
+                "물어보지 않고 도구를 돌립니다. 기본값 — 평범한 대화에 이어붙습니다.",
+                "Runs tools without asking. The default — carries on one plain conversation.",
+            ),
+            Mode::Plan => self.pick(
+                "도구를 돌리지 않고, 먼저 할 일을 세웁니다.",
+                "Does not run tools — lays out what to do first.",
+            ),
+            Mode::Work => self.pick(
+                "다음 말이 attacca의 work 목표가 됩니다. 계획을 태스크로 쪼갭니다.",
+                "The next message becomes a work goal. Attacca plans it into tasks.",
+            ),
+            Mode::Job => self.pick(
+                "다음 말을 하나의 job으로 넘깁니다. 되묻는 것이 있어도 끝까지 해냅니다.",
+                "Hands the next message off as one job that runs to the end.",
+            ),
+        }
+    }
+
+    // ── MCP panel
+    pub fn mcp_empty(self) -> &'static str {
+        self.pick(
+            "붙은 MCP 서버가 없습니다. `.mcp.json`이나 `~/.config/zyris-code/mcp.json`에 적습니다.",
+            "No MCP servers are attached. Write one in `.mcp.json` or `~/.config/zyris-code/mcp.json`.",
+        )
+    }
+    pub fn mcp_tools(self, n: usize) -> String {
+        match self {
+            Lang::Ko => format!("도구 {n}개"),
+            Lang::En => format!("{n} tools"),
+        }
+    }
+    pub fn mcp_failed(self, why: &str) -> String {
+        match self {
+            Lang::Ko => format!("못 띄웠습니다: {why}"),
+            Lang::En => format!("couldn't start it: {why}"),
+        }
+    }
+    pub fn mcp_config_hint(self) -> &'static str {
+        self.pick(
+            "`.mcp.json` · `~/.config/zyris-code/mcp.json`에 적습니다.",
+            "Write in `.mcp.json` or `~/.config/zyris-code/mcp.json`.",
+        )
+    }
+
+    // ── Skills panel
+    pub fn skills_empty(self) -> &'static str {
+        self.pick(
+            "쓸 수 있는 스킬이 없습니다. `.zyris-code/skills/`나 `~/.config/zyris-code/skills/`에 둡니다.",
+            "No skills available. Put them in `.zyris-code/skills/` or `~/.config/zyris-code/skills/`.",
+        )
+    }
+
+    // ── Plugins panel
+    pub fn plugins_empty(self) -> &'static str {
+        self.pick(
+            "플러그인이 없습니다. `/plugin add owner/repo`로 받습니다.",
+            "No plugins. Install one with `/plugin add owner/repo`.",
+        )
+    }
+    pub fn plugin_hand_placed(self) -> &'static str {
+        self.pick(" (직접 둔 것)", " (hand-placed)")
+    }
+    pub fn plugin_mcp_line(self, slug: &str, command: &str) -> String {
+        match self {
+            Lang::Ko => format!("MCP `{slug}` — `{command}`"),
+            Lang::En => format!("MCP `{slug}` — runs `{command}`"),
+        }
+    }
+    pub fn plugin_skills_line(self) -> &'static str {
+        self.pick("스킬이 딸려 있습니다", "ships a skill")
+    }
+
+    // ── Account panel
+    pub fn acc_id(self) -> &'static str {
+        self.pick("아이디", "User ID")
+    }
+    pub fn acc_plan(self) -> &'static str {
+        self.pick("플랜", "Plan")
+    }
+    pub fn acc_scopes(self) -> &'static str {
+        self.pick("부여된 권한", "Granted scopes")
+    }
+    pub fn acc_none(self) -> &'static str {
+        self.pick("없음", "none")
+    }
+    pub fn acc_logout_hint(self) -> &'static str {
+        self.pick(
+            "`/account logout` — 이 기기에서 로그아웃합니다. 다음 실행 때 다시 승인을 받습니다.",
+            "`/account logout` — log out on this device. The next launch asks for approval again.",
+        )
+    }
+
+    // ── Status panel
+    pub fn st_thread(self) -> &'static str {
+        // Deliberately not translated — sessions are called `thread` on screen in both languages.
+        self.pick("thread", "thread")
+    }
+    pub fn st_project(self) -> &'static str {
+        self.pick("프로젝트", "Project")
+    }
+    pub fn st_agent(self) -> &'static str {
+        self.pick("에이전트", "Agent")
+    }
+    pub fn st_mode(self) -> &'static str {
+        self.pick("모드", "Mode")
+    }
+    pub fn st_model(self) -> &'static str {
+        self.pick("모델", "Model")
+    }
+    pub fn st_cwd(self) -> &'static str {
+        self.pick("작업 위치", "Working dir")
+    }
+    pub fn st_thread_none(self) -> &'static str {
+        self.pick(
+            "아직 없음 — 첫 메시지에서 만들어집니다",
+            "none yet — your first message creates it",
+        )
+    }
+    pub fn st_project_default(self) -> &'static str {
+        self.pick("기본 (안 고름)", "default (not picked)")
+    }
+    pub fn st_pending_work(self) -> &'static str {
+        self.pick("다음 메시지가 새 work를 엽니다.", "Your next message opens a new work.")
+    }
+    pub fn st_pending_job(self) -> &'static str {
+        self.pick("다음 메시지가 새 job을 엽니다.", "Your next message opens a new job.")
     }
 
     // ── Question screen actions

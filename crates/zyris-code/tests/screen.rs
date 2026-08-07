@@ -907,6 +907,42 @@ fn the_picker_overlays_the_conversation_and_takes_the_keys() {
     assert_eq!(on_key(&s, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)), vec![Action::PickBack]);
 }
 
+/// The popup panel overlays the conversation with its title in the border, and
+/// while it is up keys scroll or close it instead of typing into the input.
+#[test]
+fn the_panel_overlays_the_conversation_and_takes_the_keys() {
+    use crossterm::event::KeyCode;
+    use zyris_code::app::on_key;
+    use zyris_code::app::run_command;
+
+    let mut s = State::new();
+    s.lang = zyris_code::lang::Lang::Ko;
+    s.mode = zyris_code::mode::Mode::Job;
+    run_command(&mut s, "/mode");
+
+    let screen = dump(&mut s, 70, 18);
+    assert!(screen.contains("모드"), "no title\n{screen}");
+    assert!(screen.contains('❯'), "the current mode is not marked\n{screen}");
+    assert!(screen.contains("job"), "the current mode name is missing\n{screen}");
+    assert!(screen.contains("Esc 닫기"), "no close hint\n{screen}");
+
+    // While the panel is up, typed characters must not leak into the input box.
+    for a in on_key(&s, key(KeyCode::Char('x'))) {
+        apply(&mut s, &a);
+    }
+    assert_eq!(s.input.text, "");
+
+    // ↓ scrolls the panel, Esc closes it.
+    for a in on_key(&s, key(KeyCode::Down)) {
+        apply(&mut s, &a);
+    }
+    assert_eq!(s.panel.as_ref().unwrap().scroll, 1);
+    for a in on_key(&s, key(KeyCode::Esc)) {
+        apply(&mut s, &a);
+    }
+    assert!(s.panel.is_none(), "Esc did not close the panel");
+}
+
 /// The two create rows behave differently. **Sessions are created right away; projects go through a form.**
 #[test]
 fn the_create_rows_behave_differently_by_level() {

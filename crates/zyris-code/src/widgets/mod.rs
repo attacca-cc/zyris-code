@@ -28,6 +28,7 @@ mod ask;
 mod enroll;
 mod input;
 mod newproject;
+mod panel;
 mod picker;
 mod status;
 mod transcript;
@@ -110,6 +111,13 @@ pub fn draw(frame: &mut Frame, state: &mut State) {
     // the code — key handling also gives it top priority (`on_key`).
     if let Some(view) = &state.enroll {
         enroll::draw(frame, full, view, state.lang);
+    }
+
+    // **The popup panel is drawn on top of everything.** It only opens from a slash
+    // command, so nothing else is open underneath — it covers the conversation it
+    // would otherwise have filled with text.
+    if let Some(p) = &mut state.panel {
+        panel::draw(frame, full, p, state.lang);
     }
 
     // **By default no background is painted** — the terminal uses its own. If the app painted, only the area

@@ -161,6 +161,10 @@ pub enum Action {
     FormPrev,
     FormConfirm,
     FormCancel,
+    /// Close the popup panel (Esc or Enter).
+    PanelClose,
+    /// Scroll the popup panel. Positive scrolls toward the top.
+    PanelScroll(i32),
     CycleMode,
     Approve,
     Deny,
@@ -278,6 +282,9 @@ pub struct State {
     /// The new-project form. Opens when "＋ 새 프로젝트" is chosen from the ← list.
     /// **The list stays underneath**, so closing with Esc returns right to that spot.
     pub new_project: Option<crate::newproject::Form>,
+    /// The popup panel `/mode`·`/mcp`·`/skills`·`/plugin`·`/account`·`/status` open.
+    /// `None` is the ordinary state; Esc or Enter closes it.
+    pub panel: Option<crate::panel::Panel>,
     /// Filled when the form takes Enter — (name, description). The I/O side does the
     /// creating.
     pub project_out: Option<(String, String)>,
@@ -416,6 +423,7 @@ impl Default for State {
             submit_now: false,
             picker: None,
             new_project: None,
+            panel: None,
             project_out: None,
             usage: crate::usage::Usage::default(),
             title: "Zyris Code".into(),
@@ -597,6 +605,20 @@ pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
             KeyCode::Home => vec![Action::Home],
             KeyCode::End => vec![Action::End],
             KeyCode::Char(c) if !ctrl => vec![Action::Insert(c)],
+            _ => vec![],
+        };
+    }
+
+    // **The popup panel is modal.** While it is up, keys only scroll or close it —
+    // typing must not leak into the input behind it. Esc or Enter closes; ↑↓ · j·k
+    // scroll by one row, PageUp·PageDown by a page. Only quitting always works.
+    if state.panel.is_some() && !(ctrl && matches!(key.code, KeyCode::Char('c'))) {
+        return match key.code {
+            KeyCode::Esc | KeyCode::Enter => vec![Action::PanelClose],
+            KeyCode::Up | KeyCode::Char('k') => vec![Action::PanelScroll(1)],
+            KeyCode::Down | KeyCode::Char('j') => vec![Action::PanelScroll(-1)],
+            KeyCode::PageUp => vec![Action::PanelScroll(10)],
+            KeyCode::PageDown => vec![Action::PanelScroll(-10)],
             _ => vec![],
         };
     }
@@ -848,6 +870,17 @@ pub fn apply(state: &mut State, action: &Action) {
             state.remember_sent(text);
         }
         Action::Wheel(notches) => {
+            // **With a panel open, the wheel scrolls the panel.** The transcript is
+            // hidden behind it, so scrolling that instead would move text the user
+            // cannot see.
+            if let Some(p) = &mut state.panel {
+                if *notches > 0 {
+                    p.scroll_up(*notches as usize);
+                } else {
+                    p.scroll_down((-(*notches)) as usize);
+                }
+                return;
+            }
             let (total, height) = (state.view_total, state.view_height);
             state.scroll.wheel(*notches, total, height);
             // The selection is anchored to the screen; scrolling moves the text out from under
@@ -1011,6 +1044,16 @@ pub fn apply(state: &mut State, action: &Action) {
         Action::PickDown => {
             if let Some(p) = &mut state.picker {
                 p.down();
+            }
+        }
+        Action::PanelClose => state.panel = None,
+        Action::PanelScroll(by) => {
+            if let Some(p) = &mut state.panel {
+                if *by > 0 {
+                    p.scroll_up(*by as usize);
+                } else {
+                    p.scroll_down((-(*by)) as usize);
+                }
             }
         }
         // Acting on the choice (moving in the list, switching sessions, creating) is the
@@ -1285,8 +1328,10 @@ pub fn run_command(state: &mut State, text: &str) -> Option<crate::command::Comm
     match &cmd {
         Command::Help => state.timeline.say(crate::command::help_text(state.lang)),
         Command::Mode(None) => {
-            let said = state.lang.mode_now(state.mode.label(state.lang));
-            state.timeline.say(said);
+            // **The panel is the answer now** — a wall of text in the conversation was
+            // the whole complaint. The four modes with the current one marked read
+            // better than one sentence.
+            state.panel = Some(crate::panel::mode(state.lang, state.mode));
         }
         Command::Mode(Some(mode)) => {
             state.mode = *mode;
@@ -1383,10 +1428,10 @@ fn jobs_text(jobs: &[JobRow], lang: crate::lang::Lang) -> String {
     out
 }
 
-/// What `/status` shows, built from state and session. **Pure so tests can pin it** —
-/// the I/O side only says it.
-fn status_said(state: &State, session: &Session) -> String {
-    let info = crate::lang::StatusInfo {
+/// The pieces `/status` shows, gathered once so the text and the panel tell the
+/// same story.
+fn status_info<'a>(state: &'a State, session: &'a Session) -> crate::lang::StatusInfo<'a> {
+    crate::lang::StatusInfo {
         session_id: session.id(),
         project: session.project(),
         agent: &state.agent,
@@ -1394,8 +1439,7 @@ fn status_said(state: &State, session: &Session) -> String {
         cwd: &state.cwd,
         usage: &state.usage,
         pending: session.pending_open(),
-    };
-    state.lang.status_text(&info)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2634,7 +2678,9 @@ async fn finish_command(
     use crate::command::{AccountAction, Command};
     let Some(cmd) = run_command(state, text) else { return };
     match cmd {
-        Command::Mcp => state.timeline.say(state.lang.mcp_report_text(&bridge.mcp_report())),
+        Command::Mcp => {
+            state.panel = Some(crate::panel::mcp(state.lang, &bridge.mcp_report()));
+        }
         // Stopping is I/O that touches the registry. The listing was already said by `run_command`.
         // **We don't drop it from the list** — that it died is what the reaper's `JobEnded` says.
         Command::Jobs(Some(id)) => {
@@ -2647,7 +2693,7 @@ async fn finish_command(
         }
         Command::Skills => {
             let skills = crate::tools::skill::Skills::discover(&state.cwd);
-            state.timeline.say(state.lang.skills_text(&skills.list()));
+            state.panel = Some(crate::panel::skills(state.lang, &skills.list()));
         }
         // **The preamble is an invisible place.** This is the only way to find out when
         // something quietly failed to load into it.
@@ -2672,8 +2718,21 @@ async fn finish_command(
         },
         Command::Agent(Some(name)) => switch_agent(api, state, session, agent_id, &name).await,
         Command::Plugin(what) => {
-            let said = run_plugin(state, what).await;
-            state.timeline.say(said);
+            use crate::command::Plugin as P;
+            match what {
+                // The listing is a panel now — one row per plugin reads better than
+                // a paragraph of bullets.
+                P::List => {
+                    state.panel = Some(crate::panel::plugins(
+                        state.lang,
+                        &crate::plugin::discover(&state.cwd),
+                    ));
+                }
+                other => {
+                    let said = run_plugin(state, other).await;
+                    state.timeline.say(said);
+                }
+            }
         }
         // **The closing has to reach the gate too.** `run_command` only erased it from
         // state, so without carrying it over here the screen says closed while the tools
@@ -2695,7 +2754,7 @@ async fn finish_command(
         }
         // **Needs no server call** — but the session (id, project) only lives on the I/O side.
         Command::Status => {
-            state.timeline.say(status_said(state, session));
+            state.panel = Some(crate::panel::status(state.lang, &status_info(state, session)));
         }
         Command::Undo => {
             let said = match bridge.undo() {
@@ -2720,7 +2779,8 @@ async fn finish_command(
             Ok(me) => {
                 let name =
                     if me.display_name.trim().is_empty() { &me.email } else { &me.display_name };
-                state.timeline.say(state.lang.account_text(
+                state.panel = Some(crate::panel::account(
+                    state.lang,
                     name,
                     &me.email,
                     &me.user_id,
@@ -2786,6 +2846,8 @@ async fn run_plugin(state: &mut State, what: crate::command::Plugin) -> String {
     use crate::plugin;
 
     match what {
+        // **The list is a panel now** (`finish_command` routes it there) — this arm
+        // is only a safety net for a direct call.
         P::List => state.lang.plugin_list_text(&plugin::discover(&state.cwd)),
         P::Add(source) => match plugin::install(&source).await {
             Ok(p) => {
@@ -3344,6 +3406,42 @@ mod tests {
         assert!(last_system(&mut s).contains("plan"), "{}", last_system(&mut s));
     }
 
+    /// Without an argument `/mode` opens a panel instead of a line of text — the
+    /// current mode and the three alternatives at a glance. Esc closes it, and
+    /// nothing was dumped into the conversation.
+    #[test]
+    fn mode_without_an_argument_opens_a_panel() {
+        let mut s = State::new();
+        s.mode = crate::mode::Mode::Job;
+        run_command(&mut s, "/mode");
+        let panel = s.panel.as_ref().expect("the mode panel should be up");
+        assert!(
+            panel.lines.iter().any(|l| l.to_string().contains('❯')),
+            "the current mode is not marked: {panel:?}"
+        );
+        assert!(s.timeline.items().is_empty(), "no text went into the conversation");
+        apply(&mut s, &Action::PanelClose);
+        assert!(s.panel.is_none(), "Esc closes the panel");
+    }
+
+    /// ↑↓ scroll the panel, and so does the wheel while it is open — the transcript
+    /// is hidden behind it, so scrolling that instead would move unseen text.
+    #[test]
+    fn keys_and_wheel_scroll_the_panel() {
+        let mut s = State::new();
+        run_command(&mut s, "/mode");
+        for a in on_key(&s, key(KeyCode::Down, KeyModifiers::NONE)) {
+            apply(&mut s, &a);
+        }
+        assert_eq!(s.panel.as_ref().unwrap().scroll, 1);
+        apply(&mut s, &Action::Wheel(-1));
+        assert_eq!(s.panel.as_ref().unwrap().scroll, 2);
+        apply(&mut s, &Action::Wheel(5));
+        assert_eq!(s.panel.as_ref().unwrap().scroll, 0);
+        // While the panel is open the wheel must not move the transcript.
+        assert_eq!(s.scroll.top, 0, "the transcript scroll moved");
+    }
+
     /// **A window to pick the screen language comes up.** There are only two, so the list is
     /// the answer.
     #[test]
@@ -3387,7 +3485,7 @@ mod tests {
         s.usage.model = Some("claude-opus-5-1m".into());
         s.usage.context_tokens = Some(500_000);
         s.usage.credits_used = Some("1.23".into());
-        let said = status_said(&s, &session);
+        let said = s.lang.status_text(&status_info(&s, &session));
         assert!(said.contains("세션-1"), "{said}");
         assert!(said.contains("프로젝트-1"), "{said}");
         assert!(said.contains("Main Agent"), "{said}");
@@ -3399,7 +3497,7 @@ mod tests {
         s.lang = crate::lang::Lang::En;
         s.agent = "Main Agent".into();
         let session = Session::new(None);
-        let said = status_said(&s, &session);
+        let said = s.lang.status_text(&status_info(&s, &session));
         assert!(said.contains("none yet"), "{said}");
         assert!(said.contains("Main Agent"), "{said}");
     }
