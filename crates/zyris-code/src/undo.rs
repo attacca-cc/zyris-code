@@ -61,7 +61,20 @@ struct Inner {
 impl Undo {
     /// Opens this working directory's history. The directory is created on first write.
     pub fn for_dir(cwd: &Path) -> Undo {
-        Undo(Arc::new(Inner { dir: home().join("undo").join(slug(cwd)), lock: Mutex::new(()) }))
+        Undo::under(&home(), cwd)
+    }
+
+    /// The same thing with the cache root given. **Tests use this.**
+    ///
+    /// `std::env::set_var` is process-global, so tests that each pointed `XDG_CACHE_HOME` at their
+    /// own temp directory were overwriting one another's — passing alone and failing in the suite,
+    /// at random. Handing the root in removes the shared variable from the picture, the same way
+    /// `plugin::install_into` takes its directory.
+    pub fn under(cache_root: &Path, cwd: &Path) -> Undo {
+        Undo(Arc::new(Inner {
+            dir: cache_root.join("undo").join(slug(cwd)),
+            lock: Mutex::new(()),
+        }))
     }
 
     /// Called **right before** the write.
@@ -221,8 +234,11 @@ fn home() -> PathBuf {
     if let Some(cache) = std::env::var_os("XDG_CACHE_HOME") {
         return PathBuf::from(cache).join("zyris-code");
     }
-    match std::env::var_os("HOME") {
-        Some(home) => PathBuf::from(home).join(".cache/zyris-code"),
+    // `$HOME` is not portable — `conn::user_home` also answers with `USERPROFILE`. Falling
+    // through to the temp directory on Windows put the undo history somewhere the system
+    // periodically empties, so `/undo` would work until it silently did not.
+    match crate::conn::user_home() {
+        Some(home) => home.join(".cache/zyris-code"),
         None => std::env::temp_dir().join("zyris-code"),
     }
 }

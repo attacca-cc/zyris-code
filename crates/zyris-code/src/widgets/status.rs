@@ -25,19 +25,19 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &State) {
     // makes them look like two separate pieces of info — close together, the eye takes them in at once.
     let mut left = vec![
         Span::styled(state.mode.label(state.lang), Style::default().fg(state.mode.color())),
-        Span::styled("·", Style::default().fg(theme::BORDER_LIGHT)),
+        Span::styled("·", Style::default().fg(theme::border_light())),
         Span::styled(
             if state.agent.is_empty() { "-" } else { state.agent.as_str() }.to_string(),
-            Style::default().fg(theme::TEXT_MUTED),
+            Style::default().fg(theme::text_muted()),
         ),
     ];
 
     // **If there's unsent text, it must be said.** If it isn't announced, the user believes it was sent.
     if !state.queued.is_empty() {
-        left.push(Span::styled(" · ", Style::default().fg(theme::BORDER_LIGHT)));
+        left.push(Span::styled(" · ", Style::default().fg(theme::border_light())));
         left.push(Span::styled(
             state.lang.queued(state.queued.len()),
-            Style::default().fg(theme::WARNING),
+            Style::default().fg(theme::warning()),
         ));
     }
 
@@ -88,7 +88,7 @@ fn usage_spans(state: &State) -> Vec<Span<'static>> {
     let mut out = Vec::new();
     for (i, seg) in segs.iter().enumerate() {
         if i > 0 {
-            out.push(Span::styled(" · ", Style::default().fg(theme::BORDER_LIGHT)));
+            out.push(Span::styled(" · ", Style::default().fg(theme::border_light())));
         }
         out.extend(seg.iter().cloned());
     }
@@ -98,8 +98,8 @@ fn usage_spans(state: &State) -> Vec<Span<'static>> {
 /// One `label value` segment — the label muted, the number readable.
 fn kv(label: &'static str, value: String) -> Vec<Span<'static>> {
     vec![
-        Span::styled(label, Style::default().fg(theme::TEXT_MUTED)),
+        Span::styled(label, Style::default().fg(theme::text_muted())),
         Span::styled(" ", Style::default()),
-        Span::styled(value, Style::default().fg(theme::TEXT)),
+        Span::styled(value, Style::default().fg(theme::text())),
     ]
 }

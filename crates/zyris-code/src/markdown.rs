@@ -60,7 +60,7 @@ pub fn render_rich(src: &str, width: u16) -> Rendered {
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut out_links: Vec<Vec<Link>> = Vec::new();
     let mut buf: Vec<Piece> = Vec::new();
-    let mut style = Style::default().fg(theme::TEXT);
+    let mut style = Style::default().fg(theme::text());
     let mut in_code = false;
     let mut list_depth: usize = 0;
     let mut table: Option<Table> = None;
@@ -75,22 +75,22 @@ pub fn render_rich(src: &str, width: u16) -> Rendered {
     for event in parser {
         match event {
             Event::Start(Tag::Heading { .. }) => {
-                style = Style::default().fg(theme::TEXT_HEADING).add_modifier(Modifier::BOLD);
+                style = Style::default().fg(theme::text_heading()).add_modifier(Modifier::BOLD);
             }
             Event::End(TagEnd::Heading(_)) => {
                 flush(&mut out, &mut out_links, &mut buf, width, "");
-                style = Style::default().fg(theme::TEXT);
+                style = Style::default().fg(theme::text());
             }
             Event::Start(Tag::Emphasis) => style = style.add_modifier(Modifier::ITALIC),
             Event::End(TagEnd::Emphasis) => style = style.remove_modifier(Modifier::ITALIC),
             Event::Start(Tag::Strong) => {
-                style = style.fg(theme::TEXT_HEADING).add_modifier(Modifier::BOLD)
+                style = style.fg(theme::text_heading()).add_modifier(Modifier::BOLD)
             }
-            Event::End(TagEnd::Strong) => style = Style::default().fg(theme::TEXT),
-            Event::Start(Tag::BlockQuote(_)) => style = Style::default().fg(theme::TEXT_MUTED),
+            Event::End(TagEnd::Strong) => style = Style::default().fg(theme::text()),
+            Event::Start(Tag::BlockQuote(_)) => style = Style::default().fg(theme::text_muted()),
             Event::End(TagEnd::BlockQuote(_)) => {
                 flush(&mut out, &mut out_links, &mut buf, width, "│ ");
-                style = Style::default().fg(theme::TEXT);
+                style = Style::default().fg(theme::text());
             }
             Event::Start(Tag::List(_)) => list_depth += 1,
             Event::End(TagEnd::List(_)) => list_depth = list_depth.saturating_sub(1),
@@ -98,7 +98,7 @@ pub fn render_rich(src: &str, width: u16) -> Rendered {
                 buf.push(Piece {
                     span: Span::styled(
                         format!("{}· ", "  ".repeat(list_depth.saturating_sub(1))),
-                        Style::default().fg(theme::ACCENT),
+                        Style::default().fg(theme::accent()),
                     ),
                     url: None,
                 });
@@ -112,13 +112,13 @@ pub fn render_rich(src: &str, width: u16) -> Rendered {
                 };
                 out.push(Line::from(Span::styled(
                     format!("┌─ {lang} "),
-                    Style::default().fg(theme::BORDER_LIGHT),
+                    Style::default().fg(theme::border_light()),
                 )));
                 out_links.push(Vec::new());
                 in_code = true;
             }
             Event::End(TagEnd::CodeBlock) => {
-                out.push(Line::from(Span::styled("└─", Style::default().fg(theme::BORDER_LIGHT))));
+                out.push(Line::from(Span::styled("└─", Style::default().fg(theme::border_light()))));
                 out_links.push(Vec::new());
                 in_code = false;
             }
@@ -128,7 +128,7 @@ pub fn render_rich(src: &str, width: u16) -> Rendered {
                     tb.cell.push_str(&t);
                 } else {
                     buf.push(Piece {
-                        span: Span::styled(t.to_string(), Style::default().fg(theme::ACCENT)),
+                        span: Span::styled(t.to_string(), Style::default().fg(theme::accent())),
                         url: cur_link.clone(),
                     });
                 }
@@ -136,8 +136,8 @@ pub fn render_rich(src: &str, width: u16) -> Rendered {
             Event::Text(t) if in_code => {
                 for raw in t.lines() {
                     out.push(Line::from(vec![
-                        Span::styled("│ ", Style::default().fg(theme::BORDER_LIGHT)),
-                        Span::styled(raw.to_string(), Style::default().fg(theme::TEXT)),
+                        Span::styled("│ ", Style::default().fg(theme::border_light())),
+                        Span::styled(raw.to_string(), Style::default().fg(theme::text())),
                     ]));
                     out_links.push(Vec::new());
                 }
@@ -147,11 +147,11 @@ pub fn render_rich(src: &str, width: u16) -> Rendered {
             Event::Start(Tag::Link { dest_url, .. }) => {
                 cur_link = Some(dest_url.to_string());
                 link_saved = Some(style);
-                style = Style::default().fg(theme::LINK).add_modifier(Modifier::UNDERLINED);
+                style = Style::default().fg(theme::link()).add_modifier(Modifier::UNDERLINED);
             }
             Event::End(TagEnd::Link) => {
                 cur_link = None;
-                style = link_saved.take().unwrap_or(Style::default().fg(theme::TEXT));
+                style = link_saved.take().unwrap_or(Style::default().fg(theme::text()));
             }
             // --- table ---------------------------------------------------------
             // Cell text is collected, then drawn once with widths aligned when the table ends. Column
@@ -204,7 +204,7 @@ pub fn render_rich(src: &str, width: u16) -> Rendered {
             Event::Rule => {
                 out.push(Line::from(Span::styled(
                     "─".repeat(width),
-                    Style::default().fg(theme::BORDER),
+                    Style::default().fg(theme::border()),
                 )));
                 out_links.push(Vec::new());
             }
@@ -388,17 +388,17 @@ impl Table {
             let mid: Vec<String> = w.iter().map(|n| "─".repeat(n + 2)).collect();
             Line::from(Span::styled(
                 format!("{l}{}{r}", mid.join(m)),
-                Style::default().fg(theme::BORDER_LIGHT),
+                Style::default().fg(theme::border_light()),
             ))
         };
 
         out.push(border("┌", "┬", "┐", &w));
         if !self.head.is_empty() {
-            out.push(row_line(&self.head, &w, theme::TEXT_HEADING, true));
+            out.push(row_line(&self.head, &w, theme::text_heading(), true));
             out.push(border("├", "┼", "┤", &w));
         }
         for r in &self.rows {
-            out.push(row_line(r, &w, theme::TEXT, false));
+            out.push(row_line(r, &w, theme::text(), false));
         }
         out.push(border("└", "┴", "┘", &w));
         out
@@ -408,7 +408,7 @@ impl Table {
 /// One row. Cells are cut to the width and padded right with spaces.
 fn row_line(cells: &[String], w: &[usize], fg: ratatui::style::Color, bold: bool) -> Line<'static> {
     let mut spans = Vec::new();
-    let bar = Style::default().fg(theme::BORDER_LIGHT);
+    let bar = Style::default().fg(theme::border_light());
     let mut text = Style::default().fg(fg);
     if bold {
         text = text.add_modifier(Modifier::BOLD);

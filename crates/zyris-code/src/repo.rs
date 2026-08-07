@@ -138,7 +138,7 @@ pub fn spans(
     repo: Option<&Repo>,
 ) -> Vec<Span<'static>> {
     let width = width as usize;
-    let bare = || vec![Span::styled("─".repeat(width), Style::default().fg(theme::BORDER))];
+    let bare = || vec![Span::styled("─".repeat(width), Style::default().fg(theme::border()))];
     // Lead-in, one space, and a rule long enough to still look like a rule.
     let overhead = display_width(LEAD) + 1 + MIN_RULE;
     if width <= overhead {
@@ -163,7 +163,7 @@ pub fn spans(
 /// The pieces, in order, at this level of detail. **Empty inner vectors are the whole point** —
 /// `assemble` drops them, and with them their separator.
 fn pieces(path: &str, repo: Option<&Repo>, level: Level) -> Vec<Vec<Span<'static>>> {
-    let muted = Style::default().fg(theme::TEXT_MUTED);
+    let muted = Style::default().fg(theme::text_muted());
     let mut git: Vec<Span<'static>> = Vec::new();
     if let (Some(r), false) = (repo, level == Level::NoGit) {
         git.push(Span::styled(format!("⎇ {}", r.branch), muted));
@@ -173,10 +173,10 @@ fn pieces(path: &str, repo: Option<&Repo>, level: Level) -> Vec<Vec<Span<'static
                     git.push(Span::styled(format!(" {mark}{n}"), style));
                 }
             };
-            let warn = Style::default().fg(theme::WARNING);
+            let warn = Style::default().fg(theme::warning());
             // A conflict is the one thing here that must not be missed, so it comes first and
             // wears the only alarming colour on the row.
-            count(r.conflicts, '!', Style::default().fg(theme::DANGER));
+            count(r.conflicts, '!', Style::default().fg(theme::danger()));
             count(r.staged, '+', warn);
             count(r.unstaged, '~', warn);
             if level == Level::Full {
@@ -207,11 +207,11 @@ fn assemble(
     if body + joins > budget {
         return None;
     }
-    let border = Style::default().fg(theme::BORDER);
+    let border = Style::default().fg(theme::border());
     let mut out = vec![Span::styled(LEAD, border)];
     for (i, piece) in live.iter().enumerate() {
         if i > 0 {
-            out.push(Span::styled(SEP, Style::default().fg(theme::BORDER_LIGHT)));
+            out.push(Span::styled(SEP, Style::default().fg(theme::border_light())));
         }
         out.extend(piece.iter().cloned());
     }
@@ -246,9 +246,14 @@ fn shorten(path: &str, budget: usize) -> Option<String> {
     if display_width(path) <= budget {
         return Some(path.to_string());
     }
-    let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+    // **Split on either separator.** Splitting on `/` alone meant a Windows path was one single
+    // component, so nothing could ever be cut off the head and this returned `None` — and then
+    // `spans` drew no strip at all. The whole "where am I, and what does git say" line was
+    // missing on Windows for that one reason.
+    let sep = if path.contains('\\') && !path.contains('/') { '\\' } else { '/' };
+    let parts: Vec<&str> = path.split(sep).filter(|p| !p.is_empty()).collect();
     (1..parts.len())
-        .map(|cut| format!("…/{}", parts[cut..].join("/")))
+        .map(|cut| format!("…{sep}{}", parts[cut..].join(&sep.to_string())))
         .find(|candidate| display_width(candidate) <= budget)
 }
 
@@ -310,6 +315,21 @@ pub fn interval_from(given: Option<&str>) -> Option<std::time::Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A Windows path shortens too.** Splitting on `/` alone made `C:\Users\…` one single
+    /// component, so nothing could be cut off the head, `shorten` returned `None`, and `spans`
+    /// drew no strip at all — the whole "where am I" line was missing on Windows.
+    #[test]
+    fn a_path_shortens_on_either_separator() {
+        let posix = shorten("/home/ruma/zyris-code/crates/zyris-code", 24);
+        assert_eq!(posix.as_deref(), Some("…/crates/zyris-code"), "{posix:?}");
+
+        let windows = shorten("C:\\Users\\ruma\\zyris-code\\crates\\zyris-code", 24);
+        assert_eq!(windows.as_deref(), Some("…\\crates\\zyris-code"), "{windows:?}");
+
+        // What already fits is left exactly as it was, on either platform.
+        assert_eq!(shorten("C:\\proj", 20).as_deref(), Some("C:\\proj"));
+    }
 
     #[test]
     fn the_poll_interval_is_read_off_the_environment() {

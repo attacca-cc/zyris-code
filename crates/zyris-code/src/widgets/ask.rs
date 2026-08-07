@@ -37,7 +37,7 @@ pub fn row_at(a: &Answering, area: Rect, y: u16) -> Option<usize> {
 pub fn draw(frame: &mut Frame, area: Rect, a: &Answering, lang: crate::lang::Lang) {
     let mut lines = vec![Line::from(Span::styled(
         "─".repeat(area.width as usize),
-        Style::default().fg(theme::ACCENT),
+        Style::default().fg(theme::accent()),
     ))];
 
     if a.in_review() {
@@ -47,25 +47,25 @@ pub fn draw(frame: &mut Frame, area: Rect, a: &Answering, lang: crate::lang::Lan
 
     // Question header. When there are multiple steps, append which one it is.
     let step = a.current();
-    let mut head = vec![Span::styled("? ", Style::default().fg(theme::ACCENT))];
+    let mut head = vec![Span::styled("? ", Style::default().fg(theme::accent()))];
     if let Some(h) = &step.header {
-        head.push(Span::styled(format!("[{h}] "), Style::default().fg(theme::TEXT_MUTED)));
+        head.push(Span::styled(format!("[{h}] "), Style::default().fg(theme::text_muted())));
     }
     head.push(Span::styled(
         step.question.clone(),
-        Style::default().fg(theme::TEXT_HEADING).add_modifier(Modifier::BOLD),
+        Style::default().fg(theme::text_heading()).add_modifier(Modifier::BOLD),
     ));
     if a.steps.len() > 1 {
         head.push(Span::styled(
             format!("  ·  {}/{}", a.step + 1, a.steps.len()),
-            Style::default().fg(theme::TEXT_MUTED),
+            Style::default().fg(theme::text_muted()),
         ));
     }
     lines.push(Line::from(head));
 
     for (i, row) in a.rows().into_iter().enumerate() {
         let on = i == a.cursor && !a.typing;
-        let caret = Span::styled(if on { "❯ " } else { "  " }, Style::default().fg(theme::ACCENT));
+        let caret = Span::styled(if on { "❯ " } else { "  " }, Style::default().fg(theme::accent()));
         match row {
             RowKind::Option(j) => {
                 let opt = &step.options[j];
@@ -82,20 +82,20 @@ pub fn draw(frame: &mut Frame, area: Rect, a: &Answering, lang: crate::lang::Lan
                     Span::styled(
                         mark,
                         Style::default().fg(if chosen {
-                            theme::SUCCESS
+                            theme::success()
                         } else {
-                            theme::BORDER_LIGHT
+                            theme::border_light()
                         }),
                     ),
                     Span::styled(
                         opt.label.clone(),
-                        Style::default().fg(if on { theme::TEXT_HEADING } else { theme::TEXT }),
+                        Style::default().fg(if on { theme::text_heading() } else { theme::text() }),
                     ),
                 ];
                 if let Some(d) = &opt.description {
                     spans.push(Span::styled(
                         format!("  — {d}"),
-                        Style::default().fg(theme::TEXT_MUTED),
+                        Style::default().fg(theme::text_muted()),
                     ));
                 }
                 lines.push(Line::from(truncate_spans(spans, area.width as usize)));
@@ -103,42 +103,42 @@ pub fn draw(frame: &mut Frame, area: Rect, a: &Answering, lang: crate::lang::Lan
             RowKind::Free => {
                 let mut spans = vec![caret];
                 if a.typing {
-                    spans.push(Span::styled("✎ ", Style::default().fg(theme::ACCENT)));
+                    spans.push(Span::styled("✎ ", Style::default().fg(theme::accent())));
                     if a.input.text.is_empty() {
                         // When the field is empty, say what this spot is for.
                         spans.push(Span::styled(
                             lang.type_here(),
-                            Style::default().fg(theme::BORDER_LIGHT),
+                            Style::default().fg(theme::border_light()),
                         ));
                     } else {
                         spans.push(Span::styled(
                             a.input.text.clone(),
-                            Style::default().fg(theme::TEXT),
+                            Style::default().fg(theme::text()),
                         ));
-                        spans.push(Span::styled("▎", Style::default().fg(theme::ACCENT)));
+                        spans.push(Span::styled("▎", Style::default().fg(theme::accent())));
                     }
                 } else if a.free_text().is_empty() {
                     spans.push(Span::styled(
                         lang.type_your_own(),
                         Style::default().fg(if on {
-                            theme::TEXT_HEADING
+                            theme::text_heading()
                         } else {
-                            theme::TEXT_MUTED
+                            theme::text_muted()
                         }),
                     ));
                 } else {
                     // **What was typed must stay visible.** If it isn't, there's no way to check
                     // what was written without opening it again.
-                    spans.push(Span::styled("✎ ", Style::default().fg(theme::SUCCESS)));
+                    spans.push(Span::styled("✎ ", Style::default().fg(theme::success())));
                     spans.push(Span::styled(
                         a.free_text().to_string(),
-                        Style::default().fg(theme::TEXT),
+                        Style::default().fg(theme::text()),
                     ));
                 }
                 lines.push(Line::from(truncate_spans(spans, area.width as usize)));
             }
             RowKind::Action(act) => {
-                let colour = if on { theme::ACCENT } else { theme::TEXT_MUTED };
+                let colour = if on { theme::accent() } else { theme::text_muted() };
                 lines.push(Line::from(vec![
                     caret,
                     Span::styled(
@@ -151,7 +151,7 @@ pub fn draw(frame: &mut Frame, area: Rect, a: &Answering, lang: crate::lang::Lan
     }
 
     let hint = if a.typing { lang.typing_keys() } else { lang.choosing_keys() };
-    lines.push(Line::from(Span::styled(hint.to_string(), Style::default().fg(theme::TEXT_MUTED))));
+    lines.push(Line::from(Span::styled(hint.to_string(), Style::default().fg(theme::text_muted()))));
 
     frame.render_widget(Paragraph::new(lines), area);
 }
@@ -194,17 +194,17 @@ fn draw_review(
 ) {
     lines.push(Line::from(Span::styled(
         lang.answered().to_string(),
-        Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD),
+        Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD),
     )));
     for (q, ans) in a.summary(lang) {
         let skipped = ans == lang.skipped();
         lines.push(Line::from(truncate_spans(
             vec![
-                Span::styled("  ", Style::default().fg(theme::TEXT_MUTED)),
-                Span::styled(format!("{q}  "), Style::default().fg(theme::TEXT_MUTED)),
+                Span::styled("  ", Style::default().fg(theme::text_muted())),
+                Span::styled(format!("{q}  "), Style::default().fg(theme::text_muted())),
                 Span::styled(
                     ans,
-                    Style::default().fg(if skipped { theme::BORDER_LIGHT } else { theme::TEXT }),
+                    Style::default().fg(if skipped { theme::border_light() } else { theme::text() }),
                 ),
             ],
             area.width as usize,
@@ -216,12 +216,12 @@ fn draw_review(
         let RowKind::Action(act) = row else { continue };
         let on = i == a.cursor;
         let colour = match act {
-            crate::question::Act::Reject => theme::DANGER,
-            _ if on => theme::ACCENT,
-            _ => theme::TEXT_MUTED,
+            crate::question::Act::Reject => theme::danger(),
+            _ if on => theme::accent(),
+            _ => theme::text_muted(),
         };
         lines.push(Line::from(vec![
-            Span::styled(if on { "❯ " } else { "  " }, Style::default().fg(theme::ACCENT)),
+            Span::styled(if on { "❯ " } else { "  " }, Style::default().fg(theme::accent())),
             Span::styled(
                 act.label(lang).to_string(),
                 Style::default().fg(colour).add_modifier(Modifier::BOLD),
@@ -230,7 +230,7 @@ fn draw_review(
     }
     lines.push(Line::from(Span::styled(
         lang.review_keys().to_string(),
-        Style::default().fg(theme::TEXT_MUTED),
+        Style::default().fg(theme::text_muted()),
     )));
     frame.render_widget(Paragraph::new(lines), area);
 }

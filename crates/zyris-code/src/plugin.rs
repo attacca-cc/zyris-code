@@ -108,15 +108,20 @@ fn sanitize(name: &str) -> String {
     kept.replace("..", "-").trim_matches(['-', '.']).to_string()
 }
 
+/// Where `~/…` points. **One definition for the whole app** (`conn::user_home`) — Windows has no
+/// `$HOME`, and expanding to `/` there turned every `~/…` plugin path into a drive-relative `\…`.
 fn home() -> PathBuf {
-    std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"))
+    crate::conn::user_home().unwrap_or_else(|| PathBuf::from("/"))
 }
 
 /// The two places to look for plugins. The latter wins — the project is more specific than home.
+///
+/// **The user-level one is `conn::app_dir`**, the same directory the credentials and settings use.
+/// Joining `$HOME/.config/…` here instead meant this tier did not exist at all on Windows.
 pub fn plugin_dirs(cwd: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    if let Some(home) = std::env::var_os("HOME") {
-        out.push(PathBuf::from(home).join(".config/zyris-code/plugins"));
+    if let Some(dir) = crate::conn::app_dir() {
+        out.push(dir.join("plugins"));
     }
     out.push(cwd.join(".zyris-code/plugins"));
     out
@@ -129,8 +134,11 @@ pub fn discover(cwd: &Path) -> Vec<Plugin> {
 /// Where fetched plugins live. **Only the home side** — fetching someone else's code into a project
 /// would mix it into that repo's commits.
 pub fn install_dir() -> PathBuf {
-    match std::env::var_os("HOME") {
-        Some(home) => PathBuf::from(home).join(".config/zyris-code/plugins"),
+    // **The same entry `plugin_dirs` reads.** These two used to be computed apart, and only this
+    // one had a fallback — so where the fallback fired, `/plugin add` reported success and the
+    // next launch found nothing.
+    match crate::conn::app_dir() {
+        Some(dir) => dir.join("plugins"),
         None => std::env::temp_dir().join("zyris-code/plugins"),
     }
 }

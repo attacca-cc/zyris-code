@@ -40,8 +40,8 @@ fn main() {
             let cell = &buf[(x, y)];
             bg.push(match cell.bg {
                 Color::Reset => '.',
-                c if c == zyris_code::theme::BG => '#',
-                c if c == zyris_code::theme::USER_BG => 'U',
+                c if c == zyris_code::theme::bg() => '#',
+                c if c == zyris_code::theme::user_bg() => 'U',
                 _ => '?',
             });
             let symbol = cell.symbol();

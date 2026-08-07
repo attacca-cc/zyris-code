@@ -120,7 +120,7 @@ const PATH_KEYS: &[&str] =
 pub fn escaping_path(root: &Path, capability: &str, tool: &str, args: &Value) -> Option<PathBuf> {
     let outside = |p: &str| {
         let full = zyris_capkit::resolve_under(root, p);
-        (!full.starts_with(root)).then_some(full)
+        escapes(root, &full).then_some(full)
     };
 
     for key in PATH_KEYS {
@@ -142,15 +142,14 @@ pub fn escaping_path(root: &Path, capability: &str, tool: &str, args: &Value) ->
         let command = args.get("command").and_then(Value::as_str).unwrap_or_default();
         for word in command.split_whitespace() {
             let bare = word.trim_matches(|c| matches!(c, '\'' | '"' | '(' | ')' | ';' | ',' | '`'));
-            if !(bare.starts_with('/') || bare.starts_with("~/") || bare.contains("../")) {
+            if !looks_like_a_path(bare) {
                 continue;
             }
             // Asking about things pointing at executables like `/bin/ls` would trip on every command.
-            if bare.starts_with("/usr/") || bare.starts_with("/bin/") || bare.starts_with("/sbin/")
-            {
+            if points_at_a_program(bare) {
                 continue;
             }
-            let bare = match bare.strip_prefix("~/") {
+            let bare = match strip_home_prefix(bare) {
                 Some(rest) => home().join(rest).to_string_lossy().into_owned(),
                 None => bare.to_string(),
             };
@@ -162,8 +161,76 @@ pub fn escaping_path(root: &Path, capability: &str, tool: &str, args: &Value) ->
     None
 }
 
+/// Whether a shell token is shaped like a path at all — the scan's first filter.
+///
+/// **Windows shapes count too.** An absolute path there is `C:\…`, a network path is
+/// `\\server\share`, and climbing out is `..\`. Testing only the POSIX shapes left this loop
+/// skipping every Windows token, so the fence did nothing at all on that platform while
+/// `/config dir` went on reporting `deny` — the worst kind of failure, one that reports safety
+/// it is not providing.
+fn looks_like_a_path(token: &str) -> bool {
+    token.starts_with('/')
+        || token.starts_with("\\\\")
+        || token.contains("../")
+        || token.contains("..\\")
+        || strip_home_prefix(token).is_some()
+        || drive_absolute(token)
+}
+
+/// `~/…` or `~\…`, with the prefix taken off.
+fn strip_home_prefix(token: &str) -> Option<&str> {
+    token.strip_prefix("~/").or_else(|| token.strip_prefix("~\\"))
+}
+
+/// `C:\…` or `C:/…` — a drive letter, a colon, then a separator.
+fn drive_absolute(token: &str) -> bool {
+    let mut chars = token.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.next() == Some(':')
+        && matches!(chars.next(), Some('\\') | Some('/'))
+}
+
+/// Paths that name a program rather than data. Flagging these would trip on every command.
+fn points_at_a_program(token: &str) -> bool {
+    const POSIX: &[&str] = &["/usr/", "/bin/", "/sbin/"];
+    if POSIX.iter().any(|p| token.starts_with(p)) {
+        return true;
+    }
+    // The Windows equivalents, matched without case — the filesystem there is case-insensitive
+    // and nothing stops an agent from writing `c:\windows\system32\…`.
+    let lower = token.to_ascii_lowercase().replace('/', "\\");
+    let tail = lower.get(2..).unwrap_or_default();
+    drive_absolute(token)
+        && (tail.starts_with("\\windows\\") || tail.starts_with("\\program files"))
+}
+
+/// Whether `full` lies outside `root`.
+///
+/// **Windows paths are compared without case.** `Path::starts_with` matches components
+/// byte-exactly apart from the drive letter, so with a root of `C:\Users\dev\proj` an agent
+/// writing `c:\users\dev\proj\src\main.rs` would have every in-tree path called an escape —
+/// and under `deny` that is every tool call refused.
+fn escapes(root: &Path, full: &Path) -> bool {
+    if full.starts_with(root) {
+        return false;
+    }
+    if !cfg!(windows) {
+        return true;
+    }
+    let flat = |p: &Path| p.to_string_lossy().to_ascii_lowercase().replace('/', "\\");
+    let (root, full) = (flat(root), flat(full));
+    let root = root.trim_end_matches('\\');
+    // A prefix only counts on a component boundary — `C:\proj2` must not read as inside `C:\proj`.
+    !(full == root
+        || (full.starts_with(root) && full.as_bytes().get(root.len()) == Some(&b'\\')))
+}
+
 fn home() -> PathBuf {
-    std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"))
+    // **`HOME` is a POSIX variable.** On Windows it is normally unset and the home directory is
+    // named by `USERPROFILE`; falling back to `/` made `~/notes` resolve to a drive-relative
+    // `\notes`, which never starts with the root — so every `~/…` token was called an escape
+    // regardless of where it actually pointed.
+    crate::conn::user_home().unwrap_or_else(|| PathBuf::from("/"))
 }
 
 /// Pulls from the arguments the target used to tell the screen what is running.
@@ -444,6 +511,57 @@ mod tests {
             let args = json!({ "command": command });
             assert_eq!(escaping_path(root(), "terminal", "exec", &args), None, "{command}");
         }
+    }
+
+    /// **A Windows path is a path.** The scan used to test only the POSIX shapes, so on Windows
+    /// every token was skipped and the fence did nothing at all — while `/config dir` went on
+    /// reporting `deny`. `looks_like_a_path` is pure string work, so this holds on any platform.
+    #[test]
+    fn a_windows_shaped_path_is_recognised_as_one() {
+        for token in [
+            "C:\\Users\\me\\.ssh\\id_rsa",
+            "c:/Users/me/secrets.txt",
+            "\\\\server\\share\\x",
+            "..\\..\\secret",
+            "~\\notes",
+        ] {
+            assert!(looks_like_a_path(token), "{token} was not taken for a path");
+        }
+        // The POSIX shapes still are.
+        for token in ["/etc/passwd", "~/notes", "../up"] {
+            assert!(looks_like_a_path(token), "{token} was not taken for a path");
+        }
+        // And ordinary words still are not — otherwise every command trips the fence.
+        for token in ["cargo", "-j2", "src/app.rs", "draw", "C:", "note:s"] {
+            assert!(!looks_like_a_path(token), "{token} was mistaken for a path");
+        }
+    }
+
+    /// Program paths are skipped on both platforms, and the Windows ones without regard to case
+    /// — otherwise every command that names its own interpreter trips the fence.
+    #[test]
+    fn a_path_naming_a_program_is_skipped() {
+        for token in [
+            "/usr/bin/env",
+            "/bin/sh",
+            "C:\\Windows\\System32\\cmd.exe",
+            "c:/windows/system32/where.exe",
+            "C:\\Program Files\\Git\\bin\\bash.exe",
+        ] {
+            assert!(points_at_a_program(token), "{token} should be skipped");
+        }
+        for token in ["C:\\Users\\me\\notes.txt", "/etc/passwd"] {
+            assert!(!points_at_a_program(token), "{token} is data, not a program");
+        }
+    }
+
+    /// A sibling directory that merely shares a prefix is outside — `…/proj2` is not inside
+    /// `…/proj`. The boundary has to be a separator, not a byte count.
+    #[test]
+    fn a_sibling_sharing_a_prefix_is_outside() {
+        assert!(escapes(root(), Path::new("/home/ruma/zyris-code2/x")));
+        assert!(!escapes(root(), Path::new(ROOT)));
+        assert!(!escapes(root(), Path::new("/home/ruma/zyris-code/src/app.rs")));
     }
 
     #[test]

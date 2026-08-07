@@ -53,6 +53,16 @@ struct Inner {
     jobs: Mutex<Option<crate::tools::jobs::Jobs>>,
     /// The undo log the edit tool uses. `/undo` must use the **same handle** so there's a single lock.
     undo: Mutex<Option<crate::undo::Undo>>,
+    /// The live connection, so `/reconnect` can drop it and make the runner redial.
+    ///
+    /// **This is the only way back from a connection the server no longer routes to.** attacca's
+    /// registry is `insert(node_id, connection)`, so a second window with the same credentials
+    /// displaces the first — and if that second window then closes, the registry points at a dead
+    /// connection and every tool call sits pending forever. Nothing notices: zyris discards the
+    /// heartbeat the server advertises in `HelloAck`, has no ping/pong, and `conn.closed()` never
+    /// fires for a socket that is merely unrouted. Redialling re-announces, which puts *this*
+    /// connection back in the registry.
+    connection: Mutex<Option<zyris::Connection>>,
     /// A handle for dropping credentials and getting re-approved.
     ///
     /// Noticing insufficient permissions is the **screen side after attaching** (the `me()` scope); the credentials to drop
@@ -173,6 +183,17 @@ impl Bridge {
 
     pub fn undo(&self) -> Option<crate::undo::Undo> {
         self.0.undo.lock().unwrap().clone()
+    }
+
+    /// Records the live connection. `on_connect` calls it on every connect, so it is always the
+    /// current one — holding the first would close a socket that is already gone.
+    pub fn set_connection(&self, conn: zyris::Connection) {
+        *self.0.connection.lock().unwrap() = Some(conn);
+    }
+
+    /// The live connection. `None` before the first connect.
+    pub fn connection(&self) -> Option<zyris::Connection> {
+        self.0.connection.lock().unwrap().clone()
     }
 
     /// Mounts a handle that can drop credentials. **Not present where the human gave the token directly.**

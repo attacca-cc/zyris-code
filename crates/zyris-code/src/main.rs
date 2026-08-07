@@ -30,7 +30,14 @@ async fn main() -> ExitCode {
     //
     // **Only connection failures also reach the shell.** If logs only went to a file, when the server
     // dies the user sees nothing but a frozen cursor — the `notice` layer collects the reason.
-    let log = std::env::var("ZYRIS_CODE_LOG").unwrap_or_else(|_| "/tmp/zyris-code.log".into());
+    //
+    // **The default is the platform's temp directory, not `/tmp`.** Windows has no `\tmp` on the
+    // current drive, so `File::create` failed there and the `Err` arm below silently dropped the
+    // file layer — leaving no logs at all on the one platform where nothing can be reproduced
+    // locally. `std::env::temp_dir` reads `%TEMP%` there and `/tmp` here.
+    let log = std::env::var("ZYRIS_CODE_LOG").map(std::path::PathBuf::from).unwrap_or_else(|_| {
+        std::env::temp_dir().join("zyris-code.log")
+    });
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         // **It's `zyris=info`.** If only disconnects (`warn`) were kept, the reconnecting would vanish
         // from the log and "keeps disconnecting" couldn't be traced later.
@@ -167,7 +174,13 @@ async fn main() -> ExitCode {
     //
     // You only need to know one thing: judgment (plan mode · open directory) and the approval window
     // belong to **the window that received the call**; if the two windows are in different modes, the server decides which rules apply.
-    if let Some(dir) = zyris_code::conn::credential_dir() {
+    //
+    // **The handle has to live as long as the window does.** Bound inside the `else` block it
+    // was dropped at that block's closing brace, and `Drop` deletes the very file it had just
+    // written — so no window ever left a lock behind, no second window ever found one, and the
+    // notice could not fire. That is the one warning that explains "my tool calls just sit
+    // there": whichever window the server picked is the only one being asked.
+    let _instance_lock = zyris_code::conn::credential_dir().and_then(|dir| {
         let profile =
             std::env::var("ZYRIS_PROFILE").unwrap_or_else(|_| zyris_code::conn::APP.to_string());
         if zyris_code::conn::another_instance_alive(&dir, &profile) {
@@ -178,11 +191,10 @@ async fn main() -> ExitCode {
             bridge.frame(zyris_code::app::Frame::Notice(
                 zyris_code::lang::current().another_window_notice().to_string(),
             ));
-        } else {
-            // Hold the lock for as long as we live — Drop removes it when the window ends.
-            let _lock = zyris_code::conn::claim_instance_lock(&dir, &profile);
+            return None;
         }
-    }
+        zyris_code::conn::claim_instance_lock(&dir, &profile)
+    });
     //
     // **The enrollment code is sent to the screen by upstream's `EnrollmentUi` hook** (`enroll.rs`, upstream PR #6).
     // Only when there's no screen (the extreme where the app couldn't start) does it fall to a stdout box. The old
@@ -246,6 +258,10 @@ async fn main() -> ExitCode {
                 // **Attached.** The screen is already up, so the shell notice falls silent —
                 // cutting into what ratatui is drawing means that cell never gets redrawn.
                 notice.connected();
+
+                // **Hand the connection to the screen side so `/reconnect` can drop it.** Set on
+                // every connect, so it is always the live one.
+                bridge.set_connection(conn.clone());
 
                 // **On disconnect, leave a mark on the screen and in the log.** `Runner` reconnects,
                 // but meanwhile the screen looks like nothing happened — silent failure is the worst.

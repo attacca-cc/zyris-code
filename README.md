@@ -166,13 +166,14 @@ only `/agent` and `/account` ask the server, for exactly what they need.
 | `/help` | List these |
 | `/mode [normal\|plan]` | Show or change the mode |
 | `/lang [ko\|en]` | Interface language (also in `/config`) |
-| `/config [option value]` | Settings panel, or set one: `dir allow|deny`, `lang ko|en`, `mode …|off` |
+| `/config [option value]` | Settings form, or set one: `dir allow\|deny`, `theme auto\|dark\|light`, `lang ko\|en`, `mode …\|off` |
 | `/account [logout]` | Who this node is attached as (email, plan, granted scopes); `logout` clears the stored credentials |
 | `/agent [name]` | Pick an agent (see below) |
 | `/mcp` | Connected MCP servers, and why any failed |
 | `/skills` | Available skills |
 | `/plugin [add\|remove\|update]` | Install and manage plugins |
 | `/rules` | Which `CLAUDE.md` / `AGENTS.md` files this session loaded |
+| `/reconnect` | Attach again — the way back when tool calls sit with no answer |
 | `/cwd` | Where tools resolve relative paths |
 | `/status` | Session, agent, mode and usage at a glance |
 | `/changes` | Files changed in this directory, with `+N −N` |
@@ -308,6 +309,7 @@ Plugins are loaded at startup, so restart to pick up a newly installed one.
 | `Ctrl+O` | Fold / unfold the work card |
 | `←` | Project and session picker |
 | `↑` / `↓` | Recall previous messages |
+| `PageUp` / `PageDown` | Scroll the conversation by a page (works without a wheel) |
 | `Esc` | Cancel the running turn; close the enrollment-code panel (the only key that does) |
 | `Ctrl+C` | Cancel the running turn; press again to arm quitting, once more to quit |
 | Wheel · drag | Scroll · select and copy |

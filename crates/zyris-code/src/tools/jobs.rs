@@ -359,6 +359,25 @@ async fn drain<R: tokio::io::AsyncRead + Unpin>(jobs: Jobs, id: String, stream: 
 }
 
 /// Builds the command. Lays down an environment that **discourages colour**, and what the
+/// A command that hands `line` to this platform's shell.
+///
+/// **There is no `/bin/sh` on Windows.** Hardcoding it meant every `wait.start` given a
+/// `command` (rather than an `argv`) failed to spawn there, and `wait.until`'s probe with it —
+/// so the one capability built for long builds could not run on the platform at all. Upstream
+/// capkit already forks the same way for `terminal.exec`
+/// (`zyris-capkit/src/terminal/mod.rs`), which is why `exec` worked and `wait` did not.
+pub(crate) fn shell_running(line: &str) -> tokio::process::Command {
+    if cfg!(windows) {
+        let mut c = tokio::process::Command::new("cmd");
+        c.arg("/C").arg(line);
+        c
+    } else {
+        let mut c = tokio::process::Command::new("/bin/sh");
+        c.arg("-c").arg(line);
+        c
+    }
+}
+
 /// caller gave wins.
 fn build(spec: &Spec, root: &Path) -> Result<tokio::process::Command, String> {
     let mut cmd = match (&spec.command, &spec.argv) {
@@ -369,9 +388,7 @@ fn build(spec: &Spec, root: &Path) -> Result<tokio::process::Command, String> {
             if line.trim().is_empty() {
                 return Err("command가 비어 있습니다.".into());
             }
-            let mut c = tokio::process::Command::new("/bin/sh");
-            c.arg("-c").arg(line);
-            c
+            shell_running(line)
         }
         (None, Some(argv)) => {
             let Some((program, rest)) = argv.split_first() else {

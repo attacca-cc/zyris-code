@@ -61,10 +61,14 @@ impl Skills {
     }
 
     /// The two default locations. Later wins.
+    ///
+    /// **The user tier is `conn::app_dir`** — the same directory the credentials and settings use,
+    /// and the same one `tools::announce` assembles. Building `$HOME/.config/…` by hand left this
+    /// tier missing entirely on Windows.
     pub fn discover(cwd: &std::path::Path) -> Skills {
         let mut dirs = Vec::new();
-        if let Some(home) = std::env::var_os("HOME") {
-            dirs.push(PathBuf::from(home).join(".config/zyris-code/skills"));
+        if let Some(dir) = crate::conn::app_dir() {
+            dirs.push(dir.join("skills"));
         }
         dirs.push(cwd.join(".zyris-code/skills"));
         Skills::new(dirs)

@@ -19,7 +19,7 @@ use crate::timeline::{Item, Part};
 pub const PAD: u16 = 2;
 
 fn pad() -> Span<'static> {
-    Span::styled(" ".repeat(PAD as usize), Style::default().fg(theme::TEXT))
+    Span::styled(" ".repeat(PAD as usize), Style::default().fg(theme::text()))
 }
 
 /// The width text can actually use.
@@ -182,6 +182,32 @@ impl Cache {
         self.renders
     }
 
+    /// What the line at `line` belongs to: `(item seq, how far into that item)`.
+    ///
+    /// **This is what makes the viewport survive a relayout.** `Scroll.top` is an absolute index
+    /// into a line list that `layout` rebuilds from scratch, so a width change (every wrap point
+    /// moves) or a fold toggle above the viewport silently changes what that index points at —
+    /// and always toward older text, since the clamp in `Scroll::on_content` can only move it
+    /// down. Remembering the item instead means the same words stay under the eye.
+    ///
+    /// `None` when there is nothing laid out, or `line` is past the end.
+    pub fn anchor_at(&self, line: usize) -> Option<(i64, usize)> {
+        let slot = self.slots.iter().find(|s| line < s.end())?;
+        // A line in the leading blank counts as the item's first line — the blank belongs to the
+        // separation between items, not to either of them.
+        Some((slot.seq, line.saturating_sub(slot.first_line())))
+    }
+
+    /// Where `(seq, offset)` sits now. The inverse of `anchor_at`, after a relayout.
+    ///
+    /// The offset is clamped to the item's current length: rewrapping narrower makes an item
+    /// longer and wider makes it shorter, and an offset past the end would otherwise skip into
+    /// the item below.
+    pub fn line_of(&self, seq: i64, offset: usize) -> Option<usize> {
+        let slot = self.slots.iter().find(|s| s.seq == seq)?;
+        Some(slot.first_line() + offset.min(slot.len.saturating_sub(1)))
+    }
+
     /// Decides which item lands on which line. Only redraws changed items.
     ///
     /// `skip` is the seq of the question currently being answered in the lower panel — drawing it again
@@ -302,7 +328,7 @@ impl Cache {
 }
 
 fn blank() -> Line<'static> {
-    Line::from(Span::styled("", Style::default().fg(theme::TEXT)))
+    Line::from(Span::styled("", Style::default().fg(theme::text())))
 }
 
 /// Lays one item out into lines. This is the only place markdown is parsed.
@@ -328,16 +354,16 @@ fn make(item: &Item, width: u16, folds: &Folds, lang: crate::lang::Lang) -> Made
                 let body =
                     if typed { bare.trim_start_matches(lang.free_mark()).trim() } else { raw };
                 let style = if typed {
-                    Style::default().fg(theme::ACCENT_HOVER).add_modifier(Modifier::ITALIC)
+                    Style::default().fg(theme::accent_hover()).add_modifier(Modifier::ITALIC)
                 } else {
-                    Style::default().fg(theme::TEXT)
+                    Style::default().fg(theme::text())
                 };
                 // **The bar stands on every line.** Set only on the first line, the second line onward
                 // wouldn't be distinguishable from an answer — the longer the question, the longer that stretch.
                 let _ = i;
-                let mut spans = vec![Span::styled("▌ ", Style::default().fg(theme::ACCENT))];
+                let mut spans = vec![Span::styled("▌ ", Style::default().fg(theme::accent()))];
                 if typed {
-                    spans.push(Span::styled("✎ ", Style::default().fg(theme::ACCENT_HOVER)));
+                    spans.push(Span::styled("✎ ", Style::default().fg(theme::accent_hover())));
                 }
                 let prefix_w =
                     spans.iter().map(|s| markdown::display_width(&s.content)).sum::<usize>();
@@ -355,9 +381,9 @@ fn make(item: &Item, width: u16, folds: &Folds, lang: crate::lang::Lang) -> Made
                     // into blotches, and padding with spaces to fill the width lets those spaces
                     // travel through `plain()` into the clipboard. Stretching to the screen width is
                     // done where it draws (`widgets::transcript::stretch`).
-                    out.push(Line::from(row).style(Style::default().bg(theme::USER_BG)));
+                    out.push(Line::from(row).style(Style::default().bg(theme::user_bg())));
                     links.push(shift_links(&rendered.links[li], prefix_w));
-                    spans = vec![Span::styled("▌ ", Style::default().fg(theme::ACCENT))];
+                    spans = vec![Span::styled("▌ ", Style::default().fg(theme::accent()))];
                 }
             }
         }
@@ -371,7 +397,7 @@ fn make(item: &Item, width: u16, folds: &Folds, lang: crate::lang::Lang) -> Made
             let rendered = markdown::render_rich(text, body_width(width));
             for (i, line) in rendered.lines.into_iter().enumerate() {
                 let mut spans = match i {
-                    0 => vec![Span::styled("◆ ", Style::default().fg(theme::ACCENT))],
+                    0 => vec![Span::styled("◆ ", Style::default().fg(theme::accent()))],
                     _ => vec![pad()],
                 };
                 let prefix_w =
@@ -383,8 +409,8 @@ fn make(item: &Item, width: u16, folds: &Folds, lang: crate::lang::Lang) -> Made
         }
         Item::Error { message, .. } => {
             out.push(Line::from(vec![
-                Span::styled("● ", Style::default().fg(theme::DANGER)),
-                Span::styled(message.clone(), Style::default().fg(theme::DANGER)),
+                Span::styled("● ", Style::default().fg(theme::danger())),
+                Span::styled(message.clone(), Style::default().fg(theme::danger())),
             ]));
             links.push(Vec::new());
         }
@@ -401,7 +427,7 @@ fn make(item: &Item, width: u16, folds: &Folds, lang: crate::lang::Lang) -> Made
             for (i, line) in rendered.lines.into_iter().enumerate() {
                 let mut spans = vec![Span::styled(
                     if i == 0 { "◈ " } else { "  " },
-                    Style::default().fg(theme::TEXT_MUTED),
+                    Style::default().fg(theme::text_muted()),
                 )];
                 let prefix_w =
                     spans.iter().map(|s| markdown::display_width(&s.content)).sum::<usize>();
@@ -412,8 +438,8 @@ fn make(item: &Item, width: u16, folds: &Folds, lang: crate::lang::Lang) -> Made
         }
         Item::Subagent { summary, .. } => {
             out.push(Line::from(vec![
-                Span::styled("└ ", Style::default().fg(theme::TEXT_MUTED)),
-                Span::styled(summary.clone(), Style::default().fg(theme::TEXT_MUTED)),
+                Span::styled("└ ", Style::default().fg(theme::text_muted())),
+                Span::styled(summary.clone(), Style::default().fg(theme::text_muted())),
             ]));
             links.push(Vec::new());
         }
@@ -426,14 +452,14 @@ fn make(item: &Item, width: u16, folds: &Folds, lang: crate::lang::Lang) -> Made
             heads.push((0, *seq));
             let tools = parts.iter().filter(|p| matches!(p, Part::Step(_))).count();
             let mut card = vec![
-                Span::styled(marker, Style::default().fg(theme::ACCENT)),
+                Span::styled(marker, Style::default().fg(theme::accent())),
                 Span::styled(
                     head.to_string(),
-                    Style::default().fg(theme::TEXT_MUTED).add_modifier(Modifier::BOLD),
+                    Style::default().fg(theme::text_muted()).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     format!("  ·  {}", lang.tool_count(tools)),
-                    Style::default().fg(theme::TEXT_MUTED),
+                    Style::default().fg(theme::text_muted()),
                 ),
             ];
             // **Even folded, what changed is visible.** The numbers only live on tool rows, which need the card
@@ -466,7 +492,7 @@ fn make(item: &Item, width: u16, folds: &Folds, lang: crate::lang::Lang) -> Made
                         for (li, line) in rendered.lines.into_iter().enumerate() {
                             heads.push((out.len(), *seq));
                             let mut spans =
-                                vec![Span::styled("┊ ", Style::default().fg(theme::BORDER_LIGHT))];
+                                vec![Span::styled("┊ ", Style::default().fg(theme::border_light()))];
                             let prefix_w = spans
                                 .iter()
                                 .map(|s| markdown::display_width(&s.content))
@@ -475,7 +501,7 @@ fn make(item: &Item, width: u16, folds: &Folds, lang: crate::lang::Lang) -> Made
                             // the conclusion wouldn't be visible — losing emphasis and inline
                             // code colours inside reasoning is the price paid for that.
                             spans.extend(line.spans.into_iter().map(|s| {
-                                Span::styled(s.content.to_string(), s.style.fg(theme::TEXT_MUTED))
+                                Span::styled(s.content.to_string(), s.style.fg(theme::text_muted()))
                             }));
                             out.push(Line::from(spans));
                             links.push(shift_links(&rendered.links[li], prefix_w));
@@ -488,7 +514,7 @@ fn make(item: &Item, width: u16, folds: &Folds, lang: crate::lang::Lang) -> Made
                         let rendered = markdown::render_rich(text, body_width(width));
                         for (li, line) in rendered.lines.into_iter().enumerate() {
                             let mut spans = vec![match li {
-                                0 => Span::styled("◆ ", Style::default().fg(theme::ACCENT)),
+                                0 => Span::styled("◆ ", Style::default().fg(theme::accent())),
                                 _ => pad(),
                             }];
                             let prefix_w = spans
@@ -501,7 +527,7 @@ fn make(item: &Item, width: u16, folds: &Folds, lang: crate::lang::Lang) -> Made
                         }
                     }
                     Part::Step(step) => {
-                        let dot = if step.failed { theme::DANGER } else { theme::SUCCESS };
+                        let dot = if step.failed { theme::danger() } else { theme::success() };
                         // Only rows with something to unfold are clickable. Pressing one and having
                         // nothing happen looks like a bug.
                         let can_open = !step.detail.is_empty() || step.diff.is_some();
@@ -520,13 +546,13 @@ fn make(item: &Item, width: u16, folds: &Folds, lang: crate::lang::Lang) -> Made
                             Span::styled("● ", Style::default().fg(dot)),
                             Span::styled(
                                 step.name.clone(),
-                                Style::default().fg(theme::TOOL).add_modifier(Modifier::BOLD),
+                                Style::default().fg(theme::tool()).add_modifier(Modifier::BOLD),
                             ),
                         ];
                         if !step.note.is_empty() {
                             head.push(Span::styled(
                                 format!("  {}", step.note),
-                                Style::default().fg(theme::TOOL_ARG),
+                                Style::default().fg(theme::tool_arg()),
                             ));
                         }
                         // **Even folded, how much changed is visible.** If it took unfolding to know,
@@ -541,7 +567,7 @@ fn make(item: &Item, width: u16, folds: &Folds, lang: crate::lang::Lang) -> Made
                                 (true, false) => "  ▸",
                                 (true, true) => "  ▾",
                             },
-                            Style::default().fg(theme::BORDER_LIGHT),
+                            Style::default().fg(theme::border_light()),
                         ));
                         out.push(Line::from(head));
                         links.push(Vec::new());
@@ -599,8 +625,8 @@ fn shift_links(links: &[crate::markdown::Link], shift: usize) -> Vec<crate::mark
 /// which side grew. The minus is U+2212, not a hyphen, so it has the same width as the plus — the numbers line up.
 fn counts(added: u32, removed: u32) -> Vec<Span<'static>> {
     vec![
-        Span::styled(format!("  +{added}"), Style::default().fg(theme::DIFF_ADD)),
-        Span::styled(format!(" −{removed}"), Style::default().fg(theme::DIFF_DEL)),
+        Span::styled(format!("  +{added}"), Style::default().fg(theme::diff_add())),
+        Span::styled(format!(" −{removed}"), Style::default().fg(theme::diff_del())),
     ]
 }
 
@@ -615,13 +641,13 @@ pub(crate) fn diff_line(
 ) -> Line<'static> {
     use crate::tools::diff::DiffLine;
     let (text, colour) = match line {
-        DiffLine::Add(s) => (format!("+{s}"), theme::DIFF_ADD),
-        DiffLine::Del(s) => (format!("-{s}"), theme::DIFF_DEL),
-        DiffLine::Keep(s) => (format!(" {s}"), theme::TEXT_MUTED),
-        DiffLine::Skip(n) => (lang.diff_skip(*n), theme::BORDER_LIGHT),
+        DiffLine::Add(s) => (format!("+{s}"), theme::diff_add()),
+        DiffLine::Del(s) => (format!("-{s}"), theme::diff_del()),
+        DiffLine::Keep(s) => (format!(" {s}"), theme::text_muted()),
+        DiffLine::Skip(n) => (lang.diff_skip(*n), theme::border_light()),
     };
     Line::from(vec![
-        Span::styled("  ", Style::default().fg(theme::BORDER_LIGHT)),
+        Span::styled("  ", Style::default().fg(theme::border_light())),
         Span::styled(clip_to(text, width.saturating_sub(2)), Style::default().fg(colour)),
     ])
 }
@@ -686,7 +712,7 @@ fn tool_detail_lines(
     failed: bool,
     lang: crate::lang::Lang,
 ) -> Vec<Line<'static>> {
-    let border = if failed { theme::DANGER } else { theme::BORDER_LIGHT };
+    let border = if failed { theme::danger() } else { theme::border_light() };
     // Inner width after removing the "│ " gutter. Together with the borders it equals the screen width.
     let inner = width.saturating_sub(2).max(8);
     let mut out: Vec<Line<'static>> = Vec::new();
@@ -708,15 +734,15 @@ fn tool_detail_lines(
             section = Some(head);
             let (mark, color) = match head {
                 h if h == lang.detail_args() => {
-                    (format!("⎿ {}", lang.detail_args()), theme::TOOL_ARG)
+                    (format!("⎿ {}", lang.detail_args()), theme::tool_arg())
                 }
                 h if h == lang.detail_output() => {
-                    (format!("⎿ {}", lang.detail_output()), theme::ACCENT)
+                    (format!("⎿ {}", lang.detail_output()), theme::accent())
                 }
                 h if h == lang.detail_result() => {
-                    (format!("⎿ {}", lang.detail_result()), theme::BORDER_LIGHT)
+                    (format!("⎿ {}", lang.detail_result()), theme::border_light())
                 }
-                _ => (format!("⎿ {}", lang.detail_error()), theme::DANGER),
+                _ => (format!("⎿ {}", lang.detail_error()), theme::danger()),
             };
             out.push(Line::from(vec![
                 Span::styled("│ ", Style::default().fg(border)),
@@ -726,9 +752,9 @@ fn tool_detail_lines(
             continue;
         }
         let color = match section {
-            Some(h) if h == lang.detail_error() => theme::DANGER,
-            Some(h) if h == lang.detail_output() => theme::TEXT,
-            _ => theme::TEXT_MUTED,
+            Some(h) if h == lang.detail_error() => theme::danger(),
+            Some(h) if h == lang.detail_output() => theme::text(),
+            _ => theme::text_muted(),
         };
         for line in wrap_plain(raw, inner).into_iter() {
             out.push(Line::from(vec![
@@ -759,19 +785,19 @@ fn question_rows(
     };
 
     let mark = if answered { "✓" } else { "?" };
-    let head_colour = if answered { theme::TEXT_MUTED } else { theme::ACCENT };
+    let head_colour = if answered { theme::text_muted() } else { theme::accent() };
     let mut head = vec![Span::styled(format!("{mark} "), Style::default().fg(head_colour))];
     if let Some(h) = &step.header {
-        head.push(Span::styled(format!("[{h}] "), Style::default().fg(theme::TEXT_MUTED)));
+        head.push(Span::styled(format!("[{h}] "), Style::default().fg(theme::text_muted())));
     }
     head.push(Span::styled(
         step.question.clone(),
-        Style::default().fg(theme::TEXT_HEADING).add_modifier(Modifier::BOLD),
+        Style::default().fg(theme::text_heading()).add_modifier(Modifier::BOLD),
     ));
     if steps.len() > 1 {
         head.push(Span::styled(
             format!("  ·  {}", lang.step_count(steps.len())),
-            Style::default().fg(theme::TEXT_MUTED),
+            Style::default().fg(theme::text_muted()),
         ));
     }
     out.push(Line::from(head));
@@ -909,10 +935,10 @@ mod tests {
             .find(|l| l.spans.iter().any(|s| s.content.contains("grep")))
             .expect("no tool row");
         let name = row.spans.iter().find(|s| s.content.contains("grep")).unwrap();
-        assert_eq!(name.style.fg, Some(theme::TOOL));
+        assert_eq!(name.style.fg, Some(theme::tool()));
         assert_ne!(
             name.style.fg,
-            Some(theme::TEXT_MUTED),
+            Some(theme::text_muted()),
             "it must not share the reasoning colour"
         );
     }
@@ -929,7 +955,7 @@ mod tests {
             .find(|l| l.spans.iter().any(|s| s.content.contains("grep")))
             .expect("no tool row");
         let note = row.spans.iter().find(|s| s.content.contains("viewport")).expect("no summary");
-        assert_eq!(note.style.fg, Some(theme::TOOL_ARG));
+        assert_eq!(note.style.fg, Some(theme::tool_arg()));
     }
 
     /// **Even folded, how much changed is visible.** Both the head line and tool rows carry the numbers.
@@ -979,7 +1005,7 @@ mod tests {
     fn the_user_band_rides_on_the_line_not_the_spans() {
         let items = [Item::User { seq: 1, text: "안녕".into() }];
         let r = rows(&items, 60, &Folds::new(), crate::lang::Lang::Ko);
-        assert_eq!(r.lines[0].style.bg, Some(theme::USER_BG));
+        assert_eq!(r.lines[0].style.bg, Some(theme::user_bg()));
         assert!(r.lines[0].spans.iter().all(|s| s.style.bg.is_none()), "a span got a background");
     }
 
@@ -1049,7 +1075,7 @@ mod tests {
                 .iter()
                 .skip(1)
                 .filter(|s| !s.content.trim().is_empty())
-                .all(|s| s.style.fg == Some(theme::TEXT_MUTED)),
+                .all(|s| s.style.fg == Some(theme::text_muted())),
             "추론 본문이 흐리지 않다: {:?}",
             line.spans.iter().map(|s| (s.content.clone(), s.style.fg)).collect::<Vec<_>>()
         );
@@ -1062,7 +1088,7 @@ mod tests {
         let r = rows(&items, 40, &Folds::new(), crate::lang::Lang::Ko);
         assert!(plain(&r).iter().any(|l| l.contains("크레딧이 부족합니다")));
         assert!(
-            r.lines.iter().flat_map(|l| &l.spans).any(|s| s.style.fg == Some(crate::theme::DANGER)),
+            r.lines.iter().flat_map(|l| &l.spans).any(|s| s.style.fg == Some(crate::theme::danger())),
             "오류는 빨간색이어야 한다"
         );
     }
@@ -1362,7 +1388,7 @@ mod tests {
         let err = tool_detail_lines("오류\nboom", 60, false, crate::lang::Lang::Ko);
         assert!(
             err.iter().any(|l| {
-                l.spans.iter().any(|s| s.content == "boom" && s.style.fg == Some(theme::DANGER))
+                l.spans.iter().any(|s| s.content == "boom" && s.style.fg == Some(theme::danger()))
             }),
             "오류 본문이 위험색이 아니다: {err:?}"
         );
@@ -1374,11 +1400,11 @@ mod tests {
     fn a_failed_tools_detail_box_is_red() {
         let out = tool_detail_lines("인자\n{}", 60, true, crate::lang::Lang::Ko);
         assert!(
-            out[0].spans[0].style.fg == Some(theme::DANGER),
+            out[0].spans[0].style.fg == Some(theme::danger()),
             "the top border is not in the danger colour"
         );
         assert!(
-            out.last().unwrap().spans[0].style.fg == Some(theme::DANGER),
+            out.last().unwrap().spans[0].style.fg == Some(theme::danger()),
             "아래 테두리가 위험색이 아니다"
         );
     }

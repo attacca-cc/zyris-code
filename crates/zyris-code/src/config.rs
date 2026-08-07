@@ -42,6 +42,50 @@ impl DirAccess {
     }
 }
 
+/// Which palette the screen is drawn in.
+///
+/// **`Auto` is a guess, not an answer.** Asking the terminal for its real background means OSC 11
+/// and waiting for a reply, which this app does not do — `Terminal::clear()`'s DSR hung it on
+/// terminals that never answered. `Auto` reads the `COLORFGBG` hint and settles for dark.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ThemeChoice {
+    /// Work it out from the terminal, and use dark when it does not say.
+    #[default]
+    Auto,
+    Dark,
+    Light,
+}
+
+impl ThemeChoice {
+    /// From what the person typed. Both languages' words are accepted.
+    pub fn parse(text: &str) -> Option<ThemeChoice> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "auto" | "자동" => Some(ThemeChoice::Auto),
+            other => crate::theme::Theme::parse(other).map(|t| match t {
+                crate::theme::Theme::Dark => ThemeChoice::Dark,
+                crate::theme::Theme::Light => ThemeChoice::Light,
+            }),
+        }
+    }
+
+    /// Which palette this actually resolves to right now.
+    pub fn resolve(self) -> crate::theme::Theme {
+        match self {
+            ThemeChoice::Auto => crate::theme::detect(),
+            ThemeChoice::Dark => crate::theme::Theme::Dark,
+            ThemeChoice::Light => crate::theme::Theme::Light,
+        }
+    }
+
+    pub fn code(self) -> &'static str {
+        match self {
+            ThemeChoice::Auto => "auto",
+            ThemeChoice::Dark => "dark",
+            ThemeChoice::Light => "light",
+        }
+    }
+}
+
 /// The settings. Missing keys fall back to the defaults, so an old file keeps working.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Config {
@@ -51,6 +95,10 @@ pub struct Config {
     /// The mode the app opens in. `None` means the built-in default (normal).
     #[serde(default)]
     pub default_mode: Option<Mode>,
+    /// Which palette the screen uses. **This app paints no background of its own**, so on a light
+    /// terminal the dark palette's text sits at 1.19:1 against the paper — unreadable.
+    #[serde(default)]
+    pub theme: ThemeChoice,
 }
 
 /// The file where the settings live. Same directory as the credentials and the language.
@@ -106,7 +154,7 @@ mod tests {
     /// whole round trip the command relies on.
     #[test]
     fn a_saved_config_round_trips() {
-        let c = Config { dir_access: DirAccess::Allow, default_mode: Some(Mode::Job) };
+        let c = Config { dir_access: DirAccess::Allow, default_mode: Some(Mode::Job), ..Config::default() };
         let text = serde_json::to_string(&c).unwrap();
         let back: Config = serde_json::from_str(&text).unwrap();
         assert_eq!(back, c);

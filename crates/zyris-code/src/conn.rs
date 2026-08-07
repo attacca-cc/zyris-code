@@ -124,13 +124,44 @@ pub fn credential_home() -> String {
         .unwrap_or_else(|| crate::lang::current().no_credential_dir().to_string())
 }
 
+/// The person's home directory. **One definition, because `$HOME` is not portable.**
+///
+/// Windows normally leaves `$HOME` unset and names the home directory with `USERPROFILE`. Four
+/// places read `$HOME` directly and each invented its own fallback — `/`, the temp directory, or
+/// nothing — so on Windows `~/…` expanded to a drive-relative `\…`, the undo history went to a
+/// directory the system cleans out, and paths on screen were never shortened.
+///
+/// `None` when neither is set, so each caller still decides what that means for it.
+pub fn user_home() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+/// This app's own directory — **the one place everything of ours lives.**
+///
+/// Credentials, `config.json`, the language file, skills, plugins and `mcp.json` all sit here.
+///
+/// **Everything must ask this, not build the path itself.** Four places used to join
+/// `$HOME/.config/zyris-code/…` by hand (skills twice, plugins, `mcp.json`), which is right only
+/// on Linux: macOS puts it under `Library/Application Support` and Windows has no `$HOME` at all,
+/// so on Windows that whole tier silently vanished — skills, plugins and MCP servers were simply
+/// never found, with nothing said about it. It also ignored `$ZYRIS_CONFIG_DIR` and
+/// `$XDG_CONFIG_HOME`, so a person who moved this app's directory got half of it moved.
+pub fn app_dir() -> Option<std::path::PathBuf> {
+    config_home_for(APP)
+}
+
 /// Where credentials go. **We compute it.**
 ///
 /// Upstream has no way to set an app-specific directory (`RunConfig::app` doesn't exist in zyris's `main`). Instead,
 /// zyris's `config_dir()` **checks `$ZYRIS_CONFIG_DIR` first** — so filling that variable with
 /// this value (`main.rs`) makes credentials land in this app's own location.
+///
+/// The same directory as `app_dir`; the separate name is for the thing that must never be split.
 pub fn credential_dir() -> Option<std::path::PathBuf> {
-    config_home_for(APP)
+    app_dir()
 }
 
 /// The old location. Credentials found here are migrated on first run.
@@ -417,11 +448,31 @@ fn process_alive(pid: &str) -> bool {
     unsafe { libc::kill(pid as i32, 0) == 0 }
 }
 
+/// Windows has no `kill(pid, 0)`, so it asks the task list.
+///
+/// **Answering `false` unconditionally, as this used to, disabled the warning entirely on
+/// Windows** — every window claimed the lock, no window ever saw another, and the one message
+/// that explains "my tool calls just sit there" (the server routes to whichever window connected
+/// last) could never appear on the platform where it is hardest to diagnose.
+///
+/// `tasklist` ships with every Windows install. It runs once at startup, and any failure — the
+/// binary missing, output we cannot read — answers `false`, which is exactly the old behaviour.
+/// A recycled PID can say "alive" wrongly, the same risk `kill(pid, 0)` carries on Unix.
 #[cfg(not(unix))]
-fn process_alive(_pid: &str) -> bool {
-    // On platforms with no way to ask whether a process exists, treat a leftover file as dead —
-    // the next window just overwrites it, and the warning only means something on Unix.
-    false
+fn process_alive(pid: &str) -> bool {
+    let pid = pid.trim();
+    if pid.is_empty() || pid.parse::<u32>().is_err() {
+        return false;
+    }
+    let out = std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+        .output();
+    let Ok(out) = out else { return false };
+    // With no match it prints an INFO line instead of a row, so look for the PID as its own
+    // quoted CSV field — the memory column carries digits too (`"1,234 K"`).
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .any(|line| line.split(',').any(|field| field.trim().trim_matches('"') == pid))
 }
 
 /// **The same rule** as attacca's `slugify_node_name` (`attacca-domain/src/zyris_node.rs`).

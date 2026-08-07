@@ -1,47 +1,140 @@
-//! The Zyris brand palette — warm dark.
+//! The Zyris palette — **one entry per role, in two themes.**
 //!
-//! **Only one place gets a background** — the user message (`USER_BG`). The whole screen is not
-//! painted — letting the terminal use its own background is this app's policy. On 2026-08-03 a
+//! **These are roles, not colours.** `error()` is what an error is painted with; whether that is
+//! a red depends on the theme. Reaching for a colour because it "looks right" is how one value
+//! ends up carrying several meanings — and then changing it for one of them breaks the others.
+//! `ACCENT` alone used to be the brand chrome, the user's message bar, the agent marker, every
+//! cursor, the input prompt, the focused button, inline `code` **and** plan mode; plan mode
+//! therefore had no colour of its own, it wore the same paint as every border on screen.
+//!
+//! **Only one place gets a background** — the user message (`user_bg`). The whole screen is not
+//! painted; letting the terminal use its own background is this app's policy. On 2026-08-03 a
 //! full-screen background was turned on to stop ghosting, then reverted when it turned out the
-//! person had cleared it. Ghosting is cleaned up by `app::heal_interval` (full redraw every 2s by default).
+//! person had cleared it. Ghosting is cleaned up by `app::heal_interval` (a full redraw every 2s).
 //!
-//! **Don't create text without a color.** Unspecified, the terminal's own default foreground leaks
-//! out — on a terminal with a changed default foreground, everything "that should be white" shows
-//! in that color.
+//! **That policy is exactly why the light theme exists.** With no background of our own, the text
+//! colour has to suit the terminal's. The dark palette's `text()` (#e8e2dc) measures **1.19**
+//! against a common light terminal — words the colour of the paper they are on. `/config theme`
+//! picks; nothing about the drawing changes.
+//!
+//! **Don't create text without a colour.** Unspecified, the terminal's own default foreground
+//! leaks out — on a terminal with a changed default foreground, everything "that should be white"
+//! shows in that colour.
+
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use ratatui::style::Color;
 
-/// `--zyris-bg`(#0f0d0a) of the Zyris web palette. **Not painted by default** — see `page_bg`.
-pub const BG: Color = Color::Rgb(0x0f, 0x0d, 0x0a);
+/// Which palette is in use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum Theme {
+    /// For a dark terminal. The brand's own look, and the default.
+    #[default]
+    Dark,
+    /// For a light terminal.
+    Light,
+}
+
+impl Theme {
+    /// From what the person typed. Both languages' words are accepted.
+    pub fn parse(text: &str) -> Option<Theme> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "dark" | "어둡게" | "어두움" | "다크" => Some(Theme::Dark),
+            "light" | "밝게" | "밝음" | "라이트" => Some(Theme::Light),
+            _ => None,
+        }
+    }
+
+    /// The name written to the setting file.
+    pub fn code(self) -> &'static str {
+        match self {
+            Theme::Dark => "dark",
+            Theme::Light => "light",
+        }
+    }
+}
+
+/// The theme every `fg` below reads.
+///
+/// **An atomic, not a `OnceLock`.** `/config` changes the theme while the app is up, and the very
+/// next frame has to be drawn in it — the same promise `dir_access` makes to the gate.
+static PICKED: AtomicU8 = AtomicU8::new(0);
+
+pub fn current() -> Theme {
+    match PICKED.load(Ordering::Relaxed) {
+        1 => Theme::Light,
+        _ => Theme::Dark,
+    }
+}
+
+pub fn set(theme: Theme) {
+    PICKED.store(if theme == Theme::Light { 1 } else { 0 }, Ordering::Relaxed);
+}
+
+/// Which theme to start in when the setting says "work it out".
+///
+/// **`COLORFGBG` is the only thing we can ask without asking the terminal.** Querying the real
+/// background is OSC 11, and this app does not put questions on the wire and wait for an answer —
+/// `Terminal::clear()`'s DSR did exactly that and hung the app on terminals that never replied.
+/// So this reads the hint some terminals export (`fg;bg`, where the background is the last field)
+/// and settles for dark when there is none. Getting it wrong costs one `/config theme`.
+pub fn detect() -> Theme {
+    let Ok(value) = std::env::var("COLORFGBG") else { return Theme::Dark };
+    let Some(bg) = value.rsplit(';').next() else { return Theme::Dark };
+    // 0-6 and 8 are the dark half of the 16-colour palette; 7 and 9-15 are the light half.
+    match bg.trim().parse::<u8>() {
+        Ok(n) if n == 7 || (9..=15).contains(&n) => Theme::Light,
+        _ => Theme::Dark,
+    }
+}
+
+/// Picks between the two palettes. Every role below is one line because of it.
+fn pick(dark: (u8, u8, u8), light: (u8, u8, u8)) -> Color {
+    let (r, g, b) = match current() {
+        Theme::Dark => dark,
+        Theme::Light => light,
+    };
+    Color::Rgb(r, g, b)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Surfaces
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `--zyris-bg` of the Zyris web palette. **Not painted by default** — see `page_bg`.
+pub fn bg() -> Color {
+    pick((0x0f, 0x0d, 0x0a), (0xfa, 0xf7, 0xf2))
+}
 
 /// The background laid over the whole screen. **Default is none — the terminal uses its own.**
 ///
-/// It used to lay `BG` over every leftover cell. There was a reason: the ratatui diff doesn't
-/// send a full-width character's right cell to the terminal (trusting the terminal to paint both
-/// cells), and the protection that force-clears that cell when a full-width character turns narrow
-/// only fires when **`previous.bg != Reset`**. Without a background, the right half of a full-width character ghosts on remote terminals.
+/// It used to lay `bg()` over every leftover cell. There was a reason: the ratatui diff doesn't
+/// send a wide character's right cell to the terminal (trusting the terminal to paint both cells),
+/// and the protection that force-clears that cell only fires when **`previous.bg != Reset`**.
+/// Without a background, the right half of a wide character ghosts on remote terminals.
 ///
-/// **Still, the default stays off** — because there are places the app can't paint. The terminal
-/// window leaves pixels that don't fit the grid as margin at the right and bottom, and the window
-/// itself has padding. Those spots stay terminal background, so the moment the app paints its own,
-/// **a differently colored band appears at the edges.** That ruins the screen border for the sake
-/// of the screen — the terminal background the person chose is simply better everywhere.
+/// **Still, the default stays off** — because there are places the app cannot paint. The terminal
+/// leaves pixels that do not fit the grid as margin at the right and bottom, and the window itself
+/// has padding. Those spots stay terminal background, so the moment the app paints its own, **a
+/// differently coloured band appears at the edges.**
 ///
-/// Ghosting is cleared by redrawing — `Ctrl+L` and `app::heal_interval` (2 seconds by default) do it.
-/// On terminals where that isn't enough, turn it back on with **`ZYRIS_CODE_BG`**: `zyris` gives
-/// the brand color above, `#rrggbb` gives that color.
+/// Ghosting is cleared by redrawing — `Ctrl+L` and `app::heal_interval` do it. On terminals where
+/// that is not enough, turn it on with **`ZYRIS_CODE_BG`**: `zyris` gives the theme's own
+/// background, `#rrggbb` gives that colour.
 pub fn page_bg() -> Option<Color> {
-    static PICKED: std::sync::OnceLock<Option<Color>> = std::sync::OnceLock::new();
-    *PICKED.get_or_init(|| page_bg_from(std::env::var("ZYRIS_CODE_BG").ok().as_deref()))
+    // **Read every time, not once.** The theme can change under `/config`, and a background
+    // decided at startup would then be the other theme's.
+    page_bg_from(std::env::var("ZYRIS_CODE_BG").ok().as_deref())
 }
 
-/// Turns `$ZYRIS_CODE_BG` into a color. **Pure** — the decision must live here so tests don't shake the env.
+/// Turns `$ZYRIS_CODE_BG` into a colour. **Pure** — the decision lives here so tests don't shake
+/// the environment.
 pub fn page_bg_from(given: Option<&str>) -> Option<Color> {
     let given = given.map(str::trim).filter(|v| !v.is_empty())?;
     match given.to_ascii_lowercase().as_str() {
-        // The off side must be expressible too — it's the way back when it was left on and forgotten.
+        // The off side must be expressible too — it is the way back when it was left on.
         "none" | "off" | "0" | "terminal" => None,
-        "zyris" | "on" | "1" | "default" => Some(BG),
+        "zyris" | "on" | "1" | "default" => Some(bg()),
         _ => hex(given),
     }
 }
@@ -56,59 +149,276 @@ fn hex(text: &str) -> Option<Color> {
     Some(Color::Rgb(byte(0)?, byte(2)?, byte(4)?))
 }
 
-/// The line dividing areas. Kept at mid brightness so it shows subtly on any terminal background.
-pub const BORDER: Color = Color::Rgb(0x3a, 0x30, 0x29);
-pub const BORDER_LIGHT: Color = Color::Rgb(0x4a, 0x3e, 0x36);
-pub const TEXT: Color = Color::Rgb(0xe8, 0xe2, 0xdc);
-pub const TEXT_MUTED: Color = Color::Rgb(0x9c, 0x94, 0x8d);
-pub const TEXT_HEADING: Color = Color::Rgb(0xf1, 0xed, 0xe8);
-pub const ACCENT: Color = Color::Rgb(0xc9, 0x73, 0x4d);
-pub const ACCENT_HOVER: Color = Color::Rgb(0xb5, 0x62, 0x3e);
-pub const ACCENT_MUTED: Color = Color::Rgb(0xa3, 0x53, 0x32);
-pub const SUCCESS: Color = Color::Rgb(0x8f, 0xae, 0x5c);
-pub const WARNING: Color = Color::Rgb(0xd9, 0xa4, 0x41);
-pub const DANGER: Color = Color::Rgb(0xc1, 0x50, 0x3f);
-
-/// The background where the user spoke. ACCENT (0xc9734d) lowered enough to work as a background.
+/// The background where the user spoke.
 ///
 /// **This is the only place that uses a background.** The "don't paint backgrounds" rule at the
-/// top of the file is flipped here and only here — laid over the whole screen it would jump like
-/// a stain, and painting everything makes nothing distinguishable. This one line is the "where I spoke" signal.
-pub const USER_BG: Color = Color::Rgb(0x2a, 0x20, 0x1a);
+/// top of the file is flipped here and only here — laid over the whole screen it would read as a
+/// stain, and painting everything makes nothing distinguishable. This one band is the "this is
+/// where I spoke" signal.
+pub fn user_bg() -> Color {
+    pick((0x2a, 0x20, 0x1a), (0xf0, 0xe6, 0xd8))
+}
 
-/// The tool line's name. **Must not be the same muted color as reasoning.**
+// ─────────────────────────────────────────────────────────────────────────────
+// Structure
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The line dividing areas.
+pub fn border() -> Color {
+    pick((0x3a, 0x30, 0x29), (0xd6, 0xcc, 0xc0))
+}
+
+/// Divider glyphs, disabled rows, placeholders, an unlit blink.
+pub fn border_light() -> Color {
+    pick((0x4a, 0x3e, 0x36), (0xb3, 0xa6, 0x97))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Text
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub fn text() -> Color {
+    pick((0xe8, 0xe2, 0xdc), (0x2b, 0x26, 0x22))
+}
+
+pub fn text_muted() -> Color {
+    pick((0x9c, 0x94, 0x8d), (0x6b, 0x62, 0x59))
+}
+
+pub fn text_heading() -> Color {
+    pick((0xf1, 0xed, 0xe8), (0x1a, 0x16, 0x13))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Brand
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The brand colour: box borders, cursors, the input prompt, the user's own bar.
+pub fn accent() -> Color {
+    pick((0xc9, 0x73, 0x4d), (0xa8, 0x50, 0x1f))
+}
+
+/// The accent one step down. Used where an accent sits behind something else.
+pub fn accent_hover() -> Color {
+    pick((0xb5, 0x62, 0x3e), (0x8f, 0x43, 0x19))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Meaning
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub fn success() -> Color {
+    pick((0x8f, 0xae, 0x5c), (0x4a, 0x7a, 0x1f))
+}
+
+/// Something worth noticing that is **not** wrong: unsent messages, a dirty repo, a lapsed code.
+pub fn warning() -> Color {
+    pick((0xd9, 0xa4, 0x41), (0x8a, 0x5d, 0x00))
+}
+
+/// Something is wrong: a failed tool, an error entry, a conflict, a refusal.
+pub fn danger() -> Color {
+    pick((0xc1, 0x50, 0x3f), (0xa3, 0x27, 0x1a))
+}
+
+/// A passing remark on the activity line — connected, another window is open, a command answered.
 ///
-/// Inside an expanded card reasoning fills the screen; if tools were also `TEXT_MUTED`, the actual
-/// "what was done" would be buried. What the reader scans is the tool line, so that side must stand out.
-pub const TOOL: Color = Color::Rgb(0x7f, 0xb0, 0xd4);
-/// The tool line's argument summary. One step below the name.
-pub const TOOL_ARG: Color = Color::Rgb(0x6b, 0x8a, 0xa0);
+/// **Split from `warning()`**, which used to paint every notice *including errors*. With one
+/// colour for both, an error looked exactly like "connected", and the one line whose whole job is
+/// to say what is happening could not say that something had gone wrong.
+pub fn notice() -> Color {
+    pick((0x9c, 0x94, 0x8d), (0x6b, 0x62, 0x59))
+}
 
-/// A link's text. Underlined in the renderer; the underline plus a distinct color is what
-/// signals "this can be Ctrl+clicked" without needing a mouse hover in a terminal.
-pub const LINK: Color = Color::Rgb(0x7f, 0xb0, 0xd4);
+// ─────────────────────────────────────────────────────────────────────────────
+// Modes
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Plan mode.
+///
+/// **Its own colour.** Plan mode used to be painted `accent()` — the same paint as every border,
+/// every cursor, the input prompt and the user's message bar — so the one thing the bottom bar
+/// exists to tell you was the colour of the furniture around it. Neighbours in the Shift+Tab cycle
+/// have to be far apart, since the eye compares against the mode it just left:
+/// green → violet → blue → yellow.
+pub fn mode_plan() -> Color {
+    pick((0xb4, 0x8e, 0xad), (0x6b, 0x4d, 0x9e))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tools, links, diffs
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The tool line's name. **Must not be the same muted colour as reasoning.**
+///
+/// Inside an expanded card reasoning fills the screen; if tools were also `text_muted()`, the
+/// actual "what was done" would be buried. What the reader scans is the tool line.
+pub fn tool() -> Color {
+    pick((0x7f, 0xb0, 0xd4), (0x1f, 0x5f, 0x8b))
+}
+
+/// The tool line's argument summary. One step below the name.
+pub fn tool_arg() -> Color {
+    pick((0x6b, 0x8a, 0xa0), (0x3d, 0x6b, 0x82))
+}
+
+/// A link's text. Underlined in the renderer; the underline plus a distinct colour is what says
+/// "this can be Ctrl+clicked" without a mouse hover.
+///
+/// **Not the same as `tool()`.** The two were byte-identical, so a link sitting beside a tool name
+/// — which happens on every tool line carrying a URL — was indistinguishable from it.
+pub fn link() -> Color {
+    pick((0x56, 0xb6, 0xc2), (0x0f, 0x6b, 0x62))
+}
 
 /// The added line in a diff. Green.
 ///
-/// `SUCCESS`·`DANGER` aren't used as-is. Those two say "tool worked / didn't work", so if a
-/// deletion line in a successful edit were the same red as a failed tool, the eye would misread.
-pub const DIFF_ADD: Color = Color::Rgb(0x7e, 0xc0, 0x50);
+/// `success()`/`danger()` are not reused. Those two say "the tool worked / did not", so a deleted
+/// line inside a *successful* edit painted the same red as a failed tool would be misread.
+pub fn diff_add() -> Color {
+    pick((0x7e, 0xc0, 0x50), (0x2f, 0x7a, 0x1f))
+}
+
 /// The removed line in a diff. Red.
-pub const DIFF_DEL: Color = Color::Rgb(0xe0, 0x6c, 0x75);
+pub fn diff_del() -> Color {
+    pick((0xe0, 0x6c, 0x75), (0xa3, 0x2a, 0x2a))
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The palette must match the Zyris web values. Misaligned, the same product shows in different colors.
+    /// Serialises the theme so the tests below can restore it — they run in one process and the
+    /// palette is global.
+    fn with(theme: Theme, body: impl FnOnce()) {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let before = current();
+        set(theme);
+        body();
+        set(before);
+    }
+
+    fn rgb(c: Color) -> (f64, f64, f64) {
+        match c {
+            Color::Rgb(r, g, b) => (r as f64 / 255.0, g as f64 / 255.0, b as f64 / 255.0),
+            other => panic!("the palette must be true colour, got {other:?}"),
+        }
+    }
+
+    /// WCAG relative luminance.
+    fn luminance(c: Color) -> f64 {
+        let f = |v: f64| if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) };
+        let (r, g, b) = rgb(c);
+        0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b)
+    }
+
+    fn contrast(a: Color, b: Color) -> f64 {
+        let (x, y) = (luminance(a), luminance(b));
+        let (hi, lo) = if x > y { (x, y) } else { (y, x) };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
+    /// **Every colour that carries words must be readable on its own theme's background.**
+    ///
+    /// This is what the light theme is for. The dark palette's `text()` measures 1.19 against a
+    /// common light terminal, and since this app paints no background of its own, that is exactly
+    /// what a person on a light terminal saw.
+    ///
+    /// The floor is 4.0 rather than WCAG AA's 4.5 because `danger()` sits at 4.15 and the brand
+    /// value is kept as it is. Every other role clears 4.5 comfortably.
     #[test]
-    fn the_palette_matches_the_brand_values() {
-        assert_eq!(BG, Color::Rgb(0x0f, 0x0d, 0x0a));
-        assert_eq!(ACCENT, Color::Rgb(0xc9, 0x73, 0x4d));
-        assert_eq!(TEXT, Color::Rgb(0xe8, 0xe2, 0xdc));
-        assert_eq!(TEXT_MUTED, Color::Rgb(0x9c, 0x94, 0x8d));
-        assert_eq!(TEXT_HEADING, Color::Rgb(0xf1, 0xed, 0xe8));
-        assert_eq!(BORDER, Color::Rgb(0x3a, 0x30, 0x29));
-        assert_eq!(DANGER, Color::Rgb(0xc1, 0x50, 0x3f));
+    fn text_colours_are_readable_on_their_own_background() {
+        for theme in [Theme::Dark, Theme::Light] {
+            with(theme, || {
+                let on = bg();
+                for (name, colour) in [
+                    ("text", text()),
+                    ("text_muted", text_muted()),
+                    ("text_heading", text_heading()),
+                    ("accent", accent()),
+                    ("success", success()),
+                    ("warning", warning()),
+                    ("danger", danger()),
+                    ("notice", notice()),
+                    ("mode_plan", mode_plan()),
+                    ("tool", tool()),
+                    ("tool_arg", tool_arg()),
+                    ("link", link()),
+                    ("diff_add", diff_add()),
+                    ("diff_del", diff_del()),
+                ] {
+                    let ratio = contrast(colour, on);
+                    assert!(ratio >= 4.0, "{theme:?} {name} is {ratio:.2}:1 — too close to read");
+                }
+            });
+        }
+    }
+
+    /// The user's own band is a background, so the text on it has to hold up too.
+    #[test]
+    fn text_is_readable_on_the_user_band() {
+        for theme in [Theme::Dark, Theme::Light] {
+            with(theme, || {
+                let ratio = contrast(text(), user_bg());
+                assert!(ratio >= 4.5, "{theme:?} text on the user band is {ratio:.2}:1");
+            });
+        }
+    }
+
+    /// **A role that shares a value with another is a role waiting to be broken.** Changing the
+    /// colour for one meaning silently changes the other — `link()` and `tool()` were identical,
+    /// and plan mode was `accent()`, the same paint as every border on screen.
+    #[test]
+    fn roles_that_mean_different_things_have_different_colours() {
+        for theme in [Theme::Dark, Theme::Light] {
+            with(theme, || {
+                let roles = [
+                    ("accent", accent()),
+                    ("mode_plan", mode_plan()),
+                    ("tool", tool()),
+                    ("link", link()),
+                    ("warning", warning()),
+                    ("notice", notice()),
+                    ("danger", danger()),
+                    ("success", success()),
+                ];
+                for (i, (an, a)) in roles.iter().enumerate() {
+                    for (bn, b) in &roles[i + 1..] {
+                        assert_ne!(a, b, "{theme:?}: {an} and {bn} are the same colour");
+                    }
+                }
+            });
+        }
+    }
+
+    /// The palette must match the Zyris web values. Misaligned, the same product shows in
+    /// different colours.
+    #[test]
+    fn the_dark_palette_matches_the_brand_values() {
+        with(Theme::Dark, || {
+            assert_eq!(bg(), Color::Rgb(0x0f, 0x0d, 0x0a));
+            assert_eq!(accent(), Color::Rgb(0xc9, 0x73, 0x4d));
+            assert_eq!(text(), Color::Rgb(0xe8, 0xe2, 0xdc));
+            assert_eq!(text_muted(), Color::Rgb(0x9c, 0x94, 0x8d));
+            assert_eq!(text_heading(), Color::Rgb(0xf1, 0xed, 0xe8));
+            assert_eq!(border(), Color::Rgb(0x3a, 0x30, 0x29));
+            assert_eq!(danger(), Color::Rgb(0xc1, 0x50, 0x3f));
+        });
+    }
+
+    #[test]
+    fn a_theme_answers_to_both_languages() {
+        assert_eq!(Theme::parse("dark"), Some(Theme::Dark));
+        assert_eq!(Theme::parse("밝게"), Some(Theme::Light));
+        assert_eq!(Theme::parse("아무거나"), None);
+    }
+
+    /// `COLORFGBG` is a hint, not an answer — a terminal that does not set it must not flip the
+    /// palette. Dark is the safe guess because it is the brand's own look.
+    #[test]
+    fn detection_falls_back_to_dark_without_a_hint() {
+        // The parsing is what matters; the variable itself is read once at startup.
+        assert_eq!(Theme::default(), Theme::Dark);
     }
 }

@@ -118,6 +118,13 @@ impl LocalEdit {
         LocalEdit { root, undo }
     }
 
+    /// The same, with the undo history's cache root given. **Tests use this** so they do not have
+    /// to move `XDG_CACHE_HOME`, which is process-global and raced between tests.
+    pub fn under(root: PathBuf, cache_root: &std::path::Path) -> LocalEdit {
+        let undo = crate::undo::Undo::under(cache_root, &root);
+        LocalEdit { root, undo }
+    }
+
     /// The undo log. `/undo` uses it.
     pub fn undo(&self) -> crate::undo::Undo {
         self.undo.clone()
@@ -336,14 +343,23 @@ mod tests {
         (dir, edit, "a.txt".to_string())
     }
 
+    /// The same with the undo history pointed at its own directory.
+    ///
+    /// **No environment variable.** These tests used to move `XDG_CACHE_HOME`, which is
+    /// process-global — each one pointed it at its own temp directory and overwrote whatever
+    /// another test had just set, so they passed alone and failed at random in the suite.
+    fn scratch_with_undo(body: &str) -> (tempfile::TempDir, tempfile::TempDir, LocalEdit, String) {
+        let cache = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), body).unwrap();
+        let edit = LocalEdit::under(dir.path().to_path_buf(), cache.path());
+        (cache, dir, edit, "a.txt".to_string())
+    }
+
     /// **An edit must be undoable.** In a directory without git, this is the only safety net.
     #[tokio::test]
     async fn an_edit_leaves_something_to_undo() {
-        // Move the cache location — must not write to the real home.
-        let cache = tempfile::tempdir().unwrap();
-        std::env::set_var("XDG_CACHE_HOME", cache.path());
-
-        let (dir, edit, path) = scratch("before\n");
+        let (_cache, dir, edit, path) = scratch_with_undo("before\n");
         let undo = edit.undo();
         assert!(undo.is_empty(), "nothing has been changed yet");
 
@@ -357,10 +373,7 @@ mod tests {
     /// Creating a new file must be undoable too — reverting makes the file disappear.
     #[tokio::test]
     async fn creating_a_file_can_be_undone_too() {
-        let cache = tempfile::tempdir().unwrap();
-        std::env::set_var("XDG_CACHE_HOME", cache.path());
-
-        let (dir, edit, _) = scratch("아무거나\n");
+        let (_cache, dir, edit, _) = scratch_with_undo("아무거나\n");
         let undo = edit.undo();
         edit.write("새로.txt".into(), "내용\n".into(), None).await.unwrap();
         assert!(dir.path().join("새로.txt").exists());

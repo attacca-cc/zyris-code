@@ -35,10 +35,10 @@ pub fn draw(frame: &mut Frame, area: Rect, panel: &mut Panel, lang: crate::lang:
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::ACCENT))
+        .border_style(Style::default().fg(theme::accent()))
         .title(Span::styled(
             format!(" {} ", panel.title),
-            Style::default().fg(theme::TEXT_HEADING).add_modifier(Modifier::BOLD),
+            Style::default().fg(theme::text_heading()).add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(box_area);
     frame.render_widget(block, box_area);
@@ -64,12 +64,16 @@ pub fn draw(frame: &mut Frame, area: Rect, panel: &mut Panel, lang: crate::lang:
     if let Some(button) = panel.button {
         lines.push(button_line(button, panel.button_focused, lang, width));
     }
-    let keys = match (has_button, panel.button_focused) {
-        (true, true) => lang.panel_keys_button_focused(),
-        (true, false) => lang.panel_keys_button(),
-        (false, _) => lang.panel_keys(),
+    // **A form answers to different keys, so it says so.** Showing "↑↓ scroll · Esc close"
+    // over a box whose ↑↓ move a cursor and whose Esc throws work away would be a lie.
+    // The form draws its own language too — the draft may have changed it a moment ago.
+    let keys = match (panel.form.map(|f| f.lang), has_button, panel.button_focused) {
+        (Some(draft), _, _) => draft.form_keys(),
+        (None, true, true) => lang.panel_keys_button_focused(),
+        (None, true, false) => lang.panel_keys_button(),
+        (None, false, _) => lang.panel_keys(),
     };
-    lines.push(Line::from(Span::styled(keys, Style::default().fg(theme::TEXT_MUTED))));
+    lines.push(Line::from(Span::styled(keys, Style::default().fg(theme::text_muted()))));
 
     frame.render_widget(Paragraph::new(lines), inner);
 }
@@ -87,10 +91,14 @@ fn button_line(
     };
     let text = if focused { format!("▶ [ {label} ] ◀") } else { format!("[ {label} ]") };
     let pad = " ".repeat(width.saturating_sub(display_width(&text)) / 2);
+    // **At rest it is ordinary text; the warning comes when it is about to be pressed.** Painting
+    // it `danger()` while nothing had happened made a button that was merely sitting there look
+    // like something had already gone wrong. Now the red arrives exactly when it means something:
+    // this is the key that logs you out.
     let style = if focused {
-        Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD)
+        Style::default().fg(theme::danger()).add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(theme::DANGER)
+        Style::default().fg(theme::text())
     };
     Line::from(Span::styled(format!("{pad}{text}"), style))
 }
@@ -143,7 +151,7 @@ mod tests {
     /// A line that fits is left untouched — no fake `…` on lines that fit.
     #[test]
     fn a_line_that_fits_is_untouched() {
-        let line = Line::from(Span::styled("안녕", Style::default().fg(theme::TEXT)));
+        let line = Line::from(Span::styled("안녕", Style::default().fg(theme::text())));
         let got = fit(line, 10);
         assert_eq!(got.to_string(), "안녕");
     }

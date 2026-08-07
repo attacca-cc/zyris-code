@@ -212,8 +212,8 @@ fn check_the_diff_paints(events: &[zyris_attacca::ZSessionEvent]) {
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect()
     };
-    let added = coloured(zyris_code::theme::DIFF_ADD);
-    let removed = coloured(zyris_code::theme::DIFF_DEL);
+    let added = coloured(zyris_code::theme::diff_add());
+    let removed = coloured(zyris_code::theme::diff_del());
     if added.is_empty() || removed.is_empty() {
         println!("fail — the diff did not become screen lines.");
         println!("green lines: {added:?}\nred lines: {removed:?}");

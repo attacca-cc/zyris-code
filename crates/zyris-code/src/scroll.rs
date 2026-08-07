@@ -26,9 +26,23 @@ impl Scroll {
 
     /// Wheel. Positive goes up.
     pub fn wheel(&mut self, notches: i32, total: usize, height: usize) {
-        let max_top = total.saturating_sub(height);
         let delta = notches.unsigned_abs() as usize * LINES_PER_NOTCH;
-        self.top = if notches > 0 {
+        self.move_by(delta, notches > 0, total, height);
+    }
+
+    /// Keyboard page scroll. Positive goes up, negative down — each unit is one
+    /// screen (`height` lines), like `wheel`'s notches. The wheel is the transcript's
+    /// only other scroll, and not every terminal delivers wheel events (mobile SSH,
+    /// tmux without mouse, web terminals) — PageUp/PageDown must always reach the history.
+    pub fn page(&mut self, pages: i32, total: usize, height: usize) {
+        let delta = pages.unsigned_abs() as usize * height;
+        self.move_by(delta, pages > 0, total, height);
+    }
+
+    /// Moves `delta` lines up (`up`) or down, clamped to what exists.
+    fn move_by(&mut self, delta: usize, up: bool, total: usize, height: usize) {
+        let max_top = total.saturating_sub(height);
+        self.top = if up {
             self.top.saturating_sub(delta)
         } else {
             (self.top + delta).min(max_top)
@@ -116,5 +130,50 @@ mod tests {
         let mut s = Scroll::new();
         s.on_content(4, 10);
         assert_eq!(s.window(4, 10), (0, 4));
+    }
+
+    /// A page is one screen — PageUp and PageDown move the same amount the view shows.
+    #[test]
+    fn a_page_moves_one_screen() {
+        let mut s = Scroll::new();
+        s.on_content(100, 10);
+        s.page(1, 100, 10);
+        assert_eq!(s.top, 80);
+        s.page(-1, 100, 10);
+        assert_eq!(s.top, 90, "one page down lands at the bottom");
+        assert!(s.stick);
+    }
+
+    #[test]
+    fn a_page_stops_at_the_edges() {
+        let mut s = Scroll::new();
+        s.on_content(100, 10);
+        s.page(1000, 100, 10);
+        assert_eq!(s.top, 0);
+        s.page(-1000, 100, 10);
+        assert_eq!(s.top, 90);
+    }
+
+    /// Scrolling up by page unsinks; coming back to the bottom resticks.
+    #[test]
+    fn a_page_up_unsinks_and_a_page_down_resticks() {
+        let mut s = Scroll::new();
+        s.on_content(100, 10);
+        s.page(1, 100, 10);
+        assert!(!s.stick);
+        s.page(-1, 100, 10);
+        assert!(s.stick);
+    }
+
+    /// Content growing under a page-scrolled view must not move it — the same promise
+    /// `wheel` gives.
+    #[test]
+    fn new_content_does_not_move_a_page_scrolled_view() {
+        let mut s = Scroll::new();
+        s.on_content(100, 10);
+        s.page(1, 100, 10);
+        let before = s.window(100, 10);
+        s.on_content(120, 10);
+        assert_eq!(s.window(120, 10), before, "the scrolled-up position must be kept");
     }
 }

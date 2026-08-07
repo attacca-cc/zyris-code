@@ -44,6 +44,15 @@ pub enum Command {
     Status,
     /// The settings — with no argument the panel; with `option value`, sets that one.
     Config(Option<ConfigAction>),
+    /// Drops the connection so the runner redials.
+    ///
+    /// **The way back from a connection the server no longer routes to.** attacca's registry is
+    /// `insert(node_id, connection)`, so a second window with the same credentials displaces the
+    /// first — and if that window then closes, the registry points at a dead connection and every
+    /// tool call sits pending forever. Nothing detects it: zyris discards the heartbeat the server
+    /// advertises, has no ping/pong, and `conn.closed()` never fires for a merely unrouted socket.
+    /// Redialling re-announces, which puts this connection back in the registry.
+    Reconnect,
     /// Something unknown. **Not sent to the server; tells what's available instead.**
     Unknown(String),
 }
@@ -60,6 +69,8 @@ pub enum AccountAction {
 pub enum ConfigAction {
     /// 다른 디렉토리 접근 — whether tools may touch outside the working directory.
     Dir(crate::config::DirAccess),
+    /// 화면 색 — which palette the screen is drawn in.
+    Theme(crate::config::ThemeChoice),
     /// 화면 말.
     Lang(crate::lang::Lang),
     /// 기본 모드 — the mode the app opens in. `None` turns the setting off.
@@ -132,6 +143,7 @@ pub fn parse(text: &str) -> Option<Command> {
                 None => Command::LangUnknown(given.to_string()),
             },
         },
+        "reconnect" | "재연결" => Command::Reconnect,
         "config" => match arg {
             "" => Command::Config(None),
             given => match given.split_once(char::is_whitespace) {
@@ -140,6 +152,14 @@ pub fn parse(text: &str) -> Option<Command> {
                         match crate::config::DirAccess::parse(value) {
                             Some(access) => Command::Config(Some(ConfigAction::Dir(access))),
                             None => return Some(Command::Unknown(format!("config dir {value}"))),
+                        }
+                    }
+                    "theme" | "colour" | "color" | "색" | "테마" => {
+                        match crate::config::ThemeChoice::parse(value) {
+                            Some(theme) => Command::Config(Some(ConfigAction::Theme(theme))),
+                            None => {
+                                return Some(Command::Unknown(format!("config theme {value}")))
+                            }
                         }
                     }
                     "lang" | "language" | "언어" => match crate::lang::Lang::parse(value) {
@@ -231,6 +251,7 @@ pub fn catalogue(lang: crate::lang::Lang) -> Vec<(&'static str, &'static str)> {
             ("/plugin", "플러그인을 받고 지웁니다 (add·remove·update)"),
             ("/rules", "이 쓰레드에 실린 CLAUDE.md·AGENTS.md"),
             ("/cwd", "도구가 상대경로를 푸는 자리"),
+            ("/reconnect", "다시 붙습니다. 도구 호출이 응답 없이 멈춰 있을 때"),
             ("/account", "계정 정보를 보고, 로그아웃합니다 (logout)"),
             ("/status", "지금 세션·에이전트·모드·사용량을 한눈에"),
             ("/jobs", "배경에서 도는 작업 (stop <id>로 멈춥니다)"),
@@ -250,6 +271,7 @@ pub fn catalogue(lang: crate::lang::Lang) -> Vec<(&'static str, &'static str)> {
             ("/plugin", "Install and remove plugins (add / remove / update)"),
             ("/rules", "The CLAUDE.md and AGENTS.md loaded into this thread"),
             ("/cwd", "Where tools resolve relative paths"),
+            ("/reconnect", "Attach again — when tool calls sit there with no answer"),
             ("/account", "Show account info, or log out (logout)"),
             ("/status", "Session, agent, mode and usage at a glance"),
             ("/jobs", "Background jobs (stop <id> kills one)"),
@@ -427,12 +449,20 @@ mod tests {
     }
 
     /// If the list and the parser diverge, what you pick from the list won't work.
+    ///
+    /// **Both languages.** Only the Korean list was checked, so an entry added to one and not the
+    /// other would sit in the list doing nothing for half the users.
     #[test]
     fn the_catalogue_covers_every_command_the_parser_takes() {
-        for (name, _) in catalogue(crate::lang::Lang::Ko) {
-            let got = parse(name);
-            assert!(got.is_some(), "the parser does not know {name}");
-            assert!(!matches!(got, Some(Command::Unknown(_))), "{name} falls through as unknown");
+        for lang in [crate::lang::Lang::Ko, crate::lang::Lang::En] {
+            for (name, _) in catalogue(lang) {
+                let got = parse(name);
+                assert!(got.is_some(), "{lang:?}: the parser does not know {name}");
+                assert!(
+                    !matches!(got, Some(Command::Unknown(_))),
+                    "{lang:?}: {name} falls through as unknown"
+                );
+            }
         }
     }
 

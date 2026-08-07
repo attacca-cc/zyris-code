@@ -131,6 +131,57 @@ fn a_user_message_appears_above_the_input() {
     assert!(screen.contains("안녕하세요"), "\n{screen}");
 }
 
+/// **What was typed is on screen the moment it is submitted**, with no server round trip.
+///
+/// Every user line in this suite used to be injected as a server event, so nobody ever checked
+/// the one thing a person does first — type something and look for it. Without the local echo it
+/// is missing for the whole round trip, and in 일/작업 mode the first message rides inside
+/// `ZNewJob::message` and may never come back at all.
+#[test]
+fn what_was_just_submitted_is_on_screen_without_waiting_for_the_server() {
+    let mut s = State::new();
+    apply(&mut s, &Action::Submit("이걸 해 주세요".into()));
+    let screen = dump(&mut s, 40, 10);
+    assert!(screen.contains("이걸 해 주세요"), "\n{screen}");
+}
+
+/// And when the server's own copy lands, the words do not end up on screen twice.
+#[test]
+fn the_servers_copy_of_a_submitted_message_does_not_double_it() {
+    let mut s = State::new();
+    apply(&mut s, &Action::Submit("안녕하세요".into()));
+    apply(
+        &mut s,
+        &Action::Frame(AppFrame::Event {
+            cursor: 1,
+            entry: Some(Entry { seq: 1, kind: EntryKind::User("안녕하세요".into()) }),
+        }),
+    );
+    let screen = dump(&mut s, 40, 12);
+    assert_eq!(screen.matches("안녕하세요").count(), 1, "\n{screen}");
+}
+
+/// A slash command is not a message — it must not leave a user line behind.
+#[test]
+fn a_slash_command_leaves_no_message_on_screen() {
+    let mut s = State::new();
+    apply(&mut s, &Action::Submit("/cwd".into()));
+    let screen = dump(&mut s, 40, 10);
+    assert!(!screen.contains("/cwd"), "\n{screen}");
+}
+
+/// **What you type appears as you type it.** Only a pty test covered this, so a rendering
+/// regression in the input box could only be caught by a script that needs a live server.
+#[test]
+fn typed_text_shows_in_the_input_box() {
+    let mut s = State::new();
+    for c in "안녕".chars() {
+        apply(&mut s, &Action::Insert(c));
+    }
+    let screen = dump(&mut s, 40, 10);
+    assert!(screen.contains("안녕"), "\n{screen}");
+}
+
 /// A cell's background colour. Pairs with `cell_fg`.
 fn cell_bg(state: &mut State, w: u16, h: u16, x: u16, y: u16) -> Option<ratatui::style::Color> {
     let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
@@ -142,6 +193,48 @@ fn said(state: &mut State, seq: i64, kind: EntryKind) {
     apply(state, &Action::Frame(AppFrame::Event { cursor: seq, entry: Some(Entry { seq, kind }) }));
 }
 
+/// **A scrolled-up view keeps looking at the same words when the width changes.**
+///
+/// `Scroll.top` is an absolute index into a line list that is rebuilt from scratch every layout,
+/// so re-wrapping at a new width used to move the text out from under it — always toward older
+/// content, because the clamp can only push the index down. Alt-tabbing back on Windows re-lays
+/// out for exactly this reason, and the report was "scrolling pulls up old chat".
+#[test]
+fn a_scrolled_view_keeps_its_place_when_the_width_changes() {
+    let mut s = State::new();
+    // **The replies have to be long enough to wrap differently at the two widths.** With text
+    // that fits on one line either way nothing is relaid out and the test proves nothing — it
+    // passed against the broken code until the replies got this long.
+    for seq in 1..=12 {
+        said(&mut s, seq, EntryKind::User(format!("메시지 번호 {seq} 입니다")));
+        said(&mut s, seq + 100, EntryKind::Agent(format!("답 {seq} — {}", "가나다라".repeat(30))));
+    }
+    // Draw once wide so the viewport metrics exist, then scroll up off the bottom.
+    dump(&mut s, 80, 12);
+    apply(&mut s, &Action::Wheel(6));
+    dump(&mut s, 80, 12);
+    let before = s.rows_cache.anchor_at(s.view_top).map(|(seq, _)| seq);
+    assert!(before.is_some(), "nothing is anchored at the top of the viewport");
+
+    // Re-wrap narrower — every wrap point moves and the line count grows, so the same absolute
+    // index would land somewhere much earlier in the conversation.
+    let narrow = dump(&mut s, 46, 12);
+    let after = s.rows_cache.anchor_at(s.view_top).map(|(seq, _)| seq);
+    assert_eq!(before, after, "the top of the viewport moved to a different message:\n{narrow}");
+}
+
+/// Sticking to the bottom is unaffected — the bottom is its own anchor.
+#[test]
+fn a_view_stuck_to_the_bottom_stays_there_when_the_width_changes() {
+    let mut s = State::new();
+    for seq in 1..=10 {
+        said(&mut s, seq, EntryKind::User(format!("줄 {seq}")));
+    }
+    dump(&mut s, 80, 8);
+    let narrow = dump(&mut s, 40, 8);
+    assert!(narrow.contains("줄 10"), "the last message must stay in view:\n{narrow}");
+}
+
 /// **Where the user spoke is painted with a background.** And it must run to the right edge even after the
 /// text ends — if it broke at the text width, it would look like a smudge rather than a band.
 #[test]
@@ -150,12 +243,12 @@ fn a_user_message_gets_a_band_across_the_full_width() {
     said(&mut s, 1, EntryKind::User("안녕".into()));
     assert_eq!(
         cell_bg(&mut s, 60, 12, 1, 0),
-        Some(zyris_code::theme::USER_BG),
+        Some(zyris_code::theme::user_bg()),
         "글자 자리가 안 칠해졌다"
     );
     assert_eq!(
         cell_bg(&mut s, 60, 12, 59, 0),
-        Some(zyris_code::theme::USER_BG),
+        Some(zyris_code::theme::user_bg()),
         "끝까지 안 이어진다"
     );
 }
@@ -165,7 +258,7 @@ fn a_user_message_gets_a_band_across_the_full_width() {
 fn an_agent_answer_has_no_band() {
     let mut s = State::new();
     said(&mut s, 1, EntryKind::Agent("그렇습니다".into()));
-    assert_ne!(cell_bg(&mut s, 60, 12, 3, 0), Some(zyris_code::theme::USER_BG));
+    assert_ne!(cell_bg(&mut s, 60, 12, 3, 0), Some(zyris_code::theme::user_bg()));
 }
 
 /// **By default, the page background is not painted.** The terminal is left to use its own background.
@@ -181,7 +274,7 @@ fn nothing_but_the_user_band_paints_a_background_by_default() {
     let frame = term.draw(|f| widgets::draw(f, &mut s)).unwrap();
     for cell in frame.buffer.content.iter() {
         assert!(
-            cell.bg == Color::Reset || cell.bg == zyris_code::theme::USER_BG,
+            cell.bg == Color::Reset || cell.bg == zyris_code::theme::user_bg(),
             "터미널 배경을 덮었다: symbol={:?} bg={:?}",
             cell.symbol(),
             cell.bg
@@ -196,7 +289,7 @@ fn the_page_background_can_be_asked_for_by_name_or_by_hex() {
     use zyris_code::theme::page_bg_from;
     assert_eq!(page_bg_from(None), None, "with none given, nothing is painted");
     assert_eq!(page_bg_from(Some("")), None, "an empty value counts as not given");
-    assert_eq!(page_bg_from(Some("zyris")), Some(zyris_code::theme::BG));
+    assert_eq!(page_bg_from(Some("zyris")), Some(zyris_code::theme::bg()));
     assert_eq!(page_bg_from(Some("#101820")), Some(Color::Rgb(0x10, 0x18, 0x20)));
     assert_eq!(page_bg_from(Some("none")), None, "turning it off can be stated explicitly too");
     // **A single typo must not kill the app.** If it can't be read, it falls back to not painting.
@@ -311,9 +404,9 @@ fn a_wide_char_with_a_background_emits_its_trailing_cell_when_replaced() {
     let mut backend = CrosstermBackend::new(wire.clone());
 
     let mut prev = Buffer::empty(area);
-    prev.set_string(2, 0, "한", Style::default().bg(zyris_code::theme::BG));
+    prev.set_string(2, 0, "한", Style::default().bg(zyris_code::theme::bg()));
     let mut next = Buffer::empty(area);
-    next.set_string(2, 0, "a", Style::default().bg(zyris_code::theme::BG));
+    next.set_string(2, 0, "a", Style::default().bg(zyris_code::theme::bg()));
 
     wire.take();
     backend.draw(prev.diff_iter(&next)).unwrap();
@@ -322,7 +415,7 @@ fn a_wide_char_with_a_background_emits_its_trailing_cell_when_replaced() {
 }
 
 /// **Without a background, the trailing cell doesn't go out on the wire — the very cause of ghosting.**
-/// This test doesn't pin the current behavior; rather, it documents that before `theme::BG` was laid on every cell,
+/// This test doesn't pin the current behavior; rather, it documents that before `theme::bg()` was laid on every cell,
 /// this cell was never erased when a wide char narrowed.
 #[test]
 fn a_wide_char_without_a_background_skips_its_trailing_cell() {
@@ -451,6 +544,27 @@ fn cell_fg(state: &mut State, w: u16, h: u16, x: u16, y: u16) -> Option<ratatui:
     let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
     term.draw(|f| widgets::draw(f, state)).unwrap();
     term.backend().buffer()[(x, y)].style().fg
+}
+
+/// **The palette reaches the screen.** The dark text is nearly the colour of a light terminal's
+/// paper (1.19:1), and this app paints no background of its own — so if the theme did not actually
+/// change what is drawn, a light terminal would still show words on words.
+#[test]
+fn the_light_theme_actually_changes_what_is_drawn() {
+    use zyris_code::theme::{self, Theme};
+
+    let mut s = State::new();
+    said(&mut s, 1, EntryKind::User("안녕하세요".into()));
+
+    theme::set(Theme::Dark);
+    let (dark_text, dark_colours) = dump_with_colours(&mut s, 40, 10);
+
+    theme::set(Theme::Light);
+    let (light_text, light_colours) = dump_with_colours(&mut s, 40, 10);
+
+    theme::set(Theme::Dark);
+    assert_eq!(dark_text, light_text, "only the colours change, never the layout");
+    assert_ne!(dark_colours, light_colours, "the palette never reached the cells");
 }
 
 /// The dot blinks only while working. A still dot can't say anything is running, and
@@ -1426,8 +1540,8 @@ fn an_expanded_edit_paints_additions_green_and_deletions_red() {
 
     let add = colour_of_line_containing(&screen, &colours, "+새 줄");
     let del = colour_of_line_containing(&screen, &colours, "-옛 줄");
-    assert_eq!(add, Some(zyris_code::theme::DIFF_ADD), "added lines are not green:\n{screen}");
-    assert_eq!(del, Some(zyris_code::theme::DIFF_DEL), "removed lines are not red:\n{screen}");
+    assert_eq!(add, Some(zyris_code::theme::diff_add()), "added lines are not green:\n{screen}");
+    assert_eq!(del, Some(zyris_code::theme::diff_del()), "removed lines are not red:\n{screen}");
     assert_ne!(add, del, "additions and deletions in the same colour cannot be told apart");
 }
 
@@ -1621,7 +1735,7 @@ fn the_create_row_is_coloured_apart_from_the_list() {
     let session = cell_fg(&mut s, 80, 24, LABEL_X, top + 2);
     assert_eq!(
         create,
-        Some(zyris_code::theme::ACCENT),
+        Some(zyris_code::theme::accent()),
         "the create row is not in the accent colour"
     );
     assert_ne!(create, session, "the create row and the sessions share a colour:\n{screen}");
@@ -1632,7 +1746,7 @@ fn the_create_row_is_coloured_apart_from_the_list() {
 fn the_default_mode_is_not_just_grey() {
     let mut s = State::new();
     let y = 24 - 1;
-    assert_eq!(cell_fg(&mut s, 80, 24, 0, y), Some(zyris_code::theme::SUCCESS));
+    assert_eq!(cell_fg(&mut s, 80, 24, 0, y), Some(zyris_code::theme::success()));
 }
 
 /// The divider above the input carries the working directory and what git says about it.

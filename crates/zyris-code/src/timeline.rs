@@ -123,11 +123,27 @@ struct LiveText {
     text: String,
 }
 
-/// One thing the app said.
+/// Whose words a locally-made item carries.
+///
+/// **The app's line and the user's echo share one list.** Both are said here rather than by the
+/// server, both have to stand exactly where they were said, and both take their identity from the
+/// same negative seq counter — two vectors would mean two placement passes that could disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Voice {
+    /// The app speaking — slash-command results and revert notices.
+    App,
+    /// The user's own words, put up the instant they were submitted. Retired when the server's
+    /// copy of the same message arrives.
+    Echo,
+}
+
+/// One thing that was said here rather than by the server.
 #[derive(Debug, Clone)]
 struct Said {
     /// How far the server events had arrived when it was said. It sits after this, before the next event.
     after: i64,
+    /// Who is speaking. It decides which `Item` this becomes and whether the server can retire it.
+    voice: Voice,
     /// The screen item's identity. **Negative, so it never collides with server seqs.**
     ///
     /// Since fold state (`Folds`) and the row cache (`rows::Cache`) key on seq, a collision would make
@@ -144,8 +160,30 @@ impl Timeline {
 
     /// The app says something. Slash-command results and revert notices land here.
     pub fn say(&mut self, text: impl Into<String>) {
+        self.push_said(Voice::App, text.into());
+    }
+
+    /// The user's own words, on screen the instant they were submitted.
+    ///
+    /// **Nothing else puts them there.** `Item::User` is otherwise built only from the server's
+    /// `chat_user` event (`event.rs::entry_from`), so until the round trip completes the person
+    /// sees no trace of what they just sent. In 일/작업 mode it is worse than slow: the first
+    /// message never goes through `send_message` at all — it rides inside `ZNewJob::message` /
+    /// `ZNewWork::message` (`conn::open_job`) — so it may never come back at all, and the words
+    /// would be gone for good.
+    ///
+    /// It shares the negative seq space and the placement rule with `say`, so it stands exactly
+    /// where it was typed. `upsert` takes it away when the server's copy lands — the same words
+    /// must never be on screen twice.
+    pub fn echo(&mut self, text: impl Into<String>) {
+        self.push_said(Voice::Echo, text.into());
+    }
+
+    /// The one place a locally-made item is born. **Both voices go through it** — the anchor rule
+    /// and the seq allocation must not exist in two copies.
+    fn push_said(&mut self, voice: Voice, text: String) {
         let after = self.entries.keys().next_back().copied().unwrap_or(0);
-        self.said.push(Said { after, seq: self.next_said, text: text.into() });
+        self.said.push(Said { after, voice, seq: self.next_said, text });
         self.next_said -= 1;
         self.dirty = true;
     }
@@ -164,8 +202,36 @@ impl Timeline {
         if let EntryKind::WorkStart(_) = &entry.kind {
             self.live_reasoning.clear();
         }
+        // **The server's copy takes over from the echo.** Both carry the same words, so leaving
+        // the echo up would put the message on screen twice — the same reason a durable
+        // `chat_agent` retires the streamed snippet it solidifies.
+        if let EntryKind::User(text) = &entry.kind {
+            self.retire_echo(text);
+        }
         self.entries.insert(entry.seq, entry);
         self.dirty = true;
+    }
+
+    /// Retires the **oldest** outstanding echo carrying these words.
+    ///
+    /// Oldest, because the same words sent twice leave two echoes standing, and the server records
+    /// them in the order they went out — retiring the newest would leave the pair on screen in the
+    /// wrong order once the second copy lands.
+    ///
+    /// **Finding nothing is normal.** A history replay is all server copies with no echo
+    /// outstanding, and a job's first message may produce no `chat_user` at all — there the echo
+    /// is the only copy there will ever be, and it has to stay.
+    fn retire_echo(&mut self, text: &str) {
+        // Compared trimmed: Enter submits the input verbatim while the picker path trims it, and
+        // the server may hand back either.
+        let at = self
+            .said
+            .iter()
+            .position(|s| s.voice == Voice::Echo && s.text.trim() == text.trim());
+        if let Some(at) = at {
+            self.said.remove(at);
+            self.dirty = true;
+        }
     }
 
     pub fn push_delta(&mut self, kind: ZDeltaKind, text: &str) {
@@ -309,23 +375,29 @@ impl Timeline {
 
         // Snippets meant to sit after future events (anchors not yet arrived) are carried over.
         self.live_text = live;
-        self.weave_in_what_the_app_said(out)
+        self.weave_in_what_was_said_here(out)
     }
 
-    /// Weaves what the app said into its place among the server events.
+    /// Weaves what was said here into its place among the server events.
     ///
     /// **Sweep once and merge.** Inserting one by one would let earlier inserts shift later positions,
     /// flipping the order when two or more sayings share a spot.
     ///
     /// Position is **"right after the after item"**, not a seq comparison — like the implicit work card,
     /// even when an item's seq is outside the positive range, the said spot doesn't shift.
-    fn weave_in_what_the_app_said(&self, items: Vec<Item>) -> Vec<Item> {
+    fn weave_in_what_was_said_here(&self, items: Vec<Item>) -> Vec<Item> {
         if self.said.is_empty() {
             return items;
         }
         let mut out = Vec::with_capacity(items.len() + self.said.len());
         let mut said = self.said.iter().peekable();
-        let mine = |s: &Said| Item::System { seq: s.seq, text: s.text.clone() };
+        let mine = |s: &Said| match s.voice {
+            Voice::App => Item::System { seq: s.seq, text: s.text.clone() },
+            // **Drawn exactly like the server's copy.** If the echo looked different, the line
+            // would change shape under the reader's eyes the moment the server's copy arrived,
+            // for no reason they could see.
+            Voice::Echo => Item::User { seq: s.seq, text: s.text.clone() },
+        };
         // What was said when no events existed stands at the very front.
         while said.peek().is_some_and(|s| s.after == 0) {
             out.push(mine(said.next().expect("just looked at it")));
@@ -503,6 +575,102 @@ mod tests {
         let unique: std::collections::HashSet<i64> = seqs.iter().copied().collect();
         assert_eq!(seqs.len(), unique.len(), "seq values collide: {seqs:?}");
         assert!(seqs.iter().filter(|s| **s < 0).count() == 2, "{seqs:?}");
+    }
+
+    fn users(t: &mut Timeline) -> Vec<String> {
+        t.items()
+            .iter()
+            .filter_map(|i| match i {
+                Item::User { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// **What was typed is on screen before the server has said anything.** `Item::User` is
+    /// otherwise built only from a `chat_user` event, so without the echo a person's own words
+    /// are missing for the whole round trip.
+    #[test]
+    fn a_submitted_message_is_on_screen_before_the_server_echoes_it() {
+        let mut t = Timeline::new();
+        t.echo("안녕하세요");
+        assert_eq!(users(&mut t), vec!["안녕하세요".to_string()]);
+    }
+
+    /// The durable copy takes the spot over instead of standing beside it — the same words twice
+    /// reads as having sent it twice.
+    #[test]
+    fn the_servers_copy_replaces_the_echo_instead_of_showing_it_twice() {
+        let mut t = Timeline::new();
+        t.echo("안녕하세요");
+        t.upsert(e(1, EntryKind::User("안녕하세요".into())));
+        assert_eq!(users(&mut t), vec!["안녕하세요".to_string()]);
+        assert_eq!(t.items()[0].seq(), 1, "the durable one wins the spot");
+    }
+
+    /// **The 일/작업 case.** Their first message rides inside `ZNewJob::message` and may never
+    /// come back as a `chat_user` at all — then the echo is the only copy there will ever be.
+    #[test]
+    fn an_echo_the_server_never_confirms_stays_on_screen() {
+        let mut t = Timeline::new();
+        t.echo("이걸 해 주세요");
+        t.upsert(e(1, EntryKind::WorkStart("작업".into())));
+        t.upsert(e(2, EntryKind::Agent("네".into())));
+        assert_eq!(users(&mut t), vec!["이걸 해 주세요".to_string()]);
+    }
+
+    /// Sending the same words twice leaves two echoes, and each server copy retires exactly one —
+    /// the oldest, so the pair never ends up in the wrong order.
+    #[test]
+    fn the_same_words_sent_twice_retire_one_echo_each() {
+        let mut t = Timeline::new();
+        t.echo("네");
+        t.echo("네");
+        t.upsert(e(1, EntryKind::User("네".into())));
+        assert_eq!(users(&mut t).len(), 2, "one echo left plus the durable one");
+        t.upsert(e(2, EntryKind::User("네".into())));
+        assert_eq!(users(&mut t).len(), 2, "both are durable now");
+        assert!(t.items().iter().all(|i| i.seq() > 0), "no echo is left: {:?}", t.items());
+    }
+
+    /// An echo stands where it was typed, not at the top — its seq is negative, and order must
+    /// come from the anchor rather than from comparing seqs.
+    #[test]
+    fn an_echo_stands_where_it_was_typed() {
+        let mut t = Timeline::new();
+        t.upsert(e(1, EntryKind::User("첫 질문".into())));
+        t.upsert(e(2, EntryKind::Agent("첫 답".into())));
+        t.echo("다음 질문");
+        assert_eq!(t.items().last().map(|i| i.seq()), Some(-1), "{:?}", t.items());
+        t.upsert(e(3, EntryKind::Agent("두 번째 답".into())));
+        let seqs: Vec<i64> = t.items().iter().map(|i| i.seq()).collect();
+        assert_eq!(seqs, vec![1, 2, -1, 3], "the echo must keep its place: {seqs:?}");
+    }
+
+    /// Echoes draw from the same negative counter as `say`, so nothing can collide with a server
+    /// seq — fold state and the row cache both key on it.
+    #[test]
+    fn an_echo_never_collides_with_a_server_seq() {
+        let mut t = Timeline::new();
+        t.upsert(e(1, EntryKind::User("안녕".into())));
+        t.say("앱이 한 말");
+        t.echo("내가 친 말");
+        let seqs: Vec<i64> = t.items().iter().map(|i| i.seq()).collect();
+        let unique: std::collections::HashSet<i64> = seqs.iter().copied().collect();
+        assert_eq!(seqs.len(), unique.len(), "seq values collide: {seqs:?}");
+        assert_eq!(seqs.iter().filter(|s| **s < 0).count(), 2, "{seqs:?}");
+    }
+
+    /// The app's line and the user's echo are different things on screen — one is a notice, the
+    /// other is the message. Drawing an echo as a System line would look like the app said it.
+    #[test]
+    fn an_echo_is_drawn_as_the_user_and_what_the_app_says_is_not() {
+        let mut t = Timeline::new();
+        t.say("앱이 한 말");
+        t.echo("내가 친 말");
+        let kinds: Vec<&Item> = t.items().iter().collect();
+        assert!(matches!(kinds[0], Item::System { .. }), "{kinds:?}");
+        assert!(matches!(kinds[1], Item::User { .. }), "{kinds:?}");
     }
 
     /// `/clear` empties **only the screen**. It does not delete the server's history.

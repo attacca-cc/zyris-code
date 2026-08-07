@@ -34,6 +34,24 @@ pub struct McpClient {
     next_id: u64,
 }
 
+/// Builds the command that starts an MCP server.
+///
+/// **On Windows it goes through `cmd /C`.** Rust's `Command` resolves a bare name on `PATH` by
+/// appending `.exe` only — it does not honour `PATHEXT`. The canonical MCP entry is
+/// `"command": "npx"`, and on Windows npx is `npx.cmd`, so every npx-based server failed to spawn
+/// with "program not found" and was reported in `/mcp` as a broken server. Batch launchers
+/// (`npx`, `pnpm`, `yarn`) are the common case, so the shell has to resolve it.
+fn spawner(command: &str, args: &[String]) -> tokio::process::Command {
+    if cfg!(windows) {
+        let mut c = tokio::process::Command::new("cmd");
+        c.arg("/C").arg(command).args(args);
+        return c;
+    }
+    let mut c = tokio::process::Command::new(command);
+    c.args(args);
+    c
+}
+
 impl McpClient {
     /// Spawns the server and completes the handshake. If this fails, we treat that server as nonexistent.
     pub async fn spawn(
@@ -41,8 +59,7 @@ impl McpClient {
         args: &[String],
         env: &HashMap<String, String>,
     ) -> Result<McpClient> {
-        let mut child = tokio::process::Command::new(command)
-            .args(args)
+        let mut child = spawner(command, args)
             .envs(env)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

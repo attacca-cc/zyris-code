@@ -34,10 +34,10 @@ pub fn draw(frame: &mut Frame, area: Rect, view: &EnrollView, lang: crate::lang:
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::ACCENT))
+        .border_style(Style::default().fg(theme::accent()))
         .title(Span::styled(
             format!(" {} ", lang.enroll_title()),
-            Style::default().fg(theme::TEXT_HEADING).add_modifier(Modifier::BOLD),
+            Style::default().fg(theme::text_heading()).add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(box_area);
     frame.render_widget(block, box_area);
@@ -48,34 +48,34 @@ pub fn draw(frame: &mut Frame, area: Rect, view: &EnrollView, lang: crate::lang:
         EnrollPhase::Waiting => {
             lines.push(Line::from(Span::styled(
                 lang.enroll_steps(),
-                Style::default().fg(theme::TEXT),
+                Style::default().fg(theme::text()),
             )));
             lines.push(Line::from(""));
             // The code large and clear. Keep the hyphens so double-click selects it whole — same
             // rule as the upstream box.
             lines.push(Line::from(Span::styled(
                 format!("   {}   ", view.code),
-                Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD),
+                Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD),
             )));
             lines
-                .push(Line::from(Span::styled(view.uri.clone(), Style::default().fg(theme::TOOL))));
+                .push(Line::from(Span::styled(view.uri.clone(), Style::default().fg(theme::tool()))));
             lines.push(Line::from(""));
             let remaining = view.expires_at.saturating_duration_since(std::time::Instant::now());
             lines.push(Line::from(Span::styled(
                 lang.enroll_expires(remaining.as_secs()),
-                Style::default().fg(theme::TEXT_MUTED),
+                Style::default().fg(theme::text_muted()),
             )));
         }
         EnrollPhase::Lapsed => {
             lines.push(Line::from(Span::styled(
                 lang.enroll_lapsed(),
-                Style::default().fg(theme::WARNING),
+                Style::default().fg(theme::warning()),
             )));
         }
         EnrollPhase::Denied => {
             lines.push(Line::from(Span::styled(
                 lang.enroll_denied(),
-                Style::default().fg(theme::DANGER),
+                Style::default().fg(theme::danger()),
             )));
         }
     }
@@ -83,7 +83,7 @@ pub fn draw(frame: &mut Frame, area: Rect, view: &EnrollView, lang: crate::lang:
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         lang.enroll_keys(),
-        Style::default().fg(theme::BORDER_LIGHT),
+        Style::default().fg(theme::border_light()),
     )));
 
     frame.render_widget(Paragraph::new(lines), inner);

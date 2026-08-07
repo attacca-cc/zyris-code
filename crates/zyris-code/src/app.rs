@@ -125,6 +125,10 @@ pub enum Action {
     End,
     Submit(String),
     Wheel(i32),
+    /// Keyboard page scroll. Same sign as `Wheel` — positive goes up. The wheel is
+    /// the only other way to scroll, and not every terminal delivers wheel events
+    /// (mobile SSH, tmux without mouse) — history must be reachable by keyboard alone.
+    Page(i32),
     ToggleFold,
     /// Where the mouse was pressed. Screen coordinates.
     Press(u16, u16),
@@ -163,6 +167,15 @@ pub enum Action {
     /// Activate the focused panel button (Enter/Space while it is focused).
     /// `apply` turns it into the same path as the matching slash command.
     PanelActivate,
+    /// Move the settings form's cursor between rows (↑↓). Positive is up.
+    ConfigMove(i32),
+    /// Walk the value under the settings form's cursor (←→). Positive is right.
+    ConfigShift(i32),
+    /// Take the settings form's draft and close it (Enter).
+    ///
+    /// **Esc is `PanelClose`, which throws the draft away** — that is the whole reason the
+    /// form edits a draft instead of the live settings.
+    ConfigSave,
     CycleMode,
     /// Wipe everything typed.
     ClearInput,
@@ -193,7 +206,7 @@ pub struct State {
     ///
     /// Holding on to a past circumstance ("Zyris로는 아직 만들 수 없습니다") means that
     /// spot can no longer say what is happening now. Keep it long enough to read, then clear.
-    status: Option<(String, Instant)>,
+    status: Option<(String, Instant, Severity)>,
     /// Permission mode. Not sent to the server yet — only shown and cycled.
     pub mode: Mode,
     /// Name of the currently attached agent, for the bottom bar.
@@ -335,6 +348,17 @@ pub struct State {
     /// The settings `/config` shows and changes. The gate reads `dir_access` through the
     /// bridge; `default_mode` decides the mode the next launch opens in.
     pub config: crate::config::Config,
+    /// Set while a `/reconnect` is on its way. **The drop that follows is not a failure.**
+    ///
+    /// Without it the deliberate reconnect reports itself in red as "the connection was lost" —
+    /// true, but it reads as something having gone wrong when it is the thing that was asked for.
+    pub reconnecting: bool,
+    /// Raised when the settings changed and the disk and the gate have yet to hear about it.
+    ///
+    /// **`apply` is pure, so it cannot save.** The I/O loop takes this down the same way it
+    /// takes `command_out` — and forgetting to carry a setting to `bridge.sync` is exactly
+    /// how `/mode` once left the gate on the old mode.
+    pub config_out: bool,
 }
 
 /// One row for a job running in the background.
@@ -401,7 +425,7 @@ impl Default for State {
             // definition.
             cwd: crate::tools::working_dir(),
             repo: None,
-            home: std::env::var_os("HOME").map(std::path::PathBuf::from),
+            home: crate::conn::user_home(),
             shells: Vec::new(),
             jobs: Vec::new(),
             command_out: None,
@@ -411,6 +435,8 @@ impl Default for State {
             force_update_blank: false,
             lang: crate::lang::current(),
             config: crate::config::Config::default(),
+            reconnecting: false,
+            config_out: false,
         }
     }
 }
@@ -441,7 +467,15 @@ impl State {
 
     /// Set what to say. Visible only for `STATUS_WINDOW` from this moment.
     pub fn set_status(&mut self, message: impl Into<String>) {
-        self.status = Some((message.into(), Instant::now()));
+        self.status = Some((message.into(), Instant::now(), Severity::Notice));
+    }
+
+    /// Say that something went wrong. **The activity line paints this differently.**
+    ///
+    /// Every notice used to be the same colour, errors included — so a failure looked exactly
+    /// like "connected", on the one line whose whole job is to say what is happening.
+    pub fn set_error(&mut self, message: impl Into<String>) {
+        self.status = Some((message.into(), Instant::now(), Severity::Error));
     }
 
     /// The notice to show right now. `None` once the time has passed.
@@ -449,12 +483,25 @@ impl State {
         self.status_at(Instant::now())
     }
 
+    /// How bad the current notice is. `Notice` when there is none.
+    pub fn status_severity(&self) -> Severity {
+        self.status_severity_at(Instant::now())
+    }
+
+    pub fn status_severity_at(&self, now: Instant) -> Severity {
+        self.status
+            .as_ref()
+            .filter(|(_, at, _)| now.duration_since(*at) < STATUS_WINDOW)
+            .map(|(_, _, s)| *s)
+            .unwrap_or(Severity::Notice)
+    }
+
     /// The variant that takes the clock. Split out so tests can fake time.
     pub fn status_at(&self, now: Instant) -> Option<&str> {
         self.status
             .as_ref()
-            .filter(|(_, at)| now.duration_since(*at) < STATUS_WINDOW)
-            .map(|(s, _)| s.as_str())
+            .filter(|(_, at, _)| now.duration_since(*at) < STATUS_WINDOW)
+            .map(|(s, _, _)| s.as_str())
     }
 
     /// Remember it as something sent. The same message twice in a row is kept once —
@@ -567,6 +614,20 @@ pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
     if state.panel.is_some() && !(ctrl && matches!(key.code, KeyCode::Char('c'))) {
         let has_button = state.panel.as_ref().is_some_and(|p| p.button.is_some());
         let button_focused = state.panel.as_ref().is_some_and(|p| p.button_focused);
+        // **A form is edited, not scrolled.** ↑↓ pick the row, ←→ pick the value, Enter
+        // saves and closes, Esc closes and throws the draft away. It never scrolls, because
+        // it is built to always fit (`panel::form_lines`).
+        if state.panel.as_ref().is_some_and(|p| p.form.is_some()) {
+            return match key.code {
+                KeyCode::Esc => vec![Action::PanelClose],
+                KeyCode::Enter => vec![Action::ConfigSave],
+                KeyCode::Up | KeyCode::Char('k') => vec![Action::ConfigMove(1)],
+                KeyCode::Down | KeyCode::Char('j') => vec![Action::ConfigMove(-1)],
+                KeyCode::Left | KeyCode::Char('h') => vec![Action::ConfigShift(-1)],
+                KeyCode::Right | KeyCode::Char('l') => vec![Action::ConfigShift(1)],
+                _ => vec![],
+            };
+        }
         return match key.code {
             KeyCode::Esc => vec![Action::PanelClose],
             KeyCode::Tab | KeyCode::BackTab if has_button => vec![Action::PanelFocus],
@@ -677,6 +738,11 @@ pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
         KeyCode::Right => vec![Action::Right],
         KeyCode::Home => vec![Action::Home],
         KeyCode::End => vec![Action::End],
+        // **PageUp/PageDown scroll the conversation by a page.** The wheel is the only
+        // other way and not every terminal delivers wheel events (mobile SSH, tmux
+        // without mouse) — history must be reachable by keyboard alone.
+        KeyCode::PageUp => vec![Action::Page(1)],
+        KeyCode::PageDown => vec![Action::Page(-1)],
         KeyCode::Char(c) if !ctrl => vec![Action::Insert(c)],
         _ => vec![],
     }
@@ -824,6 +890,16 @@ pub fn apply(state: &mut State, action: &Action) {
                 state.queued.push(text.clone());
                 return;
             }
+            // **The words go up the moment they are submitted.** The only other source of
+            // `Item::User` is the server's `chat_user`, so without this a person's own line is
+            // missing for the whole round trip — and in 일/작업 mode the first message never
+            // goes through `send_message` at all (it rides inside `ZNewJob::message`), so it
+            // may never appear. `Timeline::upsert` retires the echo when the server's copy lands.
+            //
+            // **One arm covers all four modes** — the mode is consulted later, in
+            // `Session::open_for`. It sits below both early returns on purpose: slash commands
+            // never reach the conversation, and a held message is echoed when it really goes out.
+            state.timeline.echo(text.as_str());
             state.remember_sent(text);
         }
         Action::Wheel(notches) => {
@@ -842,6 +918,15 @@ pub fn apply(state: &mut State, action: &Action) {
             state.scroll.wheel(*notches, total, height);
             // The selection is anchored to the screen; scrolling moves the text out from under
             // it, so the highlight would point at text different from what was copied.
+            state.drag = None;
+        }
+        Action::Page(dir) => {
+            // PageUp/PageDown with a panel open never reach here — `on_key` routes them
+            // to the panel's own scroll first. So this is always the transcript.
+            let (total, height) = (state.view_total, state.view_height);
+            state.scroll.page(*dir, total, height);
+            // Same reason as the wheel: the selection is anchored to the screen, and
+            // scrolling moves the text out from under it.
             state.drag = None;
         }
         Action::ToggleFold => {
@@ -1033,6 +1118,35 @@ pub fn apply(state: &mut State, action: &Action) {
                 }
             }
         }
+        // **The form redraws itself after every key.** The lines are what the widget draws,
+        // so a moved cursor that did not refresh would leave the mark on the old row.
+        Action::ConfigMove(by) => {
+            if let Some(p) = &mut state.panel {
+                if let Some(form) = &mut p.form {
+                    form.move_cursor(*by);
+                }
+                p.refresh();
+            }
+        }
+        Action::ConfigShift(by) => {
+            if let Some(p) = &mut state.panel {
+                if let Some(form) = &mut p.form {
+                    form.shift(*by);
+                }
+                p.refresh();
+            }
+        }
+        // **Only the draft crosses over here.** Writing the file, telling the global language
+        // and carrying the policy to the gate are all I/O, so they happen where `config_out`
+        // is picked up — the same split `command_out` uses.
+        Action::ConfigSave => {
+            if let Some(form) = state.panel.as_ref().and_then(|p| p.form) {
+                state.config = form.draft;
+                state.lang = form.lang;
+                state.config_out = true;
+            }
+            state.panel = None;
+        }
         // Acting on the choice (moving in the list, switching sessions, creating) is the
         // I/O side's job.
         Action::PickConfirm => {}
@@ -1177,7 +1291,13 @@ fn apply_frame(state: &mut State, frame: &Frame) {
         // `api_rx` tells us once it is back.
         Frame::Disconnected(why) => {
             state.connected = false;
-            state.set_status(state.lang.disconnected(why));
+            // **Losing the connection is a failure, not news** — silent failure is the worst
+            // kind, and this is the one line that gets to say it. Unless we asked for it.
+            if std::mem::take(&mut state.reconnecting) {
+                state.set_status(state.lang.reconnecting());
+            } else {
+                state.set_error(state.lang.disconnected(why));
+            }
         }
         // The time is not carried in the frame but stamped where it is received — same way
         // as `status_at`.
@@ -1205,7 +1325,13 @@ fn apply_frame(state: &mut State, frame: &Frame) {
         // announced too — not knowing it finished leaves the user waiting.
         Frame::JobEnded { id, ok, secs } => {
             state.jobs.retain(|j| j.id != *id);
-            state.set_status(state.lang.job_ended(id, *ok, *secs));
+            // A job that finished is news; a job that failed is not.
+            let said = state.lang.job_ended(id, *ok, *secs);
+            if *ok {
+                state.set_status(said);
+            } else {
+                state.set_error(said);
+            }
         }
         // The enrollment code window. It comes up on its own when re-enrollment starts. When
         // a new code arrives after a lapse only the contents are swapped — the window stays
@@ -1326,6 +1452,8 @@ pub fn run_command(state: &mut State, text: &str) -> Option<crate::command::Comm
         Command::Config(None) => {
             state.panel = Some(crate::panel::config(state.lang, state.config));
         }
+        // **Purely I/O** — dropping the socket happens in `finish_command`.
+        Command::Reconnect => {}
         Command::Config(Some(action)) => match action {
             crate::command::ConfigAction::Dir(access) => {
                 state.config.dir_access = *access;
@@ -1334,6 +1462,10 @@ pub fn run_command(state: &mut State, text: &str) -> Option<crate::command::Comm
             crate::command::ConfigAction::Lang(lang) => {
                 state.lang = *lang;
                 state.timeline.say(lang.lang_changed().to_string());
+            }
+            crate::command::ConfigAction::Theme(theme) => {
+                state.config.theme = *theme;
+                state.timeline.say(state.lang.config_theme_changed(*theme));
             }
             crate::command::ConfigAction::Mode(mode) => {
                 state.config.default_mode = *mode;
@@ -1376,6 +1508,19 @@ fn jobs_text(jobs: &[JobRow], lang: crate::lang::Lang) -> String {
     }
     out.push_str(lang.jobs_hint());
     out
+}
+
+/// How bad a notice is. **The activity line paints the two differently.**
+///
+/// Without it, every notice was one colour — including errors — so a failure looked exactly like
+/// "connected" on the one line whose whole job is to say what is happening.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Severity {
+    /// Something worth mentioning that is not wrong.
+    #[default]
+    Notice,
+    /// Something went wrong.
+    Error,
 }
 
 /// The pieces `/status` shows, gathered once so the text and the panel tell the
@@ -1447,6 +1592,14 @@ const STREAM_MIN_GAP: Duration = Duration::from_millis(100);
 
 /// How often usage and title are asked for again. Asking every frame would hammer the server.
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
+
+/// How long after focus returns a left-press is taken to be the window-activating click
+/// rather than a click meant for the transcript.
+///
+/// The activating click arrives in the same input batch as the focus event, so this only has
+/// to cover that gap — nobody focuses a window and deliberately hits a fold inside a quarter
+/// of a second.
+const FOCUS_CLICK_GRACE: Duration = Duration::from_millis(250);
 
 /// App loop watchdog. The loop bumps a progress counter at this interval, and if nothing
 /// comes up this long after the last progress the screen is restored and the process ends —
@@ -1782,6 +1935,9 @@ async fn run_inner(
     // **The saved settings come in here.** `State::default` keeps the built-in defaults so
     // tests stay deterministic; this is the one place the disk is read.
     state.config = crate::config::Config::load();
+    // **Before the first frame.** The palette decides every colour drawn from here on, and a
+    // frame drawn in the other one flashes as it is corrected.
+    crate::theme::set(state.config.theme.resolve());
     if let Some(mode) = state.config.default_mode {
         state.mode = mode;
     }
@@ -1865,6 +2021,22 @@ async fn run_inner(
                     // There is no session and no turn yet — just close.
                     return Ok(());
                 }
+                // **The gate has to hear about this loop's keys too.** First enrollment sits
+                // here for as long as it takes someone to walk to a browser, and Shift+Tab
+                // works the whole time — but `last_mode` is only seeded after this loop ends,
+                // so the main loop's edge check can never fire for a mode changed in here.
+                // The bottom bar would say one mode while the gate went on using another, and
+                // no later keypress would ever reconcile them.
+                //
+                // The main loop's full block also stages work/job sessions; there is nothing to
+                // stage yet, so carrying the decision material is the whole job here.
+                if std::mem::take(&mut state.config_out) {
+                    state.config.save();
+                    crate::lang::set(state.lang);
+                    crate::lang::save(state.lang);
+                    crate::theme::set(state.config.theme.resolve());
+                }
+                bridge.sync(state.mode, &state.config);
                 dirty = true;
             }
             _ = ticker.tick() => {
@@ -1937,7 +2109,7 @@ async fn run_inner(
     let mut agent_id = match Session::agent_id(&api).await {
         Ok(id) => id,
         Err(e) => {
-            state.set_status(e.to_string());
+            state.set_error(e.to_string());
             String::new()
         }
     };
@@ -1953,9 +2125,19 @@ async fn run_inner(
     // hand is as good as having no way to answer.
     if let Some(id) = crate::conn::session_awaiting_answer(&api).await {
         if let Err(e) = switch(&api, &mut state, &mut session, id, None, &tx).await {
-            state.set_status(e.to_string());
+            state.set_error(e.to_string());
         }
     }
+    // **Exactly one event stream is alive at a time.** This used to build a second one that
+    // merely *shadowed* the pre-connection loop's — and shadowing does not drop the first, so
+    // both stayed alive with a crossterm reader thread each, competing for the same terminal
+    // input. Keystrokes then land in whichever one wins the race and the loser's are read by
+    // nobody: that is what a key arriving late, or not at all, looks like.
+    //
+    // The old one is dropped explicitly rather than reused, because the two loops are separate
+    // `select!`s — handing a stream from one to the other leaves its in-flight read to be
+    // cancelled and re-polled by a different waker.
+    drop(keys);
     let mut keys = EventStream::new();
     let mut ticker = tokio::time::interval(frame_interval());
     let mut poll = tokio::time::interval(POLL_INTERVAL);
@@ -1963,6 +2145,8 @@ async fn run_inner(
     // When the last key event happened — the basis for detecting a paste burst on a
     // terminal without bracketed paste.
     let mut last_key_at: Option<Instant> = None;
+    // When focus last came back. The click that restored it must not act on the transcript.
+    let mut focus_back_at: Option<Instant> = None;
     // When off, leave it as a timer that never fires. The point is not to add another
     // `select!` arm.
     let mut heal = tokio::time::interval(heal_interval().unwrap_or(Duration::from_secs(86400)));
@@ -2030,6 +2214,20 @@ async fn run_inner(
                     }
                     // A paste is not a key — it goes in as one chunk, not split on Enter.
                     TermEvent::Paste(text) => vec![Action::Paste(text)],
+                    // **The click that gave the window focus back is not a click in the app.**
+                    // On Windows the activating click is delivered to us as well, and a press
+                    // with no movement toggles the fold of whatever card head it lands on and
+                    // drops the selection — so alt-tabbing back could silently unfold a card
+                    // above the viewport and slide old text into view. Swallowing the press
+                    // makes the release a no-op too, since it needs a drag to act on.
+                    TermEvent::Mouse(m)
+                        if matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
+                            && focus_back_at
+                                .is_some_and(|t: Instant| t.elapsed() < FOCUS_CLICK_GRACE) =>
+                    {
+                        focus_back_at = None;
+                        vec![]
+                    }
                     TermEvent::Mouse(m) => match m.kind {
                         MouseEventKind::ScrollUp => vec![Action::Wheel(1)],
                         MouseEventKind::ScrollDown => vec![Action::Wheel(-1)],
@@ -2044,18 +2242,32 @@ async fn run_inner(
                     },
                     // On regaining focus, redraw but **do not clear.** The focus event
                     // arrives every time the keyboard opens and closes on mobile SSH
-                    // (Termius) — clearing everything each time makes the screen flash. If
-                    // the screen really is broken, Ctrl+L redraws it whole.
+                    // (Termius) — clearing everything each time makes the screen flash.
+                    //
+                    // **Overwrite instead.** `force_update` puts every cell out again without
+                    // clearing first, so a terminal that did not restore our screen while we
+                    // were away gets it back with no flash. That is the same trick the
+                    // periodic self-heal uses.
                     TermEvent::FocusGained => {
+                        focus_back_at = Some(Instant::now());
+                        state.force_update = true;
                         dirty = true;
                         vec![]
                     }
                     // Clear and redraw whole only when the size actually changed. With
                     // same-size resizes arriving back to back, clearing everything each
                     // time flickers.
-                    TermEvent::Resize(w, h) => {
-                        if last_size != Some((w, h)) {
-                            last_size = Some((w, h));
+                    //
+                    // **The payload is not the geometry on Windows.** crossterm reports the
+                    // console *screen-buffer* size there, while ratatui lays out with the
+                    // *window* rect — two different quantities that drift apart. Deduping on
+                    // the payload therefore skips repaints that were needed and performs ones
+                    // that were not. Ask the backend what it is about to draw into instead.
+                    TermEvent::Resize(..) => {
+                        use ratatui::backend::Backend;
+                        let now = terminal.backend().size().ok().map(|s| (s.width, s.height));
+                        if now.is_some() && last_size != now {
+                            last_size = now;
                             repaint(terminal);
                         }
                         dirty = true;
@@ -2063,6 +2275,9 @@ async fn run_inner(
                     }
                     _ => vec![],
                 };
+                // Whether this event asked for anything at all. The draw at the end of the arm
+                // is keyed on it — see the comment there.
+                let acted = !actions.is_empty();
                 for action in actions {
                     match &action {
                         // `run` restores the screen, and **the turn running on the server is
@@ -2078,7 +2293,7 @@ async fn run_inner(
                         Action::Submit(_) if state.running => {}
                         Action::Submit(text) => {
                             if agent_id.is_empty() {
-                                state.set_status(state.lang.agent_cannot_send());
+                                state.set_error(state.lang.agent_cannot_send());
                             } else {
                                 send_and_tell(&api, &mut state, &mut session, &agent_id, text, &tx)
                                     .await;
@@ -2090,7 +2305,7 @@ async fn run_inner(
                             Ok(items) => state.picker = Some(crate::picker::Picker::projects(items, state.lang)),
                             Err(e) => {
                                 state.picker = None;
-                                state.set_status(e.to_string());
+                                state.set_error(e.to_string());
                             }
                         },
                         // All of "back" is decided here — from the session level, go back to
@@ -2108,7 +2323,7 @@ async fn run_inner(
                                     }
                                     Err(e) => {
                                         state.picker = None;
-                                        state.set_status(e.to_string());
+                                        state.set_error(e.to_string());
                                     }
                                 }
                             } else {
@@ -2119,7 +2334,7 @@ async fn run_inner(
                             if let Err(e) =
                                 pick(&api, &mut state, &mut session, &mut agent_id, &tx).await
                             {
-                                state.set_status(e.to_string());
+                                state.set_error(e.to_string());
                             }
                         }
                         Action::Cancel => {
@@ -2134,7 +2349,7 @@ async fn run_inner(
                         }
                         // **Scrolling is drawn by the diff.** This used to clear and redraw
                         // whole to wipe wide-character crumbs, but now every cell has a
-                        // background (`theme::BG`) so crumbs cannot arise structurally and
+                        // background (`theme::bg()`) so crumbs cannot arise structurally and
                         // there is nothing to clear — clearing makes the screen flash.
                         Action::Wheel(_) => {}
                         _ => {}
@@ -2162,6 +2377,20 @@ async fn run_inner(
                         if state.quitting {
                             break 'app;
                         }
+                    }
+
+                    // **The settings form's Enter reaches the disk and the gate here.**
+                    // The exact three things `/config …` does in `finish_command` — one
+                    // stopping short of any of them is how a setting changes on screen and
+                    // nowhere else.
+                    if std::mem::take(&mut state.config_out) {
+                        state.config.save();
+                        crate::lang::set(state.lang);
+                        crate::lang::save(state.lang);
+                        // The palette applies to the very next frame — the same promise the
+                        // directory policy makes to the gate.
+                        crate::theme::set(state.config.theme.resolve());
+                        bridge.sync(state.mode, &state.config);
                     }
 
                     // **Creating a new project.** When the form takes Enter, it is created
@@ -2203,7 +2432,7 @@ async fn run_inner(
                     if state.mode != last_mode {
                         last_mode = state.mode;
                         bridge.sync(state.mode, &state.config);
-                        restage(&mut state, &mut session);
+                        restage(&state, &mut session);
                     }
 
                     // Pressing submit on a question sends right away — putting the answer in
@@ -2212,6 +2441,10 @@ async fn run_inner(
                     if std::mem::take(&mut state.submit_now) {
                         let text = state.input.take();
                         if !text.is_empty() {
+                            // **The third way a message leaves.** Answering a question card never
+                            // builds an `Action::Submit`, so it misses the echo in `apply` — and
+                            // an answer that vanishes on Enter is the same complaint.
+                            state.timeline.echo(text.as_str());
                             send_and_tell(&api, &mut state, &mut session, &agent_id, &text, &tx)
                                 .await;
                         }
@@ -2219,10 +2452,20 @@ async fn run_inner(
                     // **Draw right where the key was pressed.** One frame is 64 bytes so
                     // there is nothing to save, and waiting for a tick makes the hand feel
                     // sluggish by exactly that much.
-                    terminal.draw(|f| widgets::draw(f, &mut state))?;
-                    dirty = false;
-                    drew_since_heal = true;
-                    last_draw = Instant::now();
+                    //
+                    // **But only when the event asked for something.** On Windows mouse motion
+                    // cannot be switched off — `EnableMouseCapture` turns on the whole console
+                    // mouse mode — so merely sliding the pointer across the window delivers a
+                    // `Moved` event per sample, each mapping to no action at all. Drawing for
+                    // every one of them is a full frame per mouse sample, and that is what the
+                    // flicker and the sluggishness are made of. `FocusGained` and `Resize`
+                    // still redraw: they set `dirty` themselves.
+                    if dirty || acted {
+                        terminal.draw(|f| widgets::draw(f, &mut state))?;
+                        dirty = false;
+                        drew_since_heal = true;
+                        last_draw = Instant::now();
+                    }
                 }
             }
             Some((sid, action)) = rx.recv() => {
@@ -2475,7 +2718,7 @@ async fn pick(
         return Ok(());
     };
     match chosen {
-        Pick::Unavailable(why) => state.set_status(why),
+        Pick::Unavailable(why) => state.set_error(why),
         Pick::OpenProject { id, name } => {
             let items = crate::conn::sessions(api, &id).await?;
             // **Remember it the moment we enter.** Even if it closes with Esc without a
@@ -2680,8 +2923,23 @@ async fn finish_command(
         // **A setting change reaches the disk and the gate.** `run_command` only touched
         // the state; `save` writes the file and `bridge.sync` carries the new policy to the
         // tools (same lesson as `/mode` forgetting `bridge.sync`).
+        // **Drop the socket and let the runner redial.** That redial re-announces, which is the
+        // only way to get back into attacca's registry once another window displaced us —
+        // nothing else here can even detect that state, let alone leave it.
+        Command::Reconnect => match bridge.connection() {
+            Some(conn) => {
+                state.reconnecting = true;
+                state.set_status(state.lang.reconnecting());
+                conn.close("reconnect requested from /reconnect");
+            }
+            None => state.set_error(state.lang.reconnect_not_attached()),
+        },
         Command::Config(Some(action)) => {
             state.config.save();
+            // The palette applies to the very next frame — the same promise the directory
+            // policy makes to the gate. Missing it is how a setting changes on screen and
+            // nowhere else.
+            crate::theme::set(state.config.theme.resolve());
             bridge.sync(state.mode, &state.config);
             if let crate::command::ConfigAction::Lang(lang) = action {
                 crate::lang::set(lang);
@@ -2823,13 +3081,18 @@ async fn flush_queue(
         return;
     }
     if agent_id.is_empty() {
-        state.set_status(state.lang.agent_cannot_send());
+        state.set_error(state.lang.agent_cannot_send());
         return;
     }
     while let Some(text) = state.queued.first().cloned() {
         match send(api, session, agent_id, &text, state.last_cursor, state.mode, tx).await {
             Ok(announced) => {
                 state.queued.remove(0);
+                // **A held message goes up when it really goes out, not when it was typed.**
+                // Until then it is still editable — ↑ pulls it back out of the queue — and an
+                // echo left behind by a message that was pulled back would be a line nobody
+                // ever sent. The same rule `remember_sent` follows on the next line.
+                state.timeline.echo(text.as_str());
                 state.remember_sent(&text);
                 // **The first queued message can open a work or job too.** Change the mode
                 // while work is running and hold a message, and that message becomes the
@@ -2839,7 +3102,7 @@ async fn flush_queue(
                 }
             }
             Err(e) => {
-                state.set_status(e.to_string());
+                state.set_error(e.to_string());
                 return;
             }
         }
@@ -2855,26 +3118,19 @@ async fn flush_queue(
 /// That really was confusing. We tell the user "the current conversation is untouched".
 ///
 /// The decision itself is `Mode::route()`'s; here we only carry it to the session and say so.
-fn restage(state: &mut State, session: &mut Session) {
+/// **It says nothing.** Switching to 일/작업 used to push an explanation into the transcript,
+/// and a transcript entry is permanent — with no server events yet it landed at the very top of
+/// the screen and stayed there (2026-08-07 user decision to drop it). The bottom bar already
+/// names the mode in its own colour, and `/mode` with no argument spells out what each one does.
+fn restage(state: &State, session: &mut Session) {
     let route = state.mode.route();
     // With a session in hand, do not stage — `open_for`'s "no staging and an id means append"
     // works as-is, so the next message goes to the current conversation.
     if session.id().is_some() {
         session.set_route(crate::mode::Route::Session);
-        let said = match route {
-            crate::mode::Route::Work => state.lang.mode_continues_work().to_string(),
-            crate::mode::Route::Job => state.lang.mode_continues_job().to_string(),
-            crate::mode::Route::Session => return,
-        };
-        state.timeline.say(said);
         return;
     }
     session.set_route(route);
-    match route {
-        crate::mode::Route::Session => {}
-        crate::mode::Route::Work => state.timeline.say(state.lang.mode_opens_work().to_string()),
-        crate::mode::Route::Job => state.timeline.say(state.lang.mode_opens_job().to_string()),
-    }
 }
 
 /// Sends, and if something new was opened, says so.
@@ -2896,7 +3152,7 @@ async fn send_and_tell(
                 state.timeline.say(said);
             }
         }
-        Err(e) => state.set_status(e.to_string()),
+        Err(e) => state.set_error(e.to_string()),
     }
 }
 
@@ -2999,6 +3255,35 @@ mod tests {
 
     fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, mods)
+    }
+
+    /// **A mode picked before the connection has to reach the gate.** Shift+Tab works the whole
+    /// time "connecting…" is on screen — first enrollment sits there for as long as it takes to
+    /// walk to a browser — but `last_mode` is only seeded once that loop ends, so the main loop's
+    /// edge check could never fire for a mode changed inside it. The bar said one mode while the
+    /// gate went on using another, and no later keypress reconciled them.
+    ///
+    /// This pins the contract the pre-connection loop now honours: whatever the keys leave in
+    /// `state`, the gate decides by.
+    #[test]
+    fn a_mode_picked_before_connecting_still_reaches_the_gate() {
+        let mut s = state();
+        let bridge = crate::tools::bridge::Bridge::new();
+        bridge.sync(s.mode, &s.config);
+        let write = crate::tools::gate::Call::new("code_edit", "edit", "a.rs".into());
+        assert_eq!(bridge.decide(&write), crate::tools::gate::Decision::Run, "normal runs");
+
+        // Cycle to plan the way the pre-connection loop does — `on_key` then `apply`, nothing else.
+        while s.mode != Mode::Plan {
+            for action in on_key(&s, key(KeyCode::BackTab, KeyModifiers::SHIFT)) {
+                apply(&mut s, &action);
+            }
+        }
+        bridge.sync(s.mode, &s.config);
+        assert!(
+            matches!(bridge.decide(&write), crate::tools::gate::Decision::Refuse(_)),
+            "the gate is still on the old mode"
+        );
     }
 
     /// Shift+Enter and Alt+Enter are newlines, not submits. With the kitty keyboard protocol
@@ -3191,18 +3476,30 @@ mod tests {
         let mut session = Session::new(None);
         session.switch_to("지금-세션".into(), None);
         s.mode = crate::mode::Mode::Work;
-        restage(&mut s, &mut session);
+        restage(&s, &mut session);
         assert_eq!(session.pending_open(), None, "must not hijack the conversation in progress");
-        assert!(last_system(&mut s).contains("이어갑니다"), "{}", last_system(&mut s));
+    }
 
-        // The English screen says the same thing — the translation must not be missing.
-        let mut s = State::new();
-        s.lang = crate::lang::Lang::En;
-        let mut session = Session::new(None);
-        session.switch_to("지금-세션".into(), None);
-        s.mode = crate::mode::Mode::Work;
-        restage(&mut s, &mut session);
-        assert!(last_system(&mut s).contains("continues as-is"), "{}", last_system(&mut s));
+    /// **Changing the mode writes nothing into the transcript.** A transcript entry is
+    /// permanent — with no server events yet it sat at the very top of the screen and stayed
+    /// there. The bottom bar names the mode already.
+    #[test]
+    fn changing_the_mode_says_nothing_on_screen() {
+        for mode in [crate::mode::Mode::Work, crate::mode::Mode::Job, crate::mode::Mode::Plan] {
+            let mut s = State::new();
+            let mut session = Session::new(None);
+            s.mode = mode;
+            restage(&s, &mut session);
+            assert!(s.timeline.items().is_empty(), "{mode:?} left something on screen");
+
+            // And the same with a conversation already in progress.
+            let mut s = State::new();
+            let mut session = Session::new(None);
+            session.switch_to("지금-세션".into(), None);
+            s.mode = mode;
+            restage(&s, &mut session);
+            assert!(s.timeline.items().is_empty(), "{mode:?} spoke over the conversation");
+        }
     }
 
     /// With no conversation the mode decides what opens — the first message becomes the work
@@ -3212,9 +3509,8 @@ mod tests {
         let mut s = State::new();
         let mut session = Session::new(None);
         s.mode = crate::mode::Mode::Job;
-        restage(&mut s, &mut session);
+        restage(&s, &mut session);
         assert_eq!(session.pending_open(), Some(crate::mode::Route::Job));
-        assert!(last_system(&mut s).contains("job"), "{}", last_system(&mut s));
     }
 
     /// An ordinary message still goes to the server.
@@ -3398,6 +3694,77 @@ mod tests {
         run_command(&mut s, "/config");
         assert!(s.panel.is_some(), "the panel must open");
         assert_eq!(s.panel.as_ref().unwrap().title, "설정");
+        assert!(s.panel.as_ref().unwrap().form.is_some(), "it is a form, not a listing");
+    }
+
+    /// Drives the settings form the way the keyboard does.
+    fn press(state: &mut State, code: KeyCode) {
+        for action in on_key(state, key(code, KeyModifiers::NONE)) {
+            apply(state, &action);
+        }
+    }
+
+    /// ←→ change the value, ↑↓ change the row, and Enter takes the lot — leaving the
+    /// saving itself to the I/O side, which is what `config_out` says.
+    #[test]
+    fn the_settings_form_takes_the_arrows_and_enter_saves() {
+        let mut s = State::new();
+        s.lang = crate::lang::Lang::Ko;
+        run_command(&mut s, "/config");
+        assert_eq!(s.config.dir_access, crate::config::DirAccess::Deny, "the default");
+
+        // The cursor opens on the first row, so → toggles directory access.
+        press(&mut s, KeyCode::Right);
+        assert_eq!(
+            s.panel.as_ref().unwrap().form.unwrap().draft.dir_access,
+            crate::config::DirAccess::Allow
+        );
+        // **Nothing has moved outside the draft yet.**
+        assert_eq!(s.config.dir_access, crate::config::DirAccess::Deny, "not saved yet");
+        assert!(!s.config_out);
+
+        // Down twice to the mode row, then → picks the first mode.
+        press(&mut s, KeyCode::Down);
+        press(&mut s, KeyCode::Down);
+        press(&mut s, KeyCode::Right);
+        assert_eq!(s.panel.as_ref().unwrap().form.unwrap().draft.default_mode, Some(Mode::ALL[0]));
+
+        press(&mut s, KeyCode::Enter);
+        assert!(s.panel.is_none(), "Enter closes the form");
+        assert_eq!(s.config.dir_access, crate::config::DirAccess::Allow);
+        assert_eq!(s.config.default_mode, Some(Mode::ALL[0]));
+        assert!(s.config_out, "the I/O side still has to save it and tell the gate");
+    }
+
+    /// **Esc throws the draft away.** A form you cannot back out of is a form nobody
+    /// experiments in.
+    #[test]
+    fn esc_closes_the_settings_form_and_changes_nothing() {
+        let mut s = State::new();
+        s.lang = crate::lang::Lang::Ko;
+        let before = s.config;
+        run_command(&mut s, "/config");
+        press(&mut s, KeyCode::Right);
+        press(&mut s, KeyCode::Down);
+        press(&mut s, KeyCode::Right);
+        press(&mut s, KeyCode::Esc);
+        assert!(s.panel.is_none(), "Esc closes the form");
+        assert_eq!(s.config, before, "nothing was kept");
+        assert_eq!(s.lang, crate::lang::Lang::Ko, "not even the language");
+        assert!(!s.config_out, "nothing to save");
+    }
+
+    /// Typing must not leak into the message box behind the form, and the form does not
+    /// scroll — it is built to fit.
+    #[test]
+    fn the_settings_form_swallows_everything_else() {
+        let mut s = State::new();
+        run_command(&mut s, "/config");
+        press(&mut s, KeyCode::Char('x'));
+        press(&mut s, KeyCode::Backspace);
+        assert_eq!(s.input.len_chars(), 0, "typing leaked into the message box");
+        assert!(s.panel.is_some(), "the form stayed open");
+        assert_eq!(s.panel.as_ref().unwrap().scroll, 0);
     }
 
     /// `option value` changes the setting and says so — the panel only shows.
@@ -3725,6 +4092,34 @@ mod tests {
         let mut s = state();
         s.drag = Some(crate::selection::Drag::new((0, 0)));
         apply(&mut s, &Action::Wheel(-1));
+        assert!(s.drag.is_none());
+    }
+
+    /// PageUp/PageDown scroll the conversation by a page — the keyboard path that still
+    /// works where the wheel does not (mobile SSH, tmux without mouse).
+    #[test]
+    fn page_keys_scroll_the_transcript() {
+        let mut s = state();
+        s.view_total = 100;
+        s.view_height = 10;
+        s.scroll.on_content(100, 10);
+        for a in on_key(&s, key(KeyCode::PageUp, KeyModifiers::NONE)) {
+            apply(&mut s, &a);
+        }
+        assert_eq!(s.scroll.top, 80, "one page up");
+        for a in on_key(&s, key(KeyCode::PageDown, KeyModifiers::NONE)) {
+            apply(&mut s, &a);
+        }
+        assert_eq!(s.scroll.top, 90, "one page down lands at the bottom");
+    }
+
+    /// Page-scrolling drops the drag for the same reason the wheel does — the highlight
+    /// would point at different text.
+    #[test]
+    fn page_scrolling_drops_the_drag() {
+        let mut s = state();
+        s.drag = Some(crate::selection::Drag::new((0, 0)));
+        apply(&mut s, &Action::Page(1));
         assert!(s.drag.is_none());
     }
 

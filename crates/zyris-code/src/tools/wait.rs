@@ -514,8 +514,8 @@ async fn probe_once(
     root: &std::path::Path,
     limit: std::time::Duration,
 ) -> (bool, String) {
-    let mut cmd = tokio::process::Command::new("/bin/sh");
-    cmd.arg("-c").arg(command);
+    // The same shell `wait.start` uses — and on Windows that is `cmd /C`, not `/bin/sh`.
+    let mut cmd = crate::tools::jobs::shell_running(command);
     cmd.current_dir(root);
     cmd.env("TERM", "dumb").env("NO_COLOR", "1");
     cmd.stdin(std::process::Stdio::null());

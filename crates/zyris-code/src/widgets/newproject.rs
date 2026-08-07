@@ -31,10 +31,10 @@ pub fn draw(frame: &mut Frame, area: Rect, form: &Form, lang: crate::lang::Lang)
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::ACCENT))
+        .border_style(Style::default().fg(theme::accent()))
         .title(Span::styled(
             format!(" {} ", lang.project_form_title()),
-            Style::default().fg(theme::TEXT_HEADING).add_modifier(Modifier::BOLD),
+            Style::default().fg(theme::text_heading()).add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(box_area);
     frame.render_widget(block, box_area);
@@ -56,11 +56,11 @@ pub fn draw(frame: &mut Frame, area: Rect, form: &Form, lang: crate::lang::Lang)
         width,
     ));
     if let Some(err) = &form.error {
-        lines.push(Line::from(Span::styled(err.clone(), Style::default().fg(theme::DANGER))));
+        lines.push(Line::from(Span::styled(err.clone(), Style::default().fg(theme::danger()))));
     }
     lines.push(Line::from(Span::styled(
         lang.project_form_keys().to_string(),
-        Style::default().fg(theme::TEXT_MUTED),
+        Style::default().fg(theme::text_muted()),
     )));
 
     frame.render_widget(Paragraph::new(lines), inner);
@@ -77,17 +77,17 @@ fn field_line(
     on: bool,
     width: usize,
 ) -> Line<'static> {
-    let mut spans = vec![Span::styled(format!("{label} "), Style::default().fg(theme::TEXT_MUTED))];
-    spans.push(Span::styled("> ", Style::default().fg(theme::ACCENT)));
+    let mut spans = vec![Span::styled(format!("{label} "), Style::default().fg(theme::text_muted()))];
+    spans.push(Span::styled("> ", Style::default().fg(theme::accent())));
     if input.text.is_empty() {
-        spans.push(Span::styled(placeholder, Style::default().fg(theme::BORDER_LIGHT)));
+        spans.push(Span::styled(placeholder, Style::default().fg(theme::border_light())));
     } else {
         // A paste can bring newlines — since it's a single-line field, show them as spaces.
         let shown = truncate(&input.text.replace('\n', " "), width.saturating_sub(3));
-        spans.push(Span::styled(shown, Style::default().fg(theme::TEXT)));
+        spans.push(Span::styled(shown, Style::default().fg(theme::text())));
     }
     if on {
-        spans.push(Span::styled("▎", Style::default().fg(theme::ACCENT)));
+        spans.push(Span::styled("▎", Style::default().fg(theme::accent())));
     }
     Line::from(spans)
 }

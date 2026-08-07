@@ -33,10 +33,10 @@ pub fn draw(frame: &mut Frame, area: Rect, picker: &Picker, lang: crate::lang::L
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::ACCENT))
+        .border_style(Style::default().fg(theme::accent()))
         .title(Span::styled(
             format!(" {} ", picker.title(lang)),
-            Style::default().fg(theme::TEXT_HEADING).add_modifier(Modifier::BOLD),
+            Style::default().fg(theme::text_heading()).add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(box_area);
     frame.render_widget(block, box_area);
@@ -44,7 +44,7 @@ pub fn draw(frame: &mut Frame, area: Rect, picker: &Picker, lang: crate::lang::L
     let mut lines: Vec<Line<'static>> = Vec::new();
     if picker.loading {
         lines
-            .push(Line::from(Span::styled(lang.loading(), Style::default().fg(theme::TEXT_MUTED))));
+            .push(Line::from(Span::styled(lang.loading(), Style::default().fg(theme::text_muted()))));
     }
 
     // **The pure side decides** where each row goes (`picker::slots`). Here we just draw.
@@ -56,11 +56,11 @@ pub fn draw(frame: &mut Frame, area: Rect, picker: &Picker, lang: crate::lang::L
                 row_line(&picker.rows[i], i == picker.cursor, picker.is_create(i), width)
             }
             Slot::Rule => {
-                Line::from(Span::styled("─".repeat(width), Style::default().fg(theme::BORDER)))
+                Line::from(Span::styled("─".repeat(width), Style::default().fg(theme::border())))
             }
             Slot::More { count, up } => Line::from(Span::styled(
                 lang.pick_more(up, count),
-                Style::default().fg(theme::TEXT_MUTED),
+                Style::default().fg(theme::text_muted()),
             )),
         });
     }
@@ -76,7 +76,7 @@ pub fn draw(frame: &mut Frame, area: Rect, picker: &Picker, lang: crate::lang::L
     };
     lines.push(Line::from(Span::styled(
         lang.picker_keys(back),
-        Style::default().fg(theme::TEXT_MUTED),
+        Style::default().fg(theme::text_muted()),
     )));
 
     frame.render_widget(Paragraph::new(lines), inner);
@@ -88,21 +88,21 @@ pub fn draw(frame: &mut Frame, area: Rect, picker: &Picker, lang: crate::lang::L
 /// session, but it's something you create, not pick.
 fn row_line(row: &crate::picker::Row, on: bool, create: bool, width: usize) -> Line<'static> {
     let fg = match (row.enabled, create, on) {
-        (false, _, _) => theme::BORDER_LIGHT,
-        (true, true, _) => theme::ACCENT,
-        (true, false, true) => theme::TEXT_HEADING,
-        (true, false, false) => theme::TEXT,
+        (false, _, _) => theme::border_light(),
+        (true, true, _) => theme::accent(),
+        (true, false, true) => theme::text_heading(),
+        (true, false, false) => theme::text(),
     };
     let (label, note) = split(width, &row.label, row.note.as_deref());
     let mut spans = vec![
-        Span::styled(if on { "❯ " } else { "  " }, Style::default().fg(theme::ACCENT)),
+        Span::styled(if on { "❯ " } else { "  " }, Style::default().fg(theme::accent())),
         Span::styled(label.clone(), Style::default().fg(fg)),
     ];
     if let Some(note) = note {
         let used = 2 + display_width(&label);
         let pad = width.saturating_sub(used + display_width(&note));
-        spans.push(Span::styled(" ".repeat(pad), Style::default().fg(theme::TEXT_MUTED)));
-        spans.push(Span::styled(note, Style::default().fg(theme::TEXT_MUTED)));
+        spans.push(Span::styled(" ".repeat(pad), Style::default().fg(theme::text_muted())));
+        spans.push(Span::styled(note, Style::default().fg(theme::text_muted())));
     }
     Line::from(spans)
 }

@@ -13,10 +13,28 @@ use crate::markdown::display_width;
 pub fn draw(frame: &mut Frame, area: Rect, state: &mut State) {
     // The question being answered in the panel below is not drawn again inside the conversation.
     let skip = state.asking.as_ref().map(|(seq, _)| *seq);
+
+    // **What the viewport was looking at, taken before the relayout.** `Scroll.top` is an
+    // absolute line index and `layout` rebuilds the line list from scratch, so a width change or
+    // a fold opening above the viewport moves the text out from under that index — always toward
+    // older content, because the clamp in `on_content` can only push it down. That is the
+    // "scrolled up, came back, and it was showing old chat" report: nothing scrolled, the lines
+    // moved. Sticking to the bottom needs no anchor; the bottom is its own anchor.
+    let anchor =
+        (!state.scroll.stick).then(|| state.rows_cache.anchor_at(state.scroll.top)).flatten();
+
     {
         // Borrow the fields separately — `timeline` and `rows_cache` must be held at the same time.
         let State { timeline, rows_cache, folds, lang, .. } = &mut *state;
         rows_cache.layout(timeline.items(), area.width, folds, skip, *lang);
+    }
+
+    // Put the view back on the same words. When nothing was relaid out this resolves to the line
+    // it already held, so it costs a lookup and changes nothing.
+    if let Some((seq, offset)) = anchor {
+        if let Some(line) = state.rows_cache.line_of(seq, offset) {
+            state.scroll.top = line;
+        }
     }
 
     let total = state.rows_cache.total();
@@ -61,7 +79,7 @@ fn stretch(line: Line<'static>, width: usize) -> Line<'static> {
     let mut spans = line.spans;
     // **Must set fg.** Without it, the terminal's own default foreground bleeds through, and
     // inverting that space shows the wrong color (the rule in `theme.rs`).
-    let mut style = Style::default().fg(crate::theme::TEXT);
+    let mut style = Style::default().fg(crate::theme::text());
     if let Some(bg) = bg {
         style = style.bg(bg);
     }

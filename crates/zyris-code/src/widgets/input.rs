@@ -28,7 +28,7 @@ const PROMPT_WIDTH: u16 = 2;
 pub fn rule(frame: &mut Frame, area: Rect) {
     let line = Line::from(Span::styled(
         "─".repeat(area.width as usize),
-        Style::default().fg(theme::BORDER),
+        Style::default().fg(theme::border()),
     ));
     frame.render_widget(Paragraph::new(line), area);
 }
@@ -55,8 +55,8 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &State) {
         // The prompt is only on the first line. Continuation lines start at the same column so the text stays tidy.
         let head = if start + i == 0 { "> " } else { "  " };
         lines.push(Line::from(vec![
-            Span::styled(head, Style::default().fg(theme::ACCENT)),
-            Span::styled(text.clone(), Style::default().fg(theme::TEXT)),
+            Span::styled(head, Style::default().fg(theme::accent())),
+            Span::styled(text.clone(), Style::default().fg(theme::text())),
         ]));
     }
     frame.render_widget(Paragraph::new(lines), area);

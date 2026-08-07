@@ -112,8 +112,10 @@ impl ServeCapability for McpCapability {
 /// Two places to read config from. **The later one wins** — the project is more specific than home.
 pub fn config_paths(cwd: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    if let Some(home) = std::env::var_os("HOME") {
-        out.push(PathBuf::from(home).join(".config/zyris-code/mcp.json"));
+    // The user tier is `conn::app_dir` — the same directory as the credentials and settings.
+    // Joining `$HOME/.config/…` here meant Windows never read a user-level `mcp.json` at all.
+    if let Some(dir) = crate::conn::app_dir() {
+        out.push(dir.join("mcp.json"));
     }
     out.push(cwd.join(".mcp.json"));
     out

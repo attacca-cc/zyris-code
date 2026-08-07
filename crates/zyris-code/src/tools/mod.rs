@@ -66,8 +66,9 @@ pub fn announce(
     // Skills are this node's plus the plugins'. The list goes once in the session preamble and
     // bodies go through `skill.load` — loading everything would eat context every turn.
     let mut skill_dirs = vec![cwd.join(".zyris-code/skills")];
-    if let Some(home) = std::env::var_os("HOME") {
-        skill_dirs.insert(0, PathBuf::from(home).join(".config/zyris-code/skills"));
+    // The user tier is `conn::app_dir` — see `Skills::discover`, which must stay in step.
+    if let Some(dir) = crate::conn::app_dir() {
+        skill_dirs.insert(0, dir.join("skills"));
     }
     skill_dirs.extend(skill::plugin_skill_dirs(&cwd));
     let skills = skill::Skills::new(skill_dirs);

@@ -80,10 +80,14 @@ impl Mode {
     pub fn color(self) -> Color {
         match self {
             // The state where tools just run. Green reads as "go ahead".
-            Mode::Normal => theme::SUCCESS,
-            Mode::Plan => theme::ACCENT,
-            Mode::Work => theme::TOOL,
-            Mode::Job => theme::WARNING,
+            Mode::Normal => theme::success(),
+            // **Its own colour, not the accent.** Plan mode used to wear `accent()` — the same
+            // paint as every box border, every cursor, the input prompt and the user's own
+            // message bar — so the one thing the bottom bar exists to say was the colour of the
+            // furniture around it.
+            Mode::Plan => theme::mode_plan(),
+            Mode::Work => theme::tool(),
+            Mode::Job => theme::warning(),
         }
     }
 

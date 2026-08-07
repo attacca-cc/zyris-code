@@ -303,44 +303,6 @@ impl Lang {
         }
     }
 
-    /// When entering `work`·`job`. **It says in advance what the next message becomes** — if you
-    /// think only the mode changed and keep writing your ongoing talk, that becomes the goal.
-    pub fn mode_opens_work(self) -> &'static str {
-        self.pick(
-            "다음에 보내는 말이 **work의 목표**가 됩니다. attacca가 계획을 세워 \
-             태스크로 쪼갭니다 — 관문 둘은 사람이 열어야 합니다.",
-            "Your next message becomes a **work goal**. Attacca plans it into tasks; \
-             the two gates need a person to open them.",
-        )
-    }
-    pub fn mode_opens_job(self) -> &'static str {
-        self.pick(
-            "다음에 보내는 말이 **job**이 됩니다. 시켜 놓으면 끝까지 해냅니다 — \
-             되묻는 것이 있으면 그대로 답하면 됩니다.",
-            "Your next message becomes a **job** — hand it over and it runs to the end. \
-             If it asks something back, just answer here.",
-        )
-    }
-
-    /// When switching to work mode with a session open. **The mode no longer opens new things** —
-    /// the ongoing conversation continues as-is, and a new work opens in a new thread.
-    pub fn mode_continues_work(self) -> &'static str {
-        self.pick(
-            "모드가 **work**입니다. 지금 대화는 그대로 이어갑니다 — \
-             새 work는 ←의 새 쓰레드에서 엽니다.",
-            "Mode is **work**. This conversation continues as-is — \
-             start a new work from a new thread (←).",
-        )
-    }
-    pub fn mode_continues_job(self) -> &'static str {
-        self.pick(
-            "모드가 **job**입니다. 지금 대화는 그대로 이어갑니다 — \
-             새 job은 ←의 새 쓰레드에서 엽니다.",
-            "Mode is **job**. This conversation continues as-is — \
-             start a new job from a new thread (←).",
-        )
-    }
-
     /// After opening. **It says which one opened by id** — that's what's needed to find it on the attacca side.
     pub fn opened_work(self, id: &str) -> String {
         match self {
@@ -1171,6 +1133,84 @@ impl Lang {
     pub fn cfg_off(self) -> &'static str {
         self.pick("안 씀", "off")
     }
+    /// The row label for the screen language. The setting itself lives with `lang.rs`.
+    pub fn cfg_language(self) -> &'static str {
+        self.pick("화면 말", "Screen language")
+    }
+    /// The row label for the palette.
+    pub fn cfg_theme(self) -> &'static str {
+        self.pick("화면 색", "Colours")
+    }
+    /// The name of a palette choice.
+    pub fn cfg_theme_name(self, choice: crate::config::ThemeChoice) -> &'static str {
+        use crate::config::ThemeChoice::{Auto, Dark, Light};
+        match (self, choice) {
+            (Lang::Ko, Auto) => "자동",
+            (Lang::Ko, Dark) => "어둡게",
+            (Lang::Ko, Light) => "밝게",
+            (Lang::En, Auto) => "auto",
+            (Lang::En, Dark) => "dark",
+            (Lang::En, Light) => "light",
+        }
+    }
+    /// What picking that palette means.
+    ///
+    /// **This app paints no background of its own** — the terminal's own shows through — so the
+    /// palette has to suit it. The dark text on a light terminal measures 1.19:1, which is words
+    /// the colour of the paper.
+    pub fn cfg_theme_desc(self, choice: crate::config::ThemeChoice) -> &'static str {
+        use crate::config::ThemeChoice::{Auto, Dark, Light};
+        match (self, choice) {
+            (Lang::Ko, Auto) => "터미널에 맞춰 고릅니다 — 알 수 없으면 어두운 쪽입니다.",
+            (Lang::Ko, Dark) => "어두운 터미널에 맞춘 색입니다.",
+            (Lang::Ko, Light) => "밝은 터미널에 맞춘 색입니다.",
+            (Lang::En, Auto) => "Follows the terminal, and falls back to dark when it won't say.",
+            (Lang::En, Dark) => "Colours for a dark terminal.",
+            (Lang::En, Light) => "Colours for a light terminal.",
+        }
+    }
+    /// What the directory-access value under the cursor means.
+    ///
+    /// **The description describes the value, not the setting.** A row label already says
+    /// which setting it is; what a person cannot guess is what `allow` will actually do.
+    pub fn cfg_dir_desc(self, access: crate::config::DirAccess) -> &'static str {
+        use crate::config::DirAccess::{Allow, Deny};
+        match (self, access) {
+            (Lang::Ko, Allow) => "작업 디렉터리 밖도 묻지 않고 통과합니다.",
+            (Lang::Ko, Deny) => "작업 디렉터리 밖은 묻지 않고 거부합니다.",
+            (Lang::En, Allow) => "Paths outside the working directory run without asking.",
+            (Lang::En, Deny) => "Paths outside the working directory are refused outright.",
+        }
+    }
+    /// What picking this screen language means.
+    pub fn cfg_lang_desc(self, choice: Lang) -> &'static str {
+        match (self, choice) {
+            (Lang::Ko, Lang::Ko) => "화면을 한국어로 씁니다.",
+            (Lang::Ko, Lang::En) => "화면을 영어로 씁니다.",
+            (Lang::En, Lang::Ko) => "Draws the screen in Korean.",
+            (Lang::En, Lang::En) => "Draws the screen in English.",
+        }
+    }
+    /// What the default-mode value means. `None` is the unset state.
+    ///
+    /// **This does not reuse `mode_desc`.** Those sentences carry markdown (`**일**`), and the
+    /// panel draws its lines as-is — the asterisks would show up literally.
+    pub fn cfg_mode_desc(self, mode: Option<Mode>) -> String {
+        match (self, mode) {
+            (Lang::Ko, None) => "따로 정하지 않습니다 — 일반 모드로 시작합니다.".into(),
+            (Lang::En, None) => "No override — starts in normal.".into(),
+            (Lang::Ko, Some(m)) => format!("켤 때 {} 모드로 시작합니다.", m.label(self)),
+            (Lang::En, Some(m)) => format!("Starts in {} mode.", m.label(self)),
+        }
+    }
+    /// The hint line of the settings form. **It names every key the form answers to** —
+    /// a form whose keys you have to guess is a form nobody finishes.
+    pub fn form_keys(self) -> String {
+        match self {
+            Lang::Ko => "↑↓ 항목 · ←→ 값 · Enter 저장 · Esc 취소".into(),
+            Lang::En => "↑↓ row · ←→ value · Enter save · Esc cancel".into(),
+        }
+    }
     /// The hint line of the `/config` panel — everything here is settable by command too.
     pub fn config_keys(self) -> String {
         match self {
@@ -1182,6 +1222,23 @@ impl Lang {
                 .into(),
         }
     }
+    /// Said while `/reconnect` is reattaching.
+    pub fn reconnecting(self) -> &'static str {
+        self.pick("다시 붙는 중…", "attaching again…")
+    }
+    /// `/reconnect` before there is anything to drop.
+    pub fn reconnect_not_attached(self) -> &'static str {
+        self.pick("아직 붙지 않았습니다.", "not attached yet.")
+    }
+
+    /// What `/config theme …` says it changed.
+    pub fn config_theme_changed(self, choice: crate::config::ThemeChoice) -> String {
+        match self {
+            Lang::Ko => format!("화면 색을 **{}**로 바꿨습니다.", self.cfg_theme_name(choice)),
+            Lang::En => format!("Colours set to **{}**.", self.cfg_theme_name(choice)),
+        }
+    }
+
     /// What `/config dir …` says it changed.
     pub fn config_dir_changed(self, access: crate::config::DirAccess) -> String {
         match (self, access) {
@@ -1832,8 +1889,6 @@ mod tests {
             en.enroll_keys(),
             en.connected(),
             en.waiting_answer(),
-            en.mode_continues_work(),
-            en.mode_continues_job(),
             en.project_form_title(),
             en.project_name(),
             en.project_name_placeholder(),
