@@ -46,8 +46,12 @@ jobs:
             linker: aarch64-linux-gnu-gcc
           - target: aarch64-apple-darwin
             os: macos-latest
+          # **Both Apple targets build on the arm64 runner.** The Intel image (macos-13) is
+          # retired, so a job asking for it sits in the queue and never starts — which held the
+          # whole release, since publishing waits on every build. The macOS SDK carries both
+          # architectures, so cross-compiling from arm64 needs nothing but the Rust target.
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-latest
           - target: x86_64-pc-windows-msvc
             os: windows-latest
 
