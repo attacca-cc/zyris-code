@@ -13,6 +13,7 @@ pub mod gate;
 pub mod guard;
 pub mod jobs;
 pub mod readonly;
+pub mod rules;
 pub mod search;
 pub mod skill;
 pub mod trim;
@@ -29,6 +30,7 @@ use bridge::Bridge;
 use edit::{CodeEditServer, LocalEdit};
 use guard::Gate;
 use readonly::ReadOnlyFileIo;
+use rules::Rules;
 
 /// The base from which tools resolve relative paths — where the process was launched.
 ///
@@ -81,6 +83,7 @@ pub fn announce(
 
     runner
         .capability(Gate::new(skill::SkillServer(skills), bridge.clone()))
+        .capability(Gate::new(rules::RulesCapServer(Rules::new(cwd.clone())), bridge.clone()))
         .capability(Gate::new(ReadOnlyFileIo::new(cwd.clone()), bridge.clone()))
         // Search is reading too. But **paths going outside are asked about even when read-only.**
         .capability(Gate::new(search::SearchServer(search::LocalSearch::new(cwd)), bridge.clone()))

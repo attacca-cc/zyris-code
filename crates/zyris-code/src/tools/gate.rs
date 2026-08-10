@@ -63,7 +63,7 @@ pub const PROBE_TARGET: &str = "probe";
 fn only_reads(call: &Call) -> bool {
     let tool = call.tool.as_str();
     match call.capability.as_str() {
-        "file_io" | "skill" | "search" => true,
+        "file_io" | "skill" | "search" | "rules" => true,
         // Peeking at a PTY is reading. Opening and writing are not.
         "terminal" => matches!(tool, "read" | "screen"),
         // work creates work on the **server**, not this computer. Only the two that look are reads —
