@@ -18,9 +18,9 @@ pub fn draw(
     tick: u64,
 ) {
     // The centered box. Sized to the list, but never taller than the screen.
-    // The separator line takes one more row, so it must be counted for everything to fit.
+    // The two separator lines take a row each, so they must be counted for everything to fit.
     let rule = picker.is_create(0) && picker.rows.len() > 1;
-    let want_h = (picker.rows.len() as u16).saturating_add(4 + rule as u16).max(6);
+    let want_h = (picker.rows.len() as u16).saturating_add(5 + rule as u16).max(6);
     let h = want_h.min(area.height.saturating_sub(2)).max(3);
     let w = 64.min(area.width.saturating_sub(4)).max(20);
     let box_area = Rect {
@@ -61,8 +61,9 @@ pub fn draw(
     }
 
     // **The pure side decides** where each row goes (`picker::slots`). Here we just draw.
+    // The rule and the key hints at the foot take a row each.
     let width = inner.width as usize;
-    let body_h = inner.height.saturating_sub(1) as usize;
+    let body_h = inner.height.saturating_sub(2) as usize;
     // **Where the window ended up is stored back.** Without it the layout would be derived
     // from the cursor alone every frame, which pins the cursor to an edge — see `window_top`.
     let (laid, top) = crate::picker::slots(&picker.rows, picker.cursor, picker.top, body_h);
@@ -81,6 +82,10 @@ pub fn draw(
             )),
         });
     }
+
+    // The key hints are not a row of the list, so a rule marks where the list ended. Without it
+    // the last entry and the hints run together and the hints read as one more thing to pick.
+    lines.push(Line::from(Span::styled("─".repeat(width), Style::default().fg(theme::border()))));
 
     // The meaning of ← changes with the level. Say it plainly.
     let back = match picker.level {
@@ -116,10 +121,16 @@ fn row_line(
         (true, false, false) => theme::text(),
     };
     // A running thread blinks its status dot; a finished one holds its colour steady.
+    //
+    // **Running's dim half must not land on the unknown grey.** Both would be the same dot at
+    // rest, and a still frame could not tell a thread that is working from one nobody has read
+    // yet — so the unknown one sits at the dimmest grey the palette has and the blink swings
+    // between orange and a brighter grey.
     let status_span = row.status.map(|s| {
         let colour = match s {
+            ThreadStatus::Unknown => theme::border_light(),
             ThreadStatus::Running if crate::widgets::activity::blink_on(tick) => theme::accent(),
-            ThreadStatus::Running => theme::border_light(),
+            ThreadStatus::Running => theme::text_muted(),
             ThreadStatus::Success => theme::success(),
             ThreadStatus::Failed => theme::danger(),
         };
@@ -239,6 +250,61 @@ mod tests {
         assert!(top.contains('┌') && top.contains('┐'), "the title ate the border: {top:?}");
     }
 
+    /// Renders the box and gives back its rows, trimmed of the screen either side.
+    fn render(picker: &mut Picker, w: u16, h: u16) -> Vec<String> {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).expect("terminal");
+        terminal
+            .draw(|f| draw(f, f.area(), picker, crate::lang::Lang::Ko, 0))
+            .expect("draw");
+        // **The cell behind a wide character has to be skipped.** ratatui fills it with a space,
+        // so joining every cell turns `새 쓰레드` into `새  쓰 레 드` and no search ever matches.
+        let buf = terminal.backend().buffer().clone();
+        (0..h)
+            .map(|y| {
+                let mut row = String::new();
+                let mut x = 0u16;
+                while x < w {
+                    let symbol = buf[(x, y)].symbol();
+                    row.push_str(symbol);
+                    x += display_width(symbol).max(1) as u16;
+                }
+                row
+            })
+            .filter(|row: &String| row.contains('│') || row.contains('┌') || row.contains('└'))
+            .collect()
+    }
+
+    /// **The create row survives all the way to the screen, wherever the cursor is.** `slots`
+    /// being right is not enough — the widget draws what it is given, and this is the thing a
+    /// person looks for when they want a new thread.
+    #[test]
+    fn the_create_row_is_drawn_even_when_the_list_is_scrolled_to_the_bottom() {
+        let items: Vec<(String, String, crate::picker::ThreadStatus)> = (0..40)
+            .map(|i| {
+                (format!("s{i}"), format!("지난 대화 {i}"), crate::picker::ThreadStatus::Unknown)
+            })
+            .collect();
+        let mut picker =
+            Picker::sessions("p1".into(), "기본".into(), items, crate::lang::Lang::Ko);
+        picker.cursor = 40;
+        let rows = render(&mut picker, 80, 20);
+        let head = rows.iter().position(|r| r.contains("＋ 새 쓰레드")).expect(
+            "the create row is gone from a scrolled list",
+        );
+        // It is the first thing under the top border, above everything that scrolls.
+        assert!(head <= 1, "the create row is not at the top: {rows:#?}");
+        assert!(
+            rows.iter().any(|r| r.contains("↑") || r.contains("더")),
+            "nothing says how many are hidden above: {rows:#?}"
+        );
+        assert!(rows.iter().any(|r| r.contains("지난 대화 39")), "the cursor row is off screen: {rows:#?}");
+        // The box keeps its walls — a row that runs past the border collapses the screen.
+        assert!(rows.iter().all(|r| r.matches('│').count() == 2 || !r.contains('│')), "{rows:#?}");
+    }
+
     /// **The name never gets shaved.** `/agent` actually got truncated to `/a…` and you couldn't
     /// tell what command it was — the reason was a long note.
     #[test]
@@ -298,9 +364,67 @@ mod tests {
             .iter()
             .find(|s| s.content.as_ref() == "●")
             .and_then(|s| s.style.fg);
-        assert_eq!(running_col, Some(theme::border_light()), "running dot off-phase must be dim");
+        assert_eq!(running_col, Some(theme::text_muted()), "running dot off-phase must be dim");
         assert_eq!(ok_col, Some(theme::success()));
         assert_eq!(failed_col, Some(theme::danger()));
+    }
+
+    fn dot(status: crate::picker::ThreadStatus, tick: u64) -> Line<'static> {
+        let row = crate::picker::Row {
+            id: Some("s1".into()),
+            label: "대화".into(),
+            note: None,
+            enabled: true,
+            status: Some(status),
+        };
+        row_line(&row, false, false, 20, tick)
+    }
+
+    /// **A dot that lands must change the colour and nothing else.** The outcomes are derived one
+    /// request at a time, so on a busy project they trickle in over seconds — if the dot were
+    /// absent until then, every title would jump two columns right as its own dot appeared and
+    /// the whole list would squirm.
+    #[test]
+    fn a_dot_landing_moves_the_title_not_at_all() {
+        use crate::picker::ThreadStatus;
+        let plain = |line: &Line<'static>| -> String {
+            line.spans.iter().map(|s| s.content.as_ref()).collect()
+        };
+        let before = plain(&dot(ThreadStatus::Unknown, 0));
+        for after in
+            [ThreadStatus::Running, ThreadStatus::Success, ThreadStatus::Failed].map(|s| dot(s, 0))
+        {
+            assert_eq!(plain(&after), before, "the row moved as its dot landed");
+        }
+    }
+
+    /// **No two dots share a colour** — least of all `Unknown` and the dim half of `Running`'s
+    /// blink, which would leave a still frame unable to say whether a thread is working or
+    /// merely unread.
+    #[test]
+    fn every_dot_colour_says_something_different() {
+        use crate::picker::ThreadStatus;
+        let colour = |status, tick| {
+            dot(status, tick)
+                .spans
+                .iter()
+                .find(|s| s.content.as_ref() == "●")
+                .and_then(|s| s.style.fg)
+                .expect("no dot was drawn")
+        };
+        // Tick 0 and 8 are the two halves of the blink.
+        let seen = [
+            colour(ThreadStatus::Unknown, 0),
+            colour(ThreadStatus::Running, 0),
+            colour(ThreadStatus::Running, 8),
+            colour(ThreadStatus::Success, 0),
+            colour(ThreadStatus::Failed, 0),
+        ];
+        for (i, a) in seen.iter().enumerate() {
+            for b in &seen[i + 1..] {
+                assert_ne!(a, b, "two dots wear the same colour: {seen:?}");
+            }
+        }
     }
 
     /// If there's no room for the note, drop the note. A half-cut note is unreadable.

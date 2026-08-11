@@ -187,6 +187,20 @@ impl Lang {
     pub fn ctrl_c_quits(self) -> &'static str {
         self.pick("Ctrl+C 종료", "Ctrl+C quits")
     }
+    /// What rides on the end of the activity line while the session has a plan: `(2/5)`.
+    ///
+    /// **The same in both languages.** It is a count, and a word in front of it would take room
+    /// from the line that has to say what is happening.
+    pub fn todo_count(self, done: usize, total: usize) -> String {
+        format!(" ({done}/{total})")
+    }
+    /// The line that stands in for the tasks that did not fit.
+    pub fn todo_more(self, n: usize) -> String {
+        match self {
+            Lang::Ko => format!("↓ {n}개 더"),
+            Lang::En => format!("↓ {n} more"),
+        }
+    }
     pub fn queued(self, n: usize) -> String {
         match self {
             Lang::Ko => format!("대기 {n}개"),
@@ -534,6 +548,21 @@ impl Lang {
             "다른 zyris-code 창이 이미 같은 자격으로 붙어 있습니다. 등록 코드 창이 그 창에 떠 있을 수 있습니다.",
             "Another zyris-code window is already using the same credential. The enrollment-code window may be there.",
         )
+    }
+    /// A window that took a slot of its own. **Said because the first launch of a slot asks for
+    /// approval again** — an enrollment window appearing for no visible reason reads as the app
+    /// having logged itself out.
+    pub fn window_slot_notice(self, slot: usize) -> String {
+        match self {
+            Lang::Ko => format!(
+                "다른 창이 이미 붙어 있어 이 창은 {slot}번 노드로 따로 등록합니다. \
+                 처음 한 번만 승인이 필요하고, 그 뒤로는 이 창이 자기 도구 호출만 받습니다."
+            ),
+            Lang::En => format!(
+                "Another window is already attached, so this one registers as node {slot} of its \
+                 own. It asks for approval once; after that this window only gets its own tool calls."
+            ),
+        }
     }
 
     // ── Commands (`/clear` · `/cwd` · `/config` · `/agent` · `/undo` · `/changes`)

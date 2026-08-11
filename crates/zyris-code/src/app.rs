@@ -21,6 +21,10 @@ pub enum Frame {
     Event {
         cursor: i64,
         entry: Option<Entry>,
+        /// What this event did to the session's todo list, if anything. It rides along with the
+        /// entry rather than arriving on its own so that **one place feeds the list** — history
+        /// replay goes back through here, so it is fed exactly like the live stream.
+        todo: Option<crate::todos::Change>,
     },
     Delta {
         kind: ZDeltaKind,
@@ -83,7 +87,7 @@ pub enum Frame {
     /// before showing anything is what made opening a busy project look like a hang.
     ThreadStatus {
         id: String,
-        status: Option<crate::picker::ThreadStatus>,
+        status: crate::picker::ThreadStatus,
     },
     /// A list could not be fetched. The list closes and the reason is said once.
     PickerFailed(String),
@@ -91,7 +95,9 @@ pub enum Frame {
     /// switching threads never blocks the loop. Tagged with the session id, so a switch made
     /// while an older one was still loading drops the loser (`frame_is_current`).
     History {
-        entries: Vec<(i64, Option<crate::event::Entry>)>,
+        /// `(cursor, what to draw, what it did to the todo list)` — the three `Frame::Event`
+        /// carries, converted off the loop and replayed back through it.
+        entries: Vec<(i64, Option<crate::event::Entry>, Option<crate::todos::Change>)>,
     },
     /// **What git says about the working directory.** Same reason as `Poll`: reading it needs
     /// a process, and awaiting that on the draw loop would stall keys and drawing. The
@@ -156,6 +162,8 @@ pub enum Action {
     /// (mobile SSH, tmux without mouse) — history must be reachable by keyboard alone.
     Page(i32),
     ToggleFold,
+    /// Unfold or fold the todo list under the activity line (Ctrl+T, or a click on that line).
+    ToggleTodos,
     /// Where the mouse was pressed. Screen coordinates.
     Press(u16, u16),
     /// A Ctrl+click landed on a link. The URL is opened by the OS (I/O side).
@@ -225,6 +233,12 @@ pub enum Action {
 
 pub struct State {
     pub timeline: Timeline,
+    /// This session's todo list, rebuilt from its todo tool calls (`todos.rs`).
+    pub todos: crate::todos::Todos,
+    /// Whether the todo list is unfolded under the activity line. **Closed by default and only
+    /// the person opens it** — the same rule the reasoning chips follow. Ctrl+T, or a click on
+    /// the activity line.
+    pub todos_open: bool,
     pub folds: Folds,
     pub input: Input,
     pub scroll: Scroll,
@@ -316,14 +330,18 @@ pub struct State {
     pub asking: Option<(i64, crate::question::Answering)>,
     /// The area the question screen occupies. Used to map a click to a row.
     pub ask_area: Option<ratatui::layout::Rect>,
+    /// Which screen row the activity line was drawn on. Clicking it opens the todo list, and
+    /// `apply` is pure — so the drawing side writes it down here, the way `view_total` is.
+    pub activity_row: Option<u16>,
     /// Should the answer filled in by submitting the question be sent right away? The I/O
     /// side sees it and clears it.
     pub submit_now: bool,
     /// The open project/session list.
     pub picker: Option<crate::picker::Picker>,
     /// Cached last-turn outcome per session id, so the picker's real-time refresh does not
-    /// refetch every thread's history on each poll. `None` = no terminal event yet.
-    pub thread_status: std::collections::HashMap<String, Option<crate::picker::ThreadStatus>>,
+    /// refetch every thread's history on each poll. `Unknown` = nothing to cache yet, so the
+    /// next refresh derives it again.
+    pub thread_status: std::collections::HashMap<String, crate::picker::ThreadStatus>,
     /// Whether a session was running on the last refresh. A running→idle transition means a
     /// turn just finished, so its cached outcome must be re-derived.
     pub thread_was_running: std::collections::HashMap<String, bool>,
@@ -432,6 +450,8 @@ impl Default for State {
     fn default() -> Self {
         Self {
             timeline: Timeline::new(),
+            todos: crate::todos::Todos::new(),
+            todos_open: false,
             folds: Folds::new(),
             input: Input::new(),
             scroll: Scroll::new(),
@@ -462,6 +482,7 @@ impl Default for State {
             screen: Vec::new(),
             asking: None,
             ask_area: None,
+            activity_row: None,
             submit_now: false,
             picker: None,
             thread_status: std::collections::HashMap::new(),
@@ -529,6 +550,12 @@ impl State {
     /// like "connected", on the one line whose whole job is to say what is happening.
     pub fn set_error(&mut self, message: impl Into<String>) {
         self.status = Some((message.into(), Instant::now(), Severity::Error));
+    }
+
+    /// Take the notice down now rather than waiting for it to fade. Used when leaving a
+    /// conversation — what it had to say stops being true the moment another is on screen.
+    pub fn clear_status(&mut self) {
+        self.status = None;
     }
 
     /// The notice to show right now. `None` once the time has passed.
@@ -767,6 +794,9 @@ pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
         // people press reflexively when the screen breaks, so it gets no other meaning.
         KeyCode::Char('l') if ctrl => vec![Action::Repaint],
         KeyCode::Char('o') if ctrl => vec![Action::ToggleFold],
+        // **t for tasks.** Nothing else claims Ctrl+T here, and the terminal sends it through
+        // untouched — it is not one of the bytes a tty reserves.
+        KeyCode::Char('t') if ctrl => vec![Action::ToggleTodos],
         KeyCode::BackTab => vec![Action::CycleMode],
         KeyCode::Char('w') if ctrl => vec![Action::DeleteWord],
         // **Wipe everything typed.** `Ctrl+U` is the canonical one — readline, bash and zsh
@@ -1040,6 +1070,7 @@ pub fn apply(state: &mut State, action: &Action) {
                 state.view_open.insert(key, now);
             }
         }
+        Action::ToggleTodos => state.todos_open = !state.todos_open,
         Action::Press(x, y) => {
             // Pressing on the question screen picks that row.
             if let (Some(area), Some((_, a))) = (state.ask_area, state.asking.as_ref()) {
@@ -1084,6 +1115,14 @@ pub fn apply(state: &mut State, action: &Action) {
             // Exporting to the clipboard is I/O and does not happen here — `run` does it.
             let Some(drag) = state.drag else { return };
             if drag.is_click() {
+                // **A click on the activity line opens or folds the todo list.** Only when there
+                // is one to show — on every other line that row is ordinary text, and taking the
+                // click would cost the ability to select it.
+                if !state.todos.is_empty() && state.activity_row == Some(drag.from.0 as u16) {
+                    state.drag = None;
+                    state.todos_open = !state.todos_open;
+                    return;
+                }
                 // No movement means a click — if that row is a foldable node head (a topic,
                 // subtopic or tool), fold or unfold it. The drag holds screen coordinates, so the
                 // row is mapped back to a transcript content row first. The person's choice is
@@ -1324,10 +1363,16 @@ pub fn apply(state: &mut State, action: &Action) {
 
 fn apply_frame(state: &mut State, frame: &Frame) {
     match frame {
-        Frame::Event { cursor, entry } => {
+        Frame::Event { cursor, entry, todo } => {
             // The cursor advances even for an event we do not render — the resume position
             // must not be lost.
             state.last_cursor = Some(*cursor);
+            // **Keyed by the event's `seq`, so an in-place update replaces.** The seq comes off
+            // the entry, which is always there for a todo change: every one of them is a
+            // `tool_call`, and those always draw.
+            if let (Some(change), Some(entry)) = (todo, entry) {
+                state.todos.note(entry.seq, change.clone());
+            }
             let Some(entry) = entry else { return };
             if let EntryKind::WorkStart(_) = entry.kind {
                 state.folds.entry(entry.seq).or_default();
@@ -1416,10 +1461,12 @@ fn apply_frame(state: &mut State, frame: &Frame) {
                 // streaming would blank them — and with a refresh every few seconds they
                 // would blink out and back for as long as the derivation took.
                 if let Some(old) = &state.picker {
-                    for row in p.rows.iter_mut().filter(|r| r.status.is_none()) {
-                        if let Some(was) =
-                            old.rows.iter().find(|o| o.id.is_some() && o.id == row.id)
-                        {
+                    let unknown = Some(crate::picker::ThreadStatus::Unknown);
+                    for row in p.rows.iter_mut().filter(|r| r.status == unknown) {
+                        let was = old.rows.iter().find(|o| o.id.is_some() && o.id == row.id);
+                        // Only a dot that says something replaces this one; the old row may be
+                        // waiting on its own derivation too.
+                        if let Some(was) = was.filter(|o| o.status != unknown) {
                             row.status = was.status;
                         }
                     }
@@ -1431,7 +1478,8 @@ fn apply_frame(state: &mut State, frame: &Frame) {
             }
         }
         // One thread's dot. **A running dot is not overwritten** — running is what is
-        // happening now, and this is only the last outcome.
+        // happening now, and this is only the last outcome. Neither is a settled dot replaced
+        // by `Unknown`: a derivation that came back empty knows less than the row already does.
         Frame::ThreadStatus { id, status } => {
             state.thread_status.insert(id.clone(), *status);
             if let Some(row) = state
@@ -1439,8 +1487,9 @@ fn apply_frame(state: &mut State, frame: &Frame) {
                 .as_mut()
                 .and_then(|p| p.rows.iter_mut().find(|r| r.id.as_deref() == Some(id.as_str())))
             {
-                if row.status != Some(crate::picker::ThreadStatus::Running) {
-                    row.status = *status;
+                use crate::picker::ThreadStatus;
+                if row.status != Some(ThreadStatus::Running) && *status != ThreadStatus::Unknown {
+                    row.status = Some(*status);
                 }
             }
         }
@@ -1455,14 +1504,10 @@ fn apply_frame(state: &mut State, frame: &Frame) {
         // rather than at the moment of the click — until this lands, the previous thread is
         // still what is on screen and still what the person can read.
         Frame::History { entries } => {
-            leave_session(state);
-            state.timeline = Timeline::new();
-            state.folds = Folds::new();
-            state.asking = None;
-            state.last_cursor = None;
-            state.scroll = Scroll::new(); // Start from the bottom.
-            for (cursor, entry) in entries {
-                let frame = Frame::Event { cursor: *cursor, entry: entry.clone() };
+            clear_conversation(state);
+            for (cursor, entry, todo) in entries {
+                let frame =
+                    Frame::Event { cursor: *cursor, entry: entry.clone(), todo: todo.clone() };
                 apply(state, &Action::Frame(frame));
             }
             state.loading_history = false;
@@ -2044,14 +2089,37 @@ pub type ApiRx = tokio::sync::watch::Receiver<Option<Arc<AttaccaApiClient>>>;
 /// switch to another session, and the previous session's turn keeps running on the server
 /// with its stream still sending frames — without the tag, the previous session's messages
 /// mix into the timeline of the session being viewed. That actually happened.
-pub type AppMsg = (Option<String>, Action);
+pub type AppMsg = (Option<Origin>, Action);
 
-/// Is this a frame from the session the screen is currently viewing? `None` (from
-/// off-screen) always passes.
-fn frame_is_current(sid: &Option<String>, current: Option<&str>) -> bool {
-    match sid {
+/// Where a frame came from. `None` in `AppMsg` means off-screen work that belongs to the window
+/// rather than to a conversation — git, the tool bridge — and always passes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Origin {
+    /// The session it is about.
+    pub session: String,
+    /// Which opening of that session's turn stream it came from. `None` for a one-shot answer
+    /// (history, a title) — those are replies to a request, not a subscription that can pile up.
+    pub stream: Option<u64>,
+}
+
+impl Origin {
+    /// A one-shot answer about a session.
+    pub fn asked(session: impl Into<String>) -> Origin {
+        Origin { session: session.into(), stream: None }
+    }
+}
+
+/// Is this frame from the conversation on screen, and from its live stream?
+///
+/// **Two ways to be stale, not one.** The session can have been left, and — because
+/// `turn_events` is a subscription that never ends on its own — an older stream on the *same*
+/// session can still be talking. Aborting stops a task sending more, but what it already put in
+/// the channel is still queued behind this, and `push_delta` appends: a doubled frame doubles the
+/// words being streamed.
+fn frame_is_current(from: &Option<Origin>, current: Option<&str>, gen: u64) -> bool {
+    match from {
         None => true,
-        Some(id) => current == Some(id.as_str()),
+        Some(o) => current == Some(o.session.as_str()) && o.stream.is_none_or(|s| s == gen),
     }
 }
 
@@ -2174,7 +2242,7 @@ async fn run_inner(
             Some((sid, action)) = rx.recv() => {
                 // There is no session yet (first enrollment). A stream frame arriving now
                 // is a stale one.
-                if !frame_is_current(&sid, None) {
+                if !frame_is_current(&sid, None, 0) {
                     continue;
                 }
                 apply(&mut state, &action);
@@ -2546,7 +2614,13 @@ async fn run_inner(
                     // events that arrived while it was loading.
                     if matches!(action, Action::Frame(Frame::History { .. })) {
                         if let Some(id) = session.id().map(str::to_string) {
-                            spawn_stream(Arc::clone(&api), id, state.last_cursor, tx.clone());
+                            spawn_stream(
+                                Arc::clone(&api),
+                                &mut session,
+                                id,
+                                state.last_cursor,
+                                tx.clone(),
+                            );
                         }
                     }
 
@@ -2671,7 +2745,7 @@ async fn run_inner(
                 // and talk in another session, and that work's events pour in here. The
                 // turn keeps running on the server, and going back to that session shows it
                 // all as history on reopen.
-                if !frame_is_current(&sid, session.id()) {
+                if !frame_is_current(&sid, session.id(), session.stream_gen()) {
                     continue;
                 }
                 // **A poll that found nothing new must not wake the screen.** git is read every
@@ -2703,7 +2777,13 @@ async fn run_inner(
                     // idle.
                     state.set_status(state.lang.connected());
                     if let Some(id) = session.id().map(str::to_string) {
-                        spawn_stream(Arc::clone(&api), id, state.last_cursor, tx.clone());
+                        spawn_stream(
+                            Arc::clone(&api),
+                            &mut session,
+                            id,
+                            state.last_cursor,
+                            tx.clone(),
+                        );
                     }
                     dirty = true;
                 }
@@ -2726,7 +2806,7 @@ async fn run_inner(
                         let usage = crate::conn::usage(&api, &id).await;
                         let title = crate::conn::session_title(&api, &id).await;
                         let _ = tx.send((
-                            Some(id),
+                            Some(Origin::asked(id)),
                             Action::Frame(Frame::Poll { usage, title }),
                         ));
                     });
@@ -2971,7 +3051,7 @@ fn spawn_sessions(
     project_id: String,
     project_name: String,
     lang: crate::lang::Lang,
-    cached: std::collections::HashMap<String, Option<crate::picker::ThreadStatus>>,
+    cached: std::collections::HashMap<String, crate::picker::ThreadStatus>,
     was_running: std::collections::HashMap<String, bool>,
 ) {
     use crate::picker::ThreadStatus;
@@ -2990,15 +3070,16 @@ fn spawn_sessions(
         for (id, title, running) in items {
             let was = was_running.get(&id).copied().unwrap_or(false);
             let status = if running {
-                Some(ThreadStatus::Running)
+                ThreadStatus::Running
             } else {
-                let known = cached.get(&id).copied().unwrap_or(None);
-                if known.is_some() && !was {
+                let known = cached.get(&id).copied().unwrap_or(ThreadStatus::Unknown);
+                if known != ThreadStatus::Unknown && !was {
                     known
                 } else {
-                    // Unknown for now — the dot arrives on its own.
+                    // Not known yet — the row goes up with a grey dot and the real one
+                    // arrives on its own.
                     derive.push(id.clone());
-                    None
+                    ThreadStatus::Unknown
                 }
             };
             now_running.insert(id.clone(), running);
@@ -3017,7 +3098,10 @@ fn spawn_sessions(
             let (api, tx, room) = (Arc::clone(&api), tx.clone(), Arc::clone(&room));
             tokio::spawn(async move {
                 let Ok(_permit) = room.acquire().await else { return };
-                let status = crate::conn::session_status(&api, &id).await;
+                // A thread whose history says nothing keeps the grey dot it went up with.
+                let status = crate::conn::session_status(&api, &id)
+                    .await
+                    .unwrap_or(crate::picker::ThreadStatus::Unknown);
                 let _ = tx.send((None, Action::Frame(Frame::ThreadStatus { id, status })));
             });
         }
@@ -3069,12 +3153,12 @@ fn spawn_history(
             Ok(events) => Frame::History {
                 entries: events
                     .iter()
-                    .map(|e| (e.cursor, crate::event::entry_from(e)))
+                    .map(|e| (e.cursor, crate::event::entry_from(e), crate::todos::change_from(e)))
                     .collect(),
             },
             Err(e) => Frame::PickerFailed(e.to_string()),
         };
-        let _ = tx.send((Some(id), Action::Frame(frame)));
+        let _ = tx.send((Some(Origin::asked(id)), Action::Frame(frame)));
     });
 }
 
@@ -3129,15 +3213,11 @@ async fn pick(
             // The previous session's turn does not belong to this screen — clear the status
             // line and the queue.
             leave_session(state);
+            clear_conversation(state);
             // A new session has no title yet.
             state.title = "Zyris Code".into();
             state.usage.clear();
-            state.timeline = Timeline::new();
-            state.folds = Folds::new();
-            state.asking = None;
-            state.last_cursor = None;
             state.picker = None;
-            state.scroll = Scroll::new();
             let _ = agent_id;
         }
         Pick::UseAgent { name } => {
@@ -3178,6 +3258,27 @@ fn leave_session(state: &mut State) {
     state.flush_queue = false;
 }
 
+/// Tears the conversation down, so what the next session draws is only its own.
+///
+/// **One place, because everything here belongs to a session.** Both the folds and the todo list
+/// are keyed by that session's event `seq`s, so leaving either behind puts the last thread's
+/// state on the next thread's rows. There are two ways out of a conversation — replacing it with
+/// a fetched history, and staging a brand new one — and when they each cleared their own list the
+/// next field added was always going to be forgotten by one of them.
+fn clear_conversation(state: &mut State) {
+    leave_session(state);
+    // **News about a conversation goes with it.** "could not send" from the thread just left,
+    // sitting on the line that is supposed to say what is happening here, reads as this thread
+    // failing.
+    state.clear_status();
+    state.timeline = Timeline::new();
+    state.todos = crate::todos::Todos::new();
+    state.folds = Folds::new();
+    state.asking = None;
+    state.last_cursor = None;
+    state.scroll = Scroll::new(); // Start from the bottom.
+}
+
 /// Switches to another session. Re-reads the past record to fill the screen and reopens the
 /// live stream.
 fn switch(
@@ -3194,6 +3295,9 @@ fn switch(
     session.switch_to(id.clone(), project_id);
     state.usage.clear();
     state.picker = None;
+    // **Cleared at the click, not when the history lands.** A notice outranks "loading…" on the
+    // activity line, so the thread being left would keep talking for the whole fetch.
+    state.clear_status();
     state.loading_history = true;
     // A title is asked for separately so it is not held up behind the history — a window
     // title still naming the previous thread makes it unclear which conversation is in view.
@@ -3202,7 +3306,7 @@ fn switch(
     let (api, tx, sid) = (Arc::clone(api), tx.clone(), id);
     tokio::spawn(async move {
         let title = crate::conn::session_title(&api, &sid).await;
-        let _ = tx.send((Some(sid), Action::Frame(Frame::Poll { usage: None, title })));
+        let _ = tx.send((Some(Origin::asked(sid)), Action::Frame(Frame::Poll { usage: None, title })));
     });
 }
 
@@ -3547,36 +3651,43 @@ async fn send(
     // the `chat_user` event for the message just sent was already recorded before the stream
     // opened, so it is never seen — the sent message disappears from the transcript. If
     // nothing has been seen yet, re-read from 0.
-    spawn_stream(Arc::clone(api), id, Some(after.unwrap_or(0)), tx.clone());
+    spawn_stream(Arc::clone(api), session, id, Some(after.unwrap_or(0)), tx.clone());
     Ok(opened.announced)
 }
 
 /// Reads the turn stream in the background and forwards it as actions.
 ///
-/// Every frame goes out **tagged with its own session's id.** The receiver uses that tag to
-/// drop frames from a stale session (`frame_is_current`) — the reason for dropping rather
-/// than cutting the stream is not to kill a turn running on the server. Going back to that
-/// session shows it all as history on reopen.
+/// **Opening one abandons the last.** `turn_events` is a live subscription that never ends by
+/// itself, and this used to be called on every message and every switch with nothing ever closed
+/// — so a session talked to five times had five subscriptions handing over the same frames, and
+/// `push_delta` appends them all. The answer being streamed came out five times over.
+///
+/// Every frame goes out **tagged with its session and this stream's number.** The receiver drops
+/// frames from a session that was left and from a stream that was abandoned (`frame_is_current`):
+/// aborting the task stops it sending more, but not what it already queued.
+///
+/// **Abandoning does not stop the turn**; it keeps running on the server and is read back as
+/// history on return.
 fn spawn_stream(
     api: Arc<AttaccaApiClient>,
+    session: &mut Session,
     session_id: String,
     after: Option<i64>,
     tx: mpsc::UnboundedSender<AppMsg>,
 ) {
-    tokio::spawn(async move {
-        let tag = session_id.clone();
-        match crate::conn::within(&api, api.turn_events(session_id, after)).await {
+    let gen = session.next_stream();
+    let task = tokio::spawn(async move {
+        let tag = || Some(Origin { session: session_id.clone(), stream: Some(gen) });
+        match crate::conn::within(&api, api.turn_events(session_id.clone(), after)).await {
             Ok(mut stream) => {
                 // `Streaming` splits into head and items. head carries the current running
                 // state.
-                let _ = tx.send((
-                    Some(tag.clone()),
-                    Action::Frame(Frame::Status { running: stream.head.running }),
-                ));
+                let running = stream.head.running;
+                let _ = tx.send((tag(), Action::Frame(Frame::Status { running })));
                 while let Some(frame) = stream.items.next().await {
                     match frame {
                         Ok(f) => {
-                            if tx.send((Some(tag.clone()), Action::Frame(frame_from(f)))).is_err() {
+                            if tx.send((tag(), Action::Frame(frame_from(f)))).is_err() {
                                 break; // The app ended.
                             }
                         }
@@ -3588,11 +3699,16 @@ fn spawn_stream(
                 }
                 // When the stream ends the turn has ended too. The status line must not
                 // freeze on "working".
-                let _ = tx.send((Some(tag), Action::Frame(Frame::Status { running: false })));
+                //
+                // **An abandoned stream never reaches here** — abort cuts the task inside
+                // `next()`. Otherwise an old stream ending would report the *new* stream's turn
+                // finished, and the activity line would go idle in the middle of one.
+                let _ = tx.send((tag(), Action::Frame(Frame::Status { running: false })));
             }
             Err(e) => tracing::error!(error = %e, "could not open the turn stream"),
         }
     });
+    session.holds_stream(task.abort_handle());
 }
 
 #[cfg(test)]
@@ -4281,7 +4397,7 @@ mod tests {
         assert!(p.rows.is_empty(), "{p:?}");
     }
 
-    fn thread_rows(ids: &[(&str, Option<crate::picker::ThreadStatus>)]) -> crate::picker::Picker {
+    fn thread_rows(ids: &[(&str, crate::picker::ThreadStatus)]) -> crate::picker::Picker {
         crate::picker::Picker::sessions(
             "p1".into(),
             "프로젝트".into(),
@@ -4297,16 +4413,16 @@ mod tests {
     fn a_thread_status_that_lands_late_fills_in_only_its_own_row() {
         use crate::picker::ThreadStatus;
         let mut s = state();
-        s.picker = Some(thread_rows(&[("a", None), ("b", None)]));
+        s.picker = Some(thread_rows(&[("a", ThreadStatus::Unknown), ("b", ThreadStatus::Unknown)]));
         apply(
             &mut s,
-            &Action::Frame(Frame::ThreadStatus { id: "b".into(), status: Some(ThreadStatus::Failed) }),
+            &Action::Frame(Frame::ThreadStatus { id: "b".into(), status: ThreadStatus::Failed }),
         );
         let rows = &s.picker.as_ref().unwrap().rows;
         let at = |id: &str| rows.iter().find(|r| r.id.as_deref() == Some(id)).unwrap().status;
         assert_eq!(at("b"), Some(ThreadStatus::Failed));
-        assert_eq!(at("a"), None, "an unrelated row moved");
-        assert_eq!(s.thread_status.get("b").copied(), Some(Some(ThreadStatus::Failed)));
+        assert_eq!(at("a"), Some(ThreadStatus::Unknown), "an unrelated row moved");
+        assert_eq!(s.thread_status.get("b").copied(), Some(ThreadStatus::Failed));
     }
 
     /// **A running dot is not overwritten by a late outcome.** Running is what is happening
@@ -4315,13 +4431,28 @@ mod tests {
     fn a_late_outcome_never_overwrites_a_running_dot() {
         use crate::picker::ThreadStatus;
         let mut s = state();
-        s.picker = Some(thread_rows(&[("a", Some(ThreadStatus::Running))]));
+        s.picker = Some(thread_rows(&[("a", ThreadStatus::Running)]));
         apply(
             &mut s,
-            &Action::Frame(Frame::ThreadStatus { id: "a".into(), status: Some(ThreadStatus::Success) }),
+            &Action::Frame(Frame::ThreadStatus { id: "a".into(), status: ThreadStatus::Success }),
         );
         let rows = &s.picker.as_ref().unwrap().rows;
         assert_eq!(rows[1].status, Some(ThreadStatus::Running), "{rows:?}");
+    }
+
+    /// **A derivation that came back empty leaves a settled dot alone.** It knows less than the
+    /// row already does, and writing it back would turn a read thread grey again.
+    #[test]
+    fn an_empty_derivation_never_greys_out_a_settled_dot() {
+        use crate::picker::ThreadStatus;
+        let mut s = state();
+        s.picker = Some(thread_rows(&[("a", ThreadStatus::Success)]));
+        apply(
+            &mut s,
+            &Action::Frame(Frame::ThreadStatus { id: "a".into(), status: ThreadStatus::Unknown }),
+        );
+        let rows = &s.picker.as_ref().unwrap().rows;
+        assert_eq!(rows[1].status, Some(ThreadStatus::Success), "{rows:?}");
     }
 
     /// **A refresh never blanks a dot that is already on screen.** It only knows the outcomes
@@ -4331,11 +4462,11 @@ mod tests {
     fn a_refresh_keeps_the_dots_that_already_landed() {
         use crate::picker::ThreadStatus;
         let mut s = state();
-        s.picker = Some(thread_rows(&[("a", Some(ThreadStatus::Success)), ("b", None)]));
+        s.picker = Some(thread_rows(&[("a", ThreadStatus::Success), ("b", ThreadStatus::Unknown)]));
         apply(
             &mut s,
             &Action::Frame(Frame::Picker {
-                picker: thread_rows(&[("a", None), ("b", Some(ThreadStatus::Failed))]),
+                picker: thread_rows(&[("a", ThreadStatus::Unknown), ("b", ThreadStatus::Failed)]),
                 thread_was_running: None,
             }),
         );
@@ -4350,7 +4481,7 @@ mod tests {
     #[test]
     fn a_list_that_arrives_too_late_is_dropped() {
         let mut s = state();
-        s.picker = Some(thread_rows(&[("a", None)]));
+        s.picker = Some(thread_rows(&[("a", crate::picker::ThreadStatus::Unknown)]));
         apply(
             &mut s,
             &Action::Frame(Frame::Picker {
@@ -4451,6 +4582,7 @@ mod tests {
         Action::Frame(Frame::Event {
             cursor: seq,
             entry: Some(Entry { seq, kind: EntryKind::WorkStart(String::new()) }),
+            todo: None,
         })
     }
 
@@ -4707,11 +4839,91 @@ mod tests {
         assert_eq!(actions, vec![Action::ToggleFold]);
     }
 
+    /// One `todo_add`, as it actually arrives — a `tool_call` event off the wire.
+    fn todo_added(seq: i64, id: &str, content: &str) -> Action {
+        let payload = serde_json::json!({
+            "name": "todo_add",
+            "arguments": {"content": content},
+            "result": {"id": id, "content": content, "status": "pending"},
+        });
+        let event = zyris_attacca::ZSessionEvent {
+            seq,
+            cursor: seq,
+            kind: "tool_call".into(),
+            payload,
+            created_at: None,
+        };
+        Action::Frame(Frame::Event {
+            cursor: seq,
+            entry: crate::event::entry_from(&event),
+            todo: crate::todos::change_from(&event),
+        })
+    }
+
+    /// **The whole path, from the event to the list.** `todos.rs` being right is no use if the
+    /// frame does not carry the change or `apply` drops it on the floor.
+    #[test]
+    fn a_todo_tool_call_lands_on_the_sessions_plan() {
+        let mut s = state();
+        apply(&mut s, &todo_added(1, "t1", "테스트 고치기"));
+        assert_eq!(s.todos.items().len(), 1, "{:?}", s.todos.items());
+        assert_eq!(s.todos.items()[0].title, "테스트 고치기");
+        assert_eq!(s.todos.counts(), (0, 1));
+    }
+
+    /// **The plan belongs to the session.** Opening another thread must not leave the one just
+    /// left showing its tasks — the same reason the timeline is torn down here.
+    #[test]
+    fn opening_another_thread_leaves_its_plan_behind() {
+        let mut s = state();
+        apply(&mut s, &todo_added(1, "t1", "앞 쓰레드의 할 일"));
+        apply(&mut s, &Action::Frame(Frame::History { entries: vec![] }));
+        assert!(s.todos.is_empty(), "{:?}", s.todos.items());
+    }
+
+    #[test]
+    fn ctrl_t_unfolds_the_plan_and_folds_it_again() {
+        let s = state();
+        assert_eq!(
+            on_key(&s, key(KeyCode::Char('t'), KeyModifiers::CONTROL)),
+            vec![Action::ToggleTodos]
+        );
+        let mut s = s;
+        assert!(!s.todos_open, "it starts folded");
+        apply(&mut s, &Action::ToggleTodos);
+        assert!(s.todos_open);
+        apply(&mut s, &Action::ToggleTodos);
+        assert!(!s.todos_open);
+    }
+
+    /// **Clicking the activity line opens the plan** — the count is right there, and reaching for
+    /// a key to see what it counts is a step too many.
+    #[test]
+    fn clicking_the_line_that_counts_the_plan_opens_it() {
+        let mut s = state();
+        apply(&mut s, &todo_added(1, "t1", "할 일"));
+        s.activity_row = Some(9);
+        apply(&mut s, &Action::Press(4, 9));
+        apply(&mut s, &Action::Release);
+        assert!(s.todos_open, "a click on the activity line must open the plan");
+    }
+
+    /// **With no plan that line is ordinary text.** Taking the click there would cost the ability
+    /// to select it, and open nothing in return.
+    #[test]
+    fn clicking_that_line_with_no_plan_takes_nothing() {
+        let mut s = state();
+        s.activity_row = Some(9);
+        apply(&mut s, &Action::Press(4, 9));
+        apply(&mut s, &Action::Release);
+        assert!(!s.todos_open);
+    }
+
     /// The position for resuming must not be lost.
     #[test]
     fn the_last_cursor_is_remembered_for_resume() {
         let mut s = state();
-        apply(&mut s, &Action::Frame(Frame::Event { cursor: 42, entry: None }));
+        apply(&mut s, &Action::Frame(Frame::Event { cursor: 42, entry: None, todo: None }));
         assert_eq!(s.last_cursor, Some(42));
     }
 
@@ -4722,15 +4934,45 @@ mod tests {
     #[test]
     fn a_frame_from_a_stale_session_is_dropped() {
         // What came from off-screen (None) passes regardless of the session.
-        assert!(frame_is_current(&None, Some("현재")));
-        assert!(frame_is_current(&None, None));
+        assert!(frame_is_current(&None, Some("현재"), 1));
+        assert!(frame_is_current(&None, None, 1));
         // A frame from its own session passes.
-        assert!(frame_is_current(&Some("a".into()), Some("a")));
+        assert!(frame_is_current(&Some(Origin::asked("a")), Some("a"), 1));
         // **A frame from a stale session is dropped** — the previous session's messages must
         // not keep coming up after switching the screen.
-        assert!(!frame_is_current(&Some("옛 세션".into()), Some("새 세션")));
+        assert!(!frame_is_current(&Some(Origin::asked("옛 세션")), Some("새 세션"), 1));
         // A stream frame arriving while there is no session yet is stale too.
-        assert!(!frame_is_current(&Some("어떤 세션".into()), None));
+        assert!(!frame_is_current(&Some(Origin::asked("어떤 세션")), None, 1));
+    }
+
+    /// **A second stream on the same session is the one that doubled the words.**
+    ///
+    /// `turn_events` is a subscription that never ends on its own, and this app opened one on
+    /// every message and every switch, closing none. Two of them hand over the same `Delta`, and
+    /// `push_delta` appends — so a session talked to five times streamed its answer five times
+    /// over, interleaved. Aborting the old task stops it sending more; this drops what it had
+    /// already queued.
+    #[test]
+    fn a_frame_from_an_abandoned_stream_of_the_same_session_is_dropped() {
+        let live = |gen| Some(Origin { session: "a".into(), stream: Some(gen) });
+        assert!(frame_is_current(&live(2), Some("a"), 2), "the live stream must pass");
+        assert!(!frame_is_current(&live(1), Some("a"), 2), "the abandoned one must not");
+        // A one-shot answer (history, a title) carries no stream number and is not affected —
+        // nothing about it can pile up.
+        assert!(frame_is_current(&Some(Origin::asked("a")), Some("a"), 2));
+    }
+
+    /// **Leaving a session abandons its stream then and there**, so the next opening gets a
+    /// number of its own and anything still queued from the old one is stale.
+    #[test]
+    fn leaving_a_session_gives_up_its_stream() {
+        let mut s = crate::conn::Session::new(None);
+        let first = s.next_stream();
+        s.switch_to("a".into(), None);
+        assert_ne!(s.stream_gen(), first, "switching must abandon the stream");
+        let after_switch = s.stream_gen();
+        s.stage_new_default();
+        assert_ne!(s.stream_gen(), after_switch, "staging a new one must too");
     }
 
     /// The wheel moves against the viewport size as last drawn — apply has to stay pure so it
@@ -5041,6 +5283,7 @@ mod tests {
             &Action::Frame(Frame::Event {
                 cursor: 2,
                 entry: Some(Entry { seq: 2, kind: EntryKind::Agent("먼저 볼게요".into()) }),
+                todo: None,
             }),
         );
         apply(&mut s, &Action::Frame(Frame::Delta { kind: ZDeltaKind::Reasoning, text: "새 생각".into() }));
@@ -5084,6 +5327,52 @@ mod tests {
         );
         let (_, text, _) = crate::widgets::activity_parts_at(&s, std::time::Instant::now());
         assert!(text.contains("b1") && text.contains("cargo build"), "{text}");
+    }
+
+    /// **`Esc 정지` stops this session's turn and nothing else.** A tool call reaches this node
+    /// with no session on it — attacca sends `zyris__node__cap__tool` and nothing more — and
+    /// another window on the same directory shares the node besides. So work running here while
+    /// this conversation is idle belongs to somebody else: shown, because the machine really is
+    /// busy, but without a hint that would not do what it says.
+    #[test]
+    fn work_that_is_not_this_conversations_gets_no_stop_hint() {
+        let mut s = state();
+        s.connected = true;
+        let job = Action::Frame(Frame::JobStart { id: "b1".into(), label: "cargo build".into() });
+        apply(&mut s, &job);
+
+        s.running = true;
+        let (mine, _, hint) = crate::widgets::activity_parts_at(&s, std::time::Instant::now());
+        assert_eq!(hint, s.lang.esc_stops(), "our own turn can be stopped");
+
+        s.running = false;
+        let (theirs, text, hint) = crate::widgets::activity_parts_at(&s, std::time::Instant::now());
+        assert!(text.contains("cargo build"), "the machine being busy is still said: {text}");
+        assert_eq!(hint, "", "nothing here for Esc to stop");
+        assert_ne!(theirs, mine, "and it must not be painted as this conversation's");
+    }
+
+    /// The same rule for `exec`, which used to hand out the hint unconditionally.
+    #[test]
+    fn a_command_running_for_someone_else_gets_no_stop_hint() {
+        let mut s = state();
+        s.connected = true;
+        apply(&mut s, &Action::Frame(Frame::ExecStart { id: 1, command: "sleep 30".into() }));
+        let (_, text, hint) = crate::widgets::activity_parts_at(&s, std::time::Instant::now());
+        assert!(text.contains("sleep 30"), "{text}");
+        assert_eq!(hint, "", "this session has no turn to stop");
+    }
+
+    /// **What a conversation had to say goes with it.** "could not send" from the thread just
+    /// left, on the line that says what is happening here, reads as this thread failing — and a
+    /// notice outranks "loading…", so it would stand for the whole fetch.
+    #[test]
+    fn news_about_the_thread_just_left_does_not_follow_you() {
+        let mut s = state();
+        s.set_error("보내지 못했습니다");
+        assert!(s.status().is_some());
+        apply(&mut s, &Action::Frame(Frame::History { entries: vec![] }));
+        assert_eq!(s.status(), None, "{:?}", s.status());
     }
 
     /// `/jobs` says **only the list and how to stop**. Dumping logs would cover the transcript.

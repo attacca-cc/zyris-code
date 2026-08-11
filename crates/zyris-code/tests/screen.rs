@@ -125,6 +125,7 @@ fn a_user_message_appears_above_the_input() {
         &Action::Frame(AppFrame::Event {
             cursor: 1,
             entry: Some(Entry { seq: 1, kind: EntryKind::User("안녕하세요".into()) }),
+            todo: None,
         }),
     );
     let screen = dump(&mut s, 40, 10);
@@ -155,6 +156,7 @@ fn the_servers_copy_of_a_submitted_message_does_not_double_it() {
         &Action::Frame(AppFrame::Event {
             cursor: 1,
             entry: Some(Entry { seq: 1, kind: EntryKind::User("안녕하세요".into()) }),
+            todo: None,
         }),
     );
     let screen = dump(&mut s, 40, 12);
@@ -190,7 +192,8 @@ fn cell_bg(state: &mut State, w: u16, h: u16, x: u16, y: u16) -> Option<ratatui:
 }
 
 fn said(state: &mut State, seq: i64, kind: EntryKind) {
-    apply(state, &Action::Frame(AppFrame::Event { cursor: seq, entry: Some(Entry { seq, kind }) }));
+    let entry = Some(Entry { seq, kind });
+    apply(state, &Action::Frame(AppFrame::Event { cursor: seq, entry, todo: None }));
 }
 
 /// **A scrolled-up view keeps looking at the same words when the width changes.**
@@ -447,6 +450,7 @@ fn there_is_no_header_taking_up_the_top_line() {
         &Action::Frame(AppFrame::Event {
             cursor: 1,
             entry: Some(Entry { seq: 1, kind: EntryKind::User("첫 줄".into()) }),
+            todo: None,
         }),
     );
     let screen = dump(&mut s, 40, 10);
@@ -466,6 +470,7 @@ fn drawing_at_a_very_narrow_width_does_not_panic() {
             entry: Some(Entry {
                 seq: 1, kind: EntryKind::Agent("한글 **강조** `코드`".into())
             }),
+            todo: None,
         }),
     );
     let _ = dump(&mut s, 12, 6);
@@ -520,6 +525,80 @@ fn what_is_happening_now_sits_between_the_chat_and_the_input_box() {
         lines[lines.len() - ACTIVITY_FROM_BOTTOM].contains("작업 중"),
         "작업 중이 안 뜬다:\n{screen}"
     );
+}
+
+/// Puts one task on the session's plan, the way the server does: a `todo_add` tool call.
+fn planned(state: &mut State, seq: i64, content: &str, status: &str) {
+    let event = zyris_attacca::ZSessionEvent {
+        seq,
+        cursor: seq,
+        kind: "tool_call".into(),
+        payload: serde_json::json!({
+            "name": "todo_add",
+            "arguments": {"content": content},
+            "result": {"id": format!("t{seq}"), "content": content, "status": status},
+        }),
+        created_at: None,
+    };
+    apply(
+        state,
+        &Action::Frame(AppFrame::Event {
+            cursor: seq,
+            entry: zyris_code::event::entry_from(&event),
+            todo: zyris_code::todos::change_from(&event),
+        }),
+    );
+}
+
+/// **How far along the plan is rides on the line that says what is happening.** Otherwise nothing
+/// on screen says the todo list exists, and the key that opens it is one nobody would press.
+#[test]
+fn the_activity_line_counts_the_plan_beside_what_it_is_doing() {
+    let mut s = State::new();
+    s.lang = zyris_code::lang::Lang::Ko;
+    s.connected = true;
+    s.running = true;
+    planned(&mut s, 1, "테스트 고치기", "completed");
+    planned(&mut s, 2, "빌드 돌리기", "pending");
+    let screen = dump(&mut s, 40, 12);
+    let lines: Vec<&str> = screen.lines().collect();
+    let at = lines.len() - ACTIVITY_FROM_BOTTOM;
+    assert!(lines[at].contains("작업 중"), "{screen}");
+    assert!(lines[at].contains("(1/2)"), "the plan is not counted:\n{screen}");
+}
+
+/// **A session with no plan says nothing about one.** An empty `(0/0)` on every screen is noise.
+#[test]
+fn a_session_without_a_plan_shows_no_count() {
+    let mut s = State::new();
+    s.lang = zyris_code::lang::Lang::Ko;
+    s.connected = true;
+    let screen = dump(&mut s, 40, 12);
+    assert!(!screen.contains("(0/0)"), "{screen}");
+}
+
+/// **The plan opens under the line that counted it, and takes its room from the conversation.**
+/// The input box and the bottom bar must stay exactly where they were — the room a person types
+/// in cannot shrink because the agent wrote itself a longer list.
+#[test]
+fn the_plan_unfolds_under_the_line_that_counts_it() {
+    let mut s = State::new();
+    s.lang = zyris_code::lang::Lang::Ko;
+    s.connected = true;
+    planned(&mut s, 1, "테스트 고치기", "completed");
+    planned(&mut s, 2, "빌드 돌리기", "in_progress");
+    let folded = dump(&mut s, 40, 14);
+    assert!(!folded.contains("1. 테스트 고치기"), "it must start folded:\n{folded}");
+
+    apply(&mut s, &Action::ToggleTodos);
+    let screen = dump(&mut s, 40, 14);
+    let lines: Vec<&str> = screen.lines().collect();
+    let at = lines.iter().position(|l| l.contains("쉬는 중")).expect(&screen);
+    assert!(lines[at + 1].contains("1. 테스트 고치기"), "{screen}");
+    assert!(lines[at + 2].contains("2. 빌드 돌리기"), "{screen}");
+    // Everything below the plan is where it always was.
+    assert!(lines[lines.len() - 2].starts_with('─'), "the rule moved:\n{screen}");
+    assert!(lines[lines.len() - 1].contains("일반"), "the bottom bar moved:\n{screen}");
 }
 
 /// The quit hint must show before anything else.
@@ -660,6 +739,7 @@ fn clicking_a_work_card_toggles_it() {
         &Action::Frame(AppFrame::Event {
             cursor: 1,
             entry: Some(Entry { seq: 1, kind: EntryKind::WorkStart("작업".into()) }),
+            todo: None,
         }),
     );
     // Streaming reasoning gives the card a chip, so there are two targets to tell apart.
@@ -709,6 +789,7 @@ fn dragging_selects_text_and_the_selection_survives_the_release() {
             entry: Some(Entry {
                 seq: 1, kind: EntryKind::Agent("안녕하세요 반갑습니다".into())
             }),
+            todo: None,
         }),
     );
     let _ = dump(&mut s, 60, 12);
@@ -734,6 +815,7 @@ fn a_click_without_moving_does_not_select() {
         &Action::Frame(AppFrame::Event {
             cursor: 1,
             entry: Some(Entry { seq: 1, kind: EntryKind::Agent("본문".into()) }),
+            todo: None,
         }),
     );
     let _ = dump(&mut s, 60, 12);
@@ -755,6 +837,7 @@ fn the_selection_survives_releasing_the_mouse() {
             entry: Some(Entry {
                 seq: 1, kind: EntryKind::Agent("안녕하세요 반갑습니다".into())
             }),
+            todo: None,
         }),
     );
     let _ = dump(&mut s, 60, 12);
@@ -780,6 +863,7 @@ fn moving_after_release_does_not_grow_the_selection() {
             entry: Some(Entry {
                 seq: 1, kind: EntryKind::Agent("안녕하세요 반갑습니다".into())
             }),
+            todo: None,
         }),
     );
     let _ = dump(&mut s, 60, 12);
@@ -805,6 +889,7 @@ fn scrolling_keeps_the_selection() {
                 entry: Some(Entry {
                     seq: i, kind: EntryKind::Agent(format!("줄 {i} 내용입니다"))
                 }),
+                todo: None,
             }),
         );
     }
@@ -837,6 +922,7 @@ fn the_highlight_covers_only_the_selected_columns() {
         &Action::Frame(AppFrame::Event {
             cursor: 1,
             entry: Some(Entry { seq: 1, kind: EntryKind::Agent("abcdefghij".into()) }),
+            todo: None,
         }),
     );
     let _ = dump(&mut s, 60, 12);
@@ -870,6 +956,7 @@ fn typing_drops_the_selection() {
         &Action::Frame(AppFrame::Event {
             cursor: 1,
             entry: Some(Entry { seq: 1, kind: EntryKind::Agent("안녕하세요 반갑습니다".into()) }),
+            todo: None,
         }),
     );
     let _ = dump(&mut s, 60, 12);
@@ -903,6 +990,7 @@ fn question_event(seq: i64, result: serde_json::Value) -> AppFrame {
             }),
             created_at: None,
         }),
+        todo: None,
     }
 }
 
@@ -1040,6 +1128,7 @@ fn the_picker_overlays_the_conversation_and_takes_the_keys() {
         &Action::Frame(AppFrame::Event {
             cursor: 1,
             entry: Some(Entry { seq: 1, kind: EntryKind::Agent("뒤에 있는 대화".into()) }),
+            todo: None,
         }),
     );
     s.picker = Some(Picker::projects(
@@ -1164,7 +1253,7 @@ fn long_picker_labels_are_truncated_inside_the_box() {
         vec![(
             "s1".into(),
             "아주아주 긴 세션 제목이 여기 들어가고 계속 이어집니다 정말로 깁니다".into(),
-            Some(zyris_code::picker::ThreadStatus::Running),
+            zyris_code::picker::ThreadStatus::Running,
         )],
         zyris_code::lang::Lang::Ko,
     ));
@@ -1252,6 +1341,7 @@ fn the_picker_box_stays_inside_the_screen_with_wide_text_behind() {
                         "한글이 잔뜩 들어간 아주 긴 줄입니다 계속 이어집니다".into(),
                     ),
                 }),
+                todo: None,
             }),
         );
     }
@@ -1282,6 +1372,7 @@ fn typed_answers_look_different_from_chosen_ones_in_history() {
                 seq: 1,
                 kind: EntryKind::User("질문?\n  - A안 (설명)\n  - 직접 입력: 내가 쓴 답".into()),
             }),
+            todo: None,
         }),
     );
     let screen = dump(&mut s, 70, 12);
@@ -1526,6 +1617,7 @@ fn state_with_edit_tool() -> State {
             entry: Some(Entry {
                 seq: 1, kind: EntryKind::WorkStart("파일을 고치는 중".into())
             }),
+            todo: None,
         }),
     );
     apply(
@@ -1550,6 +1642,7 @@ fn state_with_edit_tool() -> State {
                     }),
                 },
             }),
+            todo: None,
         }),
     );
     s.folds.insert(1, Fold { open: true, user_touched: true });
@@ -1718,6 +1811,7 @@ fn the_enroll_window_overlays_the_conversation() {
         &Action::Frame(AppFrame::Event {
             cursor: 1,
             entry: Some(Entry { seq: 1, kind: EntryKind::Agent("뒤에 있는 대화".into()) }),
+            todo: None,
         }),
     );
     apply(&mut s, &Action::Frame(AppFrame::Enroll(enroll_view())));
@@ -1733,7 +1827,7 @@ fn long_session_list(n: usize) -> zyris_code::picker::Picker {
         "zyris".into(),
         (0..n)
             .map(|i| {
-                (format!("s{i}"), format!("쓰레드 {i}"), None)
+                (format!("s{i}"), format!("쓰레드 {i}"), zyris_code::picker::ThreadStatus::Unknown)
             })
             .collect(),
         zyris_code::lang::Lang::Ko,

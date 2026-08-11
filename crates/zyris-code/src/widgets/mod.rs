@@ -2,7 +2,8 @@
 //!
 //! ```text
 //! │   (conversation)                    │
-//! │ ● working…                 Esc stop │ what's happening now
+//! │ ● working… (2/5)           Esc stop │ what's happening now
+//! │   ● 1. read the failing test        │ the plan — only while unfolded (Ctrl+T, or a click above)
 //! ├─ ~/zyris-code · * main +2 ~1 ───────┤ where tools run, and what git says (`repo::spans`)
 //! │ > input                             │ input box (grows with content)
 //! ├─────────────────────────────────────┤
@@ -34,6 +35,9 @@ mod picker;
 /// Public for the same reason as `activity` — `left_spans` is the pure seam tests read the
 /// bottom bar through.
 pub mod status;
+/// Public because `lines` is the pure seam the todo list is read through — the same reason
+/// `activity` and `status` are.
+pub mod todos;
 mod transcript;
 
 use ratatui::layout::{Constraint, Direction, Layout};
@@ -57,11 +61,16 @@ pub fn draw(frame: &mut Frame, state: &mut State) {
             state.input.height(area.width.saturating_sub(2)).min((area.height / 2).max(1)).max(1)
         }
     };
+    // **The unfolded plan takes from the conversation, never from the input.** It sits directly
+    // under the line whose count it explains, and is capped at a third of the screen — a plan of
+    // twenty tasks must not push what is being read off the top.
+    let todo_h = todos::height(state, (area.height / 3).max(1));
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(1),              // conversation
             Constraint::Length(1),           // what's happening now
+            Constraint::Length(todo_h),      // the plan, when it is unfolded
             Constraint::Length(input_h + 1), // divider + input box
             Constraint::Length(1),           // divider
             Constraint::Length(1),           // bottom bar
@@ -69,20 +78,24 @@ pub fn draw(frame: &mut Frame, state: &mut State) {
         .split(area);
 
     transcript::draw(frame, chunks[0], state);
+    // A click on this row opens the plan, and `apply` is pure — so where it landed is written
+    // down here.
+    state.activity_row = Some(chunks[1].y);
     activity::draw(frame, chunks[1], state);
+    todos::draw(frame, chunks[2], state);
     match &state.asking {
         Some((_, a)) => {
             // Moving a click to a row requires knowing this area.
-            state.ask_area = Some(chunks[2]);
-            ask::draw(frame, chunks[2], a, state.lang);
+            state.ask_area = Some(chunks[3]);
+            ask::draw(frame, chunks[3], a, state.lang);
         }
         None => {
             state.ask_area = None;
-            input::draw(frame, chunks[2], state);
+            input::draw(frame, chunks[3], state);
         }
     }
-    input::rule(frame, chunks[3]);
-    status::draw(frame, chunks[4], state);
+    input::rule(frame, chunks[4]);
+    status::draw(frame, chunks[5], state);
 
     // The picker overlaps at the very top — while it is open, that is the current task.
     if let Some(p) = &mut state.picker {

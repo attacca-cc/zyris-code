@@ -228,13 +228,13 @@ fn measure_bytes_on_the_wire() {
     for i in 0..6 {
         seq += 1;
         let entry = Entry { seq, kind: EntryKind::User(format!("{i}번째 질문입니다")) };
-        apply(&mut state, &Action::Frame(AppFrame::Event { cursor: seq, entry: Some(entry) }));
+        apply(&mut state, &Action::Frame(AppFrame::Event { cursor: seq, entry: Some(entry), todo: None }));
         seq += 1;
         let entry = Entry {
             seq,
             kind: EntryKind::Agent("그라데이션 부분은 이렇게 바꾸면 됩니다. ".repeat(30)),
         };
-        apply(&mut state, &Action::Frame(AppFrame::Event { cursor: seq, entry: Some(entry) }));
+        apply(&mut state, &Action::Frame(AppFrame::Event { cursor: seq, entry: Some(entry), todo: None }));
     }
 
     let wire = Wire::default();
