@@ -13,6 +13,7 @@ pub mod config;
 pub mod conn;
 pub mod enroll;
 pub mod event;
+pub mod github;
 pub mod hooks;
 pub mod input;
 pub mod instructions;

@@ -50,7 +50,7 @@ sha2 = "0.10"
 # Remote MCP servers (`"type": "http"`). **Already in the tree** — zyris pulls this exact version
 # with rustls, so declaring it here adds no new build. Keep `default-features = false`: the default
 # set drags in a second TLS stack, and on this machine that is minutes of build and a lot of RAM.
-reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json", "http2", "system-proxy"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json", "http2", "system-proxy", "query", "form"] }
 
 [dev-dependencies]
 # Tool tests write real files. A mock filesystem can't catch path-resolution mistakes.

@@ -55,6 +55,9 @@ pub fn announce(
     api: tokio::sync::watch::Receiver<Option<std::sync::Arc<zyris_attacca::AttaccaApiClient>>>,
 ) -> Runner {
     let edit = LocalEdit::new(cwd.clone());
+    // The GitHub tools read the repository out of this, so they need their own copy — `search`
+    // takes `cwd` by value further down.
+    let cwd2 = cwd.clone();
     // `/undo` must see the **same history** as the edit tool. Built separately, their locks would drift apart.
     bridge.set_undo(edit.undo());
     // **The reference for what counts as going outside.** Without this, the gate wouldn't see anything as outside.
@@ -99,6 +102,13 @@ pub fn announce(
         // because one of its branches waits on a work.
         .capability(Gate::new(
             wait::WaitServer(wait::Waits::new(jobs, api.clone(), bridge.clone())),
+            bridge.clone(),
+        ))
+        // **GitHub, without needing `gh` on the machine.** Announced whether or not anybody has
+        // signed in — the tools say "not signed in" plainly, which is a far better answer than a
+        // tool that is simply absent and leaves the agent shelling out to a `gh` that is not there.
+        .capability(Gate::new(
+            crate::github::GithubCapServer(crate::github::GithubTools::new(cwd2)),
             bridge.clone(),
         ))
         // **Only this one reaches outside this computer.** Big jobs are handed to attacca so a

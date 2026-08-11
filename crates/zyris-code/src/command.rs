@@ -37,6 +37,8 @@ pub enum Command {
     Quit,
     /// Shows who this node is attached as (`/account`), or logs out (`/account logout`).
     Account(Option<AccountAction>),
+    /// GitHub — who this node is signed in as, signing in, and signing out.
+    Github(Option<AccountAction>),
     /// The current session's picture — thread, project, agent, mode, and usage.
     Status,
     /// The settings — with no argument the panel; with `option value`, sets that one.
@@ -59,6 +61,9 @@ pub enum Command {
 pub enum AccountAction {
     /// Forgets the stored credentials. The next launch asks for approval again.
     Logout,
+    /// Signs in. **Only GitHub uses this** — the node's own credentials are made on first launch,
+    /// so there is nothing for `/account login` to do.
+    Login,
 }
 
 /// What `/config` can set after the command word.
@@ -181,6 +186,14 @@ pub fn parse(text: &str) -> Option<Command> {
                 Command::Jobs(Some(id.trim().to_string()))
             }
             _ => Command::Unknown(format!("jobs {arg}")),
+        },
+        "/github" => match arg {
+            "" | "status" => Command::Github(None),
+            "login" | "signin" | "sign in" | "로그인" => {
+                Command::Github(Some(AccountAction::Login))
+            }
+            "logout" | "log out" | "로그아웃" => Command::Github(Some(AccountAction::Logout)),
+            other => return Some(Command::Unknown(format!("github {other}"))),
         },
         "/account" => match arg {
             "" => Command::Account(None),
@@ -345,6 +358,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         aliases: &[],
         note_ko: "다시 붙습니다. 도구 호출이 응답 없이 멈춰 있을 때",
         note_en: "Attach again — when tool calls sit there with no answer",
+    },
+    CommandSpec {
+        name: "/github",
+        aliases: &["gh"],
+        note_ko: "GitHub 계정을 잇고 끊습니다 (login · logout)",
+        note_en: "Connect or disconnect a GitHub account (login · logout)",
     },
     CommandSpec {
         name: "/account",

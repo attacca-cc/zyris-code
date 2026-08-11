@@ -1724,6 +1724,7 @@ pub fn run_command(state: &mut State, text: &str) -> Option<crate::command::Comm
         // Needs the server — `finish_command` finishes it.
         | Command::Plugin(_)
         | Command::Account(_)
+        | Command::Github(_)
         | Command::Changes
         | Command::Undo
         // `/status` only touches the session, which lives on the I/O side (`finish_command`).
@@ -3550,7 +3551,78 @@ async fn finish_command(
             };
             state.timeline.say(said);
         }
+        // **Signing in is the person's to do, not the agent's.** The tools refuse until it has
+        // happened and say so, which is the only honest way round — a node cannot open a browser
+        // on somebody's behalf and should not try.
+        Command::Github(action) => {
+            let said = run_github(state, action.clone()).await;
+            if !said.is_empty() {
+                state.timeline.say(said);
+            }
+        }
         _ => {}
+    }
+}
+
+/// `/github`. **The wait is the whole of it** — the person has to approve a code in a browser, so
+/// this polls until they have, and says what is happening while it does.
+async fn run_github(state: &mut State, action: Option<crate::command::AccountAction>) -> String {
+    use crate::github::auth;
+
+    match action {
+        // What the account is now.
+        None => match auth::Account::load() {
+            Some(account) => state.lang.github_signed_in(&account.login),
+            None if auth::client_id().is_none() => state.lang.github_no_app().to_string(),
+            None => state.lang.github_signed_out().to_string(),
+        },
+        Some(crate::command::AccountAction::Logout) => {
+            if auth::Account::forget() {
+                state.lang.github_logged_out().to_string()
+            } else {
+                state.lang.github_nothing_to_log_out().to_string()
+            }
+        }
+        Some(crate::command::AccountAction::Login) => {
+            let pending = match auth::begin().await {
+                Ok(p) => p,
+                Err(why) => return state.lang.github_login_failed(&why.to_string()),
+            };
+            // **The code goes on screen before the wait starts.** It is the only thing the person
+            // can act on, and printing it after the polling loop would be printing it too late.
+            state
+                .timeline
+                .say(state.lang.github_code(&pending.user_code, &pending.verification_uri));
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_secs(pending.expires_in);
+            let mut wait = std::time::Duration::from_secs(pending.interval);
+            loop {
+                if std::time::Instant::now() >= deadline {
+                    return state.lang.github_login_failed("the code expired");
+                }
+                tokio::time::sleep(wait).await;
+                match auth::poll(&pending).await {
+                    auth::Poll::Waiting { interval } => {
+                        wait = std::time::Duration::from_secs(interval)
+                    }
+                    auth::Poll::Failed(why) => return state.lang.github_login_failed(&why),
+                    auth::Poll::Done(token) => {
+                        // **The login is asked for straight away** so `/github` can name the
+                        // account without a round trip, and a token that does not work is caught
+                        // here rather than at the first tool call.
+                        let login = match crate::github::api::Github::new(token.clone()) {
+                            Ok(client) => client.me().await.unwrap_or_default(),
+                            Err(_) => String::new(),
+                        };
+                        let account = auth::Account { token, login: login.clone() };
+                        if let Err(e) = account.save() {
+                            return state.lang.github_login_failed(&e.to_string());
+                        }
+                        return state.lang.github_logged_in(&login);
+                    }
+                }
+            }
+        }
     }
 }
 

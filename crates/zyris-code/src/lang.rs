@@ -1052,6 +1052,69 @@ impl Lang {
             }
         }
     }
+    // ── GitHub (`/github`)
+    pub fn github_signed_in(self, login: &str) -> String {
+        match self {
+            Lang::Ko => {
+                format!("GitHub에 `{login}`으로 이어져 있습니다. `/github logout`으로 끊습니다.")
+            }
+            Lang::En => format!("Connected to GitHub as `{login}`. `/github logout` disconnects."),
+        }
+    }
+    pub fn github_signed_out(self) -> &'static str {
+        self.pick(
+            "GitHub에 이어져 있지 않습니다. `/github login`으로 잇습니다.",
+            "Not connected to GitHub. `/github login` connects it.",
+        )
+    }
+    /// **A build with no OAuth app registered.** Saying "not signed in" here would send someone
+    /// looking for a browser page that is never going to appear.
+    pub fn github_no_app(self) -> &'static str {
+        self.pick(
+            "이 빌드에는 GitHub 앱이 등록돼 있지 않아 로그인할 수 없습니다. \
+             GitHub에서 OAuth App을 만들고 `ZYRIS_CODE_GITHUB_CLIENT_ID`에 client id를 주세요.",
+            "This build has no GitHub app registered, so there is nothing to log in to. Create an \
+             OAuth App on GitHub and give its client id as `ZYRIS_CODE_GITHUB_CLIENT_ID`.",
+        )
+    }
+    /// The code to type, and where. **Both, together** — a code with nowhere to put it is no use.
+    pub fn github_code(self, code: &str, url: &str) -> String {
+        match self {
+            Lang::Ko => format!(
+                "{url} 을 열고 이 코드를 넣어 주세요:\n\n**{code}**\n\n승인하면 이어집니다."
+            ),
+            Lang::En => format!(
+                "Open {url} and enter this code:\n\n**{code}**\n\nIt connects once you approve."
+            ),
+        }
+    }
+    pub fn github_logged_in(self, login: &str) -> String {
+        match (self, login.is_empty()) {
+            (Lang::Ko, false) => format!("GitHub에 `{login}`으로 이었습니다."),
+            (Lang::Ko, true) => "GitHub에 이었습니다.".to_string(),
+            (Lang::En, false) => format!("Connected to GitHub as `{login}`."),
+            (Lang::En, true) => "Connected to GitHub.".to_string(),
+        }
+    }
+    /// **Says the token is not revoked at GitHub.** Device flow has no secret to revoke with, and
+    /// leaving that unsaid would let someone think a live token had been destroyed.
+    pub fn github_logged_out(self) -> &'static str {
+        self.pick(
+            "GitHub 자격을 지웠습니다. GitHub 쪽 권한은 남아 있으니 \
+             github.com/settings/applications 에서 직접 해제해 주세요.",
+            "The GitHub credential is gone from this machine. The authorisation still stands on \
+             GitHub — revoke it at github.com/settings/applications.",
+        )
+    }
+    pub fn github_nothing_to_log_out(self) -> &'static str {
+        self.pick("이어져 있는 GitHub 계정이 없습니다.", "No GitHub account is connected.")
+    }
+    pub fn github_login_failed(self, why: &str) -> String {
+        match self {
+            Lang::Ko => format!("GitHub에 잇지 못했습니다: {why}"),
+            Lang::En => format!("Could not connect to GitHub: {why}"),
+        }
+    }
     pub fn plugin_where_title(self) -> &'static str {
         self.pick("어디에 받을까요?", "Where should it go?")
     }
