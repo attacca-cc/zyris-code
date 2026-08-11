@@ -416,7 +416,9 @@ mod tests {
         let undo = Undo::for_dir(work.path());
         assert!(undo.is_empty());
         let why = undo.revert_last().unwrap_err();
-        assert!(why.contains("없습니다"), "{why}");
+        // Asserted against the current language — a Korean literal here only passed because
+        // another test had set the global language first.
+        assert_eq!(why, crate::lang::current().nothing_to_undo());
     }
 
     /// **Nothing is created inside the user's repo.** Creating `.zyris-code/`

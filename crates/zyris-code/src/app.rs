@@ -67,6 +67,32 @@ pub enum Frame {
         usage: Option<crate::usage::Usage>,
         title: Option<String>,
     },
+    /// A project or thread list that finished loading — the first fill and every later
+    /// refresh both arrive this way.
+    ///
+    /// **Every list is fetched off the loop.** Awaiting one here holds keys and drawing for as
+    /// long as the server takes, and on a big account that is seconds of a frozen window.
+    /// The map rides along only when this frame knows better than the state does; `None`
+    /// leaves it alone, so a project list cannot wipe the thread cache.
+    Picker {
+        picker: crate::picker::Picker,
+        thread_was_running: Option<std::collections::HashMap<String, bool>>,
+    },
+    /// One thread's outcome dot, as it lands. **The dots stream in one by one** — deriving
+    /// each from that thread's history is a request apiece, and waiting for all of them
+    /// before showing anything is what made opening a busy project look like a hang.
+    ThreadStatus {
+        id: String,
+        status: Option<crate::picker::ThreadStatus>,
+    },
+    /// A list could not be fetched. The list closes and the reason is said once.
+    PickerFailed(String),
+    /// A session's history, replayed into the screen. Sent by the task that fetched it, so
+    /// switching threads never blocks the loop. Tagged with the session id, so a switch made
+    /// while an older one was still loading drops the loser (`frame_is_current`).
+    History {
+        entries: Vec<(i64, Option<crate::event::Entry>)>,
+    },
     /// **What git says about the working directory.** Same reason as `Poll`: reading it needs
     /// a process, and awaiting that on the draw loop would stall keys and drawing. The
     /// background arm sends the answer in and the strip above the input picks it up. `None`
@@ -132,6 +158,8 @@ pub enum Action {
     ToggleFold,
     /// Where the mouse was pressed. Screen coordinates.
     Press(u16, u16),
+    /// A Ctrl+click landed on a link. The URL is opened by the OS (I/O side).
+    OpenLink(String),
     /// Where it moved to while held.
     DragTo(u16, u16),
     /// The moment it was released. If it never moved, count it as a click.
@@ -261,6 +289,12 @@ pub struct State {
     pub rows_cache: crate::rows::Cache,
     /// Row index → seq of the card that pressing that row folds and unfolds.
     pub view_cards: std::collections::HashMap<usize, i64>,
+    /// The **effective** open state of each foldable node, as the last frame drew it.
+    ///
+    /// A click toggles from what is on screen, not from what is stored: a card with no fold state
+    /// draws open while its stored `Fold` is `open: false`, so flipping the stored value there set
+    /// `open: true` and the card did not move.
+    pub view_open: std::collections::HashMap<i64, bool>,
     /// The links on the visible transcript lines, in screen coordinates' line order.
     /// `transcript::draw` fills it from the rows cache; `widgets::draw` wraps those cells
     /// in OSC 8 so the terminal makes them Ctrl+clickable.
@@ -287,6 +321,20 @@ pub struct State {
     pub submit_now: bool,
     /// The open project/session list.
     pub picker: Option<crate::picker::Picker>,
+    /// Cached last-turn outcome per session id, so the picker's real-time refresh does not
+    /// refetch every thread's history on each poll. `None` = no terminal event yet.
+    pub thread_status: std::collections::HashMap<String, Option<crate::picker::ThreadStatus>>,
+    /// Whether a session was running on the last refresh. A running→idle transition means a
+    /// turn just finished, so its cached outcome must be re-derived.
+    pub thread_was_running: std::collections::HashMap<String, bool>,
+    /// What the project we are in is called. `Session` carries only its id, and an id on the
+    /// bottom bar says nothing — so the name is kept here, taken wherever one is entered.
+    /// `None` until a project has been chosen.
+    pub project_name: Option<String>,
+    /// A thread's history is on its way. **The old thread stays on screen until it lands** —
+    /// blanking the transcript first would leave an empty window for however long the fetch
+    /// takes, and the activity line says what is going on instead.
+    pub loading_history: bool,
     /// The new-project form. Opens when "＋ 새 프로젝트" is chosen from the ← list.
     /// **The list stays underneath**, so closing with Esc returns right to that spot.
     pub new_project: Option<crate::newproject::Form>,
@@ -343,7 +391,7 @@ pub struct State {
     /// residue only ever hides on blank cells, and a space is safe to overlap with
     /// anything, so on a slow SSH link it can never show the same word twice.
     pub force_update_blank: bool,
-    /// The screen language. `/lang` changes it and it moves together with `lang::current()`.
+    /// The screen language. `/config lang` changes it and it moves together with `lang::current()`.
     pub lang: crate::lang::Lang,
     /// The settings `/config` shows and changes. The gate reads `dir_access` through the
     /// bridge; `default_mode` decides the mode the next launch opens in.
@@ -407,6 +455,7 @@ impl Default for State {
             view_top: 0,
             rows_cache: crate::rows::Cache::new(),
             view_cards: std::collections::HashMap::new(),
+            view_open: std::collections::HashMap::new(),
             view_links: Vec::new(),
             drag: None,
             dragging: false,
@@ -415,6 +464,10 @@ impl Default for State {
             ask_area: None,
             submit_now: false,
             picker: None,
+            thread_status: std::collections::HashMap::new(),
+            thread_was_running: std::collections::HashMap::new(),
+            project_name: None,
+            loading_history: false,
             new_project: None,
             panel: None,
             project_out: None,
@@ -554,6 +607,26 @@ impl State {
             return None;
         }
         Some((self.view_top + row, (x - ox) as usize))
+    }
+
+    /// The URL of the link under the given screen coordinate, if any. `None` outside the
+    /// transcript or on a cell with no link.
+    ///
+    /// `view_links` is indexed the same way as the transcript's visible lines (line 0 is the
+    /// one at `view_origin`), and each `Link`'s columns are in that line's display columns —
+    /// so the only mapping needed is the `view_origin` offset, exactly like `inject_links`.
+    pub fn link_at(&self, x: u16, y: u16) -> Option<String> {
+        let (ox, oy) = self.view_origin;
+        if x < ox || y < oy {
+            return None;
+        }
+        let line = (y - oy) as usize;
+        let col = (x - ox) as usize;
+        self.view_links
+            .get(line)?
+            .iter()
+            .find(|l| col >= l.start && col < l.end)
+            .map(|l| l.url.clone())
     }
 }
 
@@ -813,6 +886,22 @@ pub fn apply(state: &mut State, action: &Action) {
         state.recall = None;
     }
 
+    // **Any other input drops the mouse selection.** The highlight is anchored to the screen,
+    // so once the person types, moves the cursor, sends a line, opens a list or does anything
+    // else, it points at stale text and has served its purpose. Only the mouse's own gestures
+    // (press, drag, release), a plain redraw and clearing itself keep it alive — so it never
+    // outlives the moment it was made. The wheel and page scroll are left to their own arms,
+    // which already drop the highlight while keeping the copied text.
+    if !matches!(
+        action,
+        Action::Press(..) | Action::DragTo(..) | Action::Release | Action::OpenLink(_)
+            | Action::Wheel(_) | Action::Page(_) | Action::Repaint | Action::ClearSelection
+    ) && (state.drag.is_some() || state.selection.is_some())
+    {
+        state.drag = None;
+        state.selection = None;
+    }
+
     // **With the new-project form open, character keys go to the form's active field.**
     // They must not leak into the input below — the form is a different place. Creating does
     // not call the server here; it only fills `project_out` — the I/O side actually creates.
@@ -930,19 +1019,25 @@ pub fn apply(state: &mut State, action: &Action) {
             state.drag = None;
         }
         Action::ToggleFold => {
-            // **Folds and unfolds the last work card** — including a card that arose
-            // implicitly with no work_summary (a tool-only turn with no reasoning). Same
-            // behaviour as clicking the reasoning line.
-            let last = state
-                .timeline
-                .items()
-                .iter()
-                .rev()
-                .find(|i| matches!(i, crate::timeline::Item::Work { .. }))
-                .map(|i| i.seq());
-            if let Some(seq) = last {
-                let fold = state.folds.entry(seq).or_default();
-                fold.open = !fold.open;
+            // **The key only ever reaches the last work card's head** — the whole stretch of
+            // working, opened or folded in one press. Reasoning chips and tool rows are opened by
+            // clicking them: there is no way to say *which* one from the keyboard, and walking a
+            // cursor through them would be a second selection to keep in mind.
+            //
+            // The person's choice is remembered from here on, so the run no longer opens or folds
+            // it. Like a click, it flips **what is on screen** — a running card draws open while
+            // its stored fold says `open: false`, and flipping the stored one there does nothing.
+            let key = state.timeline.items().iter().rev().find_map(|item| match item {
+                crate::timeline::Item::Work { seq, .. } => Some(*seq),
+                _ => None,
+            });
+            if let Some(key) = key {
+                let shown = state.view_open.get(&key).copied();
+                let fold = state.folds.entry(key).or_default();
+                fold.open = !shown.unwrap_or(fold.open);
+                fold.user_touched = true;
+                let now = fold.open;
+                state.view_open.insert(key, now);
             }
         }
         Action::Press(x, y) => {
@@ -989,17 +1084,28 @@ pub fn apply(state: &mut State, action: &Action) {
             // Exporting to the clipboard is I/O and does not happen here — `run` does it.
             let Some(drag) = state.drag else { return };
             if drag.is_click() {
-                // No movement means a click — if that row is a work card header, fold or
-                // unfold it. The drag holds screen coordinates, so the row is mapped back
-                // to a transcript content row first.
+                // No movement means a click — if that row is a foldable node head (a topic,
+                // subtopic or tool), fold or unfold it. The drag holds screen coordinates, so the
+                // row is mapped back to a transcript content row first. The person's choice is
+                // remembered: from now on auto-open/auto-fold leaves this node alone.
                 state.drag = None;
                 let content = state.content_at(drag.from.1 as u16, drag.from.0 as u16);
                 if let Some(&seq) = content.and_then(|(r, _)| state.view_cards.get(&r)) {
+                    let shown = state.view_open.get(&seq).copied();
                     let fold = state.folds.entry(seq).or_default();
-                    fold.open = !fold.open;
+                    fold.open = !shown.unwrap_or(fold.open);
+                    fold.user_touched = true;
+                    // **Written back at once, not left to the next frame.** Two clicks landing
+                    // before a repaint would otherwise both read the same stale state and fold
+                    // twice.
+                    let now = fold.open;
+                    state.view_open.insert(seq, now);
                 }
             }
         }
+        // **Opening a link is I/O — `run` does it.** The drag never started, so there is
+        // no selection to clear and no fold to toggle.
+        Action::OpenLink(_) => {}
         Action::AskUp => {
             if let Some((_, a)) = &mut state.asking {
                 a.up();
@@ -1075,9 +1181,10 @@ pub fn apply(state: &mut State, action: &Action) {
         // Repainting is the screen's business alone. No state changes, so there is nothing
         // to do here.
         Action::Repaint => {}
-        // Filling the list is the I/O side's job. **Do not touch it here** — `apply` runs
-        // after the I/O handling, so setting anything here overwrites the list just fetched.
-        Action::OpenPicker => {}
+        // **The box goes up empty and the rows arrive later.** The I/O side only starts the
+        // fetch; it no longer waits for it, so putting the placeholder here is safe (`apply`
+        // runs after that arm) and it is what makes ← respond the instant it is pressed.
+        Action::OpenPicker => state.picker = Some(crate::picker::Picker::loading_projects()),
         Action::PickUp => {
             if let Some(p) = &mut state.picker {
                 p.up();
@@ -1286,6 +1393,80 @@ fn apply_frame(state: &mut State, frame: &Frame) {
         // Replace, never merge. Leaving a repository behind has to clear the strip, and the
         // background arm only sends this when the value actually changed.
         Frame::Git(got) => state.repo = got.clone(),
+        // A list that finished loading. **The cursor is preserved** — a refresh landing while
+        // someone is choosing must not yank their selection out from under them.
+        //
+        // **It is dropped if the list has moved on.** A slow project list arriving after the
+        // person already went into a project would throw them back out.
+        Frame::Picker { picker, thread_was_running } => {
+            let same = state
+                .picker
+                .as_ref()
+                .is_some_and(|cur| std::mem::discriminant(&cur.level) == std::mem::discriminant(&picker.level));
+            if same {
+                let (cursor, top) =
+                    state.picker.as_ref().map(|cur| (cur.cursor, cur.top)).unwrap_or((0, 0));
+                let mut p = picker.clone();
+                p.cursor = cursor.min(p.rows.len().saturating_sub(1));
+                // The scroll position too — a refresh that snapped the list back to the top
+                // would be the same yank as losing the cursor.
+                p.top = top.min(p.rows.len().saturating_sub(1));
+                // **A dot already on screen is kept.** A refresh only knows the outcomes it
+                // had cached when it started, so a rebuild landing while the rest are still
+                // streaming would blank them — and with a refresh every few seconds they
+                // would blink out and back for as long as the derivation took.
+                if let Some(old) = &state.picker {
+                    for row in p.rows.iter_mut().filter(|r| r.status.is_none()) {
+                        if let Some(was) =
+                            old.rows.iter().find(|o| o.id.is_some() && o.id == row.id)
+                        {
+                            row.status = was.status;
+                        }
+                    }
+                }
+                state.picker = Some(p);
+            }
+            if let Some(map) = thread_was_running {
+                state.thread_was_running = map.clone();
+            }
+        }
+        // One thread's dot. **A running dot is not overwritten** — running is what is
+        // happening now, and this is only the last outcome.
+        Frame::ThreadStatus { id, status } => {
+            state.thread_status.insert(id.clone(), *status);
+            if let Some(row) = state
+                .picker
+                .as_mut()
+                .and_then(|p| p.rows.iter_mut().find(|r| r.id.as_deref() == Some(id.as_str())))
+            {
+                if row.status != Some(crate::picker::ThreadStatus::Running) {
+                    row.status = *status;
+                }
+            }
+        }
+        // **Say it and close.** A list left open and forever empty reads as a hang, and so
+        // does an activity line stuck on "loading…".
+        Frame::PickerFailed(why) => {
+            state.picker = None;
+            state.loading_history = false;
+            state.set_error(why.clone());
+        }
+        // A session's history. It arrives whole, so the screen it replaces is torn down here
+        // rather than at the moment of the click — until this lands, the previous thread is
+        // still what is on screen and still what the person can read.
+        Frame::History { entries } => {
+            leave_session(state);
+            state.timeline = Timeline::new();
+            state.folds = Folds::new();
+            state.asking = None;
+            state.last_cursor = None;
+            state.scroll = Scroll::new(); // Start from the bottom.
+            for (cursor, entry) in entries {
+                let frame = Frame::Event { cursor: *cursor, entry: entry.clone() };
+                apply(state, &Action::Frame(frame));
+            }
+            state.loading_history = false;
+        }
         // **The screen says when it dropped.** The activity line turns to "connecting…" and
         // the reason goes by once as a notice. Reconnecting is the Runner's job, and
         // `api_rx` tells us once it is back.
@@ -1403,22 +1584,6 @@ pub fn run_command(state: &mut State, text: &str) -> Option<crate::command::Comm
         Command::Mode(Some(mode)) => {
             state.mode = *mode;
             let said = state.lang.mode_changed(mode.label(state.lang));
-            state.timeline.say(said);
-        }
-        // **The screen language changes the moment it is set.** The confirmation is said
-        // **in the new language** — switching to English and getting a Korean confirmation
-        // leaves no way to tell it changed.
-        // **Typed with no argument it opens a list to pick from.** There are only two, so
-        // the list is the answer — picking by eye beats memorizing `/lang en`.
-        Command::Lang(None) => {
-            state.picker = Some(crate::picker::Picker::languages(state.lang));
-        }
-        Command::Lang(Some(lang)) => {
-            state.lang = *lang;
-            state.timeline.say(lang.lang_changed().to_string());
-        }
-        Command::LangUnknown(given) => {
-            let said = state.lang.lang_unknown(given);
             state.timeline.say(said);
         }
         Command::Cwd => {
@@ -1667,6 +1832,25 @@ fn set_terminal_title(title: &str) {
 /// literal text. The length is cut too.
 fn title_for_osc(title: &str) -> String {
     title.chars().filter(|c| !c.is_control()).take(120).collect()
+}
+
+/// Opens a URL in the OS's default browser, spawned so it never blocks the draw loop.
+///
+/// This is the emulator-independent half of link opening: the transcript also wraps link
+/// cells in OSC 8, but with mouse capture on some terminals (Alacritty) forward the
+/// Ctrl+click to the app instead of opening the hyperlink themselves (alacritty#8129). So
+/// the app opens it itself, and Ctrl+click behaves the same in every emulator.
+fn open_url(url: &str) {
+    let result = if cfg!(target_os = "macos") {
+        std::process::Command::new("open").arg(url).spawn()
+    } else if cfg!(target_os = "windows") {
+        std::process::Command::new("cmd").args(["/C", "start", "", url]).spawn()
+    } else {
+        std::process::Command::new("xdg-open").arg(url).spawn()
+    };
+    if let Err(e) = result {
+        tracing::warn!(error = %e, url, "could not open link");
+    }
 }
 
 /// How long we wait for the answer to the kitty keyboard protocol support question.
@@ -2124,9 +2308,7 @@ async fn run_inner(
     // answered before quitting, the server is still waiting, and having to hunt for it by
     // hand is as good as having no way to answer.
     if let Some(id) = crate::conn::session_awaiting_answer(&api).await {
-        if let Err(e) = switch(&api, &mut state, &mut session, id, None, &tx).await {
-            state.set_error(e.to_string());
-        }
+        switch(&mut state, &mut session, id, None, &api, &tx);
     }
     // **Exactly one event stream is alive at a time.** This used to build a second one that
     // merely *shadowed* the pre-connection loop's — and shadowing does not drop the first, so
@@ -2232,7 +2414,20 @@ async fn run_inner(
                         MouseEventKind::ScrollUp => vec![Action::Wheel(1)],
                         MouseEventKind::ScrollDown => vec![Action::Wheel(-1)],
                         MouseEventKind::Down(MouseButton::Left) => {
-                            vec![Action::Press(m.column, m.row)]
+                            // **A Ctrl+click opens a link instead of starting a drag.** The
+                            // terminal is expected to open OSC 8 hyperlinks on Ctrl+click —
+                            // but with mouse capture on, Alacritty forwards the click to the
+                            // app rather than opening it (alacritty#8129). Opening it here
+                            // makes the feature work in every emulator identically.
+                            if m.modifiers.contains(KeyModifiers::CONTROL) {
+                                if let Some(url) = state.link_at(m.column, m.row) {
+                                    vec![Action::OpenLink(url)]
+                                } else {
+                                    vec![Action::Press(m.column, m.row)]
+                                }
+                            } else {
+                                vec![Action::Press(m.column, m.row)]
+                            }
                         }
                         MouseEventKind::Drag(MouseButton::Left) => {
                             vec![Action::DragTo(m.column, m.row)]
@@ -2283,6 +2478,12 @@ async fn run_inner(
                         // `run` restores the screen, and **the turn running on the server is
                         // stopped below this.**
                         Action::Quit => break 'app,
+                        // **A Ctrl+click on a link opens it in the OS browser.** Opening is
+                        // I/O, so it happens here — `apply` ignores the action. Spawned so
+                        // the loop is not blocked on the browser.
+                        Action::OpenLink(url) => {
+                            open_url(url);
+                        }
                         // **While work is running we do not send here.** `apply` puts it on
                         // the queue and `flush_queue` below sends them in order when the
                         // turn ends. `apply` runs after this match, so the `running` seen
@@ -2299,15 +2500,10 @@ async fn run_inner(
                                     .await;
                             }
                         }
-                        // The list has to be fetched from the server — fill it the moment it
-                        // opens.
-                        Action::OpenPicker => match crate::conn::projects(&api).await {
-                            Ok(items) => state.picker = Some(crate::picker::Picker::projects(items, state.lang)),
-                            Err(e) => {
-                                state.picker = None;
-                                state.set_error(e.to_string());
-                            }
-                        },
+                        // **The list opens empty and fills itself.** Fetching it here would
+                        // hold keys and drawing until the server answered, so the box goes up
+                        // saying "loading…" and a task sends the rows in.
+                        Action::OpenPicker => spawn_projects(&api, state.lang, &tx),
                         // All of "back" is decided here — from the session level, go back to
                         // the project list; at the project level, close.
                         Action::PickBack => {
@@ -2316,26 +2512,14 @@ async fn run_inner(
                                 Some(crate::picker::Level::Sessions { .. })
                             );
                             if in_sessions {
-                                match crate::conn::projects(&api).await {
-                                    Ok(items) => {
-                                        state.picker =
-                                            Some(crate::picker::Picker::projects(items, state.lang))
-                                    }
-                                    Err(e) => {
-                                        state.picker = None;
-                                        state.set_error(e.to_string());
-                                    }
-                                }
+                                state.picker = Some(crate::picker::Picker::loading_projects());
+                                spawn_projects(&api, state.lang, &tx);
                             } else {
                                 state.picker = None;
                             }
                         }
                         Action::PickConfirm => {
-                            if let Err(e) =
-                                pick(&api, &mut state, &mut session, &mut agent_id, &tx).await
-                            {
-                                state.set_error(e.to_string());
-                            }
+                            pick(&api, &mut state, &mut session, &mut agent_id, &tx).await;
                         }
                         Action::Cancel => {
                             if let Some(id) = session.id() {
@@ -2356,6 +2540,16 @@ async fn run_inner(
                     }
                     apply(&mut state, &action);
 
+                    // **The turn stream starts once the history is in.** It resumes from just
+                    // past what was re-read, and that cursor exists only after the replay —
+                    // opening it before would either re-deliver the whole thread or skip the
+                    // events that arrived while it was loading.
+                    if matches!(action, Action::Frame(Frame::History { .. })) {
+                        if let Some(id) = session.id().map(str::to_string) {
+                            spawn_stream(Arc::clone(&api), id, state.last_cursor, tx.clone());
+                        }
+                    }
+
                     // **Selected text goes to the clipboard the moment the mouse is
                     // released.** There is no key to press — leaving Ctrl+C as the one stop
                     // key is less confusing when it matters. `apply` sets the range, so
@@ -2370,7 +2564,9 @@ async fn run_inner(
                     // Slash commands. `run_command` finishes the pure part, and only what
                     // needs the server or the disk is finished here.
                     if let Some(text) = state.command_out.take() {
-                        finish_command(&api, &bridge, &mut state, &mut session, &mut agent_id, &text)
+                        finish_command(
+                            &api, &bridge, &mut state, &mut session, &mut agent_id, &text, &tx,
+                        )
                             .await;
                         // `/quit`. The way out is the same as Ctrl+C — a running turn is
                         // stopped below.
@@ -2404,6 +2600,7 @@ async fn run_inner(
                                 // accident of starting work somewhere other than what was
                                 // just created.
                                 session.enter_project(id);
+                                state.project_name = Some(name.clone());
                                 session.stage_new_default();
                                 // Clear the previous session's turn state — moving to a new
                                 // project must not leave "working" behind.
@@ -2534,6 +2731,22 @@ async fn run_inner(
                         ));
                     });
                 }
+                // While the thread list is open, keep its statuses live: a thread that goes
+                // idle (or a new one that appears) shows up without closing and reopening.
+                // Runs off the loop like poll/git so a slow server cannot stall keys.
+                if let Some(p) = &state.picker {
+                    if let crate::picker::Level::Sessions { project_id, project_name } = &p.level {
+                        spawn_sessions(
+                            &api,
+                            &tx,
+                            project_id.clone(),
+                            project_name.clone(),
+                            state.lang,
+                            state.thread_status.clone(),
+                            state.thread_was_running.clone(),
+                        );
+                    }
+                }
                 if state.title != shown_title {
                     set_terminal_title(&state.title);
                     shown_title = state.title.clone();
@@ -2561,6 +2774,15 @@ async fn run_inner(
                 // While working the dot has to blink, so keep redrawing. One frame is around
                 // 0.2ms, so it is no burden — before, this was not possible.
                 if state.running {
+                    dirty = true;
+                }
+                // A running thread's status dot in the picker blinks too, so the list must be
+                // redrawn each frame while one is on screen.
+                if state
+                    .picker
+                    .as_ref()
+                    .is_some_and(|p| p.rows.iter().any(|r| r.status == Some(crate::picker::ThreadStatus::Running)))
+                {
                     dirty = true;
                 }
                 // With the enrollment code window up, the time left is ticking down, so keep
@@ -2704,6 +2926,158 @@ fn shutdown_signals() -> mpsc::Receiver<()> {
     rx
 }
 
+/// How many thread outcomes are derived at once.
+///
+/// Each is a history read of its own, so all of them at once would open a socket per thread on
+/// a busy project; one at a time would take as long as the sum. This is the middle.
+const STATUS_AT_ONCE: usize = 6;
+
+/// Fetches the project list off the loop.
+///
+/// **Nothing here may be awaited on the draw loop.** The list is one request, but on a big
+/// account it is not a fast one, and while it runs neither keys nor drawing happen — which is
+/// exactly what "the window freezes when I press ←" was.
+fn spawn_projects(
+    api: &Arc<AttaccaApiClient>,
+    lang: crate::lang::Lang,
+    tx: &mpsc::UnboundedSender<AppMsg>,
+) {
+    let (api, tx) = (Arc::clone(api), tx.clone());
+    tokio::spawn(async move {
+        let frame = match crate::conn::projects(&api).await {
+            Ok(items) => Frame::Picker {
+                picker: crate::picker::Picker::projects(items, lang),
+                thread_was_running: None,
+            },
+            Err(e) => Frame::PickerFailed(e.to_string()),
+        };
+        let _ = tx.send((None, Action::Frame(frame)));
+    });
+}
+
+/// Fetches a project's thread list off the loop, then **streams each thread's outcome dot in
+/// as it lands.**
+///
+/// The rows go up the moment the one list request returns; the dots follow. Deriving an
+/// outcome means reading that thread's history, so waiting for every one of them before
+/// showing anything is what made opening a busy project look like a hang.
+///
+/// A thread that is running shows as `Running` at once. A finished one reuses the cached
+/// outcome unless it was running on the last refresh — running→idle means a turn just ended,
+/// so that one is re-derived.
+fn spawn_sessions(
+    api: &Arc<AttaccaApiClient>,
+    tx: &mpsc::UnboundedSender<AppMsg>,
+    project_id: String,
+    project_name: String,
+    lang: crate::lang::Lang,
+    cached: std::collections::HashMap<String, Option<crate::picker::ThreadStatus>>,
+    was_running: std::collections::HashMap<String, bool>,
+) {
+    use crate::picker::ThreadStatus;
+    let (api, tx) = (Arc::clone(api), tx.clone());
+    tokio::spawn(async move {
+        let items = match crate::conn::sessions(&api, &project_id).await {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = tx.send((None, Action::Frame(Frame::PickerFailed(e.to_string()))));
+                return;
+            }
+        };
+        let mut rows = Vec::with_capacity(items.len());
+        let mut derive: Vec<String> = Vec::new();
+        let mut now_running = std::collections::HashMap::with_capacity(items.len());
+        for (id, title, running) in items {
+            let was = was_running.get(&id).copied().unwrap_or(false);
+            let status = if running {
+                Some(ThreadStatus::Running)
+            } else {
+                let known = cached.get(&id).copied().unwrap_or(None);
+                if known.is_some() && !was {
+                    known
+                } else {
+                    // Unknown for now — the dot arrives on its own.
+                    derive.push(id.clone());
+                    None
+                }
+            };
+            now_running.insert(id.clone(), running);
+            rows.push((id, title, status));
+        }
+        let _ = tx.send((
+            None,
+            Action::Frame(Frame::Picker {
+                picker: crate::picker::Picker::sessions(project_id, project_name, rows, lang),
+                thread_was_running: Some(now_running),
+            }),
+        ));
+
+        let room = Arc::new(tokio::sync::Semaphore::new(STATUS_AT_ONCE));
+        for id in derive {
+            let (api, tx, room) = (Arc::clone(&api), tx.clone(), Arc::clone(&room));
+            tokio::spawn(async move {
+                let Ok(_permit) = room.acquire().await else { return };
+                let status = crate::conn::session_status(&api, &id).await;
+                let _ = tx.send((None, Action::Frame(Frame::ThreadStatus { id, status })));
+            });
+        }
+    });
+}
+
+/// Fetches the agent list off the loop. Same reason as `spawn_projects`.
+fn spawn_agents(api: &Arc<AttaccaApiClient>, tx: &mpsc::UnboundedSender<AppMsg>) {
+    let (api, tx) = (Arc::clone(api), tx.clone());
+    tokio::spawn(async move {
+        let frame = match crate::conn::within(&api, api.list_agents()).await {
+            Ok(agents) => {
+                let rows = agents
+                    .into_iter()
+                    .map(|a| crate::picker::Row {
+                        id: Some(a.name.clone()),
+                        label: a.name,
+                        note: None,
+                        enabled: true,
+                        status: None,
+                    })
+                    .collect();
+                Frame::Picker {
+                    picker: crate::picker::Picker::agents(rows),
+                    thread_was_running: None,
+                }
+            }
+            Err(e) => {
+                Frame::PickerFailed(crate::lang::current().agent_list_error(&e.to_string()))
+            }
+        };
+        let _ = tx.send((None, Action::Frame(frame)));
+    });
+}
+
+/// Fetches a thread's history off the loop and sends it in as one frame.
+///
+/// **Tagged with the session id.** Switching again while this is in flight leaves an answer
+/// nobody wants any more, and `frame_is_current` drops it — otherwise the loser would land on
+/// top of the thread the person actually chose.
+fn spawn_history(
+    api: &Arc<AttaccaApiClient>,
+    tx: &mpsc::UnboundedSender<AppMsg>,
+    id: String,
+) {
+    let (api, tx) = (Arc::clone(api), tx.clone());
+    tokio::spawn(async move {
+        let frame = match crate::conn::history(&api, &id).await {
+            Ok(events) => Frame::History {
+                entries: events
+                    .iter()
+                    .map(|e| (e.cursor, crate::event::entry_from(e)))
+                    .collect(),
+            },
+            Err(e) => Frame::PickerFailed(e.to_string()),
+        };
+        let _ = tx.send((Some(id), Action::Frame(frame)));
+    });
+}
+
 /// Actually acts on what was chosen from the list.
 async fn pick(
     api: &Arc<AttaccaApiClient>,
@@ -2711,24 +3085,41 @@ async fn pick(
     session: &mut Session,
     agent_id: &mut String,
     tx: &mpsc::UnboundedSender<AppMsg>,
-) -> anyhow::Result<()> {
+) {
     use crate::picker::{Pick, Picker};
 
     let Some(chosen) = state.picker.as_ref().and_then(Picker::pick) else {
-        return Ok(());
+        return;
     };
+    // **Every way out of a thread list stays in that project** — opening a thread, making one,
+    // or closing with Esc. Taken here once rather than in each arm, so a new arm cannot forget
+    // it and leave the bottom bar naming a project we already left.
+    if let Some(crate::picker::Level::Sessions { project_name, .. }) =
+        state.picker.as_ref().map(|p| &p.level)
+    {
+        state.project_name = Some(project_name.clone());
+    }
     match chosen {
         Pick::Unavailable(why) => state.set_error(why),
         Pick::OpenProject { id, name } => {
-            let items = crate::conn::sessions(api, &id).await?;
             // **Remember it the moment we enter.** Even if it closes with Esc without a
             // session being chosen, jobs and works opened from here must belong to this
             // project.
             session.enter_project(id.clone());
-            state.picker = Some(Picker::sessions(id, name, items, state.lang));
+            state.project_name = Some(name.clone());
+            state.picker = Some(Picker::loading_sessions(id.clone(), name.clone()));
+            spawn_sessions(
+                api,
+                tx,
+                id,
+                name,
+                state.lang,
+                state.thread_status.clone(),
+                state.thread_was_running.clone(),
+            );
         }
         Pick::OpenSession { id, project_id } => {
-            switch(api, state, session, id, Some(project_id), tx).await?;
+            switch(state, session, id, Some(project_id), api, tx);
         }
         Pick::NewSession { project_id } => {
             // **Do not create it on the server now.** It is created when the first message
@@ -2748,16 +3139,6 @@ async fn pick(
             state.picker = None;
             state.scroll = Scroll::new();
             let _ = agent_id;
-        }
-        // **The screen language changes the moment it is chosen.** The confirmation is said
-        // in the new language — switching to English and getting a Korean confirmation
-        // leaves no way to tell it changed. Persisting it happens here.
-        Pick::UseLang { lang } => {
-            state.picker = None;
-            state.lang = lang;
-            crate::lang::set(lang);
-            crate::lang::save(lang);
-            state.timeline.say(lang.lang_changed().to_string());
         }
         Pick::UseAgent { name } => {
             state.picker = None;
@@ -2779,7 +3160,6 @@ async fn pick(
             state.input.insert_str(&format!("{text} "));
         }
     }
-    Ok(())
 }
 
 /// Called where the screen leaves this session. Clears the previous session's turn state.
@@ -2800,42 +3180,30 @@ fn leave_session(state: &mut State) {
 
 /// Switches to another session. Re-reads the past record to fill the screen and reopens the
 /// live stream.
-async fn switch(
-    api: &Arc<AttaccaApiClient>,
+fn switch(
     state: &mut State,
     session: &mut Session,
     id: String,
     project_id: Option<String>,
+    api: &Arc<AttaccaApiClient>,
     tx: &mpsc::UnboundedSender<AppMsg>,
-) -> anyhow::Result<()> {
-    let events = crate::conn::history(api, &id).await?;
-
-    // Clear the previous session's screen and rebuild it. Without clearing, the two sessions
-    // mix. The turn state belongs to that session too — carrying "working" over puts a line
-    // up while nothing is running in this session, and the held messages go out to this one.
-    leave_session(state);
-    state.timeline = Timeline::new();
-    state.folds = Folds::new();
-    state.asking = None;
-    state.last_cursor = None;
-
-    for event in events {
-        let cursor = event.cursor;
-        let entry = crate::event::entry_from(&event);
-        apply(state, &Action::Frame(Frame::Event { cursor, entry }));
-    }
-
+) {
+    // **The screen is not torn down here.** History is fetched off the loop, and a long thread
+    // takes a while; blanking now would leave an empty window for all of it. `Frame::History`
+    // does the clearing when it lands, so until then the previous thread stays readable.
     session.switch_to(id.clone(), project_id);
-    // Set the title now rather than waiting for polling — a window title pointing at the
-    // previous session for a few seconds after a switch makes it unclear which conversation
-    // is in view.
-    state.title = crate::conn::session_title(api, &id).await.unwrap_or_else(|| "Zyris Code".into());
     state.usage.clear();
     state.picker = None;
-    state.scroll = Scroll::new(); // Start from the bottom.
-                                  // Listen on from just past what was re-read.
-    spawn_stream(Arc::clone(api), id, state.last_cursor, tx.clone());
-    Ok(())
+    state.loading_history = true;
+    // A title is asked for separately so it is not held up behind the history — a window
+    // title still naming the previous thread makes it unclear which conversation is in view.
+    state.title = "Zyris Code".into();
+    spawn_history(api, tx, id.clone());
+    let (api, tx, sid) = (Arc::clone(api), tx.clone(), id);
+    tokio::spawn(async move {
+        let title = crate::conn::session_title(&api, &sid).await;
+        let _ = tx.send((Some(sid), Action::Frame(Frame::Poll { usage: None, title })));
+    });
 }
 
 /// Secures a session (creating one if there is none), sends the message, and opens the turn
@@ -2853,6 +3221,7 @@ async fn finish_command(
     session: &mut Session,
     agent_id: &mut String,
     text: &str,
+    tx: &mpsc::UnboundedSender<AppMsg>,
 ) {
     use crate::command::{AccountAction, Command};
     let Some(cmd) = run_command(state, text) else { return };
@@ -2880,21 +3249,11 @@ async fn finish_command(
             let found = crate::instructions::collect(&state.cwd);
             state.timeline.say(state.lang.rules_text(&found));
         }
-        Command::Agent(None) => match crate::conn::within(api, api.list_agents()).await {
-            Ok(agents) => {
-                let rows = agents
-                    .into_iter()
-                    .map(|a| crate::picker::Row {
-                        id: Some(a.name.clone()),
-                        label: a.name,
-                        note: None,
-                        enabled: true,
-                    })
-                    .collect();
-                state.picker = Some(crate::picker::Picker::agents(rows));
-            }
-            Err(e) => state.timeline.say(state.lang.agent_list_error(&e.to_string())),
-        },
+        // Off the loop, like every other list — see `spawn_projects`.
+        Command::Agent(None) => {
+            state.picker = Some(crate::picker::Picker::loading_agents());
+            spawn_agents(api, tx);
+        }
         Command::Agent(Some(name)) => switch_agent(api, state, session, agent_id, &name).await,
         Command::Plugin(what) => {
             use crate::command::Plugin as P;
@@ -2912,13 +3271,6 @@ async fn finish_command(
                     state.timeline.say(said);
                 }
             }
-        }
-        // **The chosen language goes to two places.** The global that off-screen code (shell
-        // notices, tool errors) uses, and the file the next launch reads. `run_command` is
-        // pure, so it only changed the state.
-        Command::Lang(Some(lang)) => {
-            crate::lang::set(lang);
-            crate::lang::save(lang);
         }
         // **A setting change reaches the disk and the gate.** `run_command` only touched
         // the state; `save` writes the file and `bridge.sync` carries the new policy to the
@@ -3615,28 +3967,6 @@ mod tests {
         assert!(s.panel.is_none(), "Enter still closes a panel without a button");
     }
 
-    /// **A window to pick the screen language comes up.** There are only two, so the list is
-    /// the answer.
-    #[test]
-    fn the_lang_command_opens_a_list_to_pick_from() {
-        let mut s = State::new();
-        run_command(&mut s, "/lang");
-        let picker = s.picker.as_ref().expect("the list should be up");
-        let labels: Vec<&str> = picker.rows.iter().map(|r| r.label.as_str()).collect();
-        assert!(labels.contains(&"English"), "{labels:?}");
-        assert!(labels.contains(&"한국어"), "{labels:?}");
-    }
-
-    /// Naming it outright changes it without the window — `/lang ko` is what some hands know.
-    #[test]
-    fn naming_a_language_changes_it_without_the_list() {
-        let mut s = State::new();
-        run_command(&mut s, "/lang ko");
-        assert_eq!(s.lang, crate::lang::Lang::Ko);
-        assert!(s.picker.is_none(), "with a name given there is no reason to open the list");
-        assert!(last_system(&mut s).contains("한국어"), "{}", last_system(&mut s));
-    }
-
     /// An unknown command says what does exist. Just "unknown" means getting it wrong again
     /// next time.
     #[test]
@@ -3783,7 +4113,7 @@ mod tests {
         assert_eq!(s.config.default_mode, None);
     }
 
-    /// `/config lang` changes the screen language the same way `/lang` does.
+    /// `/config lang` changes the screen language.
     #[test]
     fn the_config_command_changes_the_language() {
         let mut s = State::new();
@@ -3937,6 +4267,123 @@ mod tests {
         assert!(s.picker.is_none(), "erased it all, but the list is still there");
     }
 
+    // ── Lists that load off the loop ───────────────────────────────────
+
+    /// **← answers at once.** The list used to be fetched on the draw loop, so between the
+    /// press and the server's answer neither keys nor drawing happened — on a big account
+    /// that is a window that looks hung.
+    #[test]
+    fn pressing_left_puts_the_list_up_before_its_rows_arrive() {
+        let mut s = state();
+        apply(&mut s, &Action::OpenPicker);
+        let p = s.picker.as_ref().expect("the list did not open");
+        assert!(p.loading, "it must say it is loading: {p:?}");
+        assert!(p.rows.is_empty(), "{p:?}");
+    }
+
+    fn thread_rows(ids: &[(&str, Option<crate::picker::ThreadStatus>)]) -> crate::picker::Picker {
+        crate::picker::Picker::sessions(
+            "p1".into(),
+            "프로젝트".into(),
+            ids.iter().map(|(id, st)| ((*id).to_string(), (*id).to_string(), *st)).collect(),
+            crate::lang::Lang::Ko,
+        )
+    }
+
+    /// **A dot that lands late patches its own row.** Deriving each outcome is a request of
+    /// its own, so they arrive one at a time — redrawing the whole list per dot would reset
+    /// the cursor under whoever is choosing.
+    #[test]
+    fn a_thread_status_that_lands_late_fills_in_only_its_own_row() {
+        use crate::picker::ThreadStatus;
+        let mut s = state();
+        s.picker = Some(thread_rows(&[("a", None), ("b", None)]));
+        apply(
+            &mut s,
+            &Action::Frame(Frame::ThreadStatus { id: "b".into(), status: Some(ThreadStatus::Failed) }),
+        );
+        let rows = &s.picker.as_ref().unwrap().rows;
+        let at = |id: &str| rows.iter().find(|r| r.id.as_deref() == Some(id)).unwrap().status;
+        assert_eq!(at("b"), Some(ThreadStatus::Failed));
+        assert_eq!(at("a"), None, "an unrelated row moved");
+        assert_eq!(s.thread_status.get("b").copied(), Some(Some(ThreadStatus::Failed)));
+    }
+
+    /// **A running dot is not overwritten by a late outcome.** Running is what is happening
+    /// now; the derived one is only how the last turn ended.
+    #[test]
+    fn a_late_outcome_never_overwrites_a_running_dot() {
+        use crate::picker::ThreadStatus;
+        let mut s = state();
+        s.picker = Some(thread_rows(&[("a", Some(ThreadStatus::Running))]));
+        apply(
+            &mut s,
+            &Action::Frame(Frame::ThreadStatus { id: "a".into(), status: Some(ThreadStatus::Success) }),
+        );
+        let rows = &s.picker.as_ref().unwrap().rows;
+        assert_eq!(rows[1].status, Some(ThreadStatus::Running), "{rows:?}");
+    }
+
+    /// **A refresh never blanks a dot that is already on screen.** It only knows the outcomes
+    /// it had cached when it started, and it runs every few seconds — a rebuild that dropped
+    /// the rest would make them blink out and back for as long as the derivation took.
+    #[test]
+    fn a_refresh_keeps_the_dots_that_already_landed() {
+        use crate::picker::ThreadStatus;
+        let mut s = state();
+        s.picker = Some(thread_rows(&[("a", Some(ThreadStatus::Success)), ("b", None)]));
+        apply(
+            &mut s,
+            &Action::Frame(Frame::Picker {
+                picker: thread_rows(&[("a", None), ("b", Some(ThreadStatus::Failed))]),
+                thread_was_running: None,
+            }),
+        );
+        let rows = &s.picker.as_ref().unwrap().rows;
+        let at = |id: &str| rows.iter().find(|r| r.id.as_deref() == Some(id)).unwrap().status;
+        assert_eq!(at("a"), Some(ThreadStatus::Success), "a settled dot was blanked");
+        assert_eq!(at("b"), Some(ThreadStatus::Failed), "a fresh dot was not taken");
+    }
+
+    /// **A list that arrives after the person moved on is dropped.** A slow project list
+    /// landing once they are already inside a project would throw them back out.
+    #[test]
+    fn a_list_that_arrives_too_late_is_dropped() {
+        let mut s = state();
+        s.picker = Some(thread_rows(&[("a", None)]));
+        apply(
+            &mut s,
+            &Action::Frame(Frame::Picker {
+                picker: crate::picker::Picker::projects(vec![], crate::lang::Lang::Ko),
+                thread_was_running: None,
+            }),
+        );
+        assert!(
+            matches!(s.picker.as_ref().map(|p| &p.level), Some(crate::picker::Level::Sessions { .. })),
+            "the thread list was replaced by a stale project list"
+        );
+    }
+
+    /// **The thread on screen stays until the new one's history lands.** Blanking at the
+    /// moment of the click would leave an empty window for however long the fetch takes.
+    #[test]
+    fn switching_threads_keeps_the_old_one_on_screen_until_the_new_one_arrives() {
+        let mut s = state();
+        s.timeline.say("앞선 대화");
+        s.connected = true;
+        s.loading_history = true;
+        assert!(s.timeline.items().iter().count() > 0, "it was cleared too early");
+        assert_eq!(
+            crate::widgets::activity::parts(&s).1,
+            s.lang.loading(),
+            "the activity line must say what is going on"
+        );
+
+        apply(&mut s, &Action::Frame(Frame::History { entries: vec![] }));
+        assert!(!s.loading_history);
+        assert!(s.timeline.items().is_empty(), "the previous thread was left behind");
+    }
+
     // ── The new-project form
 
     /// With the form open, characters go to its active field — they must not leak into the
@@ -4007,6 +4454,19 @@ mod tests {
         })
     }
 
+
+    /// The fold key Ctrl+O targets — the last card's head.
+    fn last_card_key(s: &mut State) -> i64 {
+        let item = s
+            .timeline
+            .items()
+            .iter()
+            .rev()
+            .find(|i| matches!(i, crate::timeline::Item::Work { .. }))
+            .expect("no work card");
+        item.seq()
+    }
+
     /// The key people press reflexively when the screen breaks. It must get no other meaning.
     #[test]
     fn ctrl_l_asks_for_a_full_repaint() {
@@ -4037,6 +4497,58 @@ mod tests {
         apply(&mut s, &Action::Press(5, 3));
         assert_eq!(s.drag, Some(crate::selection::Drag::new((3, 5))));
         assert!(s.dragging, "the drag must be live even over empty cells");
+    }
+
+    /// `link_at` returns the URL under a cell in the transcript. Columns are display columns
+    /// of the visible line, offset by `view_origin` — same mapping `inject_links` uses.
+    #[test]
+    fn link_at_finds_the_url_under_a_cell() {
+        let mut s = state();
+        s.view_origin = (2, 1);
+        s.view_links = vec![vec![crate::markdown::Link {
+            start: 3,
+            end: 8,
+            url: "https://example.com/x".into(),
+        }]];
+        assert_eq!(
+            s.link_at(2 + 3, 1),
+            Some("https://example.com/x".to_string()),
+            "first link column"
+        );
+        assert_eq!(
+            s.link_at(2 + 7, 1),
+            Some("https://example.com/x".to_string()),
+            "last covered column"
+        );
+        assert_eq!(s.link_at(2 + 8, 1), None, "column past the link's end");
+        assert_eq!(s.link_at(2 + 2, 1), None, "column before the link's start");
+        assert_eq!(s.link_at(2, 1), None, "offset column maps to no link");
+    }
+
+    /// `link_at` returns `None` outside the transcript area and on lines with no links.
+    #[test]
+    fn link_at_is_none_outside_the_transcript() {
+        let mut s = state();
+        s.view_origin = (0, 0);
+        s.view_links = vec![vec![crate::markdown::Link {
+            start: 0,
+            end: 2,
+            url: "https://e.com/".into(),
+        }]];
+        assert_eq!(s.link_at(1, 5), None, "line beyond the transcript");
+        assert_eq!(s.link_at(1, 0), Some("https://e.com/".to_string()));
+        assert_eq!(s.view_links.len(), 1);
+    }
+
+    /// A Ctrl+click on a link becomes `Action::OpenLink`; a plain press still starts a drag.
+    /// This is exercised through `apply` — the mouse-to-action mapping itself is I/O-side.
+    #[test]
+    fn open_link_is_a_noop_in_apply() {
+        let mut s = state();
+        apply(&mut s, &Action::OpenLink("https://example.com/".into()));
+        assert!(s.drag.is_none(), "opening a link must not start a selection");
+        assert!(!s.dragging, "no drag was begun");
+        assert!(s.selection.is_none(), "no selection was made");
     }
 
     /// The drag extracts from the last drawn screen, not from the conversation alone — the
@@ -4174,14 +4686,18 @@ mod tests {
     fn an_opened_card_is_never_folded_behind_the_users_back() {
         let mut s = state();
         apply(&mut s, &work_start(1));
+        apply(&mut s, &Action::Frame(Frame::Delta { kind: ZDeltaKind::Reasoning, text: "생각".into() }));
         apply(&mut s, &Action::ToggleFold);
-        assert!(s.folds[&1].open, "one Ctrl+O unfolds it");
+        let key = last_card_key(&mut s);
+        assert!(s.folds[&key].open, "one Ctrl+O unfolds the card");
+        assert!(s.folds[&key].user_touched, "a manual toggle is remembered");
 
         for kind in [ZDeltaKind::Reasoning, ZDeltaKind::Assistant] {
             apply(&mut s, &Action::Frame(Frame::Delta { kind, text: "무언가".into() }));
         }
-        assert!(s.folds[&1].open, "a delta folded the card");
+        assert!(s.folds[&key].open, "a delta folded a card the person opened");
     }
+
 
     #[test]
     fn ctrl_o_toggles_the_latest_card() {
@@ -4508,18 +5024,32 @@ mod tests {
         }
     }
 
-    /// A new run still opens folded. **Hidden from the start** applies here too.
+    /// **A new stretch of working carries no choice of the person's.** What they folded was that
+    /// card, not every card to come — and a fold inherited from an earlier one would look like the
+    /// screen deciding for them.
     #[test]
-    fn a_new_work_run_also_starts_folded() {
+    fn a_new_work_run_does_not_inherit_a_fold() {
         let mut s = state();
         apply(&mut s, &work_start(1));
         apply(&mut s, &Action::ToggleFold);
-        assert!(s.folds[&1].open);
+        let first = last_card_key(&mut s);
+        assert!(s.folds[&first].user_touched, "Ctrl+O must be remembered on the card");
 
-        apply(&mut s, &work_start(2));
-        assert!(!s.folds[&2].open, "a new card opened unfolded");
-        assert!(s.folds[&1].open, "the earlier card must not be touched");
+        // Speaking closes the stretch; what is thought next opens a fresh one.
+        apply(
+            &mut s,
+            &Action::Frame(Frame::Event {
+                cursor: 2,
+                entry: Some(Entry { seq: 2, kind: EntryKind::Agent("먼저 볼게요".into()) }),
+            }),
+        );
+        apply(&mut s, &Action::Frame(Frame::Delta { kind: ZDeltaKind::Reasoning, text: "새 생각".into() }));
+        let second = last_card_key(&mut s);
+        assert_ne!(second, first, "speaking must have opened a new card");
+        let f = s.folds.get(&second).copied().unwrap_or_default();
+        assert!(!f.user_touched, "a fresh card must not be the person's choice");
     }
+
 
     // ── Tool approval ──────────────────────────────────────────────────
 

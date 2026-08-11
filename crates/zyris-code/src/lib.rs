@@ -31,6 +31,7 @@ pub mod scroll;
 pub mod selection;
 pub mod theme;
 pub mod timeline;
+pub mod tool_view;
 pub mod tools;
 pub mod undo;
 pub mod usage;

@@ -648,7 +648,8 @@ fn the_status_bar_names_the_mode_it_is_in() {
     }
 }
 
-/// Clicking a work card's header must fold and unfold it. If the coordinate transform is off, the wrong line gets hit.
+/// Clicking a work card's head must fold and unfold it, and its reasoning chip must be a separate
+/// target. If the coordinate transform is off, the wrong line gets hit.
 #[test]
 fn clicking_a_work_card_toggles_it() {
     use zyris_code::rows::Fold;
@@ -661,22 +662,39 @@ fn clicking_a_work_card_toggles_it() {
             entry: Some(Entry { seq: 1, kind: EntryKind::WorkStart("작업".into()) }),
         }),
     );
+    // Streaming reasoning gives the card a chip, so there are two targets to tell apart.
+    apply(
+        &mut s,
+        &Action::Frame(AppFrame::Delta {
+            kind: zyris_attacca::ZDeltaKind::Reasoning,
+            text: "생각".into(),
+        }),
+    );
+    // **The stretch has to be the one being worked on**, or it draws folded into a single line and
+    // there is no chip on screen to be a second target.
+    apply(&mut s, &Action::Frame(AppFrame::Status { running: true }));
     // It must be drawn once so the widget records coordinates and card positions.
     let _ = dump(&mut s, 60, 12);
 
-    let (row, seq) = s.view_cards.iter().map(|(r, q)| (*r, *q)).next().expect("no card");
-    assert_eq!(seq, 1);
+    let mut heads: Vec<(usize, i64)> = s.view_cards.iter().map(|(r, q)| (*r, *q)).collect();
+    heads.sort();
+    assert_eq!(heads.len(), 2, "the card head and its chip must both be clickable: {heads:?}");
+    let (row, seq) = heads[0];
+    assert_eq!(seq, 1, "the first clickable head is the card: {heads:?}");
+    assert_ne!(heads[1].1, 1, "the chip must be a target of its own: {heads:?}");
 
-    let (ox, oy) = s.view_origin;
-    let y = oy + (row - s.view_top) as u16;
-    apply(&mut s, &Action::Press(ox + 1, y));
-    apply(&mut s, &Action::Release);
+    let click = |s: &mut State, row: usize| {
+        let (ox, oy) = s.view_origin;
+        let y = oy + (row - s.view_top) as u16;
+        apply(s, &Action::Press(ox + 1, y));
+        apply(s, &Action::Release);
+    };
 
-    assert_eq!(s.folds[&1], Fold { open: true }, "a click must unfold it");
-
-    apply(&mut s, &Action::Press(ox + 1, y));
-    apply(&mut s, &Action::Release);
-    assert!(!s.folds[&1].open, "clicking again must fold it");
+    // **A running card draws open**, so the first click folds it.
+    click(&mut s, row);
+    assert_eq!(s.folds[&seq], Fold { open: false, user_touched: true }, "a click must fold it");
+    click(&mut s, row);
+    assert!(s.folds[&seq].open, "clicking again must unfold it");
 }
 
 /// Dragging selects text, and the selection **survives the release** — the I/O layer exports it to the clipboard.
@@ -809,11 +827,10 @@ fn scrolling_keeps_the_selection() {
     assert_eq!(s.selection, before, "scrolling the wheel must not drop the selection");
 }
 
-/// The highlight must cover only the selected columns. If the whole row were reversed, what's selected and what's shown would differ.
+/// The highlight must cover only the selected columns. If the whole row were washed, what's
+/// selected and what's shown would differ.
 #[test]
 fn the_highlight_covers_only_the_selected_columns() {
-    use ratatui::style::Modifier;
-
     let mut s = State::new();
     apply(
         &mut s,
@@ -833,10 +850,40 @@ fn the_highlight_covers_only_the_selected_columns() {
     let buf = term.backend().buffer().clone();
 
     let y = oy;
-    let reversed = |x: u16| buf[(x, y)].style().add_modifier.contains(Modifier::REVERSED);
-    assert!(reversed(ox), "the first selected cell must be inverted");
-    assert!(reversed(ox + 3), "the last selected cell is inverted too");
-    assert!(!reversed(ox + 8), "an unselected cell must not be inverted");
+    // Theme-independent on purpose: `the_light_theme_actually_changes_what_is_drawn` flips the
+    // global theme while this runs in parallel, so comparing against a live `selection_bg()`
+    // would race. The selection wash is never a default background and the untouched cells
+    // keep it, so checking Reset vs non-Reset is stable under any theme.
+    let bg = |x: u16| buf[(x, y)].style().bg;
+    assert_ne!(bg(ox), Some(Color::Reset), "the first selected cell must be washed");
+    assert_ne!(bg(ox + 3), Some(Color::Reset), "the last selected cell is washed too");
+    assert_eq!(bg(ox + 8), Some(Color::Reset), "an unselected cell must not be washed");
+}
+
+/// Any other input drops the selection — it is anchored to the screen, so once the person
+/// types or moves, it points at stale text.
+#[test]
+fn typing_drops_the_selection() {
+    let mut s = State::new();
+    apply(
+        &mut s,
+        &Action::Frame(AppFrame::Event {
+            cursor: 1,
+            entry: Some(Entry { seq: 1, kind: EntryKind::Agent("안녕하세요 반갑습니다".into()) }),
+        }),
+    );
+    let _ = dump(&mut s, 60, 12);
+
+    let (ox, oy) = s.view_origin;
+    apply(&mut s, &Action::Press(ox, oy));
+    apply(&mut s, &Action::DragTo(ox + 10, oy));
+    apply(&mut s, &Action::Release);
+    assert!(s.selection.is_some(), "the drag must select before an input arrives");
+    assert!(s.drag.is_some(), "the drag range is still alive after release");
+
+    apply(&mut s, &Action::Insert('a'));
+    assert!(s.selection.is_none(), "typing must drop the selection");
+    assert!(s.drag.is_none(), "the drag range must drop with it");
 }
 
 fn question_event(seq: i64, result: serde_json::Value) -> AppFrame {
@@ -1117,7 +1164,7 @@ fn long_picker_labels_are_truncated_inside_the_box() {
         vec![(
             "s1".into(),
             "아주아주 긴 세션 제목이 여기 들어가고 계속 이어집니다 정말로 깁니다".into(),
-            true,
+            Some(zyris_code::picker::ThreadStatus::Running),
         )],
         zyris_code::lang::Lang::Ko,
     ));
@@ -1489,10 +1536,9 @@ fn state_with_edit_tool() -> State {
                 seq: 2,
                 kind: EntryKind::Tool {
                     name: "zyris__arch__code_edit__edit".into(),
-                    summary: "zyris__arch__code_edit__edit · src/app.rs".into(),
-                    failed: false,
-                    detail: "인자\n{}".into(),
-                    diff: Some(Diff {
+                    action: "src/app.rs".into(),
+                    state: zyris_code::tool_view::ToolState::Ok,
+                    detail: zyris_code::tool_view::Detail::Diff(Diff {
                         path: "src/app.rs".into(),
                         added: 12,
                         removed: 3,
@@ -1506,13 +1552,13 @@ fn state_with_edit_tool() -> State {
             }),
         }),
     );
-    s.folds.insert(1, Fold { open: true });
+    s.folds.insert(1, Fold { open: true, user_touched: true });
     s
 }
 
 fn expand_the_tool_row(state: &mut State) {
     use zyris_code::rows::Fold;
-    state.folds.insert(2, Fold { open: true });
+    state.folds.insert(2, Fold { open: true, user_touched: true });
 }
 
 /// Even folded, how much changed must be visible.
@@ -1685,7 +1731,11 @@ fn long_session_list(n: usize) -> zyris_code::picker::Picker {
     zyris_code::picker::Picker::sessions(
         "p1".into(),
         "zyris".into(),
-        (0..n).map(|i| (format!("s{i}"), format!("쓰레드 {i}"), false)).collect(),
+        (0..n)
+            .map(|i| {
+                (format!("s{i}"), format!("쓰레드 {i}"), None)
+            })
+            .collect(),
         zyris_code::lang::Lang::Ko,
     )
 }
@@ -1762,7 +1812,7 @@ fn the_divider_above_the_input_carries_the_working_directory() {
         Some(zyris_code::repo::Repo { branch: "main".into(), staged: 2, ..Default::default() });
     let screen = dump(&mut state, 80, 24);
     assert!(screen.contains("~/zyris-code"), "{screen}");
-    assert!(screen.contains("⎇ main +2"), "{screen}");
+    assert!(screen.contains("* main +2"), "{screen}");
 }
 
 /// **No git, no residue.** On a machine without git the rule must resume right after the path —
@@ -1810,4 +1860,102 @@ fn a_bare_url_in_an_answer_is_not_wrapped() {
         buf.content.iter().all(|c| !c.symbol().starts_with("\u{1b}]8;;")),
         "a bare URL must not be wrapped in OSC 8"
     );
+}
+
+/// Prints a work card built **from real events**, so the shape and every tool renderer can be
+/// looked at together. Not a check — run with `--ignored --nocapture`.
+#[test]
+#[ignore = "prints a card so the layout can be looked at"]
+fn show_a_work_card() {
+    use zyris_code::rows::{rows, Fold, Folds};
+    use zyris_code::timeline::Timeline;
+
+    let ev = |seq: i64, kind: &str, payload: serde_json::Value| zyris_attacca::ZSessionEvent {
+        seq,
+        cursor: seq,
+        kind: kind.into(),
+        payload,
+        created_at: None,
+    };
+    let tool = |seq: i64, tool: &str, cap: &str, args, result| {
+        ev(
+            seq,
+            "tool_call",
+            serde_json::json!({
+                "name": format!("zyris__arch-zyris-code__{cap}__{tool}"),
+                "arguments": args,
+                "result": result,
+            }),
+        )
+    };
+
+    let events = vec![
+        ev(1, "work_summary", serde_json::json!({"content": "위젯 picker 테스트를 배경에서 실행"})),
+        ev(10, "thinking", serde_json::json!({
+            "content": "rows.rs가 대화 화면의 정본이므로 거기부터 본다.",
+            "title": "현재 파일 상태를 읽는 중",
+        })),
+        tool(
+            11,
+            "read",
+            "file_io",
+            serde_json::json!({"path": "src/picker.rs"}),
+            serde_json::json!({
+                "stat": {"path": "src/picker.rs"},
+                "content": "fn row_line(&self) -> Line {\n    …\n}",
+            }),
+        ),
+        ev(12, "thinking", serde_json::json!({
+            "content": "지금은 오른쪽 끝에 있다. 커서 표시 뒤, 레이블 앞으로 옮긴다.",
+            "title": "상태 점을 왼쪽으로 옮긴다",
+        })),
+        tool(
+            13,
+            "grep",
+            "search",
+            serde_json::json!({"pattern": "fn row_line", "glob": "**/*.rs"}),
+            serde_json::json!({
+                "hits": [{"path": "src/picker.rs", "line": 88, "text": "fn row_line(&self) -> Line {"}],
+                "truncated": false,
+                "scanned": 128,
+            }),
+        ),
+        tool(
+            14,
+            "edit",
+            "code_edit",
+            serde_json::json!({"path": "src/picker.rs"}),
+            serde_json::json!({
+                "path": "src/picker.rs",
+                "added": 1,
+                "removed": 1,
+                "diff": "-let dot = right(mark);\n+let dot = left(mark);\n",
+            }),
+        ),
+        // Still in flight: no result, no error.
+        tool(
+            15,
+            "exec",
+            "terminal",
+            serde_json::json!({"command": "cargo test -j1 -p zyris-code", "timeout_ms": 50000}),
+            serde_json::Value::Null,
+        ),
+    ];
+
+    let mut t = Timeline::new();
+    for e in &events {
+        if let Some(entry) = zyris_code::event::entry_from(e) {
+            t.upsert(entry);
+        }
+    }
+    let items = t.items().to_vec();
+
+    let open = Fold { open: true, user_touched: true };
+    for keys in [vec![12], vec![10, 11, 12, 13, 14, 15]] {
+        println!("─── 펼친 것: {keys:?} ───");
+        let folds: Folds = keys.into_iter().map(|k| (k, open)).collect();
+        for line in rows(&items, 78, &folds, zyris_code::lang::Lang::Ko).plain() {
+            println!("{line}");
+        }
+    }
 }

@@ -82,7 +82,13 @@ fn fold_context(lines: Vec<DiffLine>) -> Vec<DiffLine> {
 }
 
 impl Diff {
-    /// Text shape to carry in a tool result. `@@ N lines omitted @@` marks a folded spot.
+    /// Text shape to carry in a tool result. `@@ N @@` marks a folded spot.
+    ///
+    /// **The marker carries no words.** It used to be written with `lang::diff_omitted`, so what
+    /// went on the wire changed with the UI language while `parse` only ever read the Korean form —
+    /// in English every folded diff failed to read back and fell to a JSON dump. What a person
+    /// reads is `rows::diff_line`'s `lang::diff_skip`; this crosses a machine boundary and must not
+    /// depend on a setting.
     pub fn to_unified(&self) -> String {
         let mut out = String::new();
         for line in &self.lines {
@@ -90,10 +96,7 @@ impl Diff {
                 DiffLine::Add(s) => out.push_str(&format!("+{s}\n")),
                 DiffLine::Del(s) => out.push_str(&format!("-{s}\n")),
                 DiffLine::Keep(s) => out.push_str(&format!(" {s}\n")),
-                DiffLine::Skip(n) => {
-                    out.push_str(&crate::lang::current().diff_omitted(*n));
-                    out.push('\n');
-                }
+                DiffLine::Skip(n) => out.push_str(&format!("@@ {n} @@\n")),
             }
         }
         out
@@ -105,8 +108,9 @@ impl Diff {
         let mut lines = Vec::new();
         for raw in text.lines() {
             let line = if let Some(rest) = raw.strip_prefix("@@ ") {
-                let n = rest.split('줄').next()?.trim().parse().ok()?;
-                DiffLine::Skip(n)
+                // Leading digits only, so the worded markers older builds wrote still read back.
+                let digits: String = rest.trim_start().chars().take_while(char::is_ascii_digit).collect();
+                DiffLine::Skip(digits.parse().ok()?)
             } else {
                 match raw.chars().next() {
                     Some('+') => DiffLine::Add(raw[1..].to_string()),

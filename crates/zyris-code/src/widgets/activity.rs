@@ -58,6 +58,11 @@ pub fn parts_at(
     // we say here what is running, people wait up to 55 seconds blind.
     // **Saying you asked to stop comes first.** Until the server answers, "working" stays up,
     // and while it keeps showing, people think Ctrl+C did not work and press again.
+    // **Fetching a thread's history is something happening**, and on a long one it takes a
+    // while. Unsaid, the window looks stuck on the thread the person just left.
+    if state.loading_history {
+        return (theme::notice(), lang.loading().to_string(), "");
+    }
     if state.running && state.stopping {
         return (theme::warning(), lang.stopping().to_string(), lang.ctrl_c_quits());
     }

@@ -10,7 +10,13 @@ use crate::markdown::display_width;
 use crate::picker::{Picker, Slot};
 use crate::theme;
 
-pub fn draw(frame: &mut Frame, area: Rect, picker: &Picker, lang: crate::lang::Lang) {
+pub fn draw(
+    frame: &mut Frame,
+    area: Rect,
+    picker: &mut Picker,
+    lang: crate::lang::Lang,
+    tick: u64,
+) {
     // The centered box. Sized to the list, but never taller than the screen.
     // The separator line takes one more row, so it must be counted for everything to fit.
     let rule = picker.is_create(0) && picker.rows.len() > 1;
@@ -34,8 +40,15 @@ pub fn draw(frame: &mut Frame, area: Rect, picker: &Picker, lang: crate::lang::L
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme::accent()))
+        // **The title is cut to fit, with a `…`.** A project name is arbitrary text, and
+        // ratatui draws an over-long title straight over its own border — the box loses its
+        // top-right corner and the row ends mid-word with nothing saying it was cut.
+        // Four columns go to the two corners and the space either side of the title.
         .title(Span::styled(
-            format!(" {} ", picker.title(lang)),
+            format!(
+                " {} ",
+                crate::markdown::truncate_to(&picker.title(lang), w.saturating_sub(4) as usize)
+            ),
             Style::default().fg(theme::text_heading()).add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(box_area);
@@ -50,10 +63,14 @@ pub fn draw(frame: &mut Frame, area: Rect, picker: &Picker, lang: crate::lang::L
     // **The pure side decides** where each row goes (`picker::slots`). Here we just draw.
     let width = inner.width as usize;
     let body_h = inner.height.saturating_sub(1) as usize;
-    for slot in crate::picker::slots(&picker.rows, picker.cursor, body_h) {
+    // **Where the window ended up is stored back.** Without it the layout would be derived
+    // from the cursor alone every frame, which pins the cursor to an edge — see `window_top`.
+    let (laid, top) = crate::picker::slots(&picker.rows, picker.cursor, picker.top, body_h);
+    picker.top = top;
+    for slot in laid {
         lines.push(match slot {
             Slot::Row(i) => {
-                row_line(&picker.rows[i], i == picker.cursor, picker.is_create(i), width)
+                row_line(&picker.rows[i], i == picker.cursor, picker.is_create(i), width, tick)
             }
             Slot::Rule => {
                 Line::from(Span::styled("─".repeat(width), Style::default().fg(theme::border())))
@@ -70,9 +87,7 @@ pub fn draw(frame: &mut Frame, area: Rect, picker: &Picker, lang: crate::lang::L
         crate::picker::Level::Projects => lang.picker_close(),
         crate::picker::Level::Sessions { .. } => lang.picker_back(),
         // These two are outside the project hierarchy, so there's nowhere to go back to.
-        crate::picker::Level::Agents
-        | crate::picker::Level::Commands
-        | crate::picker::Level::Languages => lang.picker_esc_close(),
+        crate::picker::Level::Agents | crate::picker::Level::Commands => lang.picker_esc_close(),
     };
     lines.push(Line::from(Span::styled(
         lang.picker_keys(back),
@@ -86,20 +101,43 @@ pub fn draw(frame: &mut Frame, area: Rect, picker: &Picker, lang: crate::lang::L
 ///
 /// **"Create new" is a different color.** Mixed into the session list it would read as one
 /// session, but it's something you create, not pick.
-fn row_line(row: &crate::picker::Row, on: bool, create: bool, width: usize) -> Line<'static> {
+fn row_line(
+    row: &crate::picker::Row,
+    on: bool,
+    create: bool,
+    width: usize,
+    tick: u64,
+) -> Line<'static> {
+    use crate::picker::ThreadStatus;
     let fg = match (row.enabled, create, on) {
         (false, _, _) => theme::border_light(),
         (true, true, _) => theme::accent(),
         (true, false, true) => theme::text_heading(),
         (true, false, false) => theme::text(),
     };
-    let (label, note) = split(width, &row.label, row.note.as_deref());
+    // A running thread blinks its status dot; a finished one holds its colour steady.
+    let status_span = row.status.map(|s| {
+        let colour = match s {
+            ThreadStatus::Running if crate::widgets::activity::blink_on(tick) => theme::accent(),
+            ThreadStatus::Running => theme::border_light(),
+            ThreadStatus::Success => theme::success(),
+            ThreadStatus::Failed => theme::danger(),
+        };
+        Span::styled("●", Style::default().fg(colour))
+    });
+    let (label, note) = split(width, &row.label, row.note.as_deref(), row.status.is_some());
     let mut spans = vec![
         Span::styled(if on { "❯ " } else { "  " }, Style::default().fg(theme::accent())),
-        Span::styled(label.clone(), Style::default().fg(fg)),
     ];
+    // The status dot sits at the left, right after the cursor marker — a thread's state is
+    // the first thing the eye lands on, before reading its title.
+    if let Some(dot) = status_span {
+        spans.push(dot);
+        spans.push(Span::styled(" ", Style::default().fg(theme::text_muted())));
+    }
+    spans.push(Span::styled(label.clone(), Style::default().fg(fg)));
     if let Some(note) = note {
-        let used = 2 + display_width(&label);
+        let used = 2 + (row.status.is_some() as usize) * 2 + display_width(&label);
         let pad = width.saturating_sub(used + display_width(&note));
         spans.push(Span::styled(" ".repeat(pad), Style::default().fg(theme::text_muted())));
         spans.push(Span::styled(note, Style::default().fg(theme::text_muted())));
@@ -118,13 +156,15 @@ const NOTE_MIN: usize = 8;
 ///
 /// Still, the name must always be truncated — session titles have arbitrary lengths, and left
 /// alone they'd punch through the box and collapse the screen.
-fn split(width: usize, label: &str, note: Option<&str>) -> (String, Option<String>) {
-    let label = truncate(label, width.saturating_sub(2));
+fn split(width: usize, label: &str, note: Option<&str>, status: bool) -> (String, Option<String>) {
+    // The status dot and its trailing space take two columns on the left, before the label.
+    let dot = if status { 2 } else { 0 };
+    let label = truncate(label, width.saturating_sub(2 + dot));
     let Some(note) = note else {
         return (label, None);
     };
     // Leave at least two columns between the name and the note. Stuck together, they read as one word.
-    let room = width.saturating_sub(2 + display_width(&label) + 2);
+    let room = width.saturating_sub(2 + dot + display_width(&label) + 2);
     if room < NOTE_MIN {
         return (label, None);
     }
@@ -170,20 +210,104 @@ pub(crate) fn scrub_left_edge(frame: &mut Frame, box_area: Rect) {
 mod tests {
     use super::*;
 
+    /// **A long project name must not punch through the box.** ratatui draws an over-long
+    /// title straight over its own border: the top-right corner disappears and the name ends
+    /// mid-word with nothing saying it was cut.
+    #[test]
+    fn a_long_project_name_is_cut_inside_the_box() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let long = "아주 길고 긴 이름을 가진 프로젝트 그리고 더 길어지는 이름";
+        let mut picker = Picker::loading_sessions("p1".into(), long.into());
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).expect("terminal");
+        terminal
+            .draw(|f| draw(f, f.area(), &mut picker, crate::lang::Lang::Ko, 0))
+            .expect("draw");
+        // The box is centred, so its top border is not row zero — find the row it landed on.
+        let buffer = terminal.backend().buffer();
+        let rows: Vec<String> = buffer
+            .content
+            .chunks(80)
+            .map(|row| row.iter().map(|c| c.symbol()).collect())
+            .collect();
+        let top = rows.iter().find(|r| r.contains('┌')).expect("no box was drawn").clone();
+        assert!(top.contains('…'), "the title was cut with no sign of it: {top:?}");
+        assert!(!top.contains(long), "the whole name still went out: {top:?}");
+        // The border has to survive: the box is drawn 64 wide and centred, so both corners
+        // sit inside this row.
+        assert!(top.contains('┌') && top.contains('┐'), "the title ate the border: {top:?}");
+    }
+
     /// **The name never gets shaved.** `/agent` actually got truncated to `/a…` and you couldn't
     /// tell what command it was — the reason was a long note.
     #[test]
     fn a_long_note_never_eats_into_the_name() {
         let (label, _) =
-            split(62, "/agent", Some("에이전트를 고릅니다. 다음 메시지에서 새 thread가 열립니다"));
+            split(62, "/agent", Some("에이전트를 고릅니다. 다음 메시지에서 새 thread가 열립니다"), false);
         assert_eq!(label, "/agent");
+    }
+
+    /// A thread's status is drawn as a coloured dot at the left, before the title — running
+    /// orange, failed red, success green. It is the row's status, not a text note.
+    #[test]
+    fn a_thread_status_becomes_a_dot_on_the_left() {
+        use crate::picker::ThreadStatus;
+        let row = crate::picker::Row {
+            id: Some("s1".into()),
+            label: "대화".into(),
+            note: None,
+            enabled: true,
+            status: Some(ThreadStatus::Running),
+        };
+        let line = row_line(&row, false, false, 20, 8);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("●"), "no status dot: {text:?}");
+        // The dot sits before the title — the cursor marker, then the dot, then the label.
+        let dot_pos = line.spans.iter().position(|s| s.content.as_ref() == "●").unwrap();
+        let label_pos =
+            line.spans.iter().position(|s| s.content.as_ref() == "대화").unwrap();
+        assert!(dot_pos < label_pos, "status dot must precede the title: {text:?}");
+        // A finished thread holds its colour, a running one blinks (tick on/off).
+        let ok_row = crate::picker::Row {
+            id: Some("s1".into()),
+            label: "대화".into(),
+            note: None,
+            enabled: true,
+            status: Some(ThreadStatus::Success),
+        };
+        let failed_row = crate::picker::Row {
+            id: Some("s1".into()),
+            label: "대화".into(),
+            note: None,
+            enabled: true,
+            status: Some(ThreadStatus::Failed),
+        };
+        let running_col = line
+            .spans
+            .iter()
+            .find(|s| s.content.as_ref() == "●")
+            .and_then(|s| s.style.fg);
+        let ok_col = row_line(&ok_row, false, false, 20, 0)
+            .spans
+            .iter()
+            .find(|s| s.content.as_ref() == "●")
+            .and_then(|s| s.style.fg);
+        let failed_col = row_line(&failed_row, false, false, 20, 0)
+            .spans
+            .iter()
+            .find(|s| s.content.as_ref() == "●")
+            .and_then(|s| s.style.fg);
+        assert_eq!(running_col, Some(theme::border_light()), "running dot off-phase must be dim");
+        assert_eq!(ok_col, Some(theme::success()));
+        assert_eq!(failed_col, Some(theme::danger()));
     }
 
     /// If there's no room for the note, drop the note. A half-cut note is unreadable.
     #[test]
     fn a_note_is_dropped_rather_than_squeezed_to_nothing() {
         // A width where the name fits exactly and no room is left for the note.
-        let (label, note) = split(14, "가나다라마", Some("설명"));
+        let (label, note) = split(14, "가나다라마", Some("설명"), false);
         assert_eq!(label, "가나다라마", "the name was truncated");
         assert!(note.is_none(), "{note:?}");
     }
@@ -191,7 +315,7 @@ mod tests {
     /// Still, the name is cut — a session title punching through the box would collapse the screen.
     #[test]
     fn a_very_long_name_is_still_cut_to_fit() {
-        let (label, _) = split(20, &"가".repeat(40), None);
+        let (label, _) = split(20, &"가".repeat(40), None, false);
         assert!(display_width(&label) <= 18, "{} columns: {label}", display_width(&label));
         assert!(label.ends_with('…'), "no marker saying it was cut: {label}");
     }
@@ -199,7 +323,7 @@ mod tests {
     /// When both fit, both show.
     #[test]
     fn both_fit_when_there_is_room() {
-        let (label, note) = split(40, "/cwd", Some("도구가 도는 자리"));
+        let (label, note) = split(40, "/cwd", Some("도구가 도는 자리"), false);
         assert_eq!(label, "/cwd");
         assert_eq!(note.as_deref(), Some("도구가 도는 자리"));
     }

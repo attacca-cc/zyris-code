@@ -121,7 +121,7 @@ enum Level {
 const LEVELS: [Level; 5] =
     [Level::Full, Level::NoUntracked, Level::NoAhead, Level::NoCounts, Level::NoGit];
 
-/// The whole divider row: `─ ~/zyris-code · ⎇ main +2 ~1 ────────`.
+/// The whole divider row: `─ ~/zyris-code · * main +2 ~1 ────────`.
 ///
 /// **Pure**, and it always returns exactly `width` columns, so the caller hands it straight to a
 /// `Line` without measuring anything.
@@ -166,7 +166,13 @@ fn pieces(path: &str, repo: Option<&Repo>, level: Level) -> Vec<Vec<Span<'static
     let muted = Style::default().fg(theme::text_muted());
     let mut git: Vec<Span<'static>> = Vec::new();
     if let (Some(r), false) = (repo, level == Level::NoGit) {
-        git.push(Span::styled(format!("⎇ {}", r.branch), muted));
+        // **`*`, and it has to stay something like it.** The branch used to be marked `⎇`
+        // (U+2387), which `unicode-width` calls one column — and which almost no terminal font
+        // has a glyph for, so the terminal falls back to a font that draws it two columns wide.
+        // Everything after it then sits one column right of where the layout put it, and the
+        // next positioned write eats a character: `main` came out as `mai`. `*` is what
+        // `git branch` marks the current branch with, it is ASCII, and no font can widen it.
+        git.push(Span::styled(format!("* {}", r.branch), muted));
         if level != Level::NoCounts {
             let mut count = |n: usize, mark: char, style: Style| {
                 if n > 0 {
@@ -390,14 +396,14 @@ mod tests {
     fn the_separator_appears_only_between_two_present_pieces() {
         let out = strip(60, "/home/ruma/zyris-code", Some("/home/ruma"), Some(&dirty()));
         assert_eq!(out.matches('·').count(), 1, "exactly one join: {out:?}");
-        assert!(out.contains("~/zyris-code · ⎇ main"), "{out:?}");
+        assert!(out.contains("~/zyris-code · * main"), "{out:?}");
     }
 
     #[test]
     fn a_clean_repository_shows_no_counts() {
         let clean = Repo { branch: "main".into(), ..Repo::default() };
         let out = strip(60, "/home/ruma/zyris-code", Some("/home/ruma"), Some(&clean));
-        assert!(out.contains("⎇ main"), "{out:?}");
+        assert!(out.contains("* main"), "{out:?}");
         // Every count carries a digit, so no digit means no count. Checking the markers
         // themselves would trip over the `~` of the home directory.
         assert!(!out.contains(|c: char| c.is_ascii_digit()), "clean must be quiet: {out:?}");
@@ -423,7 +429,7 @@ mod tests {
         let home = Some("/home/ruma");
         let r = dirty();
         // Untracked goes before ahead, ahead before the counts, the counts before git itself.
-        let order = ["?3", "↑1", "+2", "⎇ main", "~/zyris-code"];
+        let order = ["?3", "↑1", "+2", "* main", "~/zyris-code"];
         let mut gone: Vec<&str> = Vec::new();
         for width in (8..=60u16).rev() {
             let out = strip(width, cwd, home, Some(&r));

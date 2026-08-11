@@ -3,7 +3,7 @@
 //! ```text
 //! │   (conversation)                    │
 //! │ ● working…                 Esc stop │ what's happening now
-//! ├─ ~/zyris-code · ⎇ main +2 ~1 ───────┤ where tools run, and what git says (`repo::spans`)
+//! ├─ ~/zyris-code · * main +2 ~1 ───────┤ where tools run, and what git says (`repo::spans`)
 //! │ > input                             │ input box (grows with content)
 //! ├─────────────────────────────────────┤
 //! │ base·Main Agent  · 크레딧 5% · 컨텍스트 66% (132.8k/200k) · 총 토큰 11.4M │ bottom bar — usage on the right
@@ -22,18 +22,21 @@
 //! There is no header. The app name and directory only need to be seen once, so there was no
 //! reason for them to keep taking space — that is one more line for the conversation.
 
-mod activity;
+/// Public because `parts` is the pure seam tests read the activity line through — asserting on
+/// a screen dump instead would tie every one of them to the exact wording.
+pub mod activity;
 mod ask;
 mod enroll;
 mod input;
 mod newproject;
 mod panel;
 mod picker;
-mod status;
+/// Public for the same reason as `activity` — `left_spans` is the pure seam tests read the
+/// bottom bar through.
+pub mod status;
 mod transcript;
 
 use ratatui::layout::{Constraint, Direction, Layout};
-use ratatui::style::Modifier;
 use ratatui::Frame;
 
 use crate::app::State;
@@ -82,8 +85,8 @@ pub fn draw(frame: &mut Frame, state: &mut State) {
     status::draw(frame, chunks[4], state);
 
     // The picker overlaps at the very top — while it is open, that is the current task.
-    if let Some(p) = &state.picker {
-        picker::draw(frame, full, p, state.lang);
+    if let Some(p) = &mut state.picker {
+        picker::draw(frame, full, p, state.lang, state.tick);
     }
 
     // **The new-project form is laid on top of the picker.** The picker stays below, so pressing Esc
@@ -141,22 +144,21 @@ pub fn draw(frame: &mut Frame, state: &mut State) {
         }
     }
 
-    // **Mouse selection covers the whole screen — blank space included.** Invert every cell
-    // under the drag so the selection is visible everywhere: the transcript, the status
-    // line, the enrollment window. This runs after every widget drew and before the
-    // frame is flushed, so the highlight rides the same diff as the content.
+    // **Mouse selection follows the text, not a box.** Every cell under the drag's per-line
+    // spans is washed in a faint theme colour (`selection_bg`) so the highlight shows exactly
+    // the text that will be copied — blank cells before the start stay untouched. This runs
+    // after every widget drew and before the frame is flushed, so the highlight rides the
+    // same diff as the content.
     if let Some(drag) = state.drag.filter(|d| !d.is_click()) {
-        if let Some((r0, c0, r1, c1)) =
-            selection::rect(&drag, frame.area().width, frame.area().height)
-        {
-            let width = frame.area().width as usize;
-            let cells = frame.buffer_mut().content.as_mut_slice();
-            for y in r0..=r1 {
-                for x in c0..=c1 {
-                    let idx = y as usize * width + x as usize;
-                    if let Some(cell) = cells.get_mut(idx) {
-                        cell.modifier.insert(Modifier::REVERSED);
-                    }
+        let bg = crate::theme::selection_bg();
+        let area = frame.area();
+        let width = area.width as usize;
+        let cells = frame.buffer_mut().content.as_mut_slice();
+        for (y, from, to) in selection::row_spans(&drag, area.width, area.height) {
+            for x in from..to {
+                let idx = y as usize * width + x as usize;
+                if let Some(cell) = cells.get_mut(idx) {
+                    cell.bg = bg;
                 }
             }
         }

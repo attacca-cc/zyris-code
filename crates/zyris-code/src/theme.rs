@@ -159,6 +159,18 @@ pub fn user_bg() -> Color {
     pick((0x2a, 0x20, 0x1a), (0xf0, 0xe6, 0xd8))
 }
 
+/// The wash painted over the cells a mouse drag has selected.
+///
+/// **A faint accent-tinted background, the one other place a background is allowed.** The
+/// "don't paint backgrounds" rule at the top is flipped for the same reason it is for
+/// `user_bg` — this marks the chosen span, and it has to sit on top of whatever is already
+/// under it (the transcript, the status line, the enrollment window). It stays close to the
+/// theme's own ground so the words underneath remain readable: this is "these letters are
+/// chosen", not a box around them.
+pub fn selection_bg() -> Color {
+    pick((0x3f, 0x2e, 0x22), (0xef, 0xdc, 0xca))
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Structure
 // ─────────────────────────────────────────────────────────────────────────────
@@ -262,6 +274,12 @@ pub fn tool_arg() -> Color {
     pick((0x6b, 0x8a, 0xa0), (0x3d, 0x6b, 0x82))
 }
 
+/// A reasoning chip's title inside a work card. A warm tone, so it reads as a heading distinct
+/// from `tool()` (blue) and from muted reasoning — the eye scans chip titles to find a section.
+pub fn topic() -> Color {
+    pick((0xe0, 0xc2, 0x8e), (0x8a, 0x6a, 0x2e))
+}
+
 /// A link's text. Underlined in the renderer; the underline plus a distinct colour is what says
 /// "this can be Ctrl+clicked" without a mouse hover.
 ///
@@ -362,6 +380,17 @@ mod tests {
             with(theme, || {
                 let ratio = contrast(text(), user_bg());
                 assert!(ratio >= 4.5, "{theme:?} text on the user band is {ratio:.2}:1");
+            });
+        }
+    }
+
+    /// The selection wash is a background; the words it sits under must stay readable.
+    #[test]
+    fn text_is_readable_on_the_selection_band() {
+        for theme in [Theme::Dark, Theme::Light] {
+            with(theme, || {
+                let ratio = contrast(text(), selection_bg());
+                assert!(ratio >= 4.5, "{theme:?} text on the selection is {ratio:.2}:1");
             });
         }
     }

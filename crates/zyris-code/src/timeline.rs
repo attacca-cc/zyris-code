@@ -10,31 +10,79 @@ use zyris_attacca::ZDeltaKind;
 
 use crate::event::{Entry, EntryKind};
 
+/// One tool call inside a work card.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Step {
     /// The seq of this tool-call event. **It is the fold-state key** — each tool row folds independently.
     pub seq: i64,
     /// The short name shown on screen — `exec`, not `zyris__arch__terminal__exec`.
     pub name: String,
-    /// A piece shown dimly next to the name — what the action was against.
-    pub note: String,
-    pub failed: bool,
-    /// What to show when expanded. Empty means there's nothing to expand, so pressing does nothing.
-    pub detail: String,
-    /// Attached when the tool changed files. If present, the screen draws this instead of JSON.
-    pub diff: Option<crate::tools::diff::Diff>,
+    /// What was run, against what. Shown dimly beside the name.
+    pub action: String,
+    pub state: crate::tool_view::ToolState,
+    /// What to show when expanded. [`Detail::None`] means there's nothing to expand, so pressing does nothing.
+    pub detail: crate::tool_view::Detail,
+}
+
+impl Step {
+    /// How much this call changed, when it changed files at all.
+    pub fn counts(&self) -> (u32, u32) {
+        match &self.detail {
+            crate::tool_view::Detail::Diff(d) => (d.added, d.removed),
+            _ => (0, 0),
+        }
+    }
+}
+
+/// One reasoning block inside a work card — a foldable chip.
+///
+/// **The title is the server's**, written by `agent_runtime.rs`'s `spawn_thought_title` and landing
+/// on the same `seq` by in-place update. `None` until it does; the screen falls back on the first
+/// sentence, and the chip re-titles itself when the real one arrives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Think {
+    /// The seq of the `thinking` event. **The fold key.**
+    ///
+    /// It used to be a hash of the block's ordinal within the card. That shifted whenever earlier
+    /// content streamed in, so a chip the person had folded silently re-opened under a new key.
+    pub seq: i64,
+    pub title: Option<String>,
+    pub text: String,
+}
+
+/// The fold key of the reasoning still streaming into the card `card_seq`, before its durable
+/// `thinking` event lands.
+///
+/// **Per card, not one global key.** With a single key the fold the person set on one run's live
+/// chip carried straight into the next run's — it opened already folded, under a choice made about
+/// something else.
+///
+/// The band is `[-2^62, -2^61)`, which no other identity uses: server seqs are positive, app
+/// sayings are small negatives, and implicit cards sit at `i64::MIN + n`.
+pub fn live_think_key(card_seq: i64) -> i64 {
+    const BASE: i64 = -0x4000_0000_0000_0000; // -2^62
+    let h = (card_seq as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(0x0100_0000_01B3);
+    BASE.wrapping_add((h >> 2) as i64)
 }
 
 /// A piece inside a work card. **It lays out in the exact order it arrived.**
 ///
-/// If all reasoning were gathered and tools stacked below it, "what was thought and what was done" would
-/// disappear. The model actually did think → tool → think → tool, so show it exactly that way.
+/// If all reasoning were gathered and tools stacked below it, "what was thought and what was done"
+/// would disappear. The model actually did think → tool → think → tool, so show it exactly that way.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Part {
-    Think(String),
-    /// What the agent said during a run. It stands in arrival order with tools and reasoning.
-    Text(String),
+    Think(Think),
     Step(Step),
+}
+
+impl Part {
+    /// The fold key of this part.
+    pub fn key(&self) -> i64 {
+        match self {
+            Part::Think(t) => t.seq,
+            Part::Step(s) => s.seq,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,8 +95,19 @@ pub enum Item {
         seq: i64,
         text: String,
     },
+    /// One stretch of working — everything the agent thought and did between two things it said
+    /// to the person.
+    ///
+    /// **`work_summary` is not a boundary; it is the label.** The server writes one whenever the
+    /// run's subject changes, and each is the current status of the same stretch of thinking
+    /// ("retrying the node" → "writing the report"). Starting a card per summary chopped one turn
+    /// into a column of near-empty cards and made the conversation read as far longer than it was.
+    /// So a later summary **retitles the open card**, and only the agent speaking closes it.
     Work {
+        /// The first event of the stretch. **The identity and the fold key** — it must not move
+        /// when the title changes, or the fold the person set would be lost on every retitle.
         seq: i64,
+        /// The latest `work_summary` title. Empty until one arrives.
         title: String,
         parts: Vec<Part>,
     },
@@ -198,8 +257,10 @@ impl Timeline {
     }
 
     pub fn upsert(&mut self, entry: Entry) {
-        // When a new run opens, the previous run's reasoning must not carry over.
-        if let EntryKind::WorkStart(_) = &entry.kind {
+        // The reasoning block that led here is over — its streamed copy must not carry over, or the
+        // durable `thinking` event that follows would stand beside a chip saying the same thing.
+        // **Both are ends of a block**: the subject changing, and the agent turning to speak.
+        if matches!(&entry.kind, EntryKind::WorkStart(_) | EntryKind::Agent(_)) {
             self.live_reasoning.clear();
         }
         // **The server's copy takes over from the echo.** Both carry the same words, so leaving
@@ -279,9 +340,23 @@ impl Timeline {
         let mut live: Vec<LiveText> = std::mem::take(&mut self.live_text);
         // Up to the snippets already placed. Within one build, each snippet is placed only once.
         let mut flushed = 0usize;
+        // Where the person's own messages sit, before the server's copies arrive.
+        //
+        // **An echo closes the stretch of working, exactly as its durable twin will.** The echo
+        // is woven in after this pass, so without it the card stays open across the message and
+        // **the next turn's reasoning lands inside the last turn's card** — two turns' thinking
+        // tangled in one card, drawn above the message that started the second one.
+        let mut echoes: Vec<i64> =
+            self.said.iter().filter(|s| s.voice == Voice::Echo).map(|s| s.after).collect();
+        echoes.sort_unstable();
+        let mut echoed = 0usize;
 
         for entry in self.entries.values() {
             let seq = entry.seq;
+            while echoes.get(echoed).is_some_and(|after| *after < seq) {
+                open_work = None;
+                echoed += 1;
+            }
             // Once a durable answer arrives, earlier snippets have done their part — the same text
             // must not appear twice.
             if matches!(entry.kind, EntryKind::Agent(_)) {
@@ -295,15 +370,11 @@ impl Timeline {
                     out.push(Item::User { seq, text: text.clone() });
                 }
                 EntryKind::Agent(text) => {
-                    // **Answers that arrive mid-run stand inside the card** — if messages between tools were pushed
-                    // out of the card, what was said while doing what would scatter. With no card,
-                    // it's an ordinary answer.
-                    if let Some(at) = open_work {
-                        if let Item::Work { parts, .. } = &mut out[at] {
-                            parts.push(Part::Text(text.clone()));
-                            continue;
-                        }
-                    }
+                    // **Speaking closes the stretch of working.** What is said to the person is not
+                    // part of the working out — buried inside the card it read as one more thought,
+                    // and it is the one thing in the turn they came for. Whatever the agent thinks
+                    // next opens a fresh card, which is also what makes the finished one fold away.
+                    open_work = None;
                     out.push(Item::Agent { seq, text: text.clone() });
                 }
                 EntryKind::Error(message) => {
@@ -319,43 +390,45 @@ impl Timeline {
                     out.push(Item::Question { seq, steps: steps.clone(), answered: *answered });
                 }
                 EntryKind::WorkStart(title) => {
-                    open_work = Some(out.len());
-                    out.push(Item::Work { seq, title: title.clone(), parts: Vec::new() });
-                }
-                EntryKind::Thinking(text) => {
-                    let at = card_for(&mut out, &mut open_work, seq);
-                    if let Item::Work { parts, .. } = &mut out[at] {
-                        push_think(parts, text);
+                    // **A summary retitles the open card instead of starting another one.** See
+                    // `Item::Work` — the server writes one every time the subject changes.
+                    match open_work {
+                        Some(at) => {
+                            if let Item::Work { title: head, .. } = &mut out[at] {
+                                head.clone_from(title);
+                            }
+                        }
+                        None => {
+                            open_work = Some(out.len());
+                            out.push(Item::Work {
+                                seq,
+                                title: title.clone(),
+                                parts: Vec::new(),
+                            });
+                        }
                     }
                 }
-                EntryKind::Tool { name, summary, failed, detail, diff, .. } => {
+                EntryKind::Thinking { title, text } => {
+                    let at = card_for(&mut out, &mut open_work, seq);
+                    if let Item::Work { parts, .. } = &mut out[at] {
+                        // **One event, one chip.** They are not merged: the fold key is the event's
+                        // own seq, and merging would leave one of the two keys with nothing to open.
+                        parts.push(Part::Think(Think {
+                            seq,
+                            title: title.clone(),
+                            text: text.clone(),
+                        }));
+                    }
+                }
+                EntryKind::Tool { name, action, state, detail } => {
                     let at = card_for(&mut out, &mut open_work, seq);
                     if let Item::Work { parts, .. } = &mut out[at] {
                         parts.push(Part::Step(Step {
                             seq,
                             name: short_name(name),
-                            // For a tool that changed files, **the changed file** is the summary — the argument's
-                            // `path` may be relative, and the result's is authoritative.
-                            note: match diff {
-                                Some(d) => d.path.clone(),
-                                None => summary.clone(),
-                            },
-                            failed: *failed,
+                            action: action.clone(),
+                            state: *state,
                             detail: detail.clone(),
-                            diff: diff.clone(),
-                        }));
-                    }
-                }
-                EntryKind::Todo(text) => {
-                    let at = card_for(&mut out, &mut open_work, seq);
-                    if let Item::Work { parts, .. } = &mut out[at] {
-                        parts.push(Part::Step(Step {
-                            seq,
-                            name: "todo".into(),
-                            note: text.clone(),
-                            failed: false,
-                            detail: String::new(),
-                            diff: None,
                         }));
                     }
                 }
@@ -364,12 +437,29 @@ impl Timeline {
 
         // Snippets left at the end — appended to the open card's end or as a standalone answer.
         flush_live(&mut out, &mut open_work, &live, i64::MAX, &mut self.next_said, &mut flushed);
+        // An echo sitting past the last event closes the card too — that is the ordinary case,
+        // where the message was just sent and none of its turn has come back yet.
+        if echoed < echoes.len() {
+            open_work = None;
+        }
 
         // Lay the not-yet-durable reasoning delta onto the **end** of the open card. If it's thinking again
         // after using a tool, it must attach below that tool for the order to be right.
         if !self.live_reasoning.is_empty() {
-            if let Some(Item::Work { parts, .. }) = open_work.map(|i| &mut out[i]) {
-                push_think(parts, &self.live_reasoning);
+            // **A card is opened when there is none.** Thinking that follows something the agent
+            // said has nowhere to go otherwise, and it was simply dropped — on screen the agent
+            // spoke and then appeared to stop.
+            let after_last = self.entries.keys().next_back().copied().unwrap_or(0).saturating_add(1);
+            let at = card_for(&mut out, &mut open_work, after_last);
+            if let Item::Work { seq, parts, .. } = &mut out[at] {
+                let key = live_think_key(*seq);
+                // Reasoning that hasn't gone durable yet. It has no seq of its own, so it borrows
+                // the one live key — and it is replaced by the real chip the moment the event lands.
+                parts.push(Part::Think(Think {
+                    seq: key,
+                    title: None,
+                    text: self.live_reasoning.clone(),
+                }));
             }
         }
 
@@ -383,8 +473,11 @@ impl Timeline {
     /// **Sweep once and merge.** Inserting one by one would let earlier inserts shift later positions,
     /// flipping the order when two or more sayings share a spot.
     ///
-    /// Position is **"right after the after item"**, not a seq comparison — like the implicit work card,
-    /// even when an item's seq is outside the positive range, the said spot doesn't shift.
+    /// Position is **after the item that swallowed the anchor**, not after the item whose seq
+    /// equals it. A work card's own seq is its first event, so anchoring on equality left
+    /// anything said after a card's *later* events with no item to match — it fell through to
+    /// the end of the list, and the message a person had just sent appeared **below the turn it
+    /// started**. Items are in seq order, so the last item reaching the anchor is the right one.
     fn weave_in_what_was_said_here(&self, items: Vec<Item>) -> Vec<Item> {
         if self.said.is_empty() {
             return items;
@@ -404,8 +497,10 @@ impl Timeline {
         }
         let mut pending: Vec<&Said> = Vec::new();
         for item in items {
-            // The sayings that go after this item — those whose after equals this item's seq.
-            while said.peek().is_some_and(|s| s.after == item.seq()) {
+            // The sayings this item has caught up with — everything anchored at or before the
+            // last event it holds.
+            let reached = last_seq(&item);
+            while said.peek().is_some_and(|s| s.after <= reached) {
                 pending.push(said.next().expect("just looked at it"));
             }
             out.push(item);
@@ -428,6 +523,21 @@ impl Timeline {
 /// one is a path and the other a PTY.
 fn short_name(name: &str) -> String {
     name.rsplit("__").next().unwrap_or(name).to_string()
+}
+
+/// The last server event this item holds — what an anchor is measured against.
+///
+/// **A card's own seq is only its first event.** Everything it swallowed afterwards has a
+/// higher seq, and something said after one of those belongs after the whole card. Fold keys
+/// that are not server seqs (the implicit card, the live reasoning chip) are negative, so they
+/// are left out and the item's own seq stands in.
+fn last_seq(item: &Item) -> i64 {
+    match item {
+        Item::Work { seq, parts, .. } => {
+            parts.iter().map(Part::key).filter(|k| *k > 0).max().unwrap_or(*seq)
+        }
+        other => other.seq(),
+    }
 }
 
 /// The item seq of an implicit work card. Made a very distant negative so it can't collide with server seqs
@@ -458,34 +568,18 @@ fn flush_live(
         if seg.after >= up_to {
             break;
         }
-        match open_work {
-            Some(at) => {
-                if let Item::Work { parts, .. } = &mut out[*at] {
-                    splice_text(parts, seg.after, &seg.text);
-                }
-            }
-            None => {
-                // Standalone answers share the negative seq space with app sayings — they must not collide.
-                out.push(Item::Agent { seq: *next_seq, text: seg.text.clone() });
-                *next_seq -= 1;
-            }
-        }
+        // **A snippet closes the open card, exactly as its durable twin will.** Placing it inside
+        // would make the answer look like one more thought, and the card would then jump out of
+        // the reasoning the moment the durable event landed.
+        //
+        // Standalone answers share the negative seq space with app sayings — they must not collide.
+        *open_work = None;
+        out.push(Item::Agent { seq: *next_seq, text: seg.text.clone() });
+        *next_seq -= 1;
         *from += 1;
     }
 }
 
-/// Splices a snippet into its place in the card — **before** the first tool after the anchor (`after`), or
-/// at the end if there is none. Even wedged between reasoning rows, arrival order is preserved.
-fn splice_text(parts: &mut Vec<Part>, after: i64, text: &str) {
-    let at = parts
-        .iter()
-        .position(|p| matches!(p, Part::Step(s) if s.seq > after))
-        .unwrap_or(parts.len());
-    parts.insert(at, Part::Text(text.to_string()));
-}
-
-/// Appends reasoning. Reasoning that continues with no tool in between is merged into one block —
-/// if nothing happened in between, splitting it would only hurt readability.
 /// The currently open work card. **Creates one if there isn't.**
 ///
 /// attacca creates a `work_summary` when a run starts, but there are turns where the first reasoning delta
@@ -503,19 +597,13 @@ fn card_for(out: &mut Vec<Item>, open_work: &mut Option<usize>, seq: i64) -> usi
     // **Make the implicit card's fold key not collide with the first part's seq.** If they collided,
     // expanding the card would also expand the first tool's detail under the same key (it actually
     // looked that way — in tool-only turns with no reasoning, pressing the card opened the first tool's args and result).
-    out.push(Item::Work { seq: implicit_seq(seq), title: String::new(), parts: Vec::new() });
+    out.push(Item::Work {
+        seq: implicit_seq(seq),
+        title: String::new(),
+        parts: Vec::new(),
+    });
     *open_work = Some(at);
     at
-}
-
-fn push_think(parts: &mut Vec<Part>, text: &str) {
-    match parts.last_mut() {
-        Some(Part::Think(prev)) => {
-            prev.push('\n');
-            prev.push_str(text);
-        }
-        _ => parts.push(Part::Think(text.to_string())),
-    }
 }
 
 #[cfg(test)]
@@ -683,15 +771,19 @@ mod tests {
         assert!(t.items().is_empty(), "{:?}", t.items());
     }
 
-    fn step_at(seq: i64, name: &str, note: &str) -> Step {
+    fn step_at(seq: i64, name: &str, action: &str) -> Step {
         Step {
             seq,
             name: name.into(),
-            note: note.into(),
-            failed: false,
-            detail: "인자\n{}".into(),
-            diff: None,
+            action: action.into(),
+            state: crate::tool_view::ToolState::Ok,
+            detail: crate::tool_view::Detail::None,
         }
+    }
+
+    /// A reasoning chip as the server would produce it, title and all.
+    fn think_at(seq: i64, text: &str) -> Part {
+        Part::Think(Think { seq, title: None, text: text.into() })
     }
 
     /// An updated event comes again with the same seq. Appending would make two cards.
@@ -718,13 +810,13 @@ mod tests {
     #[test]
     fn thinking_that_arrives_before_any_work_card_still_shows() {
         let mut t = Timeline::default();
-        t.upsert(e(1, EntryKind::Thinking("무엇부터 볼까".into())));
+        t.upsert(e(1, EntryKind::Thinking { title: None, text: "무엇부터 볼까".into() }));
 
         let items = t.items().to_vec();
         assert_eq!(items.len(), 1, "exactly one card must appear: {items:?}");
         match &items[0] {
             Item::Work { parts, .. } => {
-                assert_eq!(parts, &vec![Part::Think("무엇부터 볼까".into())])
+                assert_eq!(parts, &vec![think_at(1, "무엇부터 볼까")])
             }
             other => panic!("it must be a work card: {other:?}"),
         }
@@ -738,10 +830,9 @@ mod tests {
             1,
             EntryKind::Tool {
                 name: "zyris__arch__search__grep".into(),
-                summary: "fn main".into(),
-                failed: false,
-                detail: String::new(),
-                diff: None,
+                action: "fn main".into(),
+                state: crate::tool_view::ToolState::Ok,
+                detail: crate::tool_view::Detail::None,
             },
         ));
         match &t.items()[0] {
@@ -760,10 +851,9 @@ mod tests {
             2,
             EntryKind::Tool {
                 name: "zyris__arch__terminal__exec".into(),
-                summary: "커밋".into(),
-                failed: false,
-                detail: "인자\n{}\n\n출력\nok".into(),
-                diff: None,
+                action: "커밋".into(),
+                state: crate::tool_view::ToolState::Ok,
+                detail: crate::tool_view::Detail::None,
             },
         ));
         let Item::Work { seq, parts, .. } = &t.items()[0] else {
@@ -786,10 +876,9 @@ mod tests {
             2,
             EntryKind::Tool {
                 name: "zyris__arch__terminal__exec".into(),
-                summary: "커밋".into(),
-                failed: false,
-                detail: "인자\n{}\n\n출력\nok".into(),
-                diff: None,
+                action: "커밋".into(),
+                state: crate::tool_view::ToolState::Ok,
+                detail: crate::tool_view::Detail::None,
             },
         ));
         let items = t.items().to_vec();
@@ -809,7 +898,7 @@ mod tests {
     #[test]
     fn a_late_work_summary_takes_over_the_card_it_belongs_to() {
         let mut t = Timeline::default();
-        t.upsert(e(2, EntryKind::Thinking("먼저 구조를 보자".into())));
+        t.upsert(e(2, EntryKind::Thinking { title: None, text: "먼저 구조를 보자".into() }));
         t.upsert(e(1, EntryKind::WorkStart("리팩터링".into())));
 
         let items = t.items().to_vec();
@@ -817,26 +906,27 @@ mod tests {
         match &items[0] {
             Item::Work { title, parts, .. } => {
                 assert_eq!(title, "리팩터링");
-                assert_eq!(parts, &vec![Part::Think("먼저 구조를 보자".into())]);
+                assert_eq!(parts, &vec![think_at(2, "먼저 구조를 보자")]);
             }
             other => panic!("it must be a work card: {other:?}"),
         }
     }
 
-    /// The server defines the card's boundary — everything before the next work_summary belongs to this card.
+    /// **A later `work_summary` retitles the card instead of starting another one.** Every summary
+    /// of a turn is a status of the same stretch of thinking; a card apiece chopped one turn into a
+    /// column of near-empty heads.
     #[test]
-    fn a_work_card_owns_the_steps_until_the_next_work_summary() {
+    fn a_later_work_summary_retitles_the_card_it_lands_in() {
         let mut t = Timeline::new();
         t.upsert(e(1, EntryKind::WorkStart("첫 런".into())));
-        t.upsert(e(2, EntryKind::Thinking("먼저 구조를 보자".into())));
+        t.upsert(e(2, EntryKind::Thinking { title: None, text: "먼저 구조를 보자".into() }));
         t.upsert(e(
             3,
             EntryKind::Tool {
                 name: "grep".into(),
-                summary: "viewport".into(),
-                failed: false,
-                detail: "인자\n{}".into(),
-                diff: None,
+                action: "viewport".into(),
+                state: crate::tool_view::ToolState::Ok,
+                detail: crate::tool_view::Detail::None,
             },
         ));
         t.upsert(e(4, EntryKind::WorkStart("둘째 런".into())));
@@ -844,28 +934,27 @@ mod tests {
             5,
             EntryKind::Tool {
                 name: "read".into(),
-                summary: "rows.rs".into(),
-                failed: false,
-                detail: "인자\n{}".into(),
-                diff: None,
+                action: "rows.rs".into(),
+                state: crate::tool_view::ToolState::Ok,
+                detail: crate::tool_view::Detail::None,
             },
         ));
 
-        let items = t.items();
-        assert_eq!(items.len(), 2);
-        match (&items[0], &items[1]) {
-            (Item::Work { parts: first, .. }, Item::Work { parts: second, .. }) => {
+        let items = t.items().to_vec();
+        assert_eq!(items.len(), 1, "the turn was chopped into several cards: {items:?}");
+        match &items[0] {
+            Item::Work { title, parts, .. } => {
+                assert_eq!(title, "둘째 런", "the head must carry the latest subject");
                 assert_eq!(
-                    first,
+                    parts,
                     &vec![
-                        Part::Think("먼저 구조를 보자".into()),
+                        think_at(2, "먼저 구조를 보자"),
                         Part::Step(step_at(3, "grep", "viewport")),
-                    ],
-                    "첫 카드는 생각 다음 도구"
+                        Part::Step(step_at(5, "read", "rows.rs")),
+                    ]
                 );
-                assert_eq!(second.len(), 1, "the second card holds one read");
             }
-            other => panic!("there must be two work cards: {other:?}"),
+            other => panic!("it must be a work card: {other:?}"),
         }
     }
 
@@ -875,26 +964,24 @@ mod tests {
     fn thinking_and_tools_stay_in_the_order_they_happened() {
         let mut t = Timeline::new();
         t.upsert(e(1, EntryKind::WorkStart("런".into())));
-        t.upsert(e(2, EntryKind::Thinking("먼저 어디를 볼까".into())));
+        t.upsert(e(2, EntryKind::Thinking { title: None, text: "먼저 어디를 볼까".into() }));
         t.upsert(e(
             3,
             EntryKind::Tool {
                 name: "grep".into(),
-                summary: "rows".into(),
-                failed: false,
-                detail: "인자\n{}".into(),
-                diff: None,
+                action: "rows".into(),
+                state: crate::tool_view::ToolState::Ok,
+                detail: crate::tool_view::Detail::None,
             },
         ));
-        t.upsert(e(4, EntryKind::Thinking("찾았다. 이제 고치자".into())));
+        t.upsert(e(4, EntryKind::Thinking { title: None, text: "찾았다. 이제 고치자".into() }));
         t.upsert(e(
             5,
             EntryKind::Tool {
                 name: "edit".into(),
-                summary: "rows.rs".into(),
-                failed: false,
-                detail: "인자\n{}".into(),
-                diff: None,
+                action: "rows.rs".into(),
+                state: crate::tool_view::ToolState::Ok,
+                detail: crate::tool_view::Detail::None,
             },
         ));
 
@@ -902,24 +989,26 @@ mod tests {
         assert_eq!(
             parts,
             &vec![
-                Part::Think("먼저 어디를 볼까".into()),
+                think_at(2, "먼저 어디를 볼까"),
                 Part::Step(step_at(3, "grep", "rows")),
-                Part::Think("찾았다. 이제 고치자".into()),
+                think_at(4, "찾았다. 이제 고치자"),
                 Part::Step(step_at(5, "edit", "rows.rs")),
             ]
         );
     }
 
-    /// Reasoning that continues with no tool in between is one block. Nothing happened between, so there's no reason to split.
+    /// **Back-to-back reasoning stays two chips.** They used to be merged, because with nothing in
+    /// between there was no reason to split — but the fold key is now the event's own seq, and a
+    /// merge would leave one of the two keys with nothing to open.
     #[test]
-    fn back_to_back_thinking_merges_into_one_block() {
+    fn back_to_back_thinking_stays_two_chips() {
         let mut t = Timeline::new();
         t.upsert(e(1, EntryKind::WorkStart("런".into())));
-        t.upsert(e(2, EntryKind::Thinking("첫 생각".into())));
-        t.upsert(e(3, EntryKind::Thinking("이어지는 생각".into())));
+        t.upsert(e(2, EntryKind::Thinking { title: None, text: "첫 생각".into() }));
+        t.upsert(e(3, EntryKind::Thinking { title: None, text: "이어지는 생각".into() }));
 
         let Item::Work { parts, .. } = &t.items()[0] else { panic!("it must be a work card") };
-        assert_eq!(parts, &vec![Part::Think("첫 생각\n이어지는 생각".into())]);
+        assert_eq!(parts, &vec![think_at(2, "첫 생각"), think_at(3, "이어지는 생각")]);
     }
 
     /// Reasoning deltas flowing in after a tool must attach **below that tool**.
@@ -927,22 +1016,21 @@ mod tests {
     fn reasoning_deltas_after_a_tool_land_below_that_tool() {
         let mut t = Timeline::new();
         t.upsert(e(1, EntryKind::WorkStart("런".into())));
-        t.upsert(e(2, EntryKind::Thinking("먼저 보자".into())));
+        t.upsert(e(2, EntryKind::Thinking { title: None, text: "먼저 보자".into() }));
         t.upsert(e(
             3,
             EntryKind::Tool {
                 name: "grep".into(),
-                summary: "rows".into(),
-                failed: false,
-                detail: "인자\n{}".into(),
-                diff: None,
+                action: "rows".into(),
+                state: crate::tool_view::ToolState::Ok,
+                detail: crate::tool_view::Detail::None,
             },
         ));
         t.push_delta(ZDeltaKind::Reasoning, "결과를 읽어 보니");
 
         let Item::Work { parts, .. } = &t.items()[0] else { panic!("it must be a work card") };
         assert_eq!(parts.len(), 3, "{parts:?}");
-        assert_eq!(parts[2], Part::Think("결과를 읽어 보니".into()));
+        assert_eq!(parts[2], think_at(live_think_key(1), "결과를 읽어 보니"));
     }
 
     /// Answer deltas must show on screen until the durable event arrives.
@@ -978,7 +1066,7 @@ mod tests {
 
         match &t.items()[0] {
             Item::Work { parts, .. } => {
-                assert_eq!(parts, &vec![Part::Think("무엇부터 볼까".into())])
+                assert_eq!(parts, &vec![think_at(live_think_key(1), "무엇부터 볼까")])
             }
             other => panic!("it must be a work card: {other:?}"),
         }
@@ -1007,18 +1095,16 @@ mod tests {
         assert_eq!(t.rebuilds(), 3, "an event must rebuild it");
     }
 
-    /// When a new run starts, the previous run's reasoning deltas must not carry over.
+    /// When the subject changes, the reasoning that led to it must not carry over — the durable
+    /// `thinking` event that follows would otherwise stand beside a chip saying the same thing.
     #[test]
-    fn a_new_work_run_starts_with_empty_reasoning() {
+    fn a_new_subject_starts_with_empty_reasoning() {
         let mut t = Timeline::new();
-        t.upsert(e(1, EntryKind::WorkStart("첫 런".into())));
-        t.push_delta(ZDeltaKind::Reasoning, "첫 런의 생각");
-        t.upsert(e(2, EntryKind::WorkStart("둘째 런".into())));
+        t.upsert(e(1, EntryKind::WorkStart("첫 주제".into())));
+        t.push_delta(ZDeltaKind::Reasoning, "첫 주제의 생각");
+        t.upsert(e(2, EntryKind::WorkStart("둘째 주제".into())));
 
-        match &t.items()[1] {
-            Item::Work { parts, .. } => assert!(parts.is_empty(), "{parts:?}"),
-            other => panic!("it must be a work card: {other:?}"),
-        }
+        assert_eq!(shape(&mut t), vec!["card[둘째 주제]()"]);
     }
 
     fn tool_at(seq: i64, name: &str, note: &str) -> Entry {
@@ -1026,19 +1112,41 @@ mod tests {
             seq,
             EntryKind::Tool {
                 name: name.into(),
-                summary: note.into(),
-                failed: false,
-                // Use the same shape for the detail to match `step_at`'s expected values.
-                detail: "인자\n{}".into(),
-                diff: None,
+                action: note.into(),
+                state: crate::tool_view::ToolState::Ok,
+                // The same shape `step_at` builds, so the two can be compared.
+                detail: crate::tool_view::Detail::None,
             },
         )
     }
 
-    /// **Answers that arrive mid-run stand inside the card** — if messages between tools were pushed
-    /// out of the card, "what was said while doing what" would scatter. The card must not fragment either.
+    /// The shape of the items, for asserting on a whole build at once.
+    fn shape(t: &mut Timeline) -> Vec<String> {
+        t.items()
+            .iter()
+            .map(|i| match i {
+                Item::Work { title, parts, .. } => {
+                    let inside: Vec<String> = parts
+                        .iter()
+                        .map(|p| match p {
+                            Part::Think(k) => format!("think {}", k.text),
+                            Part::Step(s) => format!("tool {}", s.name),
+                        })
+                        .collect();
+                    format!("card[{title}]({})", inside.join(", "))
+                }
+                Item::Agent { text, .. } => format!("said {text}"),
+                Item::User { text, .. } => format!("user {text}"),
+                other => format!("{other:?}"),
+            })
+            .collect()
+    }
+
+    /// **What the agent says closes the stretch of working and stands outside it.** It used to be
+    /// folded into the card among the reasoning, where it read as one more thought rather than as
+    /// words addressed to the person — and it is the one thing in the turn they came for.
     #[test]
-    fn agent_text_during_a_run_goes_into_the_card_in_order() {
+    fn what_the_agent_says_closes_the_card_and_stands_outside_it() {
         let mut t = Timeline::new();
         t.upsert(e(1, EntryKind::WorkStart("커밋".into())));
         t.upsert(e(2, EntryKind::Agent("이제 커밋합니다".into())));
@@ -1046,44 +1154,34 @@ mod tests {
         t.upsert(e(4, EntryKind::Agent("커밋하고 푸시하는 중".into())));
         t.upsert(tool_at(5, "exec", "git push"));
 
-        let items = t.items().to_vec();
-        assert_eq!(items.len(), 1, "the card must not be split: {items:?}");
-        match &items[0] {
-            Item::Work { parts, .. } => assert_eq!(
-                parts,
-                &vec![
-                    Part::Text("이제 커밋합니다".into()),
-                    Part::Step(step_at(3, "exec", "git commit")),
-                    Part::Text("커밋하고 푸시하는 중".into()),
-                    Part::Step(step_at(5, "exec", "git push")),
-                ],
-                "말한 순서 그대로 카드 안에 있어야 한다"
-            ),
-            other => panic!("it must be a work card: {other:?}"),
-        }
+        assert_eq!(
+            shape(&mut t),
+            vec![
+                "card[커밋]()",
+                "said 이제 커밋합니다",
+                "card[](tool exec)",
+                "said 커밋하고 푸시하는 중",
+                "card[](tool exec)",
+            ]
+        );
     }
 
-    /// **Streaming text stands before the tool that follows it** — inside the card, above the tool row.
+    /// **A streaming snippet closes the card exactly as its durable twin will.** Placed inside, the
+    /// answer would jump out of the reasoning the moment the durable event landed.
     #[test]
-    fn live_text_during_a_run_lands_before_the_following_tool() {
+    fn live_text_closes_the_card_just_as_its_durable_twin_will() {
         let mut t = Timeline::new();
         t.upsert(e(1, EntryKind::WorkStart("커밋".into())));
         t.push_delta(ZDeltaKind::Assistant, "전부 통과. 이제 커밋합니다");
         t.upsert(tool_at(2, "exec", "git commit"));
-        let Item::Work { parts, .. } = &t.items()[0] else {
-            panic!("it must be a work card");
-        };
+
         assert_eq!(
-            parts,
-            &vec![
-                Part::Text("전부 통과. 이제 커밋합니다".into()),
-                Part::Step(step_at(2, "exec", "git commit")),
-            ],
-            "텍스트가 도구 아래로 밀렸다"
+            shape(&mut t),
+            vec!["card[커밋]()", "said 전부 통과. 이제 커밋합니다", "card[](tool exec)"]
         );
     }
 
-    /// **Streaming text split by a tool stays two segments** — merged into one,
+    /// **Streaming text split by a tool stays two answers** — merged into one,
     /// the two messages would look like a single block.
     #[test]
     fn live_text_split_by_a_tool_stays_two_segments() {
@@ -1092,17 +1190,69 @@ mod tests {
         t.push_delta(ZDeltaKind::Assistant, "이제 커밋합니다");
         t.upsert(tool_at(2, "exec", "git commit"));
         t.push_delta(ZDeltaKind::Assistant, "커밋하고 푸시하는 중");
-        let Item::Work { parts, .. } = &t.items()[0] else {
-            panic!("it must be a work card");
-        };
+
         assert_eq!(
-            parts,
-            &vec![
-                Part::Text("이제 커밋합니다".into()),
-                Part::Step(step_at(2, "exec", "git commit")),
-                Part::Text("커밋하고 푸시하는 중".into()),
-            ],
-            "도구 사이 두 토막이 합쳐졌다: {parts:?}"
+            shape(&mut t),
+            vec![
+                "card[커밋]()",
+                "said 이제 커밋합니다",
+                "card[](tool exec)",
+                "said 커밋하고 푸시하는 중",
+            ]
+        );
+    }
+
+    /// **A second message does not pour its turn into the first turn's card.**
+    ///
+    /// The message goes up as an echo, which is woven in *after* the card boundaries are
+    /// decided — so the card stayed open across it and the new turn's reasoning landed in the
+    /// old card, above the message that started it. Two turns' thinking tangled in one card.
+    #[test]
+    fn sending_another_message_starts_a_card_of_its_own() {
+        let mut t = Timeline::new();
+        t.upsert(e(1, EntryKind::WorkStart("첫 턴".into())));
+        t.upsert(e(2, EntryKind::Thinking { title: None, text: "첫 턴의 생각".into() }));
+        // Sent from here — the server's copy has not arrived yet.
+        t.echo("또 물어봄");
+        t.upsert(e(3, EntryKind::WorkStart("둘째 턴".into())));
+        t.upsert(e(4, EntryKind::Thinking { title: None, text: "둘째 턴의 생각".into() }));
+
+        assert_eq!(
+            shape(&mut t),
+            vec![
+                "card[첫 턴](think 첫 턴의 생각)",
+                "user 또 물어봄",
+                "card[둘째 턴](think 둘째 턴의 생각)",
+            ]
+        );
+    }
+
+    /// The same before any of the new turn has come back — the commonest moment of all.
+    #[test]
+    fn an_echo_with_nothing_after_it_yet_still_closes_the_card() {
+        let mut t = Timeline::new();
+        t.upsert(e(1, EntryKind::WorkStart("첫 턴".into())));
+        t.echo("또 물어봄");
+        t.push_delta(ZDeltaKind::Reasoning, "새 턴의 생각");
+
+        assert_eq!(
+            shape(&mut t),
+            vec!["card[첫 턴]()", "user 또 물어봄", "card[](think 새 턴의 생각)"]
+        );
+    }
+
+    /// **Thinking that follows something said opens a new card.** It has nowhere else to go, and it
+    /// was simply dropped — on screen the agent spoke and then appeared to stop.
+    #[test]
+    fn thinking_after_an_answer_opens_a_new_card() {
+        let mut t = Timeline::new();
+        t.upsert(e(1, EntryKind::WorkStart("런".into())));
+        t.upsert(e(2, EntryKind::Agent("먼저 살펴볼게요".into())));
+        t.push_delta(ZDeltaKind::Reasoning, "어디부터 볼까");
+
+        assert_eq!(
+            shape(&mut t),
+            vec!["card[런]()", "said 먼저 살펴볼게요", "card[](think 어디부터 볼까)"]
         );
     }
 
@@ -1135,13 +1285,83 @@ mod tests {
         t.push_delta(ZDeltaKind::Assistant, "생각");
         let _ = t.items();
         t.upsert(tool_at(2, "grep", "rows"));
-        let Item::Work { parts, .. } = &t.items()[0] else {
-            panic!("it must be a work card");
-        };
-        assert_eq!(
-            parts,
-            &vec![Part::Text("생각".into()), Part::Step(step_at(2, "grep", "rows")),],
-            "토막이 두 번 들어갔다: {parts:?}"
-        );
+        assert_eq!(shape(&mut t), vec!["card[런]()", "said 생각", "card[](tool grep)"]);
+    }
+
+    // ── The card's own shape ────────────────────────────────────────────────
+
+    /// **One `thinking` event, one chip — they are never merged.** The fold key is the event's own
+    /// seq, so merging two blocks would leave one of the two keys with nothing to open.
+    #[test]
+    fn each_thinking_event_becomes_its_own_chip() {
+        let mut t = Timeline::default();
+        t.upsert(e(1, EntryKind::WorkStart("런".into())));
+        t.upsert(e(2, EntryKind::Thinking { title: None, text: "먼저 보자".into() }));
+        t.upsert(e(3, EntryKind::Thinking { title: None, text: "이제 고치자".into() }));
+
+        let Item::Work { parts, .. } = &t.items()[0] else { panic!("{:?}", t.items()) };
+        let keys: Vec<i64> = parts.iter().map(Part::key).collect();
+        assert_eq!(keys, vec![2, 3], "the chips must key on their own event seqs: {parts:?}");
+    }
+
+    /// **A chip's fold key is the event's seq, not its position in the card.** The old key hashed
+    /// the block's ordinal, so a chip the person had folded silently re-opened under a new key as
+    /// soon as earlier content streamed in.
+    #[test]
+    fn a_chips_fold_key_does_not_move_when_earlier_content_arrives() {
+        let mut t = Timeline::default();
+        t.upsert(e(1, EntryKind::WorkStart("런".into())));
+        t.upsert(e(5, EntryKind::Thinking { title: None, text: "이제 고치자".into() }));
+        let before = key_of_last_chip(&mut t);
+
+        // An event that belongs *earlier* in the card arrives late — replays and in-place updates
+        // both do this.
+        t.upsert(e(3, EntryKind::Thinking { title: None, text: "먼저 보자".into() }));
+        assert_eq!(before, key_of_last_chip(&mut t), "the fold key moved under the person");
+    }
+
+    fn key_of_last_chip(t: &mut Timeline) -> i64 {
+        let Item::Work { parts, .. } = &t.items()[0] else { panic!("no work card") };
+        parts
+            .iter()
+            .rev()
+            .find_map(|p| match p {
+                Part::Think(c) => Some(c.seq),
+                _ => None,
+            })
+            .expect("no chip")
+    }
+
+    /// The title lands later, by in-place update on the same seq. **It must replace the chip, not
+    /// add one** — that is the whole reason `seq` is the identity here.
+    #[test]
+    fn a_late_title_retitles_the_chip_instead_of_adding_one() {
+        let mut t = Timeline::default();
+        t.upsert(e(1, EntryKind::WorkStart("런".into())));
+        t.upsert(e(2, EntryKind::Thinking { title: None, text: "먼저 보자".into() }));
+        t.upsert(e(
+            2,
+            EntryKind::Thinking { title: Some("파일을 훑는 중".into()), text: "먼저 보자".into() },
+        ));
+
+        let Item::Work { parts, .. } = &t.items()[0] else { panic!("{:?}", t.items()) };
+        assert_eq!(parts.len(), 1, "the update added a chip instead of replacing: {parts:?}");
+        let Part::Think(chip) = &parts[0] else { panic!("{parts:?}") };
+        assert_eq!(chip.title.as_deref(), Some("파일을 훑는 중"));
+    }
+
+    /// Reasoning that is still streaming has no seq of its own, so it borrows a key derived from
+    /// its card. **Per card** — with one global key, a fold the person set on one run's live chip
+    /// carried into the next run's, which then opened already folded.
+    #[test]
+    fn streaming_reasoning_gets_a_key_of_its_own_card() {
+        let mut t = Timeline::default();
+        t.upsert(e(1, EntryKind::WorkStart("런".into())));
+        t.push_delta(ZDeltaKind::Reasoning, "생각하는 중");
+
+        let Item::Work { parts, .. } = &t.items()[0] else { panic!("no work card") };
+        assert_eq!(parts.iter().map(Part::key).collect::<Vec<_>>(), vec![live_think_key(1)]);
+        assert_ne!(live_think_key(1), live_think_key(2), "two runs must not share a live key");
+        assert!(live_think_key(1) < 0, "the live key must not collide with a server seq");
     }
 }

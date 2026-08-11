@@ -492,7 +492,10 @@ mod tests {
 
         install_into(into, &at).await.unwrap();
         let why = install_into(into, &at).await.unwrap_err();
-        assert!(why.contains("이미 있습니다"), "{why}");
+        // Asserted against the current language — a Korean literal here only passed because
+        // another test had set the global language first.
+        let name = into.read_dir().unwrap().next().unwrap().unwrap().file_name();
+        assert_eq!(why, crate::lang::current().plugin_already_there(&name.to_string_lossy()));
     }
 
     /// An update must actually pull the new commit.

@@ -461,8 +461,11 @@ mod tests {
         // Pretend another session changed it in between
         std::fs::write(dir.path().join("a.txt"), "before\nother-session\n").unwrap();
         let e =
-            edit.edit(p, "before".into(), "after".into(), None, Some(read_at)).await.unwrap_err();
-        assert!(e.message.contains("바뀌었"), "{}", e.message);
+            edit.edit(p, "before".into(), "after".into(), None, Some(read_at.clone())).await.unwrap_err();
+        // **Asserted against the current language, not a Korean literal.** This used to read
+        // `contains("바뀌었")` and only passed because another test had set the global language to
+        // Korean first — the process default is English.
+        assert_eq!(e.message, stale_message(&dir, &read_at));
         assert_eq!(
             std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
             "before\nother-session\n"
@@ -484,8 +487,19 @@ mod tests {
         let (dir, edit, p) = scratch("before\n");
         let good = format!("sha256:{}", sha256_of(b"before\n"));
         std::fs::write(dir.path().join("a.txt"), "before\nother\n").unwrap();
-        let e = edit.edit(p, "before".into(), "after".into(), None, Some(good)).await.unwrap_err();
-        assert!(e.message.contains("바뀌었"), "{}", e.message);
+        let e = edit
+            .edit(p, "before".into(), "after".into(), None, Some(good.clone()))
+            .await
+            .unwrap_err();
+        assert_eq!(e.message, stale_message(&dir, &good));
+    }
+
+    /// The stale-version message **in whatever language is set.** These assertions used to hold a
+    /// Korean fragment and only passed because another test had set the global language to Korean
+    /// first — the process default is English.
+    fn stale_message(dir: &tempfile::TempDir, base: &str) -> String {
+        let now = current_version(&dir.path().join("a.txt")).unwrap();
+        crate::lang::current().edit_changed_after_read("a.txt", base, &now)
     }
 
     /// Overwriting an existing file without base_version must be refused — it's the prime source of silent overwrites.

@@ -14,6 +14,15 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut State) {
     // The question being answered in the panel below is not drawn again inside the conversation.
     let skip = state.asking.as_ref().map(|(seq, _)| *seq);
 
+    // The blink phase for the "running" tool dot. Wall-clock based, so it alternates without state.
+    let blink_on = {
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        (ms / 500).is_multiple_of(2)
+    };
+
     // **What the viewport was looking at, taken before the relayout.** `Scroll.top` is an
     // absolute line index and `layout` rebuilds the line list from scratch, so a width change or
     // a fold opening above the viewport moves the text out from under that index — always toward
@@ -25,8 +34,9 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut State) {
 
     {
         // Borrow the fields separately — `timeline` and `rows_cache` must be held at the same time.
-        let State { timeline, rows_cache, folds, lang, .. } = &mut *state;
-        rows_cache.layout(timeline.items(), area.width, folds, skip, *lang);
+        let State { timeline, rows_cache, folds, running, lang, .. } = &mut *state;
+        let turn = crate::rows::Turn { running: *running, blink: blink_on };
+        rows_cache.layout(timeline.items(), area.width, folds, skip, turn, *lang);
     }
 
     // Put the view back on the same words. When nothing was relaid out this resolves to the line
@@ -44,6 +54,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut State) {
     state.view_height = height;
     state.view_origin = (area.x, area.y);
     state.view_cards = state.rows_cache.cards().clone();
+    state.view_open = state.rows_cache.open_states().clone();
 
     state.scroll.on_content(total, height);
     let (start, end) = state.scroll.window(total, height);

@@ -54,18 +54,36 @@ pub fn extract(rows: &[String], drag: &Drag) -> String {
     out.join("\n")
 }
 
-/// The screen rectangle `(top, left, bottom, right)` the drag covers, clipped to the
-/// terminal size. `None` when the drag never moved — that is a click, not a selection.
-pub fn rect(drag: &Drag, width: u16, height: u16) -> Option<(u16, u16, u16, u16)> {
+/// The per-row column spans the drag highlights, as `(row, from, to)` with `to` exclusive,
+/// clipped to the terminal size. Empty when the drag never moved — that is a click, not a
+/// selection.
+///
+/// **This is text selection, not a box.** It mirrors `extract`, so the highlight shows exactly
+/// the text that gets copied: a single line spans from its start column to its end column; a
+/// multi-line drag takes the first line from its start column, the whole middle lines, and the
+/// last line up to its end column. The blank cells before the start (and after the end on the
+/// last line) stay untouched — a solid rectangle of colour around the words would read as
+/// "box the text", not "select these letters".
+pub fn row_spans(drag: &Drag, width: u16, height: u16) -> Vec<(u16, u16, u16)> {
     if drag.is_click() {
-        return None;
+        return Vec::new();
     }
     let ((r0, c0), (r1, c1)) = drag.ordered();
     let h = height as usize;
     let w = width as usize;
     let (r0, r1) = (r0.min(h.saturating_sub(1)), r1.min(h.saturating_sub(1)));
     let (c0, c1) = (c0.min(w.saturating_sub(1)), c1.min(w.saturating_sub(1)));
-    Some((r0 as u16, c0 as u16, r1 as u16, c1 as u16))
+    let mut out = Vec::new();
+    if r0 == r1 {
+        out.push((r0 as u16, c0 as u16, c1 as u16));
+        return out;
+    }
+    out.push((r0 as u16, c0 as u16, w as u16));
+    for r in (r0 + 1)..r1 {
+        out.push((r as u16, 0, w as u16));
+    }
+    out.push((r1 as u16, 0, c1 as u16));
+    out
 }
 
 /// The characters in screen columns `[from, to)`. Full-width glyphs count as 2 cells.
@@ -139,26 +157,44 @@ mod tests {
         assert!(got.ends_with("세 번째 줄"), "{got:?}");
     }
 
-    /// A drag that moved covers the rectangle between the two points, in either direction.
+    /// A drag that moved selects text, not a box: the first row starts at its start column,
+    /// the middle row is whole, and the last runs to its end column — the blank cells before
+    /// the start and after the end stay untouched.
     #[test]
-    fn rect_covers_the_drag_either_way_around() {
+    fn row_spans_follow_the_text_not_a_rectangle() {
+        let d = Drag { from: (1, 3), to: (3, 7) };
+        assert_eq!(row_spans(&d, 80, 24), vec![(1, 3, 80), (2, 0, 80), (3, 0, 7)]);
+    }
+
+    /// A single-line drag spans just its two ends.
+    #[test]
+    fn row_spans_on_one_line_span_the_two_ends() {
+        let d = Drag { from: (0, 2), to: (0, 6) };
+        assert_eq!(row_spans(&d, 80, 24), vec![(0, 2, 6)]);
+    }
+
+    /// Dragging backwards gives the same spans as forwards.
+    #[test]
+    fn row_spans_are_the_same_either_way_around() {
         let down = Drag { from: (1, 3), to: (3, 7) };
         let up = Drag { from: (3, 7), to: (1, 3) };
-        assert_eq!(rect(&down, 80, 24), Some((1, 3, 3, 7)));
-        assert_eq!(rect(&up, 80, 24), Some((1, 3, 3, 7)));
+        assert_eq!(row_spans(&down, 80, 24), row_spans(&up, 80, 24));
     }
 
     /// A drag that never moved is a click and highlights nothing.
     #[test]
-    fn rect_is_none_for_a_click() {
-        assert_eq!(rect(&Drag::new((2, 3)), 80, 24), None);
+    fn row_spans_is_empty_for_a_click() {
+        assert_eq!(row_spans(&Drag::new((2, 3)), 80, 24), Vec::<(u16, u16, u16)>::new());
     }
 
-    /// The mouse can go past the edge of the terminal; the rectangle is clamped to it.
+    /// The mouse can go past the edge of the terminal; the spans are clamped to it.
     #[test]
-    fn rect_is_clamped_to_the_terminal() {
+    fn row_spans_are_clamped_to_the_terminal() {
         let d = Drag { from: (0, 0), to: (99, 999) };
-        assert_eq!(rect(&d, 80, 24), Some((0, 0, 23, 79)));
+        let spans = row_spans(&d, 80, 24);
+        assert_eq!(spans.len(), 24);
+        assert_eq!(spans.first(), Some(&(0, 0, 80)));
+        assert_eq!(spans.last(), Some(&(23, 0, 79)));
     }
 
     #[test]

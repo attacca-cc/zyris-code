@@ -9,6 +9,17 @@
 //!
 //! This module is pure. Fetching lists and creating sessions is the I/O spot's job.
 
+/// How a thread (session) is doing, shown as a coloured dot in the list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadStatus {
+    /// A turn is running right now. Drawn orange and blinking.
+    Running,
+    /// The last turn finished cleanly.
+    Success,
+    /// The last turn ended in an error.
+    Failed,
+}
+
 /// One row of the list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row {
@@ -19,6 +30,8 @@ pub struct Row {
     pub note: Option<String>,
     /// Whether it can be picked.
     pub enabled: bool,
+    /// A per-thread status dot. Only session rows carry one; the rest stay `None`.
+    pub status: Option<ThreadStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,8 +45,6 @@ pub enum Level {
     Agents,
     /// The slash-command list shown when typing `/`.
     Commands,
-    /// The screen-language list `/lang` opens.
-    Languages,
 }
 
 /// What happens when picked.
@@ -54,8 +65,6 @@ pub enum Pick {
     /// Puts this command in the input field. **Doesn't run it immediately** — commands like
     /// `/mode` take arguments, so you must be able to keep typing after picking.
     TypeCommand { text: String },
-    /// Switches the screen to this language.
-    UseLang { lang: crate::lang::Lang },
     /// A row that can't be picked. Says why.
     Unavailable(String),
 }
@@ -71,13 +80,37 @@ pub enum Slot {
     More { count: usize, up: bool },
 }
 
-/// Decides how many rows fit and lays out what goes in them.
+/// Where the window sits after the cursor moved to `cursor`.
+///
+/// **The window only moves when the cursor would leave it.** It used to be derived from the
+/// cursor alone — `start = cursor - (visible - 1)` — which pins the cursor to the bottom edge,
+/// so every ↑ scrolled the list by one even though there were rows above the cursor still on
+/// screen. Walking back up then never reached the `↑ N more` mark: it kept retreating.
+pub fn window_top(len: usize, cursor: usize, top: usize, visible: usize) -> usize {
+    let last = len.saturating_sub(visible);
+    if cursor < top {
+        // Off the top — follow it up, one row at a time.
+        return cursor;
+    }
+    if cursor >= top + visible {
+        // Off the bottom — the cursor becomes the last visible row.
+        return (cursor + 1 - visible).min(last);
+    }
+    // Still inside. **Stay put**, except that a shrinking list must not leave the window
+    // hanging past the end.
+    top.min(last)
+}
+
+/// Decides how many rows fit and lays out what goes in them, given where the window was.
+///
+/// Returns the layout and where the window ended up — the caller stores that back, and it is
+/// what makes scrolling stick instead of snapping to the cursor every keypress.
 ///
 /// **The cursor is always visible.** And the cut side notes how many more there are — without it,
 /// the list looks like it ends there and the user won't look below.
-pub fn slots(rows: &[Row], cursor: usize, height: usize) -> Vec<Slot> {
+pub fn slots(rows: &[Row], cursor: usize, top: usize, height: usize) -> (Vec<Slot>, usize) {
     if rows.is_empty() || height == 0 {
-        return Vec::new();
+        return (Vec::new(), 0);
     }
     let has_create = rows.first().is_some_and(|r| r.id.is_none());
 
@@ -86,7 +119,7 @@ pub fn slots(rows: &[Row], cursor: usize, height: usize) -> Vec<Slot> {
     let (mut room, mut start, mut end) = (height, 0usize, rows.len());
     for _ in 0..3 {
         let visible = room.max(1).min(rows.len());
-        start = cursor.saturating_sub(visible.saturating_sub(1));
+        start = window_top(rows.len(), cursor, top, visible);
         end = (start + visible).min(rows.len());
         let extra = (start > 0) as usize
             + (end < rows.len()) as usize
@@ -122,7 +155,7 @@ pub fn slots(rows: &[Row], cursor: usize, height: usize) -> Vec<Slot> {
             None => out.truncate(height),
         }
     }
-    out
+    (out, start)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,14 +163,34 @@ pub struct Picker {
     pub level: Level,
     pub rows: Vec<Row>,
     pub cursor: usize,
+    /// The first visible row. **Remembered rather than derived from the cursor** — deriving it
+    /// pins the cursor to an edge and makes the list scroll on every keypress. `slots` returns
+    /// where it ended up and the widget stores it back.
+    pub top: usize,
     /// Whether the list is still loading.
     pub loading: bool,
 }
 
 impl Picker {
     /// An empty projects screen waiting for the list.
+    ///
+    /// **The box goes up before the answer does.** Fetching the list takes a request, and on a
+    /// big account not a fast one — with nothing on screen until it returns, pressing ← looks
+    /// like the app stopped responding.
     pub fn loading_projects() -> Self {
-        Self { level: Level::Projects, rows: Vec::new(), cursor: 0, loading: true }
+        Self { level: Level::Projects, rows: Vec::new(), cursor: 0, top: 0, loading: true }
+    }
+
+    /// An empty thread list waiting for the list. Carries the project it belongs to, so `Esc`
+    /// still knows where back is while it loads.
+    pub fn loading_sessions(project_id: String, project_name: String) -> Self {
+        Self {
+            level: Level::Sessions { project_id, project_name },
+            rows: Vec::new(),
+            cursor: 0,
+            top: 0,
+            loading: true,
+        }
     }
 
     /// The projects list. The top row is new-project.
@@ -148,44 +201,53 @@ impl Picker {
             // Says right there what happens when picked.
             note: Some(lang.new_project_note().into()),
             enabled: true,
+            status: None,
         }];
         rows.extend(items.into_iter().map(|(id, name, is_default)| Row {
             id: Some(id),
             label: name,
             note: is_default.then(|| lang.default_project().to_string()),
             enabled: true,
+            status: None,
         }));
         // The first row is the unselectable 'new project', so start on the second (first real project).
         let cursor = if rows.len() > 1 { 1 } else { 0 };
-        Self { level: Level::Projects, rows, cursor, loading: false }
+        Self { level: Level::Projects, rows, cursor, top: 0, loading: false }
     }
 
     /// One project's session list. The top row is new-session.
     pub fn sessions(
         project_id: String,
         project_name: String,
-        items: Vec<(String, String, bool)>,
+        items: Vec<(String, String, Option<ThreadStatus>)>,
         lang: crate::lang::Lang,
     ) -> Self {
         let mut rows =
-            vec![Row { id: None, label: lang.new_thread().into(), note: None, enabled: true }];
-        rows.extend(items.into_iter().map(|(id, title, running)| Row {
+            vec![Row { id: None, label: lang.new_thread().into(), note: None, enabled: true, status: None }];
+        rows.extend(items.into_iter().map(|(id, title, status)| Row {
             id: Some(id),
             label: title,
-            note: running.then(|| lang.running().to_string()),
+            note: None,
             enabled: true,
+            status,
         }));
         Self {
             level: Level::Sessions { project_id, project_name },
             rows,
             cursor: 0,
+            top: 0,
             loading: false,
         }
     }
 
+    /// An empty agents screen waiting for the list.
+    pub fn loading_agents() -> Self {
+        Self { level: Level::Agents, rows: Vec::new(), cursor: 0, top: 0, loading: true }
+    }
+
     /// The agents list. Opened by `/agent`.
     pub fn agents(rows: Vec<Row>) -> Self {
-        Self { level: Level::Agents, rows, cursor: 0, loading: false }
+        Self { level: Level::Agents, rows, cursor: 0, top: 0, loading: false }
     }
 
     /// The slash-command list. Opens when `/` is typed.
@@ -200,26 +262,10 @@ impl Picker {
                 label: name.to_string(),
                 note: Some(note.to_string()),
                 enabled: true,
+                status: None,
             })
             .collect();
-        Self { level: Level::Commands, rows, cursor: 0, loading: false }
-    }
-
-    /// The screen-language list. **Each name is written in its own language** — if it were in a language
-    /// you can't read, you couldn't tell what you're picking. The cursor sits on the language in use.
-    pub fn languages(now: crate::lang::Lang) -> Self {
-        use crate::lang::Lang;
-        let rows: Vec<Row> = [Lang::En, Lang::Ko]
-            .into_iter()
-            .map(|lang| Row {
-                id: Some(lang.code().to_string()),
-                label: lang.name().to_string(),
-                note: (lang == now).then(|| now.in_use().to_string()),
-                enabled: true,
-            })
-            .collect();
-        let cursor = rows.iter().position(|r| r.id.as_deref() == Some(now.code())).unwrap_or(0);
-        Self { level: Level::Languages, rows, cursor, loading: false }
+        Self { level: Level::Commands, rows, cursor: 0, top: 0, loading: false }
     }
 
     /// Narrows the list by typed text. If nothing remains, leaves it as is — an empty list looks broken.
@@ -275,10 +321,7 @@ impl Picker {
             (Level::Projects, None) => Some(Pick::NewProject),
             (Level::Agents, Some(name)) => Some(Pick::UseAgent { name: name.clone() }),
             (Level::Commands, Some(text)) => Some(Pick::TypeCommand { text: text.clone() }),
-            (Level::Languages, Some(code)) => {
-                crate::lang::Lang::parse(code).map(|lang| Pick::UseLang { lang })
-            }
-            (Level::Agents, None) | (Level::Commands, None) | (Level::Languages, None) => None,
+            (Level::Agents, None) | (Level::Commands, None) => None,
         }
     }
 
@@ -289,7 +332,6 @@ impl Picker {
             Level::Sessions { project_name, .. } => lang.threads_in(project_name),
             Level::Agents => lang.agents().into(),
             Level::Commands => lang.commands().into(),
-            Level::Languages => lang.language().into(),
         }
     }
 }
@@ -311,21 +353,28 @@ mod tests {
             label: crate::lang::Lang::Ko.new_thread().into(),
             note: None,
             enabled: true,
+            status: None,
         }];
         rows.extend((0..n).map(|i| Row {
             id: Some(format!("s{i}")),
             label: format!("thread {i}"),
             note: None,
             enabled: true,
+            status: None,
         }));
         rows
+    }
+
+    /// The layout from a window that has not been scrolled yet — what these assertions are about.
+    fn lay(rows: &[Row], cursor: usize, height: usize) -> Vec<Slot> {
+        slots(rows, cursor, 0, height).0
     }
 
     /// When everything fits there are no overflow marks. Saying "more" when nothing is cut is a lie.
     #[test]
     fn a_list_that_fits_gets_no_overflow_marks() {
         let rows = many(3);
-        let got = slots(&rows, 0, 10);
+        let got = lay(&rows, 0, 10);
         assert!(!got.iter().any(|s| matches!(s, Slot::More { .. })), "{got:?}");
         assert_eq!(got.iter().filter(|s| matches!(s, Slot::Row(_))).count(), 4);
     }
@@ -334,7 +383,7 @@ mod tests {
     #[test]
     fn a_long_list_says_how_many_are_left_below() {
         let rows = many(30);
-        let got = slots(&rows, 0, 8);
+        let got = lay(&rows, 0, 8);
         let Some(Slot::More { count, up }) = got.last() else {
             panic!("the count left below is missing: {got:?}");
         };
@@ -347,11 +396,55 @@ mod tests {
     #[test]
     fn scrolling_down_marks_what_is_left_above() {
         let rows = many(30);
-        let got = slots(&rows, 20, 8);
+        let got = lay(&rows, 20, 8);
         assert!(
             matches!(got.first(), Some(Slot::More { up: true, .. })),
-            "위로 남은 개수가 없다: {got:?}"
+            "no count of what is left above: {got:?}"
         );
+    }
+
+    /// **Going back up does not scroll until the cursor reaches the top of the window.**
+    ///
+    /// The window used to be derived from the cursor alone, which pinned the cursor to the
+    /// bottom edge: one ↑ from the bottom moved `↑ 25 more` to `↑ 26 more` even though the
+    /// cursor was nowhere near it. Walking up then never reached the mark — it retreated with
+    /// every keypress, and the rows above it could not be read.
+    #[test]
+    fn walking_back_up_holds_the_window_until_the_cursor_reaches_it() {
+        let rows = many(40);
+        // Scrolled to the bottom, then four steps back up.
+        let (_, top) = slots(&rows, 39, 0, 9);
+        assert!(top > 0, "it did not scroll down at all");
+        let mut at = top;
+        for cursor in (36..=38).rev() {
+            let (_, now) = slots(&rows, cursor, at, 9);
+            assert_eq!(now, at, "the window moved while the cursor was still inside it");
+            at = now;
+        }
+        // Once the cursor reaches the first visible row, one more ↑ moves the window by one.
+        let (_, now) = slots(&rows, at - 1, at, 9);
+        assert_eq!(now, at - 1, "at the top edge it must follow the cursor");
+    }
+
+    /// The same the other way — walking down holds until the cursor reaches the bottom row.
+    #[test]
+    fn walking_down_holds_the_window_until_the_cursor_reaches_the_bottom() {
+        let rows = many(40);
+        let (first, _) = slots(&rows, 0, 0, 9);
+        let visible = first.iter().filter(|s| matches!(s, Slot::Row(_))).count();
+        for cursor in 1..visible {
+            let (_, now) = slots(&rows, cursor, 0, 9);
+            assert_eq!(now, 0, "the list scrolled while row {cursor} was still on screen");
+        }
+    }
+
+    /// A window left hanging past the end of a list that shrank is pulled back.
+    #[test]
+    fn a_window_past_the_end_of_a_shrunken_list_is_pulled_back() {
+        let rows = many(6);
+        let (got, top) = slots(&rows, 0, 30, 9);
+        assert_eq!(top, 0, "{got:?}");
+        assert!(got.iter().any(|s| matches!(s, Slot::Row(0))), "{got:?}");
     }
 
     /// **The cursor is always visible.** If it weren't, you couldn't tell what you're picking.
@@ -359,10 +452,10 @@ mod tests {
     fn the_cursor_is_always_inside_the_window() {
         let rows = many(40);
         for cursor in [0, 1, 7, 20, 40] {
-            let got = slots(&rows, cursor, 9);
+            let got = lay(&rows, cursor, 9);
             assert!(
                 got.iter().any(|s| matches!(s, Slot::Row(i) if *i == cursor)),
-                "커서 {cursor}가 안 보인다: {got:?}"
+                "the cursor at {cursor} is not on screen: {got:?}"
             );
         }
     }
@@ -373,7 +466,7 @@ mod tests {
         let rows = many(40);
         for height in 1..14 {
             for cursor in [0, 5, 39] {
-                let got = slots(&rows, cursor, height);
+                let got = lay(&rows, cursor, height);
                 assert!(got.len() <= height, "{} rows in a height of {height}: {got:?}", got.len());
             }
         }
@@ -382,7 +475,7 @@ mod tests {
     /// **"New" is ruled off from the list.** Kept together, it reads as one more session.
     #[test]
     fn the_create_row_is_ruled_off_from_the_list() {
-        let got = slots(&many(3), 0, 10);
+        let got = lay(&many(3), 0, 10);
         assert_eq!(got[0], Slot::Row(0));
         assert_eq!(got[1], Slot::Rule, "no rule: {got:?}");
         assert_eq!(got[2], Slot::Row(1));
@@ -391,14 +484,14 @@ mod tests {
     /// Once scrolled past where the create row is visible, there's no rule either.
     #[test]
     fn there_is_no_rule_once_the_create_row_scrolls_away() {
-        let got = slots(&many(30), 25, 8);
+        let got = lay(&many(30), 25, 8);
         assert!(!got.contains(&Slot::Rule), "{got:?}");
     }
 
     /// Lists without a create row (agents·commands) get no rule.
     #[test]
     fn a_list_without_a_create_row_has_no_rule() {
-        let got = slots(&Picker::commands(crate::lang::Lang::Ko).rows, 0, 20);
+        let got = lay(&Picker::commands(crate::lang::Lang::Ko).rows, 0, 20);
         assert!(!got.contains(&Slot::Rule), "{got:?}");
     }
 
@@ -406,7 +499,9 @@ mod tests {
         Picker::agents(
             ["Main Agent", "Zyris Code"]
                 .into_iter()
-                .map(|n| Row { id: Some(n.into()), label: n.into(), note: None, enabled: true })
+                .map(|n| {
+                    Row { id: Some(n.into()), label: n.into(), note: None, enabled: true, status: None }
+                })
                 .collect(),
         )
     }
@@ -482,7 +577,7 @@ mod tests {
         let s = Picker::sessions(
             "p1".into(),
             "기본".into(),
-            vec![("s1".into(), "지난 대화".into(), false)],
+            vec![("s1".into(), "지난 대화".into(), None)],
             crate::lang::Lang::Ko,
         );
         assert_eq!(s.rows[0].label, "＋ 새 쓰레드");
@@ -496,12 +591,12 @@ mod tests {
         let mut s = Picker::sessions(
             "p1".into(),
             "기본".into(),
-            vec![("s1".into(), "지난 대화".into(), true)],
+            vec![("s1".into(), "지난 대화".into(), Some(ThreadStatus::Running))],
             crate::lang::Lang::Ko,
         );
         s.down();
         assert_eq!(s.pick(), Some(Pick::OpenSession { id: "s1".into(), project_id: "p1".into() }));
-        assert_eq!(s.rows[1].note.as_deref(), Some("작업 중"));
+        assert_eq!(s.rows[1].status, Some(ThreadStatus::Running));
     }
 
     #[test]

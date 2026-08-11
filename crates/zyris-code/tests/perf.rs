@@ -38,7 +38,7 @@ fn conversation(turns: usize, table_rows: usize) -> Timeline {
         seq += 1;
         t.upsert(Entry { seq, kind: EntryKind::WorkStart(format!("{i}번째 작업")) });
         seq += 1;
-        t.upsert(Entry { seq, kind: EntryKind::Thinking("무엇부터 볼까".repeat(20)) });
+        t.upsert(Entry { seq, kind: EntryKind::Thinking { title: None, text: "무엇부터 볼까".repeat(20) } });
         seq += 1;
         t.upsert(Entry { seq, kind: EntryKind::Agent(long_table(table_rows)) });
     }
@@ -55,7 +55,7 @@ fn frame_all(t: &mut Timeline, folds: &Folds) -> usize {
 
 /// The current way — rebuilds only changed items and lays out just the visible window.
 fn frame_cached(t: &mut Timeline, cache: &mut Cache, folds: &Folds) -> usize {
-    cache.layout(t.items(), WIDTH, folds, None, zyris_code::lang::Lang::En);
+    cache.layout(t.items(), WIDTH, folds, None, zyris_code::rows::Turn::default(), zyris_code::lang::Lang::En);
     let top = cache.total().saturating_sub(HEIGHT);
     cache.window(top, top + HEIGHT).len()
 }

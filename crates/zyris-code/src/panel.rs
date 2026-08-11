@@ -684,7 +684,7 @@ mod tests {
         let cfg = crate::config::Config { dir_access: DirAccess::Allow, default_mode: Some(Mode::Job), ..Default::default() };
         let p = config(Lang::Ko, cfg);
         let joined = text(&p).join("\n");
-        for label in ["다른 디렉토리 접근", "화면 말", "기본 모드"] {
+        for label in ["다른 디렉토리 접근", "언어", "기본 모드"] {
             assert!(joined.contains(label), "{label} is missing: {joined}");
         }
         assert!(joined.contains("< "), "no value field: {joined}");

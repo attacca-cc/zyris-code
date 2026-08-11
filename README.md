@@ -9,7 +9,7 @@ editing files, searching the tree, running shell commands, and exposing the tool
 of any local MCP server you configure. The agent runs on Attacca; the tools run
 here.
 
-> The interface is bilingual (Korean and English), switchable with `/lang` — English is the
+> The interface is bilingual (Korean and English), switchable in `/config` — English is the
 > default, and Korean follows the locale or your choice. Mode names and prompts are given
 > in both languages below where it matters.
 
@@ -200,7 +200,6 @@ only `/agent` and `/account` ask the server, for exactly what they need.
 |---|---|
 | `/help` | List these |
 | `/mode [normal\|plan]` | Show or change the mode |
-| `/lang [ko\|en]` | Interface language (also in `/config`) |
 | `/config [option value]` | Settings form, or set one: `dir allow\|deny`, `theme auto\|dark\|light`, `lang ko\|en`, `mode …\|off` |
 | `/account [logout]` | Who this node is attached as (email, plan, granted scopes); `logout` clears the stored credentials |
 | `/agent [name]` | Pick an agent (see below) |
@@ -341,7 +340,7 @@ Plugins are loaded at startup, so restart to pick up a newly installed one.
 |---|---|
 | `Enter` | Send |
 | `Shift+Tab` | Cycle mode: normal → plan → work → job |
-| `Ctrl+O` | Fold / unfold the work card |
+| `Ctrl+O` | Fold / unfold the latest work card |
 | `←` | Project and session picker |
 | `↑` / `↓` | Recall previous messages |
 | `PageUp` / `PageDown` | Scroll the conversation by a page (works without a wheel) |
@@ -358,11 +357,18 @@ that is gone, and spends credit doing it. `SIGTERM` and `SIGHUP` (closing the
 terminal) take the same path. If the server does not answer within three
 seconds the window closes anyway.
 
-Work cards are folded and unfolded by hand (`Ctrl+O`) and never move on their
-own — a screen that folds itself while you are reading it is worse than one card
-too many. Folding hides the **reasoning**; the tool rows stay visible underneath
-the card head, so you can see what the agent did without opening anything.
-Clicking a tool row opens its detail independently of the card.
+**A work card is one stretch of working — everything the agent thought and did
+between two things it said to you.** Its head keeps rewriting itself to say what
+is happening ("retrying the node" → "writing the report"), and reads `Done` once
+the stretch is over. What the agent says to you stands outside the card, so a
+folded card never hides an answer.
+
+A running card is open; a finished one folds itself into that one line. `Ctrl+O`
+folds and unfolds the latest card, and from then on that card is yours — it stops
+following the turn. Inside the card, the reasoning chips stay folded until you
+click one: watching the model talk itself round is noise, and it pushes the tool
+rows off the screen. Clicking a tool row opens its input and output, rendered per
+tool rather than as raw JSON.
 
 Switching to another session (`←`) while a turn is running does not stop that
 turn — it keeps running on the server, and its events stop appearing here. When
@@ -402,7 +408,7 @@ titles and bodies, and issues are all in English. Contributors read them, and an
 shuts most of them out. `panic!`, `expect` and log messages count as writing too — they are
 read by whoever is debugging.
 
-**The one exception is `lang.rs`.** The interface is bilingual and switches with `/lang`, so
+**The one exception is `lang.rs`.** The interface is bilingual and switches in `/config`, so
 the Korean side of `lang.rs` is a feature, not a leftover — don't translate it away. User-facing
 text belongs there rather than hardcoded at the call site, which is also how it gets an English
 version at all.

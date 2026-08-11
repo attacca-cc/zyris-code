@@ -426,7 +426,10 @@ fn row_line(cells: &[String], w: &[usize], fg: ratatui::style::Color, bold: bool
 }
 
 /// Cuts to not exceed the width. When cut, a `…` goes at the end — being cut must be visible.
-fn truncate_to(s: &str, limit: usize) -> String {
+///
+/// Counted in **display columns**, so fullwidth text is cut where it actually reaches the limit
+/// rather than where its bytes or chars run out.
+pub fn truncate_to(s: &str, limit: usize) -> String {
     if display_width(s) <= limit {
         return s.to_string();
     }

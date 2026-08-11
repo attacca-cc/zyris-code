@@ -1,4 +1,4 @@
-//! Produces the screen's words in Korean and English. Changed with `/lang`.
+//! Produces the screen's words in Korean and English. Changed with `/config lang`.
 //!
 //! **All phrases are gathered in this one place.** Split per-widget with conditionals, one language
 //! would inevitably get edited alone, leaving half the screen in the other language. With a single
@@ -11,7 +11,7 @@
 //! - `lang::current()` — used where there is no screen (the shell notice in `notice.rs`, errors the
 //!   tools return). Carrying it as an argument that far would string a `lang` through functions that aren't even pure.
 //!
-//! `/lang` sets both together. If they diverged, the conversation window would be English while only the shell notice stayed Korean.
+//! `/config lang` sets both together. If they diverged, the conversation window would be English while only the shell notice stayed Korean.
 //!
 //! ## Which words come here
 //!
@@ -57,8 +57,8 @@ pub fn set(lang: Lang) {
 }
 
 impl Lang {
-    /// From what the person typed. **Both languages' names are accepted** — typing `/lang` with a
-    /// Korean word on an English screen is natural, and so is `/lang english` on a Korean one.
+    /// From what the person typed. **Both languages' names are accepted** — typing `/config lang` with a
+    /// Korean word on an English screen is natural, and so is `/config lang english` on a Korean one.
     pub fn parse(text: &str) -> Option<Lang> {
         match text.trim().to_ascii_lowercase().as_str() {
             "ko" | "kr" | "korean" | "한글" | "한국어" => Some(Lang::Ko),
@@ -96,7 +96,7 @@ impl Lang {
 ///
 /// Order: `$ZYRIS_CODE_LANG` → last choice → system locale → Korean.
 ///
-/// **What a person gave always wins.** The last choice comes next because a `/lang` change must
+/// **What a person gave always wins.** The last choice comes next because a language change must
 /// survive into the next run to count as a "setting".
 pub fn startup() -> Lang {
     if let Some(given) = std::env::var("ZYRIS_CODE_LANG").ok().and_then(|v| Lang::parse(&v)) {
@@ -346,13 +346,6 @@ impl Lang {
     pub fn commands(self) -> &'static str {
         self.pick("명령", "Commands")
     }
-    pub fn language(self) -> &'static str {
-        self.pick("화면 말", "Language")
-    }
-    /// The mark attached to the language currently in use, in the list.
-    pub fn in_use(self) -> &'static str {
-        self.pick("지금", "in use")
-    }
     pub fn new_project(self) -> &'static str {
         self.pick("＋ 새 프로젝트", "+ New project")
     }
@@ -483,28 +476,12 @@ impl Lang {
         self.pick("Esc 닫기", "Esc close")
     }
 
-    // ── `/lang`
-    pub fn lang_now(self) -> String {
-        match self {
-            Lang::Ko => {
-                format!("화면 말: **{}**. `/lang en`으로 영어로 바꿉니다.", Lang::Ko.name())
-            }
-            Lang::En => {
-                format!("Interface language: **{}**. Use `/lang ko` for Korean.", Lang::En.name())
-            }
-        }
-    }
+    // ── The confirmation shown when the language is changed
     pub fn lang_changed(self) -> &'static str {
         self.pick(
-            "화면 말을 한국어로 바꿨습니다. 다음에 켤 때도 이대로입니다.",
+            "언어를 한국어로 바꿨습니다. 다음에 켤 때도 이대로입니다.",
             "Interface language is now English. It stays this way next time.",
         )
-    }
-    pub fn lang_unknown(self, given: &str) -> String {
-        match self {
-            Lang::Ko => format!("`{given}`가 무슨 말인지 모르겠습니다. `ko` 또는 `en`입니다."),
-            Lang::En => format!("Cannot tell what `{given}` means. Use `ko` or `en`."),
-        }
     }
 
     // ── Shell notice · no screen (notice.rs · main.rs · the connection bails in app.rs)
@@ -1135,7 +1112,7 @@ impl Lang {
     }
     /// The row label for the screen language. The setting itself lives with `lang.rs`.
     pub fn cfg_language(self) -> &'static str {
-        self.pick("화면 말", "Screen language")
+        self.pick("언어", "Language")
     }
     /// The row label for the palette.
     pub fn cfg_theme(self) -> &'static str {
@@ -1504,19 +1481,62 @@ impl Lang {
             Lang::En => format!("Exit code {code}"),
         }
     }
+    /// A command that finished cleanly. **A quiet success still has to say so** — an empty detail
+    /// reads as a broken tool.
+    pub fn detail_ok(self) -> &'static str {
+        self.pick("완료", "Done")
+    }
+    /// The headline of a `grep` detail: how many matches, across how many files scanned.
+    pub fn detail_hits(self, hits: usize, scanned: u32) -> String {
+        match self {
+            Lang::Ko => format!("{hits}처 · {scanned}개 파일을 살펴봄"),
+            Lang::En => format!("{hits} matches · {scanned} files scanned"),
+        }
+    }
+    /// The headline of a `glob`/`list` detail.
+    pub fn detail_found(self, n: usize) -> String {
+        match self {
+            Lang::Ko => format!("{n}개"),
+            Lang::En => format!("{n} entries"),
+        }
+    }
+    /// Says the result was cut short. **Without it, "nothing more matched" and "we stopped
+    /// looking" are indistinguishable.**
+    pub fn detail_truncated(self) -> &'static str {
+        self.pick("… 여기까지만 가져왔습니다", "… cut short here")
+    }
+    /// A reasoning chip with no title and no words yet.
+    pub fn thinking(self) -> &'static str {
+        self.pick("생각하는 중…", "Thinking…")
+    }
+    /// The head of a stretch of working that is over. **Not the last title it carried** — that one
+    /// described a step in the middle, and left standing it reads as still going.
+    pub fn run_done(self) -> &'static str {
+        self.pick("완료", "Done")
+    }
     pub fn detail_no_output(self) -> &'static str {
         self.pick("(출력 없음)", "(no output)")
     }
     pub fn detail_clipped(self) -> &'static str {
         self.pick("… (잘렸습니다)", "… (clipped)")
     }
+    /// The byte offset a ranged `file_io.read` started at. It keeps repeated reads of one file apart.
+    pub fn action_from_byte(self, offset: i64) -> String {
+        match self {
+            Lang::Ko => format!("{offset}바이트부터"),
+            Lang::En => format!("from byte {offset}"),
+        }
+    }
     pub fn default_shell(self) -> &'static str {
         self.pick("기본 셸", "default shell")
     }
+    /// **English needs the singular.** A card that used one tool said "1 tools", which reads as a
+    /// bug in the very line that is supposed to summarize the run.
     pub fn tool_count(self, n: usize) -> String {
-        match self {
-            Lang::Ko => format!("도구 {n}개"),
-            Lang::En => format!("{n} tools"),
+        match (self, n) {
+            (Lang::Ko, _) => format!("도구 {n}개"),
+            (Lang::En, 1) => "1 tool".to_string(),
+            (Lang::En, _) => format!("{n} tools"),
         }
     }
     pub fn step_count(self, n: usize) -> String {
@@ -1529,12 +1549,6 @@ impl Lang {
         match self {
             Lang::Ko => format!(" … {n}줄 생략"),
             Lang::En => format!(" … {n} lines skipped"),
-        }
-    }
-    pub fn diff_omitted(self, n: u32) -> String {
-        match self {
-            Lang::Ko => format!("@@ {n}줄 생략 @@"),
-            Lang::En => format!("@@ {n} lines omitted @@"),
         }
     }
 
@@ -1753,9 +1767,17 @@ impl Lang {
 
 #[cfg(test)]
 mod tests {
+
+    /// Found against a real session: a card that used one tool said "1 tools".
+    #[test]
+    fn one_tool_is_singular_in_english() {
+        assert_eq!(Lang::En.tool_count(1), "1 tool");
+        assert_eq!(Lang::En.tool_count(2), "2 tools");
+        assert_eq!(Lang::Ko.tool_count(1), "도구 1개");
+    }
     use super::*;
 
-    /// **Both languages' names are accepted.** Typing `/lang` with a Korean word on an English screen
+    /// **Both languages' names are accepted.** Typing `/config lang` with a Korean word on an English screen
     /// is natural, and so is the reverse — accepting only the current screen language would leave someone who chose wrong with no way back.
     #[test]
     fn either_language_can_be_named_in_either_language() {
@@ -1967,9 +1989,11 @@ mod tests {
             en.plugin_removed("x"),
             en.plugin_unknown("x"),
             en.detail_exit_code(1),
+            en.action_from_byte(120),
+            en.detail_hits(3, 42),
+            en.detail_found(3),
             en.tool_count(3),
             en.diff_skip(2),
-            en.diff_omitted(2),
             en.pick_more(true, 3),
             en.picker_keys("← close"),
             en.changes_text(&[], std::path::Path::new("/")),

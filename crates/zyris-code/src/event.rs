@@ -20,15 +20,18 @@ pub enum EntryKind {
     Agent(String),
     /// Start of a work run. Empty content means the title isn't decided yet.
     WorkStart(String),
-    Thinking(String),
+    /// One reasoning block. **`title` is the server's, not ours** — `agent_runtime.rs`'s
+    /// `spawn_thought_title` labels each block with a small model and updates the event in place,
+    /// so a card that opened untitled fills in by itself (the `seq`-keyed upsert is what makes that
+    /// land in the same row). `None` until that lands, and forever if the side model is off.
+    Thinking { title: Option<String>, text: String },
     Tool {
         name: String,
-        summary: String,
-        failed: bool,
-        /// What to show when expanded — what it received and what it returned. Empty means nothing to expand.
-        detail: String,
-        /// For tools that changed files, what changed and how. The screen draws it in green/red.
-        diff: Option<crate::tools::diff::Diff>,
+        /// What was run, against what. Built by `tool_view::action`.
+        action: String,
+        state: crate::tool_view::ToolState,
+        /// What to show when expanded, already hardened into a drawable shape.
+        detail: crate::tool_view::Detail,
     },
     /// What the agent asked. Picking an answer sends it back as an ordinary message.
     ///
@@ -37,7 +40,6 @@ pub enum EntryKind {
         steps: Vec<crate::question::Step>,
         answered: bool,
     },
-    Todo(String),
     Subagent(String),
     Error(String),
 }
@@ -52,9 +54,15 @@ pub fn entry_from(event: &ZSessionEvent) -> Option<Entry> {
         "chat_user" => EntryKind::User(text(p, "content")),
         "chat_agent" => EntryKind::Agent(text(p, "content")),
         "work_summary" => EntryKind::WorkStart(text(p, "content")),
-        "thinking" => EntryKind::Thinking(text(p, "content")),
+        "thinking" => EntryKind::Thinking {
+            title: p.get("title").and_then(Value::as_str).filter(|s| !s.trim().is_empty()).map(str::to_string),
+            text: text(p, "content"),
+        },
         "error" => EntryKind::Error(text(p, "message")),
-        "todo_change" => EntryKind::Todo(text(p, "to_status")),
+        // `todo_change` carries `{todo_item_id, from_status, to_status}` and **no text**, so there
+        // is nothing to put on screen but a bare status word. Dropped until the server sends the
+        // todo's own words (2026-08-10).
+        "todo_change" => return None,
         "subagent_update" => EntryKind::Subagent(text(p, "summary")),
         "tool_call" => {
             let name = text(p, "name");
@@ -70,12 +78,19 @@ pub fn entry_from(event: &ZSessionEvent) -> Option<Entry> {
                     });
                 }
             }
+            let args = p.get("arguments");
+            let result = p.get("result").filter(|v| !v.is_null());
             EntryKind::Tool {
-                summary: tool_summary(p, &name),
-                detail: tool_detail(p, &name),
-                diff: diff_of(&name, p.get("result")),
+                action: crate::tool_view::action(&name, args, result),
+                detail: crate::tool_view::detail(&name, args, result, p.get("error")),
+                // **Pending is `no result and no error`, not "the turn is running".** attacca
+                // writes the event when the call starts and updates it in place when it returns.
+                state: match (failed, result.is_some()) {
+                    (true, _) => crate::tool_view::ToolState::Failed,
+                    (false, true) => crate::tool_view::ToolState::Ok,
+                    (false, false) => crate::tool_view::ToolState::Pending,
+                },
                 name,
-                failed,
             }
         }
         // Model-only. Never rendered.
@@ -88,163 +103,6 @@ pub fn entry_from(event: &ZSessionEvent) -> Option<Entry> {
 
 fn text(payload: &Value, field: &str) -> String {
     payload.get(field).and_then(Value::as_str).unwrap_or_default().to_string()
-}
-
-/// The **short** argument summary for a tool row. The name isn't included here — the screen paints
-/// the two separately.
-///
-/// The full arguments aren't expanded. Since the detail can be seen by pressing to expand, what
-/// belongs here is the one piece of "what it was done to". **It used to just take the first JSON value**, which made `write`'s `content` come out whole and one tool row become a whole file.
-const SUMMARY_LIMIT: usize = 56;
-
-fn tool_summary(payload: &Value, name: &str) -> String {
-    let args = payload.get("arguments");
-    let pick = |k: &str| args.and_then(|a| a.get(k)).and_then(Value::as_str);
-    let tail = name.rsplit("__").next().unwrap_or(name);
-
-    let chosen = match tail {
-        "exec" => pick("command"),
-        "glob" | "grep" => pick("pattern"),
-        "load" => pick("name"),
-        "open" | "open_stream" => pick("shell").or(Some(crate::lang::current().default_shell())),
-        // For things that keep a PTY going, which shell it is is everything.
-        "read" | "write" | "screen" | "resize" | "close" if pick("pty").is_some() => pick("pty"),
-        "edit" | "multi_edit" | "write" | "version" | "stat" | "list" | "read_stream" => {
-            pick("path")
-        }
-        // For unknown tools (server built-ins · MCP), look through the common names first, and fall back to the first string.
-        _ => ["path", "name", "query", "title", "content", "url", "id"]
-            .into_iter()
-            .find_map(pick)
-            .or_else(|| args.and_then(Value::as_object)?.values().find_map(Value::as_str)),
-    };
-    clip_summary(chosen.unwrap_or_default())
-}
-
-/// Make it one line and clip it when long. **A leftover newline turns one tool row into several lines.**
-fn clip_summary(s: &str) -> String {
-    let one: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    if one.chars().count() <= SUMMARY_LIMIT {
-        return one;
-    }
-    one.chars().take(SUMMARY_LIMIT).chain(['…']).collect()
-}
-
-/// Pulls the diff out of a file-changing tool's result.
-///
-/// attacca sends tool names as `zyris__{slug}__{capability}__{tool}`, so only the tail is looked
-/// at. If it can't be pulled, it's `None` and falls back to a JSON dump as now — **not dying is the
-/// point.** The result shape is ours to define (`tools::edit::EditResult`), but it's JSON that came
-/// back around the server, so anything can arrive.
-fn diff_of(name: &str, result: Option<&Value>) -> Option<crate::tools::diff::Diff> {
-    let tail = name.rsplit("__").next()?;
-    if !matches!(tail, "edit" | "multi_edit" | "write") {
-        return None;
-    }
-    let r = result?;
-    let text = r.get("diff")?.as_str()?;
-    let path = r.get("path").and_then(Value::as_str).unwrap_or_default();
-    let added = r.get("added")?.as_u64()? as u32;
-    let removed = r.get("removed")?.as_u64()? as u32;
-    crate::tools::diff::Diff::parse(text, path, added, removed)
-}
-
-/// Unfolds a `terminal` result so a person can read it.
-///
-/// Without this, passing through `to_string_pretty` would make `"stdout": "   Compiling…\n"` into
-/// **escaped newlines and the entire build log on one line.**
-///
-/// A different shape means `None` and it falls back to JSON as now — the result shape is set
-/// upstream (`zyris_caps::ExecOutput`) and it's JSON that came back around the server, so anything
-/// can arrive. Same place, same approach as `diff_of`.
-fn exec_detail(name: &str, result: Option<&Value>) -> Option<String> {
-    let tail = name.rsplit("__").next()?;
-    if !matches!(tail, "exec" | "read" | "screen") {
-        return None;
-    }
-    let r = result?;
-    // Only exec has an exit code. read·screen are a single screen text.
-    let out = r.get("stdout").or_else(|| r.get("data")).or_else(|| r.get("text"))?.as_str()?;
-    let err = r.get("stderr").and_then(Value::as_str).unwrap_or_default();
-
-    let mut s = String::new();
-    if r.get("timed_out").and_then(Value::as_bool) == Some(true) {
-        s.push_str(crate::lang::current().detail_timed_out());
-        s.push('\n');
-    } else if let Some(code) = r.get("exit_code").and_then(Value::as_i64).filter(|c| *c != 0) {
-        s.push_str(&crate::lang::current().detail_exit_code(code));
-        s.push('\n');
-    }
-    if !out.is_empty() {
-        s.push_str(out);
-        if !s.ends_with('\n') {
-            s.push('\n');
-        }
-    }
-    if !err.is_empty() {
-        if !s.is_empty() {
-            s.push('\n');
-        }
-        s.push_str("stderr\n");
-        s.push_str(err);
-    }
-    // **If nothing is said, the tool looks broken.** Quiet commands that succeed are common.
-    if s.is_empty() {
-        s.push_str(crate::lang::current().detail_no_output());
-    }
-    Some(s)
-}
-
-/// What to show when expanded — what it received and what it returned.
-///
-/// **It's hardened into text right here.** Holding the raw JSON would weigh down the timeline, and
-/// it only ever reaches the screen as text anyway. Very long results are clipped too — one tool has
-/// no reason to take thousands of screen lines, and the web UI holds the original if you want it all.
-const DETAIL_LIMIT: usize = 4000;
-
-fn tool_detail(payload: &Value, name: &str) -> String {
-    let lang = crate::lang::current();
-    let mut out = String::new();
-    if let Some(args) = payload.get("arguments").filter(|v| !v.is_null()) {
-        out.push_str(lang.detail_args());
-        out.push('\n');
-        out.push_str(&flatten(args));
-    }
-    if let Some(err) = payload.get("error").filter(|v| !v.is_null()) {
-        push_section(&mut out, lang.detail_error(), err);
-    } else if let Some(res) = payload.get("result").filter(|v| !v.is_null()) {
-        // What the shell spat out is prose, not JSON.
-        match exec_detail(name, Some(res)) {
-            Some(text) => push_section(&mut out, lang.detail_output(), &Value::String(text)),
-            None => push_section(&mut out, lang.detail_result(), res),
-        }
-    }
-    clip(out)
-}
-
-fn push_section(out: &mut String, head: &str, v: &Value) {
-    if !out.is_empty() {
-        out.push('\n');
-    }
-    out.push_str(head);
-    out.push('\n');
-    out.push_str(&flatten(v));
-}
-
-/// A string as-is, otherwise JSON pretty-printed.
-fn flatten(v: &Value) -> String {
-    match v.as_str() {
-        Some(s) => s.to_string(),
-        None => serde_json::to_string_pretty(v).unwrap_or_default(),
-    }
-}
-
-fn clip(s: String) -> String {
-    if s.chars().count() <= DETAIL_LIMIT {
-        return s;
-    }
-    let cut: String = s.chars().take(DETAIL_LIMIT).collect();
-    format!("{cut}\n{}", crate::lang::current().detail_clipped())
 }
 
 #[cfg(test)]
@@ -261,142 +119,97 @@ mod tests {
         format!("zyris__arch__terminal__{tool}")
     }
 
-    fn exec_json(code: i32, out: &str, err: &str, timed_out: bool) -> Value {
-        json!({"exit_code": code, "stdout": out, "stderr": err, "timed_out": timed_out})
-    }
 
-    /// **The name isn't put in the summary.** The screen paints name and summary separately, so
-    /// mixing them here would mean splitting them apart again.
+    /// **The readable path must be the one that actually reaches the screen.** If only
+    /// `tool_view::detail` is right and `entry_from` doesn't call it, the person still sees raw JSON.
+    ///
+    /// A real `ExecOutput` is serialized in, so a drift in the upstream shape is caught here — the
+    /// same seam that caught capkit v3 adding `stdout_truncated`.
     #[test]
-    fn the_summary_is_only_the_argument() {
-        let got =
-            tool_summary(&json!({"arguments": {"command": "cargo build -j2"}}), &wire("exec"));
-        assert_eq!(got, "cargo build -j2");
-    }
-
-    /// **Don't just take the first JSON value.** For `write`, `content` is the whole file, so if it
-    /// became the tool row, one line would be a whole file.
-    #[test]
-    fn writing_a_file_is_summarised_by_its_path_not_its_content() {
-        let got = tool_summary(
-            &json!({"arguments": {"content": "아주 긴 파일 내용\n두 번째 줄\n", "path": "src/app.rs"}}),
-            "zyris__arch__code_edit__write",
-        );
-        assert_eq!(got, "src/app.rs");
-    }
-
-    /// A leftover newline turns one tool row into several lines.
-    #[test]
-    fn a_summary_is_always_one_line() {
-        let got =
-            tool_summary(&json!({"arguments": {"command": "echo 하나\necho 둘"}}), &wire("exec"));
-        assert!(!got.contains('\n'), "{got:?}");
-    }
-
-    /// Long ones are clipped. A tool row is for skimming, not reading.
-    #[test]
-    fn a_long_summary_is_clipped() {
-        let got = tool_summary(&json!({"arguments": {"command": "x".repeat(400)}}), &wire("exec"));
-        assert!(got.chars().count() <= SUMMARY_LIMIT + 1, "{} columns", got.chars().count());
-        assert!(got.ends_with('…'), "no marker saying it was cut");
-    }
-
-    /// Unknown tools must still say something — server built-ins and MCP come here.
-    #[test]
-    fn an_unknown_tool_still_gets_a_summary() {
-        assert_eq!(
-            tool_summary(&json!({"arguments": {"query": "ratatui"}}), "web_search"),
-            "ratatui"
-        );
-        assert_eq!(tool_summary(&json!({"arguments": {"무엇": "값"}}), "mystery"), "값");
-        assert_eq!(tool_summary(&json!({"arguments": {}}), "mystery"), "");
-    }
-
-    /// **A real `ExecOutput` is serialized in.** If the shape drifts, it's caught here — the same
-    /// seam test `diff_of` does with `EditResult`.
-    #[test]
-    fn a_real_exec_result_becomes_readable_lines() {
+    fn a_real_exec_result_reaches_the_tool_row_as_readable_lines() {
         let out = zyris_caps::ExecOutput {
             exit_code: 0,
             stdout: "   Compiling zyris-code\n    Finished dev\n".into(),
             stderr: String::new(),
             timed_out: false,
-            // capkit v3 says separately whether it had to cut the output. **This test is the
-            // seam that caught the shape change** when the pin moved to upstream `main`.
             stdout_truncated: false,
             stderr_truncated: false,
         };
-        let got = exec_detail(&wire("exec"), Some(&serde_json::to_value(&out).unwrap()))
-            .expect("did not recognise the exec result");
-        assert!(got.contains("   Compiling zyris-code\n    Finished dev"), "{got:?}");
-        assert!(!got.contains("\\n"), "a newline was left escaped: {got:?}");
-        assert!(!got.contains("exit_code"), "raw JSON keys are visible: {got:?}");
-    }
-
-    /// A failed command must show its exit code. If 0 and 3 can't be told apart, the log has to be read again.
-    #[test]
-    fn a_failed_command_shows_its_exit_code() {
-        crate::lang::set(crate::lang::Lang::Ko);
-        let got = exec_detail(
-            &wire("exec"),
-            Some(&exec_json(3, "", "error[E0308]: mismatched\n", false)),
-        )
-        .unwrap();
-        assert!(got.contains("종료 코드 3"), "{got:?}");
-        assert!(got.contains("E0308"), "{got:?}");
-    }
-
-    /// Timing out and producing nothing are different things.
-    #[test]
-    fn a_timed_out_command_says_so() {
-        crate::lang::set(crate::lang::Lang::Ko);
-        let got = exec_detail(&wire("exec"), Some(&exec_json(-1, "", "", true))).unwrap();
-        assert!(got.contains("시간이 다 됐습니다"), "{got:?}");
-    }
-
-    /// If nothing is said, the tool looks broken.
-    #[test]
-    fn a_silent_command_still_says_something() {
-        let got = exec_detail(&wire("exec"), Some(&exec_json(0, "", "", false))).unwrap();
-        assert!(!got.trim().is_empty(), "an empty result turned into an empty screen");
-    }
-
-    /// A different shape falls to `None` and JSON comes out as now. **Not dying is the point.**
-    #[test]
-    fn something_that_is_not_an_exec_result_falls_back() {
-        assert!(exec_detail(&wire("exec"), Some(&json!({"nope": 1}))).is_none());
-        assert!(exec_detail("zyris__arch__code_edit__edit", Some(&exec_json(0, "a", "", false)))
-            .is_none());
-        assert!(exec_detail(&wire("exec"), None).is_none());
-    }
-
-    /// A PTY screen is prose too, not JSON.
-    #[test]
-    fn a_pty_screen_is_shown_as_text_too() {
-        let got = exec_detail(&wire("screen"), Some(&json!({"data": "$ ls\na.rs  b.rs\n"})))
-            .expect("did not recognise the screen result");
-        assert!(got.contains("a.rs  b.rs"), "{got:?}");
-        assert!(!got.contains("\\n"), "{got:?}");
-    }
-
-    /// **It must be the path that actually reaches the screen.** If only `exec_detail` is right and
-    /// `tool_detail` doesn't call it, the user still sees raw JSON.
-    #[test]
-    fn the_readable_output_actually_reaches_the_tool_row() {
         let e = ev(
             7,
             "tool_call",
             json!({
                 "name": wire("exec"),
                 "arguments": {"command": "cargo build"},
-                "result": exec_json(0, "   Compiling zyris-code\n", "", false),
+                "result": serde_json::to_value(&out).unwrap(),
             }),
         );
-        let EntryKind::Tool { detail, .. } = entry_from(&e).unwrap().kind else {
+        let EntryKind::Tool { detail, action, state, .. } = entry_from(&e).unwrap().kind else {
             panic!("not a tool entry");
         };
-        assert!(detail.contains("   Compiling zyris-code"), "{detail:?}");
-        assert!(!detail.contains("\\n"), "{detail:?}");
+        assert_eq!(action, "cargo build");
+        assert_eq!(state, crate::tool_view::ToolState::Ok);
+        match detail {
+            crate::tool_view::Detail::Exec { exit, out, .. } => {
+                assert_eq!(exit, Some(0));
+                assert!(out.contains("   Compiling zyris-code\n    Finished dev"), "{out:?}");
+            }
+            other => panic!("expected an exec detail, got {other:?}"),
+        }
+    }
+
+    /// **A call with no result yet is pending, not a success.** attacca writes the event when the
+    /// call starts and updates it in place when it returns; painting that green would say a build
+    /// finished the moment it began.
+    #[test]
+    fn a_call_that_has_not_returned_is_pending() {
+        let e = ev(
+            6,
+            "tool_call",
+            json!({"name": wire("exec"), "arguments": {"command": "cargo build"}, "result": null}),
+        );
+        let EntryKind::Tool { state, .. } = entry_from(&e).unwrap().kind else {
+            panic!("not a tool entry");
+        };
+        assert_eq!(state, crate::tool_view::ToolState::Pending);
+    }
+
+    /// The server labels each reasoning block with a small model and updates the event in place.
+    /// **Dropping that title is what made the client clip a mid-sentence heading of its own.**
+    #[test]
+    fn a_thinking_event_keeps_the_title_the_server_gave_it() {
+        let e = ev(3, "thinking", json!({"content": "먼저 …", "title": "현재 파일 상태를 읽는 중"}));
+        assert_eq!(
+            entry_from(&e).unwrap().kind,
+            EntryKind::Thinking {
+                title: Some("현재 파일 상태를 읽는 중".into()),
+                text: "먼저 …".into(),
+            }
+        );
+    }
+
+    /// The title lands later (or never, if the side model is off). Until then there is none —
+    /// the screen falls back on its own, and the `seq` upsert swaps it in when it arrives.
+    #[test]
+    fn a_thinking_event_without_a_title_yet_carries_none() {
+        let e = ev(3, "thinking", json!({"content": "먼저 …", "title": null}));
+        let EntryKind::Thinking { title, .. } = entry_from(&e).unwrap().kind else {
+            panic!("not a thinking entry");
+        };
+        assert_eq!(title, None);
+        let blank = ev(4, "thinking", json!({"content": "먼저 …", "title": "   "}));
+        let EntryKind::Thinking { title, .. } = entry_from(&blank).unwrap().kind else {
+            panic!("not a thinking entry");
+        };
+        assert_eq!(title, None, "a blank title is no title");
+    }
+
+    /// `todo_change` carries `{todo_item_id, from_status, to_status}` and no text at all, so all it
+    /// could ever draw is a bare status word. It is dropped until the server sends the words.
+    #[test]
+    fn a_todo_change_draws_nothing() {
+        let e = ev(5, "todo_change", json!({"todo_item_id": "x", "to_status": "in_progress"}));
+        assert_eq!(entry_from(&e), None);
     }
 
     #[test]
@@ -430,9 +243,9 @@ mod tests {
         );
         let entry = entry_from(&e).unwrap();
         match entry.kind {
-            EntryKind::Tool { name, failed, .. } => {
+            EntryKind::Tool { name, state, .. } => {
                 assert_eq!(name, "web_search");
-                assert!(failed);
+                assert_eq!(state, crate::tool_view::ToolState::Failed);
             }
             other => panic!("it must be a tool entry: {other:?}"),
         }
@@ -514,7 +327,7 @@ mod tests {
             }),
         );
         match entry_from(&e).unwrap().kind {
-            EntryKind::Tool { diff: Some(d), .. } => {
+            EntryKind::Tool { detail: crate::tool_view::Detail::Diff(d), .. } => {
                 assert_eq!((d.added, d.removed), (1, 1));
                 assert_eq!(d.lines.len(), 2);
             }
@@ -547,7 +360,9 @@ mod tests {
             }),
         );
         match entry_from(&e).unwrap().kind {
-            EntryKind::Tool { diff: Some(back), .. } => assert_eq!(back, d),
+            EntryKind::Tool { detail: crate::tool_view::Detail::Diff(back), .. } => {
+                assert_eq!(back, d)
+            }
             other => panic!("a diff must be attached: {other:?}"),
         }
     }
@@ -563,7 +378,10 @@ mod tests {
                 "arguments": {"query": "x"}, "result": {"hits": 3}, "error": null
             }),
         );
-        assert!(matches!(entry_from(&e).unwrap().kind, EntryKind::Tool { diff: None, .. }));
+        assert!(matches!(
+            entry_from(&e).unwrap().kind,
+            EntryKind::Tool { detail: crate::tool_view::Detail::Json { .. }, .. }
+        ));
     }
 
     /// An unknown kind must not kill the app. It must survive even when attacca adds new events.

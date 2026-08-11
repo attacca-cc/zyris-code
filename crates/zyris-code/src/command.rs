@@ -13,12 +13,6 @@ pub enum Command {
     Help,
     /// Without an argument, reports the current mode; with one, changes it.
     Mode(Option<Mode>),
-    /// The screen language. Without an argument, reports the current one; with one, changes it.
-    /// **An unknown language isn't dropped into `Unknown`** — it must say what's wrong on the spot
-    /// so the user can retype (`Lang(None)` means "the current one", so there's no room).
-    Lang(Option<crate::lang::Lang>),
-    /// A language we couldn't understand, like `/lang Japanese`.
-    LangUnknown(String),
     Mcp,
     Skills,
     /// Which `CLAUDE.md`·`AGENTS.md` are loaded into the session.
@@ -71,7 +65,7 @@ pub enum ConfigAction {
     Dir(crate::config::DirAccess),
     /// 화면 색 — which palette the screen is drawn in.
     Theme(crate::config::ThemeChoice),
-    /// 화면 말.
+    /// The UI language.
     Lang(crate::lang::Lang),
     /// 기본 모드 — the mode the app opens in. `None` turns the setting off.
     Mode(Option<crate::mode::Mode>),
@@ -118,9 +112,14 @@ pub fn parse(text: &str) -> Option<Command> {
     };
     // **Some agents have spaces in their names** ("Main Agent"). Cutting at the first word would make them unpickable.
     let some = |s: &str| (!s.is_empty()).then(|| s.to_string());
-    Some(match name {
-        "help" | "h" => Command::Help,
-        "mode" => Command::Mode(match arg {
+    // **The command word is recognized from `COMMANDS`** — the same table `/help` and the `/`-list
+    // are built from, so recognition and the help can't drift apart. Only argument handling lives here.
+    let Some(spec) = COMMANDS.iter().find(|c| c.matches(name)) else {
+        return Some(Command::Unknown(name.to_string()));
+    };
+    Some(match spec.name {
+        "/help" => Command::Help,
+        "/mode" => Command::Mode(match arg {
             "" => None,
             other => match mode_named(other) {
                 Some(m) => Some(m),
@@ -128,23 +127,16 @@ pub fn parse(text: &str) -> Option<Command> {
                 None => return Some(Command::Unknown(format!("mode {other}"))),
             },
         }),
-        "mcp" => Command::Mcp,
-        "skills" | "skill" => Command::Skills,
-        "rules" | "claude" | "agents" => Command::Rules,
-        "cwd" | "pwd" => Command::Cwd,
-        "agent" => Command::Agent(some(arg)),
-        "plugin" | "plugins" => Command::Plugin(plugin_action(arg)),
-        "undo" => Command::Undo,
-        "clear" => Command::Clear,
-        "lang" | "language" | "언어" => match arg {
-            "" => Command::Lang(None),
-            given => match crate::lang::Lang::parse(given) {
-                Some(lang) => Command::Lang(Some(lang)),
-                None => Command::LangUnknown(given.to_string()),
-            },
-        },
-        "reconnect" | "재연결" => Command::Reconnect,
-        "config" => match arg {
+        "/mcp" => Command::Mcp,
+        "/skills" => Command::Skills,
+        "/rules" => Command::Rules,
+        "/cwd" => Command::Cwd,
+        "/agent" => Command::Agent(some(arg)),
+        "/plugin" => Command::Plugin(plugin_action(arg)),
+        "/undo" => Command::Undo,
+        "/clear" => Command::Clear,
+        "/reconnect" => Command::Reconnect,
+        "/config" => match arg {
             "" => Command::Config(None),
             given => match given.split_once(char::is_whitespace) {
                 Some((option, value)) => match option {
@@ -180,23 +172,24 @@ pub fn parse(text: &str) -> Option<Command> {
                 None => return Some(Command::Unknown(format!("config {arg}"))),
             },
         },
-        "changes" | "changed" | "diff" => Command::Changes,
+        "/changes" => Command::Changes,
         // Looking and stopping only. Starting one stays the agent's `wait.start` alone.
-        "jobs" | "job" => match arg.split_once(' ') {
+        "/jobs" => match arg.split_once(' ') {
             None if arg.is_empty() || arg == "list" => Command::Jobs(None),
             Some(("stop" | "kill", id)) if !id.trim().is_empty() => {
                 Command::Jobs(Some(id.trim().to_string()))
             }
             _ => Command::Unknown(format!("jobs {arg}")),
         },
-        "account" => match arg {
+        "/account" => match arg {
             "" => Command::Account(None),
             "logout" | "log out" | "로그아웃" => Command::Account(Some(AccountAction::Logout)),
             other => return Some(Command::Unknown(format!("account {other}"))),
         },
-        "status" | "info" => Command::Status,
-        "quit" | "exit" | "q" => Command::Quit,
-        other => Command::Unknown(other.to_string()),
+        "/status" => Command::Status,
+        "/quit" => Command::Quit,
+        // **Only when a `COMMANDS` entry is missing its dispatch arm** — the coverage test catches it.
+        _ => unreachable!("no dispatch arm for {}", spec.name),
     })
 }
 
@@ -236,51 +229,68 @@ fn mode_named(s: &str) -> Option<Mode> {
     }
 }
 
-/// The list that appears when `/` is typed. **`/help` prints the same thing** — if the two diverge, one goes stale.
+/// One slash command: what it's called, what else it answers to, and what it does.
+///
+/// **The single source of truth** for a command's name, aliases, and both-language descriptions.
+/// `parse` recognizes a command through it, and `/help` and the `/`-list are built from it — so
+/// adding a command here (plus its dispatch arm in `parse`) is all it takes, and the two can't drift.
+pub struct CommandSpec {
+    /// How it's shown in the list, with the leading `/` — `/mode`.
+    pub name: &'static str,
+    /// The tokens (without the `/`) the parser also accepts — e.g. `skill` for `/skills`.
+    pub aliases: &'static [&'static str],
+    pub note_ko: &'static str,
+    pub note_en: &'static str,
+}
+
+impl CommandSpec {
+    /// The token (without the leading `/`) that names this command.
+    pub fn token(&self) -> &'static str {
+        self.name.strip_prefix('/').unwrap_or(self.name)
+    }
+    /// Whether `token` names this command — its own name or one of its aliases.
+    pub fn matches(&self, token: &str) -> bool {
+        self.token() == token || self.aliases.contains(&token)
+    }
+}
+
+/// The one command list. **Order is the order the `/`-list and `/help` are shown in.**
+pub const COMMANDS: &[CommandSpec] = &[
+    CommandSpec { name: "/help", aliases: &["h"], note_ko: "쓸 수 있는 명령", note_en: "What you can type" },
+    CommandSpec { name: "/mode", aliases: &[], note_ko: "모드를 보거나 바꿉니다 (일반·계획·일·작업)", note_en: "Show or change the mode (normal / plan / work / job)" },
+    CommandSpec { name: "/config", aliases: &[], note_ko: "설정 — 다른 디렉토리 접근(allow·deny)·언어·기본 모드", note_en: "Settings — directory access (allow / deny), language, default mode" },
+    CommandSpec { name: "/agent", aliases: &[], note_ko: "에이전트를 고릅니다. 다음 메시지에서 새 쓰레드가 열립니다", note_en: "Pick an agent. A new thread opens with your next message" },
+    CommandSpec { name: "/mcp", aliases: &[], note_ko: "붙은 MCP 서버와 도구 수", note_en: "MCP servers that connected, and how many tools each brought" },
+    CommandSpec { name: "/skills", aliases: &["skill"], note_ko: "쓸 수 있는 스킬", note_en: "Skills available here" },
+    CommandSpec { name: "/plugin", aliases: &["plugins"], note_ko: "플러그인을 받고 지웁니다 (add·remove·update)", note_en: "Install and remove plugins (add / remove / update)" },
+    CommandSpec { name: "/rules", aliases: &["claude", "agents"], note_ko: "이 쓰레드에 실린 CLAUDE.md·AGENTS.md", note_en: "The CLAUDE.md and AGENTS.md loaded into this thread" },
+    CommandSpec { name: "/cwd", aliases: &["pwd"], note_ko: "도구가 상대경로를 푸는 자리", note_en: "Where tools resolve relative paths" },
+    CommandSpec { name: "/reconnect", aliases: &[], note_ko: "다시 붙습니다. 도구 호출이 응답 없이 멈춰 있을 때", note_en: "Attach again — when tool calls sit there with no answer" },
+    CommandSpec { name: "/account", aliases: &[], note_ko: "계정 정보를 보고, 로그아웃합니다 (logout)", note_en: "Show account info, or log out (logout)" },
+    CommandSpec { name: "/status", aliases: &["info"], note_ko: "지금 세션·에이전트·모드·사용량을 한눈에", note_en: "Session, agent, mode and usage at a glance" },
+    CommandSpec { name: "/jobs", aliases: &["job"], note_ko: "배경에서 도는 작업 (stop <id>로 멈춥니다)", note_en: "Background jobs (stop <id> kills one)" },
+    CommandSpec { name: "/changes", aliases: &["changed", "diff"], note_ko: "이 디렉터리에서 바꾼 파일", note_en: "Files changed in this directory" },
+    CommandSpec { name: "/undo", aliases: &[], note_ko: "마지막 편집을 되돌립니다", note_en: "Undo the last edit" },
+    CommandSpec { name: "/clear", aliases: &[], note_ko: "화면의 대화를 지웁니다 (쓰레드는 그대로입니다)", note_en: "Clear the screen (the thread itself is untouched)" },
+    CommandSpec { name: "/quit", aliases: &["exit", "q"], note_ko: "끝냅니다. 도는 턴이 있으면 서버에서도 멈춥니다", note_en: "Quit. A running turn is stopped on the server too" },
+];
+
+/// The list that appears when `/` is typed. **`/help` prints the same thing.**
+///
+/// **Not hand-written** — built from `COMMANDS`, the one place a command's name and description
+/// live, so the list and the parser can't drift apart.
 pub fn catalogue(lang: crate::lang::Lang) -> Vec<(&'static str, &'static str)> {
     use crate::lang::Lang;
-    match lang {
-        Lang::Ko => vec![
-            ("/help", "쓸 수 있는 명령"),
-            ("/mode", "모드를 보거나 바꿉니다 (일반·계획·일·작업)"),
-            ("/lang", "화면 말을 바꿉니다 (ko·en)"),
-            ("/config", "설정 — 다른 디렉토리 접근(allow·deny)·화면 말·기본 모드"),
-            ("/agent", "에이전트를 고릅니다. 다음 메시지에서 새 쓰레드가 열립니다"),
-            ("/mcp", "붙은 MCP 서버와 도구 수"),
-            ("/skills", "쓸 수 있는 스킬"),
-            ("/plugin", "플러그인을 받고 지웁니다 (add·remove·update)"),
-            ("/rules", "이 쓰레드에 실린 CLAUDE.md·AGENTS.md"),
-            ("/cwd", "도구가 상대경로를 푸는 자리"),
-            ("/reconnect", "다시 붙습니다. 도구 호출이 응답 없이 멈춰 있을 때"),
-            ("/account", "계정 정보를 보고, 로그아웃합니다 (logout)"),
-            ("/status", "지금 세션·에이전트·모드·사용량을 한눈에"),
-            ("/jobs", "배경에서 도는 작업 (stop <id>로 멈춥니다)"),
-            ("/changes", "이 디렉터리에서 바꾼 파일"),
-            ("/undo", "마지막 편집을 되돌립니다"),
-            ("/clear", "화면의 대화를 지웁니다 (쓰레드는 그대로입니다)"),
-            ("/quit", "끝냅니다. 도는 턴이 있으면 서버에서도 멈춥니다"),
-        ],
-        Lang::En => vec![
-            ("/help", "What you can type"),
-            ("/mode", "Show or change the mode (normal / plan / work / job)"),
-            ("/lang", "Change the interface language (ko / en)"),
-            ("/config", "Settings — directory access (allow / deny), language, default mode"),
-            ("/agent", "Pick an agent. A new thread opens with your next message"),
-            ("/mcp", "MCP servers that connected, and how many tools each brought"),
-            ("/skills", "Skills available here"),
-            ("/plugin", "Install and remove plugins (add / remove / update)"),
-            ("/rules", "The CLAUDE.md and AGENTS.md loaded into this thread"),
-            ("/cwd", "Where tools resolve relative paths"),
-            ("/reconnect", "Attach again — when tool calls sit there with no answer"),
-            ("/account", "Show account info, or log out (logout)"),
-            ("/status", "Session, agent, mode and usage at a glance"),
-            ("/jobs", "Background jobs (stop <id> kills one)"),
-            ("/changes", "Files changed in this directory"),
-            ("/undo", "Undo the last edit"),
-            ("/clear", "Clear the screen (the thread itself is untouched)"),
-            ("/quit", "Quit. A running turn is stopped on the server too"),
-        ],
-    }
+    COMMANDS
+        .iter()
+        .map(|c| {
+            let note = match lang {
+                Lang::Ko => c.note_ko,
+                Lang::En => c.note_en,
+            };
+            (c.name, note)
+        })
+        .collect()
 }
 
 /// Keys worth knowing. **If it isn't on the screen, it doesn't exist** — a README isn't opened when you need it.
@@ -466,6 +476,24 @@ mod tests {
         }
     }
 
+    /// The registry is the source for the help and the picker, so every name and alias in it
+    /// must actually be a command the parser answers to — a token added to the registry but not
+    /// to `parse` would sit in the list doing nothing.
+    #[test]
+    fn every_registry_name_and_alias_is_something_the_parser_knows() {
+        for spec in COMMANDS {
+            for token in std::iter::once(spec.token()).chain(spec.aliases.iter().copied()) {
+                let text = format!("/{token}");
+                let got = parse(&text);
+                assert!(got.is_some(), "{text} is not a command");
+                assert!(
+                    !matches!(got, Some(Command::Unknown(_))),
+                    "{text} falls through as unknown"
+                );
+            }
+        }
+    }
+
     /// **Projects are now made from a form in the list** — no separate command needed.
     #[test]
     fn project_is_not_a_command_anymore() {
@@ -476,6 +504,18 @@ mod tests {
             catalogue(crate::lang::Lang::Ko).iter().chain(catalogue(crate::lang::Lang::En).iter())
         {
             assert_ne!(*name, "/project", "/project is still in the list");
+        }
+    }
+
+    /// **Language lives in `/config` now** — `/lang` is gone, so typing it must say what exists.
+    #[test]
+    fn lang_is_not_a_command_anymore() {
+        assert_eq!(parse("/lang"), Some(Command::Unknown("lang".into())));
+        assert_eq!(parse("/lang ko"), Some(Command::Unknown("lang".into())));
+        for (name, _) in
+            catalogue(crate::lang::Lang::Ko).iter().chain(catalogue(crate::lang::Lang::En).iter())
+        {
+            assert_ne!(*name, "/lang", "/lang is still in the list");
         }
     }
 

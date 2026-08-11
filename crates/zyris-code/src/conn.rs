@@ -868,6 +868,36 @@ pub async fn sessions(
         .collect())
 }
 
+/// How a session's last turn ended, read back from its history.
+///
+/// `None` when the session has no terminal event yet — a fresh thread that has not taken a turn.
+pub fn status_from_events(
+    events: &[zyris_attacca::ZSessionEvent],
+) -> Option<crate::picker::ThreadStatus> {
+    use crate::picker::ThreadStatus;
+    let mut out = None;
+    for e in events {
+        match e.kind.as_str() {
+            // A terminal error marks the turn failed.
+            "error" => out = Some(ThreadStatus::Failed),
+            // An answer (or a completed work run) marks it a success. A tool error
+            // mid-turn is not terminal — the agent may still finish.
+            "chat_agent" | "work_summary" => out = Some(ThreadStatus::Success),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Fetches a session's history and derives its last-turn status.
+pub async fn session_status(
+    api: &AttaccaApiClient,
+    session_id: &str,
+) -> Option<crate::picker::ThreadStatus> {
+    let events = history(api, session_id).await.ok()?;
+    status_from_events(&events)
+}
+
 /// The session's past history. Used to fill the screen when switching sessions.
 ///
 /// An empty `after` means everything — the opposite of `turn_events`, so don't confuse them.
@@ -938,6 +968,41 @@ mod tests {
     use super::*;
     use serde_json::json;
     use zyris_attacca::{ZDeltaKind, ZSessionEvent};
+
+    fn event(seq: i64, kind: &str, message: &str) -> ZSessionEvent {
+        ZSessionEvent {
+            seq,
+            cursor: seq,
+            kind: kind.into(),
+            payload: json!({ "message": message }),
+            created_at: None,
+        }
+    }
+
+    /// A thread's status comes from its last terminal event: an error marks it failed, an
+    /// answer (or a finished work run) marks it a success, and a bare thread has none.
+    #[test]
+    fn a_threads_status_is_its_last_turn_outcome() {
+        use crate::picker::ThreadStatus;
+        // No terminal event yet — a fresh thread.
+        assert_eq!(status_from_events(&[]), None);
+        // Mid-turn tool chatter, then an answer → success.
+        let ok = [event(1, "chat_user", "안녕"), event(2, "tool_call", ""), event(3, "chat_agent", "hi")];
+        assert_eq!(status_from_events(&ok), Some(ThreadStatus::Success));
+        // An answer that never comes, then an error → failed.
+        let err = [event(1, "chat_user", "안녕"), event(2, "error", "boom")];
+        assert_eq!(status_from_events(&err), Some(ThreadStatus::Failed));
+        // A tool error mid-turn is not terminal — the agent can still finish.
+        let recovered = [
+            event(1, "chat_user", "안녕"),
+            event(2, "tool_call", ""),
+            event(3, "chat_agent", "hi"),
+        ];
+        assert_eq!(status_from_events(&recovered), Some(ThreadStatus::Success));
+        // A completed work run counts as a success too.
+        let work = [event(1, "chat_user", ""), event(2, "work_summary", "done")];
+        assert_eq!(status_from_events(&work), Some(ThreadStatus::Success));
+    }
 
     /// **Credentials go to this app's own directory.** `~/.config/zyris/` was shared by every zyris
     /// program, so two unprofiled ones registered on top of each other's identity.

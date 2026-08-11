@@ -18,7 +18,15 @@ use crate::app::State;
 use crate::theme;
 use crate::usage::{compact, context_limit};
 
-pub fn draw(frame: &mut Frame, area: Rect, state: &State) {
+/// How much of the project name the bottom bar shows.
+///
+/// **A name is an identifier, not a sentence** — a few words in, one project is already told
+/// from another, and past that it only pushes mode·agent around and crowds out the usage. Cut
+/// names get a `…` so a truncated one is never mistaken for the whole thing.
+const PROJECT_WIDTH: usize = 16;
+
+/// The mode·agent·project group. Pure, so a test can read it without a terminal.
+pub fn left_spans(state: &State) -> Vec<Span<'static>> {
     // Attach at the far left — aligns with the dot of the status line directly above.
     //
     // No spaces around the middle dot. Mode and agent are meant to be read as **one set**, so a gap
@@ -32,6 +40,17 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &State) {
         ),
     ];
 
+    // **Which project the next job or work lands in.** It is decided here and nowhere on
+    // screen said, so a work opened after wandering through the list went somewhere the person
+    // could not check. Spaced apart from mode·agent, which are one set on their own.
+    if let Some(name) = &state.project_name {
+        left.push(Span::styled(" · ", Style::default().fg(theme::border_light())));
+        left.push(Span::styled(
+            crate::markdown::truncate_to(name, PROJECT_WIDTH),
+            Style::default().fg(theme::text_muted()),
+        ));
+    }
+
     // **If there's unsent text, it must be said.** If it isn't announced, the user believes it was sent.
     if !state.queued.is_empty() {
         left.push(Span::styled(" · ", Style::default().fg(theme::border_light())));
@@ -40,8 +59,11 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &State) {
             Style::default().fg(theme::warning()),
         ));
     }
+    left
+}
 
-    let left_line = Line::from(left);
+pub fn draw(frame: &mut Frame, area: Rect, state: &State) {
+    let left_line = Line::from(left_spans(state));
     let usage = usage_spans(state);
     let left_w = left_line.width();
     let usage_w = Line::from(usage.clone()).width();
@@ -102,4 +124,39 @@ fn kv(label: &'static str, value: String) -> Vec<Span<'static>> {
         Span::styled(" ", Style::default()),
         Span::styled(value, Style::default().fg(theme::text())),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text(state: &State) -> String {
+        left_spans(state).iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    /// **Which project the next job or work lands in is said on screen.** It was decided by
+    /// wandering through the list and then never shown, so a work opened afterwards went
+    /// somewhere the person had no way to check.
+    #[test]
+    fn the_bottom_bar_says_which_project_we_are_in() {
+        let mut s = State::new();
+        s.agent = "Main Agent".into();
+        assert!(!text(&s).contains('·') || !text(&s).contains("Zyris"), "{:?}", text(&s));
+        s.project_name = Some("Zyris Project".into());
+        assert!(text(&s).contains("Zyris Project"), "{:?}", text(&s));
+    }
+
+    /// **A long name is cut with a `…`.** A project name is arbitrary text, and left whole it
+    /// pushes mode·agent around and crowds the usage off the right edge.
+    #[test]
+    fn a_long_project_name_is_cut_on_the_bottom_bar() {
+        let mut s = State::new();
+        s.project_name = Some("아주 길고 긴 이름을 가진 프로젝트".into());
+        let shown = text(&s);
+        assert!(shown.contains('…'), "{shown:?}");
+        assert!(
+            crate::markdown::display_width(&shown) <= 40,
+            "the bar was pushed out of shape: {shown:?}"
+        );
+    }
 }
