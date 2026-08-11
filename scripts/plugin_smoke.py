@@ -30,7 +30,7 @@ env0 = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
 for a in (["init","-q","-b","main"],["add","-A"],["commit","-qm","first"]):
     subprocess.run(["git"]+a, cwd=ORIGIN, env=env0, check=True, capture_output=True)
 
-env = dict(os.environ, ZYRIS_PROFILE="zyris-code",
+env = dict(os.environ, ZYRIS_CODE_LANG="ko", ZYRIS_PROFILE="zyris-code",
            ZYRIS_CODE_LOG="/tmp/zyris-code-plugin.log")
 p, r = pty.openpty()
 p_fd = p
@@ -41,7 +41,8 @@ buf, ok, n = [], True, 0
 def until(needle, secs, label):
     t = time.time() + secs
     while True:
-        if needle in ANSI.sub("", "".join(buf)): return True
+        wanted = (needle,) if isinstance(needle, str) else tuple(needle)
+        if any(w in ANSI.sub("", "".join(buf)) for w in wanted): return True
         if time.time() >= t: print(f"  ✗ {label}: '{needle}' 못 봤다"); return False
         rr,_,_ = select.select([p],[],[],0.5)
         if rr: buf.append(os.read(p,65536).decode("utf-8","replace"))
@@ -97,7 +98,7 @@ def close_panel():
     os.write(p, b"\x1b"); time.sleep(0.6)
 
 try:
-    if not until("일반", 30, "첫 프레임"): sys.exit(1)
+    if not until(("일반", "계획", "작업", "일"), 30, "첫 프레임"): sys.exit(1)
     print("  ✓ 떴다"); n += 1
     time.sleep(2)
     buf.clear(); send("/plugin")

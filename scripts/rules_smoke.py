@@ -39,7 +39,10 @@ ASK = (
 
 def until(fd, needle, buf, deadline, label):
     while True:
-        if needle in ANSI.sub("", "".join(buf)):
+        # `needle` may be a tuple; then **any one** of them passes. Used for what the person's
+        # settings can change, such as the mode label in the bottom bar.
+        wanted = (needle,) if isinstance(needle, str) else tuple(needle)
+        if any(w in ANSI.sub("", "".join(buf)) for w in wanted):
             return True
         if time.time() >= deadline:
             break
@@ -70,6 +73,7 @@ def main():
 
     env = dict(
         os.environ,
+        ZYRIS_CODE_LANG="ko",
         ZYRIS_PROFILE="zyris-code",
         ZYRIS_CODE_LOG="/tmp/zyris-code-rules.log",
     )
@@ -92,7 +96,7 @@ def main():
     total = 3
 
     try:
-        if not until(primary, "일반", buf, time.time() + 30, "첫 프레임"):
+        if not until(primary, ("일반", "계획", "작업", "일"), buf, time.time() + 30, "첫 프레임"):
             return finish(proc, primary, checks, total, False)
         print("  ✓ 떴다")
         checks += 1
