@@ -78,24 +78,55 @@ async fn main() -> ExitCode {
     if std::env::var_os("ZYRIS_CONFIG_DIR").is_none_or(|v| v.is_empty()) {
         if let Some(dir) = zyris_code::conn::credential_dir() {
             std::env::set_var("ZYRIS_CONFIG_DIR", &dir);
-            // What's left in the old place is **moved over** (not copied). If two live refresh tokens
-            // sit on disk, both will be presented eventually, and attacca reads that reuse as a leaked
-            // chain and revokes the whole node — both die.
-            if let Some(legacy) = zyris_code::conn::legacy_credential_dir() {
-                let profile = std::env::var("ZYRIS_PROFILE")
-                    .unwrap_or_else(|_| zyris_code::conn::APP.to_string());
-                let moved = zyris_code::conn::migrate_credentials(&legacy, &dir, &profile);
-                if moved > 0 {
-                    tracing::info!(moved, "moved credentials from the old credential directory");
-                }
-            }
         }
     }
 
-    // The profile splits again inside that directory. Unset just leaves it `default`, and now
-    // that `default` is ours.
+    // **Which window this is, decided before anything that depends on it.**
+    //
+    // Two windows on one credential are **one node** to the server, and its registry keeps the
+    // connection that arrived last — so the earlier window keeps a live socket and is handed no
+    // tool calls at all. The node side cannot route around that; the only way out is to stop being
+    // the same node, and identity here is the credential. So each window takes a slot and files
+    // its credentials under a profile of its own (`conn::claim_window`).
+    //
+    // **Splitting by working directory is not enough** — running several windows in one directory
+    // is ordinary, and they would collide exactly as before.
+    //
+    // The profile, the credential file, and the node name all hang off this, so it has to be
+    // settled first. **The handle lives as long as `main`** — dropping it removes the lock file,
+    // and a window that gave up its slot early would hand its identity to the next one to start.
+    let window = zyris_code::conn::credential_dir().map(|dir| {
+        let base = std::env::var("ZYRIS_PROFILE").unwrap_or_else(|_| zyris_code::conn::APP.to_string());
+        zyris_code::conn::claim_window(&dir, &base)
+    });
+    let slot = window.as_ref().map_or(1, |w| w.slot);
+
+    // The profile splits again inside that directory. **A profile the person gave wins** — then
+    // they have said which identity this window is, and taking a slot on top would file the
+    // credentials somewhere they did not ask for.
     if std::env::var_os("ZYRIS_PROFILE").is_none() {
-        std::env::set_var("ZYRIS_PROFILE", "zyris-code");
+        let profile = window
+            .as_ref()
+            .map_or_else(|| zyris_code::conn::APP.to_string(), |w| w.profile.clone());
+        std::env::set_var("ZYRIS_PROFILE", profile);
+    }
+
+    // What's left in the old place is **moved over** (not copied). If two live refresh tokens
+    // sit on disk, both will be presented eventually, and attacca reads that reuse as a leaked
+    // chain and revokes the whole node — both die.
+    //
+    // **Only this window's own profile is moved.** A later window's profile never existed back
+    // then, so there is nothing of its to find, and reaching for another profile's file would log
+    // that program out.
+    if let (Some(dir), Some(legacy)) =
+        (zyris_code::conn::credential_dir(), zyris_code::conn::legacy_credential_dir())
+    {
+        let profile =
+            std::env::var("ZYRIS_PROFILE").unwrap_or_else(|_| zyris_code::conn::APP.to_string());
+        let moved = zyris_code::conn::migrate_credentials(&legacy, &dir, &profile);
+        if moved > 0 {
+            tracing::info!(moved, "moved credentials from the old credential directory");
+        }
     }
 
     // **The scopes to request must be decided before credentials are made.** Since `Enroller` copies
@@ -111,8 +142,12 @@ async fn main() -> ExitCode {
     // machine's other nodes** — if `zyris-daemon` runs alongside, both attach as `arch`, and attacca
     // separates them by appending `-2` to one, but which one keeps `arch` depends on attach order.
     // Then the tool names the agent reads (`zyris__arch__…`) change from run to run.
+    //
+    // **The window slot goes in the name too.** Separate credentials already make them separate
+    // nodes, but with equal names attacca's `slug_with_suffix` decides which keeps the bare slug by
+    // attach order — and then the tool names the agent reads move between runs.
     if std::env::var_os("ZYRIS_NODE_NAME").is_none() {
-        std::env::set_var("ZYRIS_NODE_NAME", zyris_code::conn::node_name());
+        std::env::set_var("ZYRIS_NODE_NAME", zyris_code::conn::default_node_name(slot));
     }
 
     // **The app is raised before the runner.** That way the enrollment code window is on screen from
@@ -163,38 +198,45 @@ async fn main() -> ExitCode {
     // another window can touch this computer too. The only thing blocking is `tools::guard::Gate`.
     let cwd = zyris_code::tools::working_dir();
 
-    // **Multiple windows are not blocked. They are announced.**
+    // **Every window is its own node** (`conn::claim_window`, taken at the top of `main`).
     //
-    // With two windows using the same credentials, the server registry **overwrites with the later
-    // connection** — the first window's socket stays alive but stops receiving tool calls. Blocking
-    // wouldn't change that (with the same directory, whichever window receives, the files changed are
-    // the same), so the second window isn't refused; but if it tangles quietly, the person has no way
-    // to know which window is receiving. So when an earlier window is alive, that fact is said once
-    // in the activity line (`conn::another_instance_alive`; lock file `.instance-<profile>.lock`).
+    // It used to be one node for all of them, because identity is the credential and they shared
+    // one. The server registry is keyed by node id (`insert(node_id, connection)`), so the second
+    // window replaced the first's connection and the first was handed no tool calls at all while
+    // its socket stayed up. This app could only say so and carry on. Now each window takes a slot,
+    // files its credentials under a profile of its own, and registers under a name of its own —
+    // so a tool call lands in the window whose session made it.
     //
-    // You only need to know one thing: judgment (plan mode · open directory) and the approval window
-    // belong to **the window that received the call**; if the two windows are in different modes, the server decides which rules apply.
+    // **The judgment still belongs to the window that received the call** (plan mode, `/config`
+    // dir access). That is now the same window that asked, which is what it always should have been.
     //
-    // **The handle has to live as long as the window does.** Bound inside the `else` block it
-    // was dropped at that block's closing brace, and `Drop` deletes the very file it had just
-    // written — so no window ever left a lock behind, no second window ever found one, and the
-    // notice could not fire. That is the one warning that explains "my tool calls just sit
-    // there": whichever window the server picked is the only one being asked.
-    let _instance_lock = zyris_code::conn::credential_dir().and_then(|dir| {
-        let profile =
-            std::env::var("ZYRIS_PROFILE").unwrap_or_else(|_| zyris_code::conn::APP.to_string());
-        if zyris_code::conn::another_instance_alive(&dir, &profile) {
+    // **The handle has to live as long as the window does.** Bound inside a block it was dropped at
+    // the closing brace, and `Drop` deletes the very file it had just written — so no window ever
+    // left a lock behind and no later window ever found one.
+    //
+    // Here is where the screen exists to say what the slot means. **A window past the first enrols
+    // once** — an approval window with no explanation reads as the app having logged itself out.
+    match window.as_ref() {
+        Some(w) if w.slot > 1 => {
+            tracing::info!(slot = w.slot, profile = %w.profile, "this window registers as a node of its own");
+            bridge.frame(zyris_code::app::Frame::Notice(
+                zyris_code::lang::current().window_slot_notice(w.slot),
+            ));
+        }
+        // Every slot was taken, so this window shares the first one's identity and the old tangle
+        // is back: the server hands tool calls to whichever connection arrived last.
+        Some(w) if w.lock.is_none() => {
             tracing::warn!(
-                "another zyris-code window is attached with the same credentials. tool calls go \
-                 to whichever window the server picked."
+                "every window slot is taken, so this window shares a credential. tool calls go to \
+                 whichever window the server picked."
             );
             bridge.frame(zyris_code::app::Frame::Notice(
                 zyris_code::lang::current().another_window_notice().to_string(),
             ));
-            return None;
         }
-        zyris_code::conn::claim_instance_lock(&dir, &profile)
-    });
+        _ => {}
+    }
+    let _instance_lock = window;
     //
     // **The enrollment code is sent to the screen by upstream's `EnrollmentUi` hook** (`enroll.rs`, upstream PR #6).
     // Only when there's no screen (the extreme where the app couldn't start) does it fall to a stdout box. The old

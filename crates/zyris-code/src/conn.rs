@@ -348,12 +348,28 @@ pub fn agent_name() -> String {
 /// then **truncates at 16 characters** (`ZYRIS_NODE_SLUG_MAX_LEN`). `arch zyris-code` fits exactly as
 /// `arch-zyris-code` (15 chars), but with a long hostname the trailing `zyris-code` gets cut
 /// away and only the hostname remains. In that case **the distinguishing part goes first.**
+/// The name **actually announced**, which is whatever `$ZYRIS_NODE_NAME` holds — `main` fills it
+/// in at startup and a value the person gave wins. Read this to *report* the name (`/cwd`); use
+/// `default_node_name` to decide what to put there.
+///
+/// Before, this recomputed the default instead, so `/cwd` named a node that was not the one on the
+/// server whenever the name had been set by hand — and, once windows split, for every window but
+/// the first.
 pub fn node_name() -> String {
+    match std::env::var("ZYRIS_NODE_NAME") {
+        Ok(name) if !name.trim().is_empty() => name,
+        _ => default_node_name(1),
+    }
+}
+
+/// What this window registers as when nobody said otherwise. `slot` is its window number
+/// (`claim_window`) — see `compose_name` for why it changes the name at all.
+pub fn default_node_name(slot: usize) -> String {
     let host = zyris::machine_name().unwrap_or_else(|| "node".to_string());
     let dir = std::env::current_dir()
         .ok()
         .and_then(|d| d.file_name().map(|n| n.to_string_lossy().into_owned()));
-    compose_name(&host, dir.as_deref())
+    compose_name(&host, dir.as_deref(), slot)
 }
 
 /// The pure decision that builds the name. `dir` is the last fragment of the working directory.
@@ -363,8 +379,22 @@ pub fn node_name() -> String {
 /// Since the slug truncates at 16 characters, the directory only survives in the display name (the slug is always
 /// of the form `arch-zyris-code`). When the directory equals the app name (running in this repo), it's not
 /// appended — no reason to say the same thing twice.
-fn compose_name(host: &str, dir: Option<&str>) -> String {
+///
+/// **A window past the first carries its number, and it goes in front.** Two windows sharing one
+/// credential are one node to the server, so splitting the credential is what makes them separate
+/// — and then their names must differ too, or attacca's `slug_with_suffix` decides which is which
+/// by attach order and the agent's tool names move between runs. Trailing it (`arch zyris-code 2`)
+/// does not work: the slug is cut at 16 characters and trims straight back onto the first
+/// window's. `zyris-code-2 arch` survives the cut as `zyris-code-2-arc`.
+fn compose_name(host: &str, dir: Option<&str>, slot: usize) -> String {
     let suffix = dir.filter(|d| !d.is_empty() && *d != SUFFIX);
+    if slot > 1 {
+        let head = format!("{SUFFIX}-{slot} {host}");
+        return match suffix {
+            Some(dir) => format!("{head} · {dir}"),
+            None => head,
+        };
+    }
     let natural = match suffix {
         Some(dir) => format!("{host} {SUFFIX} · {dir}"),
         None => format!("{host} {SUFFIX}"),
@@ -433,6 +463,58 @@ pub fn claim_instance_lock(config_dir: &std::path::Path, profile: &str) -> Optio
     } else {
         None
     }
+}
+
+/// How many windows can be told apart before they start sharing an identity again.
+///
+/// Every slot past the first costs **one approval, once** — its credential is a node the server
+/// has never seen. Eight is well past what anyone opens at a time, and the cost of the number
+/// being generous is only unused lock files.
+pub const MAX_WINDOWS: usize = 8;
+
+/// Which window this process is, and what that makes its credentials.
+///
+/// **The lock has to outlive everything.** Dropping it removes the file, and a window that let go
+/// of its slot at the end of a block would hand its identity to the next one to start.
+pub struct Window {
+    /// The profile its credentials are filed under (`wss-<server>-<profile>.json`).
+    pub profile: String,
+    /// 1 for the first window on this machine. Above that it is a node of its own.
+    pub slot: usize,
+    /// `None` when every slot was taken — then it shares the first window's identity and the
+    /// old tangle is back, so the screen says so.
+    pub lock: Option<InstanceLock>,
+}
+
+/// The profile name for a window slot. **Slot 1 is the bare profile** — anything else would log
+/// out every install that already exists the moment it updates.
+pub fn window_profile(base: &str, slot: usize) -> String {
+    if slot <= 1 { base.to_string() } else { format!("{base}-{slot}") }
+}
+
+/// Takes the lowest free window slot.
+///
+/// **This is what stops two windows fighting over one node.** The server keys its registry by node
+/// id (`insert(node_id, connection)`), so a second window on the same credential replaces the
+/// first's connection: the first keeps a live socket and stops being handed a single tool call.
+/// Nothing on the node side can undo that — the fix is to stop being the same node, which means a
+/// credential of its own, which means a profile of its own.
+///
+/// Splitting by working directory was the obvious alternative and it is not enough: several
+/// windows in **one** directory is a normal way to work, and they would collide exactly as before.
+///
+/// The cost is one browser approval the first time a slot is used. It is paid once per slot, not
+/// per launch — the credential is kept like any other.
+pub fn claim_window(config_dir: &std::path::Path, base: &str) -> Window {
+    for slot in 1..=MAX_WINDOWS {
+        let profile = window_profile(base, slot);
+        if let Some(lock) = claim_instance_lock(config_dir, &profile) {
+            return Window { profile, slot, lock: Some(lock) };
+        }
+    }
+    // Out of slots. **Starting anyway beats refusing** — sharing is what this app did for its
+    // whole life, and the window that loses the race still draws, still talks, still reads.
+    Window { profile: base.to_string(), slot: 1, lock: None }
 }
 
 #[cfg(unix)]
@@ -524,6 +606,20 @@ pub struct Session {
     /// saying anything; if `id` was already dropped then, the conversation in progress is lost. A staged
     /// open and "no session" are different states.
     pending_open: Option<Route>,
+    /// How many turn streams this window has opened. Every stream frame is tagged with its own
+    /// number, so one from an abandoned stream can be told from the live one's.
+    stream_gen: u64,
+    /// The task reading the live turn stream. **Aborted before another opens.**
+    ///
+    /// `turn_events` is a live subscription that never ends by itself — attacca chains the
+    /// backfill onto a broadcast receiver (`zyris_gateway.rs::turn_events`). This app used to
+    /// open one on **every message** and every switch and close none, so a session that had been
+    /// talked to five times had five subscriptions delivering the same frames. `push_delta`
+    /// appends, so the answer being streamed came out five times over, interleaved.
+    ///
+    /// **Dropping the subscription does not stop the turn.** If it did, `turn_to_stop` would not
+    /// have to send `cancel_turn` when the window closes.
+    stream_task: Option<tokio::task::AbortHandle>,
 }
 
 /// What you need to know after opening a session.
@@ -554,6 +650,31 @@ impl Session {
         self.id.as_deref()
     }
 
+    /// Abandons whatever turn stream is open and hands out the number of the next one.
+    ///
+    /// **Exactly one live subscription at a time** — see `stream_task`. Aborting kills the task
+    /// mid-`next()`, so the "the stream ended, the turn must be over" line at the bottom of
+    /// `spawn_stream` never runs for an abandoned one: an old stream cannot report the new one's
+    /// turn finished.
+    pub fn next_stream(&mut self) -> u64 {
+        if let Some(task) = self.stream_task.take() {
+            task.abort();
+        }
+        self.stream_gen += 1;
+        self.stream_gen
+    }
+
+    /// Remembers the task reading the live stream, so the next one can abandon it.
+    pub fn holds_stream(&mut self, task: tokio::task::AbortHandle) {
+        self.stream_task = Some(task);
+    }
+
+    /// Which opening the live stream is. Frames tagged with any other number are stale — abort
+    /// stops a task from sending more, but whatever it already put in the channel is still there.
+    pub fn stream_gen(&self) -> u64 {
+        self.stream_gen
+    }
+
     /// Switches to another session.
     ///
     /// **Clears the staged open.** Picking a session from the list means "go there", and letting that word
@@ -571,6 +692,9 @@ impl Session {
             self.project = Some(p);
         }
         self.pending_open = None;
+        // **The stream goes when the session does.** The turn keeps running on the server and is
+        // read back as history on return; what must not happen is it still writing to this screen.
+        self.next_stream();
     }
 
     /// Opened one from the project list. **Remembered even before picking a session** — opening the list,
@@ -589,6 +713,7 @@ impl Session {
         self.id = None;
         self.project = Some(project_id);
         self.pending_open = None;
+        self.next_stream();
     }
 
     /// Points the next message where the mode decided.
@@ -622,6 +747,7 @@ impl Session {
         // **The project stays as is.** `/agent` changes the agent, not leaves the project —
         // clearing it here would create the next session in the default project.
         self.pending_open = None;
+        self.next_stream();
     }
 
     /// Finds the dedicated agent.
@@ -803,7 +929,11 @@ const PLANNER_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
 /// Wire frames to app frames. Even events we don't render **still pass the cursor through.**
 pub fn frame_from(f: ZTurnFrame) -> Frame {
     match f {
-        ZTurnFrame::Event { cursor, event } => Frame::Event { cursor, entry: entry_from(&event) },
+        ZTurnFrame::Event { cursor, event } => Frame::Event {
+            cursor,
+            entry: entry_from(&event),
+            todo: crate::todos::change_from(&event),
+        },
         ZTurnFrame::Delta { kind, text } => Frame::Delta { kind, text },
         ZTurnFrame::Status { running } => Frame::Status { running },
     }
@@ -1153,16 +1283,87 @@ mod tests {
         assert!(slug.len() <= 16, "{slug}");
     }
 
+    /// **A second window is a node of its own, and its slug says so.**
+    ///
+    /// Two windows on one credential are one node to the server, and the registry keeps the
+    /// connection that arrived last — so the earlier window's socket lives on while every tool
+    /// call goes to the other one. Splitting the credential is what makes them separate nodes;
+    /// this is the name half of it.
+    ///
+    /// The distinguishing part goes **first**, because the slug is cut at 16 characters: putting
+    /// the number on the end (`arch zyris-code 2`) is trimmed straight back to `arch-zyris-code`
+    /// and lands on top of the first window's slug again.
+    #[test]
+    fn a_later_window_gets_a_slug_that_is_its_own() {
+        let first = compose_name("arch", Some("zyris-daemon"), 1);
+        let second = compose_name("arch", Some("zyris-daemon"), 2);
+        assert_eq!(first, "arch zyris-code · zyris-daemon");
+        assert_eq!(second, "zyris-code-2 arch · zyris-daemon");
+        assert_ne!(slug_of(&first), slug_of(&second), "both windows claim the same slug");
+        // And it is still recognisably this app, however the truncation falls.
+        for name in [&first, &second] {
+            let slug = slug_of(name);
+            assert!(slug.starts_with("zyris-code") || slug.contains("zyris-code"), "{name} → {slug}");
+            assert!(slug.len() <= 16, "{slug}");
+        }
+    }
+
+    /// **The window number is deterministic, not the attach order.** A slug that depended on which
+    /// window connected first would rename the agent's tools between runs.
+    #[test]
+    fn every_window_slot_gets_a_slug_of_its_own() {
+        let mut seen = std::collections::HashSet::new();
+        for slot in 1..=MAX_WINDOWS {
+            let slug = slug_of(&compose_name("arch", None, slot));
+            assert!(seen.insert(slug.clone()), "slot {slot} reuses a slug: {slug}");
+        }
+    }
+
+    /// **The first window's profile does not change.** Anything else logs out every existing
+    /// install on its next start.
+    #[test]
+    fn the_first_window_keeps_the_profile_it_always_had() {
+        assert_eq!(window_profile("zyris-code", 1), "zyris-code");
+        assert_eq!(window_profile("zyris-code", 2), "zyris-code-2");
+    }
+
+    /// Windows take the lowest free slot, and a window that ended gives its slot back.
+    #[test]
+    fn a_second_window_takes_the_next_free_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = claim_window(dir.path(), "test");
+        assert_eq!((first.slot, first.profile.as_str()), (1, "test"));
+        let second = claim_window(dir.path(), "test");
+        assert_eq!((second.slot, second.profile.as_str()), (2, "test-2"));
+        assert!(second.lock.is_some(), "a second window must hold a slot of its own");
+        // The one in the middle leaving frees its number for whoever comes next.
+        drop(first);
+        let third = claim_window(dir.path(), "test");
+        assert_eq!(third.slot, 1, "a freed slot must be reused");
+    }
+
+    /// **Past the last slot the windows share, as they always did.** Refusing to start would be
+    /// worse than the tangle it prevents, and the notice still says what is going on.
+    #[test]
+    fn past_the_last_slot_a_window_shares_rather_than_refusing_to_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let held: Vec<Window> = (0..MAX_WINDOWS).map(|_| claim_window(dir.path(), "test")).collect();
+        assert!(held.iter().all(|w| w.lock.is_some()), "every slot should have been claimed");
+        let extra = claim_window(dir.path(), "test");
+        assert_eq!(extra.slot, 1, "it falls back to the first window's identity");
+        assert!(extra.lock.is_none(), "and it knows it does not own that slot");
+    }
+
     /// **The working directory goes into the name.** Different directories on the same machine must be distinguishable.
     /// The slug truncates at 16 characters, so it only survives in the display name.
     #[test]
     fn the_node_name_carries_the_working_directory() {
-        assert_eq!(compose_name("arch", Some("zyris-daemon")), "arch zyris-code · zyris-daemon");
+        assert_eq!(compose_name("arch", Some("zyris-daemon"), 1), "arch zyris-code · zyris-daemon");
         assert_eq!(slug_of("arch zyris-code · zyris-daemon"), "arch-zyris-code");
         // A directory equal to the app name isn't appended — it's a duplicate.
-        assert_eq!(compose_name("arch", Some("zyris-code")), "arch zyris-code");
+        assert_eq!(compose_name("arch", Some("zyris-code"), 1), "arch zyris-code");
         // Without a directory (e.g. root) it's the usual name.
-        assert_eq!(compose_name("arch", None), "arch zyris-code");
+        assert_eq!(compose_name("arch", None, 1), "arch zyris-code");
     }
 
     /// A dead window's trace is not a living window. PID 0 must be treated as dead, since kill(0, 0)
@@ -1364,7 +1565,7 @@ mod tests {
             },
         };
         match frame_from(f) {
-            Frame::Event { cursor, entry } => {
+            Frame::Event { cursor, entry, .. } => {
                 assert_eq!(cursor, 99);
                 assert!(entry.is_none(), "recall is not rendered");
             }
