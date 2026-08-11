@@ -13,7 +13,10 @@ pub enum Command {
     Help,
     /// Without an argument, reports the current mode; with one, changes it.
     Mode(Option<Mode>),
-    Mcp,
+    /// `/mcp` on its own lists; `/mcp on|off <name>` decides whether a **discovered** server may
+    /// start (`mcp::discovery`). What was written for this app directly is not switchable — it was
+    /// written for this app.
+    Mcp(Option<McpSwitch>),
     Skills,
     /// Which `CLAUDE.md`·`AGENTS.md` are loaded into the session.
     Rules,
@@ -127,7 +130,7 @@ pub fn parse(text: &str) -> Option<Command> {
                 None => return Some(Command::Unknown(format!("mode {other}"))),
             },
         }),
-        "/mcp" => Command::Mcp,
+        "/mcp" => Command::Mcp(mcp_switch(arg)),
         "/skills" => Command::Skills,
         "/rules" => Command::Rules,
         "/cwd" => Command::Cwd,
@@ -194,6 +197,35 @@ pub fn parse(text: &str) -> Option<Command> {
 }
 
 /// What comes after `/plugin`. **Arguments can contain spaces** (addresses don't, but names can).
+/// `/mcp on <name>` · `/mcp off <name>`. Anything else lists.
+///
+/// **An unknown word is not silently taken as a list.** `/mcp of playwright` would then look like
+/// it worked and change nothing.
+fn mcp_switch(arg: &str) -> Option<McpSwitch> {
+    let (verb, name) = match arg.split_once(char::is_whitespace) {
+        Some((v, r)) => (v, r.trim()),
+        None => (arg, ""),
+    };
+    match (verb, name) {
+        ("" | "list", _) => None,
+        ("on" | "off", "") => Some(McpSwitch::Unknown(format!("mcp {verb}"))),
+        ("on", name) => Some(McpSwitch::On(name.to_string())),
+        ("off", name) => Some(McpSwitch::Off(name.to_string())),
+        (other, _) => Some(McpSwitch::Unknown(format!("mcp {other}"))),
+    }
+}
+
+/// What `/mcp on|off` was asked to do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpSwitch {
+    /// Let this discovered server start from the next launch.
+    On(String),
+    Off(String),
+    /// Neither, and **said rather than swallowed** — a typo that changes nothing silently reads
+    /// as the setting having been taken.
+    Unknown(String),
+}
+
 fn plugin_action(arg: &str) -> Plugin {
     let (verb, rest) = match arg.split_once(char::is_whitespace) {
         Some((v, r)) => (v, r.trim()),

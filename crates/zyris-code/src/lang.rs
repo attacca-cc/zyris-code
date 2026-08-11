@@ -1045,10 +1045,10 @@ impl Lang {
         for spec in &p.mcp {
             s.push_str(&match self {
                 Lang::Ko => {
-                    format!("- MCP `{}` — 다음 실행 때 `{}`을 돌립니다\n", spec.slug, spec.command)
+                    format!("- MCP `{}` — 다음 실행 때 `{}`을 씁니다\n", spec.slug, spec.transport.summary())
                 }
                 Lang::En => {
-                    format!("- MCP `{}` — runs `{}` on the next launch\n", spec.slug, spec.command)
+                    format!("- MCP `{}` — uses `{}` on the next launch\n", spec.slug, spec.transport.summary())
                 }
             });
         }
@@ -1348,6 +1348,56 @@ impl Lang {
             "`.mcp.json` · `~/.config/zyris-code/mcp.json`에 적습니다.",
             "Write in `.mcp.json` or `~/.config/zyris-code/mcp.json`.",
         )
+    }
+    /// Heading over the servers other clients already have set up.
+    pub fn mcp_found_heading(self) -> &'static str {
+        self.pick("다른 프로그램의 설정에서 찾은 것", "Found in another program's settings")
+    }
+    /// Where one was found, and whether this machine said yes to it.
+    pub fn mcp_found_from(self, source: &str, on: bool) -> String {
+        match (self, on) {
+            (Lang::Ko, true) => format!("{source} · 다음 실행에 켭니다"),
+            (Lang::Ko, false) => format!("{source} · 꺼져 있습니다"),
+            (Lang::En, true) => format!("{source} · on from the next launch"),
+            (Lang::En, false) => format!("{source} · off"),
+        }
+    }
+    pub fn mcp_switch_hint(self) -> &'static str {
+        self.pick(
+            "`/mcp on <이름>`으로 켜고 `/mcp off <이름>`으로 끕니다. 찾은 것은 켜기 전에는 돌지 않습니다.",
+            "`/mcp on <name>` turns one on, `/mcp off <name>` turns it off. Nothing found here runs until you do.",
+        )
+    }
+    /// What `/mcp on|off` answers. **It says to restart** — servers are started once, at launch.
+    pub fn mcp_switched(self, slug: &str, on: bool) -> String {
+        match (self, on) {
+            (Lang::Ko, true) => format!("`{slug}`을 켰습니다. 다시 띄우면 도구가 붙습니다."),
+            (Lang::Ko, false) => format!("`{slug}`을 껐습니다. 다시 띄우면 빠집니다."),
+            (Lang::En, true) => format!("`{slug}` is on. Restart and its tools attach."),
+            (Lang::En, false) => format!("`{slug}` is off. Restart and it goes."),
+        }
+    }
+    /// Asked to switch something that is not in the found list.
+    pub fn mcp_not_found(self, slug: &str) -> String {
+        match self {
+            Lang::Ko => format!(
+                "`{slug}`은 찾은 목록에 없습니다. `/mcp`로 이름을 확인해 주세요 — \
+                 직접 적어 둔 서버는 언제나 돌기 때문에 켜고 끌 것이 없습니다."
+            ),
+            Lang::En => format!(
+                "`{slug}` is not in the found list. Check the name with `/mcp` — a server you \
+                 wrote down yourself always runs, so there is nothing to switch."
+            ),
+        }
+    }
+    /// Nothing changed, because it already was that way.
+    pub fn mcp_already(self, slug: &str, on: bool) -> String {
+        match (self, on) {
+            (Lang::Ko, true) => format!("`{slug}`은 이미 켜져 있습니다."),
+            (Lang::Ko, false) => format!("`{slug}`은 이미 꺼져 있습니다."),
+            (Lang::En, true) => format!("`{slug}` is already on."),
+            (Lang::En, false) => format!("`{slug}` is already off."),
+        }
     }
 
     // ── Skills panel
@@ -2034,12 +2084,7 @@ mod tests {
             en.plugin_contents_text(&Plugin {
                 name: "x".into(),
                 description: String::new(),
-                mcp: vec![crate::mcp::bridge::ServerSpec {
-                    slug: "m".into(),
-                    command: "cmd".into(),
-                    args: vec![],
-                    env: Default::default(),
-                }],
+                mcp: vec![crate::mcp::bridge::ServerSpec { slug: "m".into(), transport: crate::mcp::bridge::Transport::Stdio { command: "cmd".into(), args: vec![], env: Default::default() } }],
                 skills: None,
                 root: "/tmp".into(),
             }),

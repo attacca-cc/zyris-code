@@ -1690,7 +1690,7 @@ pub fn run_command(state: &mut State, text: &str) -> Option<crate::command::Comm
                 .say(state.lang.unknown_command(what, &crate::command::help_text(state.lang)));
         }
         // The ones that cannot be done here. The I/O side takes them.
-        Command::Mcp
+        Command::Mcp(_)
         | Command::Skills
         | Command::Rules
         | Command::Agent(_)
@@ -3330,8 +3330,45 @@ async fn finish_command(
     use crate::command::{AccountAction, Command};
     let Some(cmd) = run_command(state, text) else { return };
     match cmd {
-        Command::Mcp => {
-            state.panel = Some(crate::panel::mcp(state.lang, &bridge.mcp_report()));
+        // **Read off disk at the moment it is asked for.** Another client may have added a server
+        // since this window started, and a list that only knew about launch time would keep saying
+        // it is not there.
+        Command::Mcp(None) => {
+            let allowed = crate::mcp::discovery::Allowed::load();
+            let found: Vec<(String, String, bool)> = crate::mcp::discovery::found(&state.cwd)
+                .into_iter()
+                .map(|f| (f.spec.slug.clone(), f.source, allowed.allows(&f.spec.slug)))
+                .collect();
+            state.panel = Some(crate::panel::mcp(state.lang, &bridge.mcp_report(), &found));
+        }
+        Command::Mcp(Some(switch)) => {
+            use crate::command::McpSwitch;
+            let (slug, on) = match &switch {
+                McpSwitch::On(slug) => (slug.clone(), true),
+                McpSwitch::Off(slug) => (slug.clone(), false),
+                McpSwitch::Unknown(what) => {
+                    let help = crate::command::help_text(state.lang);
+                    state.timeline.say(state.lang.unknown_command(what, &help));
+                    return;
+                }
+            };
+            // **Only what was discovered can be switched.** A server written down for this app
+            // always runs, so saying "off" about one would be a promise this cannot keep.
+            let known = crate::mcp::discovery::found(&state.cwd)
+                .into_iter()
+                .any(|f| f.spec.slug == slug);
+            if !known {
+                state.timeline.say(state.lang.mcp_not_found(&slug));
+                return;
+            }
+            let mut allowed = crate::mcp::discovery::Allowed::load();
+            let said = if allowed.set(&slug, on) {
+                allowed.save();
+                state.lang.mcp_switched(&slug, on)
+            } else {
+                state.lang.mcp_already(&slug, on)
+            };
+            state.timeline.say(said);
         }
         // Stopping is I/O that touches the registry. The listing was already said by `run_command`.
         // **We don't drop it from the list** — that it died is what the reaper's `JobEnded` says.

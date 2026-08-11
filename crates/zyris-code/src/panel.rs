@@ -285,8 +285,17 @@ pub fn mode(lang: Lang, now: Mode) -> Panel {
 }
 
 /// The `/mcp` panel — every attached server and how many tools it brought.
-pub fn mcp(lang: Lang, report: &[(String, Result<usize, String>)]) -> Panel {
-    if report.is_empty() {
+/// The `/mcp` panel: what is running, and **what could be**.
+///
+/// `found` is what other clients already have set up (`mcp::discovery`), with whether this machine
+/// has said yes. Showing it is the whole point of discovering it — a list nobody sees may as well
+/// not have been read.
+pub fn mcp(
+    lang: Lang,
+    report: &[(String, Result<usize, String>)],
+    found: &[(String, String, bool)],
+) -> Panel {
+    if report.is_empty() && found.is_empty() {
         return Panel::new(lang.title_mcp().into(), vec![muted(lang.mcp_empty().to_string())]);
     }
     let mut lines = Vec::new();
@@ -304,6 +313,32 @@ pub fn mcp(lang: Lang, report: &[(String, Result<usize, String>)]) -> Panel {
             Span::styled(" — ", Style::default().fg(theme::border_light())),
             Span::styled(text, Style::default().fg(color)),
         ]));
+    }
+    if !found.is_empty() {
+        if !lines.is_empty() {
+            lines.push(blank());
+        }
+        lines.push(muted(lang.mcp_found_heading().to_string()));
+        for (slug, source, on) in found {
+            // **The dot says whether it will start**, because that is the only thing about a
+            // discovered entry a person has to decide.
+            let (mark, colour) =
+                if *on { ("● ", theme::success()) } else { ("○ ", theme::text_muted()) };
+            lines.push(Line::from(vec![
+                Span::styled(mark, Style::default().fg(colour)),
+                Span::styled(
+                    slug.clone(),
+                    Style::default().fg(theme::text_heading()).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" — ", Style::default().fg(theme::border_light())),
+                Span::styled(
+                    lang.mcp_found_from(source, *on),
+                    Style::default().fg(theme::text_muted()),
+                ),
+            ]));
+        }
+        lines.push(blank());
+        lines.push(muted(lang.mcp_switch_hint().to_string()));
     }
     lines.push(blank());
     lines.push(muted(lang.mcp_config_hint().to_string()));
@@ -364,7 +399,7 @@ pub fn plugins(lang: Lang, found: &[Plugin]) -> Panel {
         }
         lines.push(Line::from(spans));
         for spec in &p.mcp {
-            lines.push(muted(format!("    {}", lang.plugin_mcp_line(&spec.slug, &spec.command))));
+            lines.push(muted(format!("    {}", lang.plugin_mcp_line(&spec.slug, &spec.transport.summary()))));
         }
         if p.skills.is_some() {
             lines.push(muted(format!("    {}", lang.plugin_skills_line())));
@@ -606,7 +641,7 @@ mod tests {
 
     #[test]
     fn an_empty_mcp_report_says_there_are_none_and_where_to_write_them() {
-        let p = mcp(Lang::Ko, &[]);
+        let p = mcp(Lang::Ko, &[], &[]);
         assert!(text(&p)[0].contains("없습니다"), "{:?}", text(&p));
         assert!(p.title.contains("MCP"), "{}", p.title);
     }
@@ -614,11 +649,34 @@ mod tests {
     #[test]
     fn a_mcp_report_lists_servers_with_their_outcome() {
         let report = vec![("files".into(), Ok(3)), ("broken".into(), Err("없는 명령".into()))];
-        let p = mcp(Lang::Ko, &report);
+        let p = mcp(Lang::Ko, &report, &[]);
         let joined = text(&p).join("\n");
         assert!(joined.contains("files"), "{joined}");
         assert!(joined.contains("도구 3개"), "{joined}");
         assert!(joined.contains("못 띄웠습니다"), "{joined}");
+    }
+
+    /// **What was found is shown even when nothing is running.** A list nobody sees may as well
+    /// not have been read, and with no servers of our own the panel used to say only "there are
+    /// none" while three sat in another client's config.
+    #[test]
+    fn servers_found_in_another_program_are_offered_with_a_way_to_turn_them_on() {
+        let found = vec![("playwright".to_string(), "Cursor".to_string(), false)];
+        let p = mcp(Lang::Ko, &[], &found);
+        let joined = text(&p).join("\n");
+        assert!(joined.contains("playwright"), "{joined}");
+        assert!(joined.contains("Cursor"), "where it came from is the basis for trusting it: {joined}");
+        assert!(joined.contains("/mcp on"), "no way to turn it on: {joined}");
+        assert!(!joined.contains("없습니다"), "it said there were none: {joined}");
+    }
+
+    /// On and off must not read the same. The dot carries it, so the words have to as well.
+    #[test]
+    fn a_server_that_is_on_reads_differently_from_one_that_is_off() {
+        let on = text(&mcp(Lang::Ko, &[], &[("a".into(), "Cursor".into(), true)])).join("\n");
+        let off = text(&mcp(Lang::Ko, &[], &[("a".into(), "Cursor".into(), false)])).join("\n");
+        assert_ne!(on, off);
+        assert!(on.contains("켭니다"), "{on}");
     }
 
     #[test]

@@ -45,18 +45,10 @@ struct Manifest {
     name: String,
     #[serde(default)]
     description: String,
+    /// **Read through the same parser the config files use** (`mcp::bridge::SpecFile`), so a
+    /// plugin can point at a remote server exactly the way a config file does.
     #[serde(default, rename = "mcpServers", alias = "mcp")]
-    mcp: HashMap<String, ServerSpecFile>,
-}
-
-/// The shape written in the file. `ServerSpec`'s `slug` comes from the key, so it's not here.
-#[derive(Debug, Deserialize)]
-struct ServerSpecFile {
-    command: String,
-    #[serde(default)]
-    args: Vec<String>,
-    #[serde(default)]
-    env: HashMap<String, String>,
+    mcp: HashMap<String, crate::mcp::bridge::SpecFile>,
 }
 
 /// Pulls the place to clone and the directory name it lands in out of what the person typed.
@@ -303,11 +295,8 @@ pub fn discover_in(dirs: &[PathBuf]) -> Vec<Plugin> {
                 mcp: manifest
                     .mcp
                     .into_iter()
-                    .map(|(slug, s)| ServerSpec {
-                        slug,
-                        command: s.command,
-                        args: s.args,
-                        env: s.env,
+                    .filter_map(|(slug, s)| {
+                        Some(ServerSpec { slug, transport: s.into_transport()? })
                     })
                     .collect(),
                 skills: skills.is_dir().then_some(skills),
@@ -583,7 +572,7 @@ mod tests {
         assert_eq!(found[0].name, "깃");
         assert_eq!(found[0].mcp.len(), 1);
         assert_eq!(found[0].mcp[0].slug, "gh");
-        assert_eq!(found[0].mcp[0].command, "npx");
+        assert_eq!(found[0].mcp[0].transport.summary(), "npx");
     }
 
     /// If `skills/` exists, it comes along too — a plugin adds more than just tools.

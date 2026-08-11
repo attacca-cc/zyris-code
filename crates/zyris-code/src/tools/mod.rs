@@ -120,6 +120,18 @@ pub fn start_mcp(caps: zyris::Capabilities, cwd: PathBuf, bridge: Bridge) {
                 None => specs.push(spec),
             }
         }
+        // **What another client set up starts only if this machine said yes** (`/mcp on`). Those
+        // entries name a program somebody else's client was told to run, and running it because it
+        // happened to be on disk is not a decision this app gets to make.
+        let allowed = crate::mcp::discovery::Allowed::load();
+        for found in crate::mcp::discovery::found(&cwd) {
+            if !allowed.allows(&found.spec.slug) {
+                continue;
+            }
+            if !specs.iter().any(|s| s.slug == found.spec.slug) {
+                specs.push(found.spec);
+            }
+        }
         if specs.is_empty() {
             return;
         }

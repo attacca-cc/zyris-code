@@ -22,22 +22,82 @@ use zyris::{
 use crate::mcp::client::{sanitize, McpClient, McpTool};
 
 /// One server written in one config file.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerSpec {
     /// The name written in the config. The capability name becomes `mcp_{here}`.
-    #[serde(skip)]
     pub slug: String,
-    pub command: String,
-    #[serde(default)]
-    pub args: Vec<String>,
-    #[serde(default)]
-    pub env: HashMap<String, String>,
+    pub transport: Transport,
 }
 
+/// How the server is reached. **Read from whatever shape the file uses**, because every client
+/// writes these files a little differently and a person pointing us at their existing config
+/// should not have to rewrite it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Transport {
+    /// A child process speaking line-delimited JSON-RPC.
+    Stdio { command: String, args: Vec<String>, env: HashMap<String, String> },
+    /// A remote server over HTTP (`mcp::http`).
+    Http { url: String, headers: HashMap<String, String> },
+}
+
+impl Transport {
+    /// A one-line description for `/mcp`. **The command or the host, never the whole thing** —
+    /// an args list runs off the screen and a URL can carry a token in its query.
+    pub fn summary(&self) -> String {
+        match self {
+            Transport::Stdio { command, .. } => command.clone(),
+            Transport::Http { url, .. } => {
+                let host = url.split("://").nth(1).unwrap_or(url);
+                host.split('/').next().unwrap_or(host).to_string()
+            }
+        }
+    }
+}
+
+/// The file shape, as written by hand or by another client.
+///
+/// **`type` is a hint, not the decider.** Plenty of configs leave it out entirely, and the fields
+/// that are present say it plainly enough: a `url` is remote, a `command` is a child process. A
+/// `type` that says `http` or `sse` only settles the case where both are somehow there.
+#[derive(Debug, Deserialize)]
+pub struct SpecFile {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    command: Option<String>,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    env: HashMap<String, String>,
+    url: Option<String>,
+    #[serde(default)]
+    headers: HashMap<String, String>,
+}
+
+impl SpecFile {
+    pub fn into_transport(self) -> Option<Transport> {
+        let remote = self.kind.as_deref().is_some_and(|k| k == "http" || k == "sse");
+        match (self.url, self.command) {
+            (Some(url), command) if remote || command.is_none() => {
+                Some(Transport::Http { url, headers: self.headers })
+            }
+            (_, Some(command)) => {
+                Some(Transport::Stdio { command, args: self.args, env: self.env })
+            }
+            // Neither a command nor a url. **Dropped rather than guessed at** — a half-written
+            // entry that starts nothing is better than one that starts the wrong thing.
+            _ => None,
+        }
+    }
+}
+
+/// A config file. **`servers` is read as well as `mcpServers`** — VS Code writes the former, and a
+/// person pointing us at their file should not have to rename anything.
 #[derive(Debug, Deserialize)]
 struct ConfigFile {
     #[serde(default, rename = "mcpServers")]
-    servers: HashMap<String, ServerSpec>,
+    servers: HashMap<String, SpecFile>,
+    #[serde(default, rename = "servers")]
+    vscode: HashMap<String, SpecFile>,
 }
 
 pub struct McpCapability {
@@ -55,7 +115,12 @@ pub struct McpCapability {
 
 impl McpCapability {
     pub async fn start(spec: &ServerSpec) -> anyhow::Result<McpCapability> {
-        let mut client = McpClient::spawn(&spec.command, &spec.args, &spec.env).await?;
+        let mut client = match &spec.transport {
+            Transport::Stdio { command, args, env } => {
+                McpClient::spawn(command, args, env).await?
+            }
+            Transport::Http { url, headers } => McpClient::connect(url, headers).await?,
+        };
         let tools = client.list_tools().await?;
         Ok(McpCapability {
             name: sanitize(&format!("mcp_{}", spec.slug)),
@@ -142,9 +207,12 @@ pub fn merge_configs(files: Vec<Value>) -> Vec<ServerSpec> {
     let mut merged: HashMap<String, ServerSpec> = HashMap::new();
     for file in files {
         let Ok(parsed) = serde_json::from_value::<ConfigFile>(file) else { continue };
-        for (slug, mut spec) in parsed.servers {
-            spec.slug = slug.clone();
-            merged.insert(slug, spec);
+        for (slug, spec) in parsed.servers.into_iter().chain(parsed.vscode) {
+            let Some(transport) = spec.into_transport() else {
+                tracing::warn!("MCP server '{slug}' says neither a command nor a url");
+                continue;
+            };
+            merged.insert(slug.clone(), ServerSpec { slug, transport });
         }
     }
     // Fix the order by name. Emitting in raw HashMap order would make the announce differ per run.
@@ -258,18 +326,8 @@ mod tests {
     #[tokio::test]
     async fn two_servers_that_wash_to_the_same_name_are_split() {
         let specs = vec![
-            ServerSpec {
-                slug: "연습".into(),
-                command: "cat".into(),
-                args: vec![],
-                env: HashMap::new(),
-            },
-            ServerSpec {
-                slug: "실습".into(),
-                command: "cat".into(),
-                args: vec![],
-                env: HashMap::new(),
-            },
+            ServerSpec { slug: "연습".into(), transport: Transport::Stdio { command: "cat".into(), args: vec![], env: HashMap::new() } },
+            ServerSpec { slug: "실습".into(), transport: Transport::Stdio { command: "cat".into(), args: vec![], env: HashMap::new() } },
         ];
         let (started, _) = start_all(&specs).await;
         let names: Vec<String> = started.iter().map(|c| c.descriptor().name).collect();
@@ -288,7 +346,7 @@ mod tests {
             json!({"mcpServers": {"a": {"command": "프로젝트"}}}),
         ]);
         assert_eq!(merged.len(), 1);
-        assert_eq!(merged[0].command, "프로젝트");
+        assert_eq!(merged[0].transport.summary(), "프로젝트");
         assert_eq!(merged[0].slug, "a");
     }
 
@@ -306,18 +364,8 @@ mod tests {
     #[tokio::test]
     async fn a_server_that_fails_to_start_does_not_stop_the_others() {
         let specs = vec![
-            ServerSpec {
-                slug: "없는놈".into(),
-                command: "이런건-없다".into(),
-                args: vec![],
-                env: HashMap::new(),
-            },
-            ServerSpec {
-                slug: "좋은놈".into(),
-                command: "cat".into(),
-                args: vec![],
-                env: HashMap::new(),
-            },
+            ServerSpec { slug: "없는놈".into(), transport: Transport::Stdio { command: "이런건-없다".into(), args: vec![], env: HashMap::new() } },
+            ServerSpec { slug: "좋은놈".into(), transport: Transport::Stdio { command: "cat".into(), args: vec![], env: HashMap::new() } },
         ];
         let (started, failed) = start_all(&specs).await;
         assert_eq!(started.len(), 1, "the one that works must come up");
