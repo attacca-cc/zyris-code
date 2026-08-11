@@ -460,8 +460,10 @@ mod tests {
         let read_at = current_version(&dir.path().join("a.txt")).unwrap();
         // Pretend another session changed it in between
         std::fs::write(dir.path().join("a.txt"), "before\nother-session\n").unwrap();
-        let e =
-            edit.edit(p, "before".into(), "after".into(), None, Some(read_at.clone())).await.unwrap_err();
+        let e = edit
+            .edit(p, "before".into(), "after".into(), None, Some(read_at.clone()))
+            .await
+            .unwrap_err();
         // **Asserted against the current language, not a Korean literal.** This used to read
         // `contains("바뀌었")` and only passed because another test had set the global language to
         // Korean first — the process default is English.

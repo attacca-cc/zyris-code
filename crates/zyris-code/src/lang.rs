@@ -1040,15 +1040,55 @@ impl Lang {
             Lang::En => format!("`{name}` isn't among the fetched plugins."),
         }
     }
+    /// A plugin command whose file had no prompt in it. **Said rather than sending nothing** — an
+    /// Enter that produces no message reads as the app having missed the key.
+    pub fn plugin_command_empty(self, name: &str) -> String {
+        match self {
+            Lang::Ko => {
+                format!("`/{name}`에는 보낼 내용이 없습니다. 플러그인의 명령 파일이 비어 있습니다.")
+            }
+            Lang::En => {
+                format!("`/{name}` has nothing to send — the plugin's command file is empty.")
+            }
+        }
+    }
+    pub fn plugin_where_title(self) -> &'static str {
+        self.pick("어디에 받을까요?", "Where should it go?")
+    }
+    pub fn plugin_where_machine(self) -> &'static str {
+        self.pick("이 컴퓨터", "This machine")
+    }
+    pub fn plugin_where_machine_note(self) -> &'static str {
+        self.pick("모든 프로젝트에서 씁니다", "Used from every project")
+    }
+    pub fn plugin_where_project(self) -> &'static str {
+        self.pick("이 프로젝트", "This project")
+    }
+    /// **Says it lands in the repo.** A fetched plugin inside the working directory shows up in
+    /// `git status`, and finding out at commit time is the wrong time.
+    pub fn plugin_where_project_note(self) -> &'static str {
+        self.pick(
+            "`.zyris-code/plugins/`에 받습니다 — git에 잡힙니다",
+            "Into `.zyris-code/plugins/` — it will show up in git",
+        )
+    }
     pub fn plugin_contents_text(self, p: &Plugin) -> String {
         let mut s = String::new();
         for spec in &p.mcp {
             s.push_str(&match self {
                 Lang::Ko => {
-                    format!("- MCP `{}` — 다음 실행 때 `{}`을 씁니다\n", spec.slug, spec.transport.summary())
+                    format!(
+                        "- MCP `{}` — 다음 실행 때 `{}`을 씁니다\n",
+                        spec.slug,
+                        spec.transport.summary()
+                    )
                 }
                 Lang::En => {
-                    format!("- MCP `{}` — uses `{}` on the next launch\n", spec.slug, spec.transport.summary())
+                    format!(
+                        "- MCP `{}` — uses `{}` on the next launch\n",
+                        spec.slug,
+                        spec.transport.summary()
+                    )
                 }
             });
         }
@@ -2084,8 +2124,18 @@ mod tests {
             en.plugin_contents_text(&Plugin {
                 name: "x".into(),
                 description: String::new(),
-                mcp: vec![crate::mcp::bridge::ServerSpec { slug: "m".into(), transport: crate::mcp::bridge::Transport::Stdio { command: "cmd".into(), args: vec![], env: Default::default() } }],
+                mcp: vec![crate::mcp::bridge::ServerSpec {
+                    slug: "m".into(),
+                    transport: crate::mcp::bridge::Transport::Stdio {
+                        command: "cmd".into(),
+                        args: vec![],
+                        env: Default::default(),
+                    },
+                }],
                 skills: None,
+                agents: None,
+                commands: Vec::new(),
+                hooks: Vec::new(),
                 root: "/tmp".into(),
             }),
             en.plugin_added(
@@ -2094,6 +2144,9 @@ mod tests {
                     description: String::new(),
                     mcp: vec![],
                     skills: None,
+                    agents: None,
+                    commands: Vec::new(),
+                    hooks: Vec::new(),
                     root: "/tmp".into(),
                 },
                 "contents",

@@ -285,10 +285,8 @@ impl Timeline {
     fn retire_echo(&mut self, text: &str) {
         // Compared trimmed: Enter submits the input verbatim while the picker path trims it, and
         // the server may hand back either.
-        let at = self
-            .said
-            .iter()
-            .position(|s| s.voice == Voice::Echo && s.text.trim() == text.trim());
+        let at =
+            self.said.iter().position(|s| s.voice == Voice::Echo && s.text.trim() == text.trim());
         if let Some(at) = at {
             self.said.remove(at);
             self.dirty = true;
@@ -400,11 +398,7 @@ impl Timeline {
                         }
                         None => {
                             open_work = Some(out.len());
-                            out.push(Item::Work {
-                                seq,
-                                title: title.clone(),
-                                parts: Vec::new(),
-                            });
+                            out.push(Item::Work { seq, title: title.clone(), parts: Vec::new() });
                         }
                     }
                 }
@@ -449,7 +443,8 @@ impl Timeline {
             // **A card is opened when there is none.** Thinking that follows something the agent
             // said has nowhere to go otherwise, and it was simply dropped — on screen the agent
             // spoke and then appeared to stop.
-            let after_last = self.entries.keys().next_back().copied().unwrap_or(0).saturating_add(1);
+            let after_last =
+                self.entries.keys().next_back().copied().unwrap_or(0).saturating_add(1);
             let at = card_for(&mut out, &mut open_work, after_last);
             if let Item::Work { seq, parts, .. } = &mut out[at] {
                 let key = live_think_key(*seq);
@@ -597,11 +592,7 @@ fn card_for(out: &mut Vec<Item>, open_work: &mut Option<usize>, seq: i64) -> usi
     // **Make the implicit card's fold key not collide with the first part's seq.** If they collided,
     // expanding the card would also expand the first tool's detail under the same key (it actually
     // looked that way — in tool-only turns with no reasoning, pressing the card opened the first tool's args and result).
-    out.push(Item::Work {
-        seq: implicit_seq(seq),
-        title: String::new(),
-        parts: Vec::new(),
-    });
+    out.push(Item::Work { seq: implicit_seq(seq), title: String::new(), parts: Vec::new() });
     *open_work = Some(at);
     at
 }
@@ -1341,7 +1332,9 @@ mod tests {
         t.upsert(e(2, EntryKind::Thinking { title: None, text: "먼저 보자".into() }));
         t.upsert(e(
             2,
-            EntryKind::Thinking { title: Some("파일을 훑는 중".into()), text: "먼저 보자".into() },
+            EntryKind::Thinking {
+                title: Some("파일을 훑는 중".into()), text: "먼저 보자".into()
+            },
         ));
 
         let Item::Work { parts, .. } = &t.items()[0] else { panic!("{:?}", t.items()) };

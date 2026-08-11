@@ -29,6 +29,8 @@ struct Inner {
     config: Mutex<Config>,
     /// The working directory. **It's the yardstick for whether something leaves it.**
     root: Mutex<PathBuf>,
+    /// What the plugins want run around a tool call (`hooks.rs`). Empty is the usual case.
+    hooks: Mutex<Vec<crate::hooks::Hook>>,
     /// What goes to the screen. Empty before the screen is up.
     ///
     /// `None` in `AppMsg` means it came from outside the screen (tools, the bridge) — only the turn stream
@@ -106,6 +108,19 @@ impl Bridge {
     pub fn sync(&self, mode: Mode, config: &Config) {
         *self.0.mode.lock().unwrap() = mode;
         *self.0.config.lock().unwrap() = *config;
+    }
+
+    /// Records what the plugins want run around a tool call. `tools::announce` calls it once,
+    /// at startup, because that is when plugins are read.
+    ///
+    /// **Held here rather than in the gate** so every capability sees the same list — the gate is
+    /// one wrapper per capability, and a list per wrapper would drift the moment one was rebuilt.
+    pub fn set_hooks(&self, hooks: Vec<crate::hooks::Hook>) {
+        *self.0.hooks.lock().unwrap() = hooks;
+    }
+
+    pub fn hooks(&self) -> Vec<crate::hooks::Hook> {
+        self.0.hooks.lock().unwrap().clone()
     }
 
     /// Records the working directory. `tools::announce` calls it once.

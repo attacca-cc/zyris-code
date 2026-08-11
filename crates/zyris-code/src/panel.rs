@@ -109,8 +109,9 @@ impl Setting {
             Setting::Language => {
                 lang.cfg_lang_desc(if i == 0 { Lang::Ko } else { Lang::En }).to_string()
             }
-            Setting::DefaultMode => lang
-                .cfg_mode_desc(i.checked_sub(1).map(|n| Mode::ALL[n.min(Mode::ALL.len() - 1)])),
+            Setting::DefaultMode => {
+                lang.cfg_mode_desc(i.checked_sub(1).map(|n| Mode::ALL[n.min(Mode::ALL.len() - 1)]))
+            }
             Setting::Theme => lang.cfg_theme_desc(THEMES[i.min(THEMES.len() - 1)]).to_string(),
         }
     }
@@ -399,7 +400,10 @@ pub fn plugins(lang: Lang, found: &[Plugin]) -> Panel {
         }
         lines.push(Line::from(spans));
         for spec in &p.mcp {
-            lines.push(muted(format!("    {}", lang.plugin_mcp_line(&spec.slug, &spec.transport.summary()))));
+            lines.push(muted(format!(
+                "    {}",
+                lang.plugin_mcp_line(&spec.slug, &spec.transport.summary())
+            )));
         }
         if p.skills.is_some() {
             lines.push(muted(format!("    {}", lang.plugin_skills_line())));
@@ -555,10 +559,7 @@ fn form_lines(form: &Form) -> Vec<Line<'static>> {
                 Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD),
             )
         } else {
-            (
-                Style::default().fg(theme::border_light()),
-                Style::default().fg(theme::text()),
-            )
+            (Style::default().fg(theme::border_light()), Style::default().fg(theme::text()))
         };
         lines.push(Line::from(vec![
             Span::styled(if on { "❯ " } else { "  " }, Style::default().fg(theme::accent())),
@@ -665,7 +666,10 @@ mod tests {
         let p = mcp(Lang::Ko, &[], &found);
         let joined = text(&p).join("\n");
         assert!(joined.contains("playwright"), "{joined}");
-        assert!(joined.contains("Cursor"), "where it came from is the basis for trusting it: {joined}");
+        assert!(
+            joined.contains("Cursor"),
+            "where it came from is the basis for trusting it: {joined}"
+        );
         assert!(joined.contains("/mcp on"), "no way to turn it on: {joined}");
         assert!(!joined.contains("없습니다"), "it said there were none: {joined}");
     }
@@ -739,7 +743,11 @@ mod tests {
     /// brackets — a setting you can't see the value of might as well not exist.
     #[test]
     fn the_config_form_shows_every_setting_with_its_current_value() {
-        let cfg = crate::config::Config { dir_access: DirAccess::Allow, default_mode: Some(Mode::Job), ..Default::default() };
+        let cfg = crate::config::Config {
+            dir_access: DirAccess::Allow,
+            default_mode: Some(Mode::Job),
+            ..Default::default()
+        };
         let p = config(Lang::Ko, cfg);
         let joined = text(&p).join("\n");
         for label in ["다른 디렉토리 접근", "언어", "기본 모드"] {
@@ -861,7 +869,11 @@ mod tests {
     /// not on the defaults.
     #[test]
     fn the_draft_starts_from_the_settings_it_was_given() {
-        let cfg = crate::config::Config { dir_access: DirAccess::Allow, default_mode: Some(Mode::Plan), ..Default::default() };
+        let cfg = crate::config::Config {
+            dir_access: DirAccess::Allow,
+            default_mode: Some(Mode::Plan),
+            ..Default::default()
+        };
         let p = config(Lang::En, cfg);
         let form = p.form.expect("the config panel carries a form");
         assert_eq!(form.draft, cfg);

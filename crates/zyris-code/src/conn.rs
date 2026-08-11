@@ -489,7 +489,11 @@ pub struct Window {
 /// The profile name for a window slot. **Slot 1 is the bare profile** — anything else would log
 /// out every install that already exists the moment it updates.
 pub fn window_profile(base: &str, slot: usize) -> String {
-    if slot <= 1 { base.to_string() } else { format!("{base}-{slot}") }
+    if slot <= 1 {
+        base.to_string()
+    } else {
+        format!("{base}-{slot}")
+    }
 }
 
 /// Takes the lowest free window slot.
@@ -1117,7 +1121,11 @@ mod tests {
         // No terminal event yet — a fresh thread.
         assert_eq!(status_from_events(&[]), None);
         // Mid-turn tool chatter, then an answer → success.
-        let ok = [event(1, "chat_user", "안녕"), event(2, "tool_call", ""), event(3, "chat_agent", "hi")];
+        let ok = [
+            event(1, "chat_user", "안녕"),
+            event(2, "tool_call", ""),
+            event(3, "chat_agent", "hi"),
+        ];
         assert_eq!(status_from_events(&ok), Some(ThreadStatus::Success));
         // An answer that never comes, then an error → failed.
         let err = [event(1, "chat_user", "안녕"), event(2, "error", "boom")];
@@ -1303,7 +1311,10 @@ mod tests {
         // And it is still recognisably this app, however the truncation falls.
         for name in [&first, &second] {
             let slug = slug_of(name);
-            assert!(slug.starts_with("zyris-code") || slug.contains("zyris-code"), "{name} → {slug}");
+            assert!(
+                slug.starts_with("zyris-code") || slug.contains("zyris-code"),
+                "{name} → {slug}"
+            );
             assert!(slug.len() <= 16, "{slug}");
         }
     }
@@ -1347,7 +1358,8 @@ mod tests {
     #[test]
     fn past_the_last_slot_a_window_shares_rather_than_refusing_to_start() {
         let dir = tempfile::tempdir().unwrap();
-        let held: Vec<Window> = (0..MAX_WINDOWS).map(|_| claim_window(dir.path(), "test")).collect();
+        let held: Vec<Window> =
+            (0..MAX_WINDOWS).map(|_| claim_window(dir.path(), "test")).collect();
         assert!(held.iter().all(|w| w.lock.is_some()), "every slot should have been claimed");
         let extra = claim_window(dir.path(), "test");
         assert_eq!(extra.slot, 1, "it falls back to the first window's identity");

@@ -44,12 +44,8 @@ pub fn lines(items: &[Todo], lang: Lang, width: usize, rows: usize) -> Vec<Line<
         return vec![];
     }
     let shown = if items.len() <= rows { items.len() } else { rows.saturating_sub(1) };
-    let mut out: Vec<Line<'static>> = items
-        .iter()
-        .take(shown)
-        .enumerate()
-        .map(|(i, todo)| row(todo, i + 1, width))
-        .collect();
+    let mut out: Vec<Line<'static>> =
+        items.iter().take(shown).enumerate().map(|(i, todo)| row(todo, i + 1, width)).collect();
     if shown < items.len() {
         let muted = Style::default().fg(theme::text_muted());
         out.push(Line::from(vec![
@@ -137,7 +133,8 @@ mod tests {
     /// count on the activity line would then disagree with what is on screen.
     #[test]
     fn a_plan_too_long_for_the_room_counts_what_is_hidden() {
-        let items: Vec<Todo> = (1..=10).map(|i| todo(&format!("할 일 {i}"), Status::Pending)).collect();
+        let items: Vec<Todo> =
+            (1..=10).map(|i| todo(&format!("할 일 {i}"), Status::Pending)).collect();
         let out = lines(&items, Lang::Ko, 40, 4);
         assert_eq!(out.len(), 4, "it must not exceed the rows it was given");
         assert_eq!(plain(&out[3]), "  ↓ 7개 더");
@@ -146,7 +143,8 @@ mod tests {
 
     #[test]
     fn a_list_that_fits_shows_every_task() {
-        let items: Vec<Todo> = (1..=3).map(|i| todo(&format!("할 일 {i}"), Status::Pending)).collect();
+        let items: Vec<Todo> =
+            (1..=3).map(|i| todo(&format!("할 일 {i}"), Status::Pending)).collect();
         assert_eq!(lines(&items, Lang::Ko, 40, 3).len(), 3);
     }
 

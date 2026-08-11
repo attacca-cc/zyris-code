@@ -221,8 +221,7 @@ fn escapes(root: &Path, full: &Path) -> bool {
     let (root, full) = (flat(root), flat(full));
     let root = root.trim_end_matches('\\');
     // A prefix only counts on a component boundary — `C:\proj2` must not read as inside `C:\proj`.
-    !(full == root
-        || (full.starts_with(root) && full.as_bytes().get(root.len()) == Some(&b'\\')))
+    !(full == root || (full.starts_with(root) && full.as_bytes().get(root.len()) == Some(&b'\\')))
 }
 
 fn home() -> PathBuf {

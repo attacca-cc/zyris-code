@@ -180,7 +180,12 @@ fn clip_body(s: String) -> String {
 ///
 /// The order matters: an error outranks everything (what failed is what should be read), a diff
 /// outranks the tool's own shape, and everything unrecognized lands in [`Detail::Json`].
-pub fn detail(name: &str, args: Option<&Value>, result: Option<&Value>, error: Option<&Value>) -> Detail {
+pub fn detail(
+    name: &str,
+    args: Option<&Value>,
+    result: Option<&Value>,
+    error: Option<&Value>,
+) -> Detail {
     let lang = crate::lang::current();
     let args = args.filter(|v| !v.is_null());
     let result = result.filter(|v| !v.is_null());
@@ -377,10 +382,7 @@ mod tests {
     #[test]
     fn a_grep_row_shows_the_pattern_and_where_it_looked() {
         let args = json!({"pattern": "fn row_line", "glob": "**/*.rs"});
-        assert_eq!(
-            action(&wire("search", "grep"), Some(&args), None),
-            "\"fn row_line\" · **/*.rs"
-        );
+        assert_eq!(action(&wire("search", "grep"), Some(&args), None), "\"fn row_line\" · **/*.rs");
     }
 
     /// `file_io.read` and `terminal.read` share a tool name and mean different things.
@@ -498,8 +500,10 @@ mod tests {
         match detail(&wire("terminal", "exec"), None, Some(&res), None) {
             Detail::Exec { out, .. } => {
                 assert!(out.chars().count() < BODY_LIMIT * 2);
-                assert!(out.ends_with(crate::lang::Lang::En.detail_clipped())
-                    || out.ends_with(crate::lang::Lang::Ko.detail_clipped()));
+                assert!(
+                    out.ends_with(crate::lang::Lang::En.detail_clipped())
+                        || out.ends_with(crate::lang::Lang::Ko.detail_clipped())
+                );
             }
             other => panic!("expected an exec detail, got {other:?}"),
         }

@@ -75,6 +75,10 @@ pub fn announce(
     skill_dirs.extend(skill::plugin_skill_dirs(&cwd));
     let skills = skill::Skills::new(skill_dirs);
 
+    // What the plugins want run around a tool call. **Read once, here** — the gate wraps every
+    // capability separately, so a list held per wrapper would drift the moment one was rebuilt.
+    bridge.set_hooks(crate::plugin::hooks(&crate::plugin::discover(&cwd)));
+
     // Two things to put in the session: **this repo's conventions** (`CLAUDE.md`·`AGENTS.md`) and the skill list.
     // Conventions come first — they must be followed no matter what, while skills are only used when relevant.
     let parts = [crate::instructions::preamble(&cwd), skill::preamble(&skills)];

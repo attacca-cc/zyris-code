@@ -77,7 +77,8 @@ fn field_line(
     on: bool,
     width: usize,
 ) -> Line<'static> {
-    let mut spans = vec![Span::styled(format!("{label} "), Style::default().fg(theme::text_muted()))];
+    let mut spans =
+        vec![Span::styled(format!("{label} "), Style::default().fg(theme::text_muted()))];
     spans.push(Span::styled("> ", Style::default().fg(theme::accent())));
     if input.text.is_empty() {
         spans.push(Span::styled(placeholder, Style::default().fg(theme::border_light())));

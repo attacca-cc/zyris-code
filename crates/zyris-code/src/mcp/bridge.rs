@@ -116,9 +116,7 @@ pub struct McpCapability {
 impl McpCapability {
     pub async fn start(spec: &ServerSpec) -> anyhow::Result<McpCapability> {
         let mut client = match &spec.transport {
-            Transport::Stdio { command, args, env } => {
-                McpClient::spawn(command, args, env).await?
-            }
+            Transport::Stdio { command, args, env } => McpClient::spawn(command, args, env).await?,
             Transport::Http { url, headers } => McpClient::connect(url, headers).await?,
         };
         let tools = client.list_tools().await?;
@@ -206,8 +204,18 @@ pub fn load_config(cwd: &Path) -> Vec<ServerSpec> {
 pub fn merge_configs(files: Vec<Value>) -> Vec<ServerSpec> {
     let mut merged: HashMap<String, ServerSpec> = HashMap::new();
     for file in files {
-        let Ok(parsed) = serde_json::from_value::<ConfigFile>(file) else { continue };
-        for (slug, spec) in parsed.servers.into_iter().chain(parsed.vscode) {
+        let Ok(parsed) = serde_json::from_value::<ConfigFile>(file.clone()) else { continue };
+        let mut entries: HashMap<String, SpecFile> =
+            parsed.servers.into_iter().chain(parsed.vscode).collect();
+        // **A plugin's `.mcp.json` puts the servers at the top level**, with no wrapper key at all
+        // — that is what the official example plugin ships. Falling back only when neither wrapper
+        // was found keeps this from reading arbitrary JSON as a server list.
+        if entries.is_empty() {
+            if let Ok(bare) = serde_json::from_value::<HashMap<String, SpecFile>>(file) {
+                entries = bare;
+            }
+        }
+        for (slug, spec) in entries {
             let Some(transport) = spec.into_transport() else {
                 tracing::warn!("MCP server '{slug}' says neither a command nor a url");
                 continue;
@@ -326,8 +334,22 @@ mod tests {
     #[tokio::test]
     async fn two_servers_that_wash_to_the_same_name_are_split() {
         let specs = vec![
-            ServerSpec { slug: "연습".into(), transport: Transport::Stdio { command: "cat".into(), args: vec![], env: HashMap::new() } },
-            ServerSpec { slug: "실습".into(), transport: Transport::Stdio { command: "cat".into(), args: vec![], env: HashMap::new() } },
+            ServerSpec {
+                slug: "연습".into(),
+                transport: Transport::Stdio {
+                    command: "cat".into(),
+                    args: vec![],
+                    env: HashMap::new(),
+                },
+            },
+            ServerSpec {
+                slug: "실습".into(),
+                transport: Transport::Stdio {
+                    command: "cat".into(),
+                    args: vec![],
+                    env: HashMap::new(),
+                },
+            },
         ];
         let (started, _) = start_all(&specs).await;
         let names: Vec<String> = started.iter().map(|c| c.descriptor().name).collect();
@@ -364,8 +386,22 @@ mod tests {
     #[tokio::test]
     async fn a_server_that_fails_to_start_does_not_stop_the_others() {
         let specs = vec![
-            ServerSpec { slug: "없는놈".into(), transport: Transport::Stdio { command: "이런건-없다".into(), args: vec![], env: HashMap::new() } },
-            ServerSpec { slug: "좋은놈".into(), transport: Transport::Stdio { command: "cat".into(), args: vec![], env: HashMap::new() } },
+            ServerSpec {
+                slug: "없는놈".into(),
+                transport: Transport::Stdio {
+                    command: "이런건-없다".into(),
+                    args: vec![],
+                    env: HashMap::new(),
+                },
+            },
+            ServerSpec {
+                slug: "좋은놈".into(),
+                transport: Transport::Stdio {
+                    command: "cat".into(),
+                    args: vec![],
+                    env: HashMap::new(),
+                },
+            },
         ];
         let (started, failed) = start_all(&specs).await;
         assert_eq!(started.len(), 1, "the one that works must come up");

@@ -71,10 +71,7 @@ impl Undo {
     /// at random. Handing the root in removes the shared variable from the picture, the same way
     /// `plugin::install_into` takes its directory.
     pub fn under(cache_root: &Path, cwd: &Path) -> Undo {
-        Undo(Arc::new(Inner {
-            dir: cache_root.join("undo").join(slug(cwd)),
-            lock: Mutex::new(()),
-        }))
+        Undo(Arc::new(Inner { dir: cache_root.join("undo").join(slug(cwd)), lock: Mutex::new(()) }))
     }
 
     /// Called **right before** the write.

@@ -955,7 +955,9 @@ fn typing_drops_the_selection() {
         &mut s,
         &Action::Frame(AppFrame::Event {
             cursor: 1,
-            entry: Some(Entry { seq: 1, kind: EntryKind::Agent("안녕하세요 반갑습니다".into()) }),
+            entry: Some(Entry {
+                seq: 1, kind: EntryKind::Agent("안녕하세요 반갑습니다".into())
+            }),
             todo: None,
         }),
     );
@@ -1985,10 +1987,14 @@ fn show_a_work_card() {
 
     let events = vec![
         ev(1, "work_summary", serde_json::json!({"content": "위젯 picker 테스트를 배경에서 실행"})),
-        ev(10, "thinking", serde_json::json!({
-            "content": "rows.rs가 대화 화면의 정본이므로 거기부터 본다.",
-            "title": "현재 파일 상태를 읽는 중",
-        })),
+        ev(
+            10,
+            "thinking",
+            serde_json::json!({
+                "content": "rows.rs가 대화 화면의 정본이므로 거기부터 본다.",
+                "title": "현재 파일 상태를 읽는 중",
+            }),
+        ),
         tool(
             11,
             "read",
@@ -1999,10 +2005,14 @@ fn show_a_work_card() {
                 "content": "fn row_line(&self) -> Line {\n    …\n}",
             }),
         ),
-        ev(12, "thinking", serde_json::json!({
-            "content": "지금은 오른쪽 끝에 있다. 커서 표시 뒤, 레이블 앞으로 옮긴다.",
-            "title": "상태 점을 왼쪽으로 옮긴다",
-        })),
+        ev(
+            12,
+            "thinking",
+            serde_json::json!({
+                "content": "지금은 오른쪽 끝에 있다. 커서 표시 뒤, 레이블 앞으로 옮긴다.",
+                "title": "상태 점을 왼쪽으로 옮긴다",
+            }),
+        ),
         tool(
             13,
             "grep",

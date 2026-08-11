@@ -38,7 +38,10 @@ fn conversation(turns: usize, table_rows: usize) -> Timeline {
         seq += 1;
         t.upsert(Entry { seq, kind: EntryKind::WorkStart(format!("{i}번째 작업")) });
         seq += 1;
-        t.upsert(Entry { seq, kind: EntryKind::Thinking { title: None, text: "무엇부터 볼까".repeat(20) } });
+        t.upsert(Entry {
+            seq,
+            kind: EntryKind::Thinking { title: None, text: "무엇부터 볼까".repeat(20) },
+        });
         seq += 1;
         t.upsert(Entry { seq, kind: EntryKind::Agent(long_table(table_rows)) });
     }
@@ -55,7 +58,14 @@ fn frame_all(t: &mut Timeline, folds: &Folds) -> usize {
 
 /// The current way — rebuilds only changed items and lays out just the visible window.
 fn frame_cached(t: &mut Timeline, cache: &mut Cache, folds: &Folds) -> usize {
-    cache.layout(t.items(), WIDTH, folds, None, zyris_code::rows::Turn::default(), zyris_code::lang::Lang::En);
+    cache.layout(
+        t.items(),
+        WIDTH,
+        folds,
+        None,
+        zyris_code::rows::Turn::default(),
+        zyris_code::lang::Lang::En,
+    );
     let top = cache.total().saturating_sub(HEIGHT);
     cache.window(top, top + HEIGHT).len()
 }
@@ -228,13 +238,19 @@ fn measure_bytes_on_the_wire() {
     for i in 0..6 {
         seq += 1;
         let entry = Entry { seq, kind: EntryKind::User(format!("{i}번째 질문입니다")) };
-        apply(&mut state, &Action::Frame(AppFrame::Event { cursor: seq, entry: Some(entry), todo: None }));
+        apply(
+            &mut state,
+            &Action::Frame(AppFrame::Event { cursor: seq, entry: Some(entry), todo: None }),
+        );
         seq += 1;
         let entry = Entry {
             seq,
             kind: EntryKind::Agent("그라데이션 부분은 이렇게 바꾸면 됩니다. ".repeat(30)),
         };
-        apply(&mut state, &Action::Frame(AppFrame::Event { cursor: seq, entry: Some(entry), todo: None }));
+        apply(
+            &mut state,
+            &Action::Frame(AppFrame::Event { cursor: seq, entry: Some(entry), todo: None }),
+        );
     }
 
     let wire = Wire::default();

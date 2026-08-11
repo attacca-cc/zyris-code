@@ -57,6 +57,17 @@ impl<C: ServeCapability> ServeCapability for Gate<C> {
             Decision::Refuse(why) => return Err(WireError::invalid_params(why)),
         }
 
+        // **A plugin's hooks run here and nowhere else.** This is the one point every tool call
+        // already passes, so there is no second path to keep in step — and a hook can only refuse,
+        // never rewrite, so nothing downstream has to re-read what it did (`hooks.rs`).
+        let hooks = self.bridge.hooks();
+        let named = format!("{}.{}", gated.capability, gated.tool);
+        if let crate::hooks::Verdict::Refused(why) =
+            crate::hooks::run(&hooks, crate::hooks::When::Before, &named, &args).await
+        {
+            return Err(WireError::invalid_params(why));
+        }
+
         let (call, cut) = self.clamp_exec(call, &args, wire_deadline());
         // **Shows what's running while it runs.** `exec` gives its result only once at completion
         // (protocol §terminal), so without this a human waits up to 55 seconds
@@ -69,6 +80,11 @@ impl<C: ServeCapability> ServeCapability for Gate<C> {
         let out = self.inner.dispatch(call).await;
         if let Some(id) = running {
             self.bridge.frame(crate::app::Frame::ExecDone { id });
+        }
+        // **After the call, whatever it did.** The verdict is not read — the call already happened,
+        // and reporting a refusal now would describe something that did not occur.
+        if !hooks.is_empty() {
+            crate::hooks::run(&hooks, crate::hooks::When::After, &named, &args).await;
         }
         let out = out?;
         self.note_the_shells(&gated, &args, &out);

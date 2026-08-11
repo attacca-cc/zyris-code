@@ -56,8 +56,10 @@ pub fn draw(
 
     let mut lines: Vec<Line<'static>> = Vec::new();
     if picker.loading {
-        lines
-            .push(Line::from(Span::styled(lang.loading(), Style::default().fg(theme::text_muted()))));
+        lines.push(Line::from(Span::styled(
+            lang.loading(),
+            Style::default().fg(theme::text_muted()),
+        )));
     }
 
     // **The pure side decides** where each row goes (`picker::slots`). Here we just draw.
@@ -92,7 +94,9 @@ pub fn draw(
         crate::picker::Level::Projects => lang.picker_close(),
         crate::picker::Level::Sessions { .. } => lang.picker_back(),
         // These two are outside the project hierarchy, so there's nowhere to go back to.
-        crate::picker::Level::Agents | crate::picker::Level::Commands => lang.picker_esc_close(),
+        crate::picker::Level::Agents
+        | crate::picker::Level::Commands
+        | crate::picker::Level::PluginTarget { .. } => lang.picker_esc_close(),
     };
     lines.push(Line::from(Span::styled(
         lang.picker_keys(back),
@@ -137,9 +141,8 @@ fn row_line(
         Span::styled("●", Style::default().fg(colour))
     });
     let (label, note) = split(width, &row.label, row.note.as_deref(), row.status.is_some());
-    let mut spans = vec![
-        Span::styled(if on { "❯ " } else { "  " }, Style::default().fg(theme::accent())),
-    ];
+    let mut spans =
+        vec![Span::styled(if on { "❯ " } else { "  " }, Style::default().fg(theme::accent()))];
     // The status dot sits at the left, right after the cursor marker — a thread's state is
     // the first thing the eye lands on, before reading its title.
     if let Some(dot) = status_span {
@@ -232,16 +235,11 @@ mod tests {
         let long = "아주 길고 긴 이름을 가진 프로젝트 그리고 더 길어지는 이름";
         let mut picker = Picker::loading_sessions("p1".into(), long.into());
         let mut terminal = Terminal::new(TestBackend::new(80, 12)).expect("terminal");
-        terminal
-            .draw(|f| draw(f, f.area(), &mut picker, crate::lang::Lang::Ko, 0))
-            .expect("draw");
+        terminal.draw(|f| draw(f, f.area(), &mut picker, crate::lang::Lang::Ko, 0)).expect("draw");
         // The box is centred, so its top border is not row zero — find the row it landed on.
         let buffer = terminal.backend().buffer();
-        let rows: Vec<String> = buffer
-            .content
-            .chunks(80)
-            .map(|row| row.iter().map(|c| c.symbol()).collect())
-            .collect();
+        let rows: Vec<String> =
+            buffer.content.chunks(80).map(|row| row.iter().map(|c| c.symbol()).collect()).collect();
         let top = rows.iter().find(|r| r.contains('┌')).expect("no box was drawn").clone();
         assert!(top.contains('…'), "the title was cut with no sign of it: {top:?}");
         assert!(!top.contains(long), "the whole name still went out: {top:?}");
@@ -256,9 +254,7 @@ mod tests {
         use ratatui::Terminal;
 
         let mut terminal = Terminal::new(TestBackend::new(w, h)).expect("terminal");
-        terminal
-            .draw(|f| draw(f, f.area(), picker, crate::lang::Lang::Ko, 0))
-            .expect("draw");
+        terminal.draw(|f| draw(f, f.area(), picker, crate::lang::Lang::Ko, 0)).expect("draw");
         // **The cell behind a wide character has to be skipped.** ratatui fills it with a space,
         // so joining every cell turns `새 쓰레드` into `새  쓰 레 드` and no search ever matches.
         let buf = terminal.backend().buffer().clone();
@@ -287,20 +283,23 @@ mod tests {
                 (format!("s{i}"), format!("지난 대화 {i}"), crate::picker::ThreadStatus::Unknown)
             })
             .collect();
-        let mut picker =
-            Picker::sessions("p1".into(), "기본".into(), items, crate::lang::Lang::Ko);
+        let mut picker = Picker::sessions("p1".into(), "기본".into(), items, crate::lang::Lang::Ko);
         picker.cursor = 40;
         let rows = render(&mut picker, 80, 20);
-        let head = rows.iter().position(|r| r.contains("＋ 새 쓰레드")).expect(
-            "the create row is gone from a scrolled list",
-        );
+        let head = rows
+            .iter()
+            .position(|r| r.contains("＋ 새 쓰레드"))
+            .expect("the create row is gone from a scrolled list");
         // It is the first thing under the top border, above everything that scrolls.
         assert!(head <= 1, "the create row is not at the top: {rows:#?}");
         assert!(
             rows.iter().any(|r| r.contains("↑") || r.contains("더")),
             "nothing says how many are hidden above: {rows:#?}"
         );
-        assert!(rows.iter().any(|r| r.contains("지난 대화 39")), "the cursor row is off screen: {rows:#?}");
+        assert!(
+            rows.iter().any(|r| r.contains("지난 대화 39")),
+            "the cursor row is off screen: {rows:#?}"
+        );
         // The box keeps its walls — a row that runs past the border collapses the screen.
         assert!(rows.iter().all(|r| r.matches('│').count() == 2 || !r.contains('│')), "{rows:#?}");
     }
@@ -309,8 +308,12 @@ mod tests {
     /// tell what command it was — the reason was a long note.
     #[test]
     fn a_long_note_never_eats_into_the_name() {
-        let (label, _) =
-            split(62, "/agent", Some("에이전트를 고릅니다. 다음 메시지에서 새 thread가 열립니다"), false);
+        let (label, _) = split(
+            62,
+            "/agent",
+            Some("에이전트를 고릅니다. 다음 메시지에서 새 thread가 열립니다"),
+            false,
+        );
         assert_eq!(label, "/agent");
     }
 
@@ -331,8 +334,7 @@ mod tests {
         assert!(text.contains("●"), "no status dot: {text:?}");
         // The dot sits before the title — the cursor marker, then the dot, then the label.
         let dot_pos = line.spans.iter().position(|s| s.content.as_ref() == "●").unwrap();
-        let label_pos =
-            line.spans.iter().position(|s| s.content.as_ref() == "대화").unwrap();
+        let label_pos = line.spans.iter().position(|s| s.content.as_ref() == "대화").unwrap();
         assert!(dot_pos < label_pos, "status dot must precede the title: {text:?}");
         // A finished thread holds its colour, a running one blinks (tick on/off).
         let ok_row = crate::picker::Row {
@@ -349,11 +351,8 @@ mod tests {
             enabled: true,
             status: Some(ThreadStatus::Failed),
         };
-        let running_col = line
-            .spans
-            .iter()
-            .find(|s| s.content.as_ref() == "●")
-            .and_then(|s| s.style.fg);
+        let running_col =
+            line.spans.iter().find(|s| s.content.as_ref() == "●").and_then(|s| s.style.fg);
         let ok_col = row_line(&ok_row, false, false, 20, 0)
             .spans
             .iter()

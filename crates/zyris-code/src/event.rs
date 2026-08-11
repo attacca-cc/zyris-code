@@ -24,7 +24,10 @@ pub enum EntryKind {
     /// `spawn_thought_title` labels each block with a small model and updates the event in place,
     /// so a card that opened untitled fills in by itself (the `seq`-keyed upsert is what makes that
     /// land in the same row). `None` until that lands, and forever if the side model is off.
-    Thinking { title: Option<String>, text: String },
+    Thinking {
+        title: Option<String>,
+        text: String,
+    },
     Tool {
         name: String,
         /// What was run, against what. Built by `tool_view::action`.
@@ -55,7 +58,11 @@ pub fn entry_from(event: &ZSessionEvent) -> Option<Entry> {
         "chat_agent" => EntryKind::Agent(text(p, "content")),
         "work_summary" => EntryKind::WorkStart(text(p, "content")),
         "thinking" => EntryKind::Thinking {
-            title: p.get("title").and_then(Value::as_str).filter(|s| !s.trim().is_empty()).map(str::to_string),
+            title: p
+                .get("title")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_string),
             text: text(p, "content"),
         },
         "error" => EntryKind::Error(text(p, "message")),
@@ -119,7 +126,6 @@ mod tests {
         format!("zyris__arch__terminal__{tool}")
     }
 
-
     /// **The readable path must be the one that actually reaches the screen.** If only
     /// `tool_view::detail` is right and `entry_from` doesn't call it, the person still sees raw JSON.
     ///
@@ -178,7 +184,8 @@ mod tests {
     /// **Dropping that title is what made the client clip a mid-sentence heading of its own.**
     #[test]
     fn a_thinking_event_keeps_the_title_the_server_gave_it() {
-        let e = ev(3, "thinking", json!({"content": "먼저 …", "title": "현재 파일 상태를 읽는 중"}));
+        let e =
+            ev(3, "thinking", json!({"content": "먼저 …", "title": "현재 파일 상태를 읽는 중"}));
         assert_eq!(
             entry_from(&e).unwrap().kind,
             EntryKind::Thinking {

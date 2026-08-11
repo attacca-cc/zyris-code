@@ -154,7 +154,11 @@ mod tests {
     /// whole round trip the command relies on.
     #[test]
     fn a_saved_config_round_trips() {
-        let c = Config { dir_access: DirAccess::Allow, default_mode: Some(Mode::Job), ..Config::default() };
+        let c = Config {
+            dir_access: DirAccess::Allow,
+            default_mode: Some(Mode::Job),
+            ..Config::default()
+        };
         let text = serde_json::to_string(&c).unwrap();
         let back: Config = serde_json::from_str(&text).unwrap();
         assert_eq!(back, c);

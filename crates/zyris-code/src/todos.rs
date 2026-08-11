@@ -178,7 +178,10 @@ mod tests {
     }
 
     fn added(seq: i64, id: &str, content: &str) -> ZSessionEvent {
-        ev(seq, json!({"name": "todo_add", "arguments": {"content": content}, "result": item(id, content, "pending")}))
+        ev(
+            seq,
+            json!({"name": "todo_add", "arguments": {"content": content}, "result": item(id, content, "pending")}),
+        )
     }
 
     /// A real `todo_add` answer, straight off attacca's `TodoItem`.
@@ -241,7 +244,8 @@ mod tests {
         for (seq, id, title) in [(1, "t1", "하나"), (2, "t2", "둘"), (3, "t3", "셋")] {
             todos.note(seq, change_from(&added(seq, id, title)).unwrap());
         }
-        let done = ev(4, json!({"name": "todo_update_status", "result": item("t1", "하나", "completed")}));
+        let done =
+            ev(4, json!({"name": "todo_update_status", "result": item("t1", "하나", "completed")}));
         todos.note(4, change_from(&done).unwrap());
         let ids: Vec<&str> = todos.items().iter().map(|t| t.id.as_str()).collect();
         assert_eq!(ids, ["t1", "t2", "t3"]);
@@ -267,7 +271,10 @@ mod tests {
     fn a_removed_task_leaves_the_list() {
         let mut todos = Todos::new();
         todos.note(1, change_from(&added(1, "t1", "하나")).unwrap());
-        let gone = ev(2, json!({"name": "todo_remove", "arguments": {"item_id": "t1"}, "result": {"removed": "t1"}}));
+        let gone = ev(
+            2,
+            json!({"name": "todo_remove", "arguments": {"item_id": "t1"}, "result": {"removed": "t1"}}),
+        );
         todos.note(2, change_from(&gone).unwrap());
         assert!(todos.is_empty(), "{:?}", todos.items());
     }
@@ -287,7 +294,8 @@ mod tests {
     /// result comes back through the server and can hold anything.
     #[test]
     fn other_tools_and_other_events_say_nothing() {
-        let tool = ev(1, json!({"name": "zyris__arch__terminal__exec", "arguments": {"command": "ls"}}));
+        let tool =
+            ev(1, json!({"name": "zyris__arch__terminal__exec", "arguments": {"command": "ls"}}));
         assert_eq!(change_from(&tool), None);
         let thinking = ZSessionEvent {
             seq: 2,

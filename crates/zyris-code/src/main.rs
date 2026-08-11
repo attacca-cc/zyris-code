@@ -35,9 +35,9 @@ async fn main() -> ExitCode {
     // current drive, so `File::create` failed there and the `Err` arm below silently dropped the
     // file layer — leaving no logs at all on the one platform where nothing can be reproduced
     // locally. `std::env::temp_dir` reads `%TEMP%` there and `/tmp` here.
-    let log = std::env::var("ZYRIS_CODE_LOG").map(std::path::PathBuf::from).unwrap_or_else(|_| {
-        std::env::temp_dir().join("zyris-code.log")
-    });
+    let log = std::env::var("ZYRIS_CODE_LOG")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir().join("zyris-code.log"));
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         // **It's `zyris=info`.** If only disconnects (`warn`) were kept, the reconnecting would vanish
         // from the log and "keeps disconnecting" couldn't be traced later.
@@ -96,7 +96,8 @@ async fn main() -> ExitCode {
     // settled first. **The handle lives as long as `main`** — dropping it removes the lock file,
     // and a window that gave up its slot early would hand its identity to the next one to start.
     let window = zyris_code::conn::credential_dir().map(|dir| {
-        let base = std::env::var("ZYRIS_PROFILE").unwrap_or_else(|_| zyris_code::conn::APP.to_string());
+        let base =
+            std::env::var("ZYRIS_PROFILE").unwrap_or_else(|_| zyris_code::conn::APP.to_string());
         zyris_code::conn::claim_window(&dir, &base)
     });
     let slot = window.as_ref().map_or(1, |w| w.slot);

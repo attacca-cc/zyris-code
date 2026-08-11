@@ -604,13 +604,14 @@ fn make(item: &Item, width: u16, folds: &Folds, turn: Turn, lang: crate::lang::L
                 (true, true) => lang.thinking(),
                 (true, false) => title.as_str(),
             };
-            let steps = || parts.iter().filter_map(|p| match p {
-                Part::Step(s) => Some(s),
-                _ => None,
-            });
+            let steps = || {
+                parts.iter().filter_map(|p| match p {
+                    Part::Step(s) => Some(s),
+                    _ => None,
+                })
+            };
             let total = steps().count();
-            let (add, rem) =
-                steps().fold((0, 0), |(a, r), s| (a + s.counts().0, r + s.counts().1));
+            let (add, rem) = steps().fold((0, 0), |(a, r), s| (a + s.counts().0, r + s.counts().1));
             // **`✻`, not `◆`.** `◆` is what an answer wears, and the head is the opposite of an
             // answer — it is the working out gathered behind one line. A chevron won't do either:
             // it is exactly what the reasoning chips under it use, and the head stopped reading as
@@ -1058,10 +1059,7 @@ fn json_line(raw: &str, base: ratatui::style::Color) -> Vec<Span<'static>> {
             // every key was drawn as `command":` — it read like broken JSON.
             let key = format!("\"{}", &after_quote[..=end]);
             spans.push(Span::styled(key, Style::default().fg(theme::tool_arg())));
-            spans.push(Span::styled(
-                after_quote[end + 1..].to_string(),
-                Style::default().fg(base),
-            ));
+            spans.push(Span::styled(after_quote[end + 1..].to_string(), Style::default().fg(base)));
             return spans;
         }
     }
@@ -1127,11 +1125,7 @@ mod tests {
     }
 
     fn think_at(seq: i64, title: &str, text: &str) -> Part {
-        Part::Think(crate::timeline::Think {
-            seq,
-            title: Some(title.into()),
-            text: text.into(),
-        })
+        Part::Think(crate::timeline::Think { seq, title: Some(title.into()), text: text.into() })
     }
 
     fn work_at(seq: i64) -> Item {
@@ -1201,7 +1195,6 @@ mod tests {
         assert!(out.iter().any(|l| l.contains("도구 1개")), "the head still counts tools: {out:?}");
     }
 
-
     /// Unfolded, thinking interleaves between tools — in the order it came.
     #[test]
     fn an_open_card_interleaves_thinking_with_tools() {
@@ -1212,7 +1205,6 @@ mod tests {
         assert!(think < tool, "the thought must come before the tool: {out:?}");
     }
 
-
     #[test]
     fn an_open_card_shows_reasoning_and_steps() {
         let folds = open_all(&work());
@@ -1220,7 +1212,6 @@ mod tests {
         assert!(out.iter().any(|l| l.contains("rows.rs가 정본")), "{out:?}");
         assert!(out.iter().any(|l| l.contains("grep")), "{out:?}");
     }
-
 
     /// **The head line says how many times tools were used.** What's counted is `Part::Step`, i.e. tool calls,
     /// so the "steps" suffix doesn't point at them.
@@ -1241,7 +1232,6 @@ mod tests {
         assert!(out[0].contains(crate::lang::Lang::Ko.run_done()), "{out:?}");
         assert!(out[0].contains("도구 1개"), "the head still says what it did: {out:?}");
     }
-
 
     #[test]
     fn a_user_message_is_marked_with_the_accent_bar() {
@@ -1265,7 +1255,6 @@ mod tests {
         assert!(!row.contains("zyris__"), "the raw wire name is shown: {row:?}");
     }
 
-
     /// **Tools must be a different colour from reasoning.** In an open card, reasoning fills the screen;
     /// if tools are also dim, "what was done" gets buried in the thinking pile.
     #[test]
@@ -1287,7 +1276,6 @@ mod tests {
         );
     }
 
-
     /// The name and its summary are **coloured separately** — one span can't split colours.
     #[test]
     fn the_name_and_its_summary_are_coloured_apart() {
@@ -1302,7 +1290,6 @@ mod tests {
         let note = row.spans.iter().find(|s| s.content.contains("viewport")).expect("no summary");
         assert_eq!(note.style.fg, Some(theme::tool_arg()));
     }
-
 
     /// **Even folded, how much changed is visible.** Both the head line and tool rows carry the numbers.
     #[test]
@@ -1327,7 +1314,6 @@ mod tests {
             "the tool row must show what it changed: {out:?}"
         );
     }
-
 
     /// Sticking `+0 −0` on a card that changed nothing is its own kind of noise.
     #[test]
@@ -1408,7 +1394,6 @@ mod tests {
         );
     }
 
-
     /// Reasoning must be dimmer than the answer. At the same brightness, the conclusion isn't visible.
     #[test]
     fn reasoning_is_dimmer_than_the_answer() {
@@ -1432,7 +1417,6 @@ mod tests {
         );
     }
 
-
     /// An error must never pass quietly.
     #[test]
     fn an_error_is_always_visible_and_red() {
@@ -1440,7 +1424,10 @@ mod tests {
         let r = rows(&items, 40, &Folds::new(), crate::lang::Lang::Ko);
         assert!(plain(&r).iter().any(|l| l.contains("크레딧이 부족합니다")));
         assert!(
-            r.lines.iter().flat_map(|l| &l.spans).any(|s| s.style.fg == Some(crate::theme::danger())),
+            r.lines
+                .iter()
+                .flat_map(|l| &l.spans)
+                .any(|s| s.style.fg == Some(crate::theme::danger())),
             "오류는 빨간색이어야 한다"
         );
     }
@@ -1467,7 +1454,14 @@ mod tests {
         for folds in [Folds::new(), Folds::from([(2, Fold { open: true, user_touched: true })])] {
             let want = rows(&items, 40, &folds, crate::lang::Lang::Ko);
             let mut cache = Cache::new();
-            cache.layout(&items, 40, &folds, None, Turn { running: false, blink: false }, crate::lang::Lang::Ko);
+            cache.layout(
+                &items,
+                40,
+                &folds,
+                None,
+                Turn { running: false, blink: false },
+                crate::lang::Lang::Ko,
+            );
 
             assert_eq!(cache.total(), want.lines.len(), "the row counts must match");
             assert_eq!(cache.plain(), want.plain(), "the contents must match");
@@ -1483,7 +1477,14 @@ mod tests {
         let all = rows(&items, 40, &folds, crate::lang::Lang::Ko).plain();
 
         let mut cache = Cache::new();
-        cache.layout(&items, 40, &folds, None, Turn { running: false, blink: false }, crate::lang::Lang::Ko);
+        cache.layout(
+            &items,
+            40,
+            &folds,
+            None,
+            Turn { running: false, blink: false },
+            crate::lang::Lang::Ko,
+        );
         for (from, to) in [(0usize, 3usize), (2, 5), (1, cache.total()), (0, cache.total())] {
             let got: Vec<String> = cache
                 .window(from, to)
@@ -1503,18 +1504,39 @@ mod tests {
         let folds = Folds::new();
         let mut cache = Cache::new();
 
-        cache.layout(&items, 40, &folds, None, Turn { running: false, blink: false }, crate::lang::Lang::Ko);
+        cache.layout(
+            &items,
+            40,
+            &folds,
+            None,
+            Turn { running: false, blink: false },
+            crate::lang::Lang::Ko,
+        );
         let first = cache.renders();
         assert_eq!(first, items.len() as u64, "everything is drawn the first time");
 
-        cache.layout(&items, 40, &folds, None, Turn { running: false, blink: false }, crate::lang::Lang::Ko);
+        cache.layout(
+            &items,
+            40,
+            &folds,
+            None,
+            Turn { running: false, blink: false },
+            crate::lang::Lang::Ko,
+        );
         assert_eq!(cache.renders(), first, "unchanged, not a single row is drawn again");
 
         // A delta was appended to the answer — only that item should be redrawn.
         if let Item::Agent { text, .. } = &mut items[2] {
             text.push_str("| c | 3 |\n");
         }
-        cache.layout(&items, 40, &folds, None, Turn { running: false, blink: false }, crate::lang::Lang::Ko);
+        cache.layout(
+            &items,
+            40,
+            &folds,
+            None,
+            Turn { running: false, blink: false },
+            crate::lang::Lang::Ko,
+        );
         assert_eq!(cache.renders(), first + 1, "only the changed one is drawn again");
     }
 
@@ -1526,13 +1548,27 @@ mod tests {
     fn opening_a_chip_redraws_only_that_card() {
         let items = mixed();
         let mut cache = Cache::new();
-        cache.layout(&items, 40, &Folds::new(), None, Turn { running: false, blink: false }, crate::lang::Lang::Ko);
+        cache.layout(
+            &items,
+            40,
+            &Folds::new(),
+            None,
+            Turn { running: false, blink: false },
+            crate::lang::Lang::Ko,
+        );
         let before = cache.renders();
 
         let chip = chip_key(&items[1]);
         let open = Fold { open: true, user_touched: true };
         let opened = Folds::from([(chip, open), (items[1].seq(), open)]);
-        cache.layout(&items, 40, &opened, None, Turn { running: false, blink: false }, crate::lang::Lang::Ko);
+        cache.layout(
+            &items,
+            40,
+            &opened,
+            None,
+            Turn { running: false, blink: false },
+            crate::lang::Lang::Ko,
+        );
         assert_eq!(cache.renders(), before + 1, "only the card holding that chip is drawn again");
         assert!(
             cache.plain().iter().any(|l| l.contains("rows.rs가 정본")),
@@ -1546,10 +1582,24 @@ mod tests {
         let items = mixed();
         let folds = Folds::new();
         let mut cache = Cache::new();
-        cache.layout(&items, 40, &folds, None, Turn { running: false, blink: false }, crate::lang::Lang::Ko);
+        cache.layout(
+            &items,
+            40,
+            &folds,
+            None,
+            Turn { running: false, blink: false },
+            crate::lang::Lang::Ko,
+        );
         let before = cache.renders();
 
-        cache.layout(&items, 80, &folds, None, Turn { running: false, blink: false }, crate::lang::Lang::Ko);
+        cache.layout(
+            &items,
+            80,
+            &folds,
+            None,
+            Turn { running: false, blink: false },
+            crate::lang::Lang::Ko,
+        );
         assert_eq!(cache.renders(), before + items.len() as u64);
         assert_eq!(cache.plain(), rows(&items, 80, &folds, crate::lang::Lang::Ko).plain());
     }
@@ -1568,14 +1618,28 @@ mod tests {
             Item::Question { seq: 2, steps, answered: false },
         ];
         let mut cache = Cache::new();
-        cache.layout(&items, 40, &Folds::new(), Some(2), Turn { running: false, blink: false }, crate::lang::Lang::Ko);
+        cache.layout(
+            &items,
+            40,
+            &Folds::new(),
+            Some(2),
+            Turn { running: false, blink: false },
+            crate::lang::Lang::Ko,
+        );
         assert!(
             !cache.plain().iter().any(|l| l.contains("어느 쪽으로 갈까요")),
             "the question being answered must not appear twice: {:?}",
             cache.plain()
         );
 
-        cache.layout(&items, 40, &Folds::new(), None, Turn { running: false, blink: false }, crate::lang::Lang::Ko);
+        cache.layout(
+            &items,
+            40,
+            &Folds::new(),
+            None,
+            Turn { running: false, blink: false },
+            crate::lang::Lang::Ko,
+        );
         assert!(
             cache.plain().iter().any(|l| l.contains("어느 쪽으로 갈까요")),
             "답이 끝나면 대화에 남아야 한다"
@@ -1626,7 +1690,6 @@ mod tests {
         assert!(lines[row].contains("grep"), "{:?}", lines[row]);
     }
 
-
     /// **Nothing inside a folded card is clickable** — its rows aren't on screen, so a click
     /// target there would point at whatever happens to be drawn at that row instead.
     #[test]
@@ -1637,7 +1700,6 @@ mod tests {
         let by_seq: Vec<i64> = r.cards.values().copied().collect();
         assert_eq!(by_seq, vec![1], "only the card head is clickable when it is folded");
     }
-
 
     /// **A folded card hides open tool details too** — folding the card means folding everything
     /// under it. (The symptom was that folding a card left the tool details below fully expanded.)
@@ -1652,7 +1714,6 @@ mod tests {
         assert!(!out.iter().any(|l| l.contains("grep")), "a folded card hides its rows: {out:?}");
         assert!(!out.iter().any(|l| l.contains("인자")), "tool details are visible: {out:?}");
     }
-
 
     /// **What the agent said survives the card folding away.** It is a message of its own, not one
     /// of the card's parts, so folding the working out never takes the answer with it.
@@ -1672,7 +1733,6 @@ mod tests {
         assert!(out.iter().any(|l| l.contains("이제 커밋합니다")), "{out:?}");
     }
 
-
     /// **Thinking lines must be clickable too** — clicking folds and unfolds the card (the same
     /// action as Ctrl+O). It doesn't open tool detail.
     #[test]
@@ -1688,7 +1748,6 @@ mod tests {
             }
         }
     }
-
 
     /// **A detail is drawn per shape, not as one flat dump.** A shell log, a diff and a match list
     /// are read three different ways, and a JSON dump of any of them is read none.
@@ -1734,8 +1793,12 @@ mod tests {
     #[test]
     fn a_silent_command_still_says_something() {
         use crate::tool_view::{Detail, ToolState};
-        let d =
-            Detail::Exec { exit: Some(0), timed_out: false, out: String::new(), err: String::new() };
+        let d = Detail::Exec {
+            exit: Some(0),
+            timed_out: false,
+            out: String::new(),
+            err: String::new(),
+        };
         let out = detail_lines(&d, 60, ToolState::Ok, crate::lang::Lang::Ko);
         let plain: Vec<String> =
             out.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect()).collect();
@@ -1748,7 +1811,11 @@ mod tests {
         use crate::tool_view::{Detail, Hit, ToolState};
         let d = Detail::Hits {
             scanned: 42,
-            hits: vec![Hit { path: "src/rows.rs".into(), line: 88, text: "fn row_line() {".into() }],
+            hits: vec![Hit {
+                path: "src/rows.rs".into(),
+                line: 88,
+                text: "fn row_line() {".into(),
+            }],
             truncated: false,
         };
         let out = detail_lines(&d, 60, ToolState::Ok, crate::lang::Lang::Ko);
@@ -1834,7 +1901,6 @@ mod tests {
         );
     }
 
-
     /// **Unfolding one tool must redraw that item.**
     /// Looking only at the item's own fold would make the cache think "nothing changed" and the screen stays put.
     #[test]
@@ -1842,16 +1908,29 @@ mod tests {
         let items = [work_at(1)];
         let card_open = open_all(&items[0]);
         let mut cache = Cache::new();
-        cache.layout(&items, 60, &card_open, None, Turn { running: false, blink: false }, crate::lang::Lang::Ko);
+        cache.layout(
+            &items,
+            60,
+            &card_open,
+            None,
+            Turn { running: false, blink: false },
+            crate::lang::Lang::Ko,
+        );
         let before = cache.renders();
 
         let mut both = card_open.clone();
         both.insert(100, Fold { open: true, user_touched: true });
-        cache.layout(&items, 60, &both, None, Turn { running: false, blink: false }, crate::lang::Lang::Ko);
+        cache.layout(
+            &items,
+            60,
+            &both,
+            None,
+            Turn { running: false, blink: false },
+            crate::lang::Lang::Ko,
+        );
         assert_eq!(cache.renders(), before + 1, "a tool was unfolded but nothing was redrawn");
         assert!(cache.plain().iter().any(|l| l.contains("인자")), "{:?}", cache.plain());
     }
-
 
     /// A stretch whose title hasn't arrived yet must still hold its place — the server writes the
     /// first `work_summary` a moment after the run starts.
@@ -1939,7 +2018,9 @@ mod tests {
                     Part::Step(step_at(3, "exec")),
                 ],
             },
-            Item::Agent { seq: 4, text: "다 됐습니다! 셋을 하나로 묶었습니다.".into() },
+            Item::Agent {
+                seq: 4, text: "다 됐습니다! 셋을 하나로 묶었습니다.".into()
+            },
         ];
         // The card is open, so its own children are on screen to be told apart from.
         let out = plain(&rows(&items, 78, &open_all(&items[0]), crate::lang::Lang::Ko));

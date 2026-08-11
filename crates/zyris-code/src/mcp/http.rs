@@ -185,7 +185,8 @@ mod tests {
     /// between the two, and a client that reads only one of them is broken against half of them.
     #[test]
     fn an_answer_on_an_event_stream_is_read_too() {
-        let body = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"ok\":true}}\n\n";
+        let body =
+            "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"ok\":true}}\n\n";
         assert_eq!(reply_to(body, 3).unwrap()["result"]["ok"], json!(true));
     }
 
@@ -291,7 +292,10 @@ mod tests {
         // answers 404 and the tool list comes back empty for no visible reason.
         let seen = server.await.unwrap();
         assert_eq!(seen[0], "", "nothing to echo on the first request");
-        assert!(seen[1..].iter().all(|s| s.contains("s-1")), "the session id was not sent back: {seen:?}");
+        assert!(
+            seen[1..].iter().all(|s| s.contains("s-1")),
+            "the session id was not sent back: {seen:?}"
+        );
     }
 
     #[test]

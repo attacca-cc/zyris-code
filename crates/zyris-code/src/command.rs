@@ -152,9 +152,7 @@ pub fn parse(text: &str) -> Option<Command> {
                     "theme" | "colour" | "color" | "색" | "테마" => {
                         match crate::config::ThemeChoice::parse(value) {
                             Some(theme) => Command::Config(Some(ConfigAction::Theme(theme))),
-                            None => {
-                                return Some(Command::Unknown(format!("config theme {value}")))
-                            }
+                            None => return Some(Command::Unknown(format!("config theme {value}"))),
                         }
                     }
                     "lang" | "language" | "언어" => match crate::lang::Lang::parse(value) {
@@ -288,23 +286,108 @@ impl CommandSpec {
 
 /// The one command list. **Order is the order the `/`-list and `/help` are shown in.**
 pub const COMMANDS: &[CommandSpec] = &[
-    CommandSpec { name: "/help", aliases: &["h"], note_ko: "쓸 수 있는 명령", note_en: "What you can type" },
-    CommandSpec { name: "/mode", aliases: &[], note_ko: "모드를 보거나 바꿉니다 (일반·계획·일·작업)", note_en: "Show or change the mode (normal / plan / work / job)" },
-    CommandSpec { name: "/config", aliases: &[], note_ko: "설정 — 다른 디렉토리 접근(allow·deny)·언어·기본 모드", note_en: "Settings — directory access (allow / deny), language, default mode" },
-    CommandSpec { name: "/agent", aliases: &[], note_ko: "에이전트를 고릅니다. 다음 메시지에서 새 쓰레드가 열립니다", note_en: "Pick an agent. A new thread opens with your next message" },
-    CommandSpec { name: "/mcp", aliases: &[], note_ko: "붙은 MCP 서버와 도구 수", note_en: "MCP servers that connected, and how many tools each brought" },
-    CommandSpec { name: "/skills", aliases: &["skill"], note_ko: "쓸 수 있는 스킬", note_en: "Skills available here" },
-    CommandSpec { name: "/plugin", aliases: &["plugins"], note_ko: "플러그인을 받고 지웁니다 (add·remove·update)", note_en: "Install and remove plugins (add / remove / update)" },
-    CommandSpec { name: "/rules", aliases: &["claude", "agents"], note_ko: "이 쓰레드에 실린 CLAUDE.md·AGENTS.md", note_en: "The CLAUDE.md and AGENTS.md loaded into this thread" },
-    CommandSpec { name: "/cwd", aliases: &["pwd"], note_ko: "도구가 상대경로를 푸는 자리", note_en: "Where tools resolve relative paths" },
-    CommandSpec { name: "/reconnect", aliases: &[], note_ko: "다시 붙습니다. 도구 호출이 응답 없이 멈춰 있을 때", note_en: "Attach again — when tool calls sit there with no answer" },
-    CommandSpec { name: "/account", aliases: &[], note_ko: "계정 정보를 보고, 로그아웃합니다 (logout)", note_en: "Show account info, or log out (logout)" },
-    CommandSpec { name: "/status", aliases: &["info"], note_ko: "지금 세션·에이전트·모드·사용량을 한눈에", note_en: "Session, agent, mode and usage at a glance" },
-    CommandSpec { name: "/jobs", aliases: &["job"], note_ko: "배경에서 도는 작업 (stop <id>로 멈춥니다)", note_en: "Background jobs (stop <id> kills one)" },
-    CommandSpec { name: "/changes", aliases: &["changed", "diff"], note_ko: "이 디렉터리에서 바꾼 파일", note_en: "Files changed in this directory" },
-    CommandSpec { name: "/undo", aliases: &[], note_ko: "마지막 편집을 되돌립니다", note_en: "Undo the last edit" },
-    CommandSpec { name: "/clear", aliases: &[], note_ko: "화면의 대화를 지웁니다 (쓰레드는 그대로입니다)", note_en: "Clear the screen (the thread itself is untouched)" },
-    CommandSpec { name: "/quit", aliases: &["exit", "q"], note_ko: "끝냅니다. 도는 턴이 있으면 서버에서도 멈춥니다", note_en: "Quit. A running turn is stopped on the server too" },
+    CommandSpec {
+        name: "/help",
+        aliases: &["h"],
+        note_ko: "쓸 수 있는 명령",
+        note_en: "What you can type",
+    },
+    CommandSpec {
+        name: "/mode",
+        aliases: &[],
+        note_ko: "모드를 보거나 바꿉니다 (일반·계획·일·작업)",
+        note_en: "Show or change the mode (normal / plan / work / job)",
+    },
+    CommandSpec {
+        name: "/config",
+        aliases: &[],
+        note_ko: "설정 — 다른 디렉토리 접근(allow·deny)·언어·기본 모드",
+        note_en: "Settings — directory access (allow / deny), language, default mode",
+    },
+    CommandSpec {
+        name: "/agent",
+        aliases: &[],
+        note_ko: "에이전트를 고릅니다. 다음 메시지에서 새 쓰레드가 열립니다",
+        note_en: "Pick an agent. A new thread opens with your next message",
+    },
+    CommandSpec {
+        name: "/mcp",
+        aliases: &[],
+        note_ko: "붙은 MCP 서버와 도구 수",
+        note_en: "MCP servers that connected, and how many tools each brought",
+    },
+    CommandSpec {
+        name: "/skills",
+        aliases: &["skill"],
+        note_ko: "쓸 수 있는 스킬",
+        note_en: "Skills available here",
+    },
+    CommandSpec {
+        name: "/plugin",
+        aliases: &["plugins"],
+        note_ko: "플러그인을 받고 지웁니다 (add·remove·update)",
+        note_en: "Install and remove plugins (add / remove / update)",
+    },
+    CommandSpec {
+        name: "/rules",
+        aliases: &["claude", "agents"],
+        note_ko: "이 쓰레드에 실린 CLAUDE.md·AGENTS.md",
+        note_en: "The CLAUDE.md and AGENTS.md loaded into this thread",
+    },
+    CommandSpec {
+        name: "/cwd",
+        aliases: &["pwd"],
+        note_ko: "도구가 상대경로를 푸는 자리",
+        note_en: "Where tools resolve relative paths",
+    },
+    CommandSpec {
+        name: "/reconnect",
+        aliases: &[],
+        note_ko: "다시 붙습니다. 도구 호출이 응답 없이 멈춰 있을 때",
+        note_en: "Attach again — when tool calls sit there with no answer",
+    },
+    CommandSpec {
+        name: "/account",
+        aliases: &[],
+        note_ko: "계정 정보를 보고, 로그아웃합니다 (logout)",
+        note_en: "Show account info, or log out (logout)",
+    },
+    CommandSpec {
+        name: "/status",
+        aliases: &["info"],
+        note_ko: "지금 세션·에이전트·모드·사용량을 한눈에",
+        note_en: "Session, agent, mode and usage at a glance",
+    },
+    CommandSpec {
+        name: "/jobs",
+        aliases: &["job"],
+        note_ko: "배경에서 도는 작업 (stop <id>로 멈춥니다)",
+        note_en: "Background jobs (stop <id> kills one)",
+    },
+    CommandSpec {
+        name: "/changes",
+        aliases: &["changed", "diff"],
+        note_ko: "이 디렉터리에서 바꾼 파일",
+        note_en: "Files changed in this directory",
+    },
+    CommandSpec {
+        name: "/undo",
+        aliases: &[],
+        note_ko: "마지막 편집을 되돌립니다",
+        note_en: "Undo the last edit",
+    },
+    CommandSpec {
+        name: "/clear",
+        aliases: &[],
+        note_ko: "화면의 대화를 지웁니다 (쓰레드는 그대로입니다)",
+        note_en: "Clear the screen (the thread itself is untouched)",
+    },
+    CommandSpec {
+        name: "/quit",
+        aliases: &["exit", "q"],
+        note_ko: "끝냅니다. 도는 턴이 있으면 서버에서도 멈춥니다",
+        note_en: "Quit. A running turn is stopped on the server too",
+    },
 ];
 
 /// The list that appears when `/` is typed. **`/help` prints the same thing.**
@@ -323,6 +406,14 @@ pub fn catalogue(lang: crate::lang::Lang) -> Vec<(&'static str, &'static str)> {
             (c.name, note)
         })
         .collect()
+}
+
+/// The names this app answers to itself, without the slash.
+///
+/// **A plugin may not take one of these.** `/help` has to stay `/help`, whatever a plugin calls a
+/// file of its own — so a colliding plugin command is namespaced instead (`plugin::commands`).
+pub fn builtin_names() -> Vec<&'static str> {
+    COMMANDS.iter().map(|c| c.name.trim_start_matches('/')).collect()
 }
 
 /// Keys worth knowing. **If it isn't on the screen, it doesn't exist** — a README isn't opened when you need it.

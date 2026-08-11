@@ -109,7 +109,8 @@ impl Diff {
         for raw in text.lines() {
             let line = if let Some(rest) = raw.strip_prefix("@@ ") {
                 // Leading digits only, so the worded markers older builds wrote still read back.
-                let digits: String = rest.trim_start().chars().take_while(char::is_ascii_digit).collect();
+                let digits: String =
+                    rest.trim_start().chars().take_while(char::is_ascii_digit).collect();
                 DiffLine::Skip(digits.parse().ok()?)
             } else {
                 match raw.chars().next() {

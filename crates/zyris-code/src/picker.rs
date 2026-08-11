@@ -54,6 +54,12 @@ pub enum Level {
     Agents,
     /// The slash-command list shown when typing `/`.
     Commands,
+    /// Where to put a plugin that is about to be fetched. **Asked rather than assumed**: on this
+    /// machine it is there for every project, and in the project it travels with the repo — and
+    /// which of those someone wants is not something the address can say.
+    PluginTarget {
+        source: String,
+    },
 }
 
 /// What happens when picked.
@@ -74,6 +80,8 @@ pub enum Pick {
     /// Puts this command in the input field. **Doesn't run it immediately** — commands like
     /// `/mode` take arguments, so you must be able to keep typing after picking.
     TypeCommand { text: String },
+    /// Fetches a plugin into the machine's directory or this project's.
+    InstallPlugin { source: String, project: bool },
     /// A row that can't be picked. Says why.
     Unavailable(String),
 }
@@ -267,8 +275,13 @@ impl Picker {
         items: Vec<(String, String, ThreadStatus)>,
         lang: crate::lang::Lang,
     ) -> Self {
-        let mut rows =
-            vec![Row { id: None, label: lang.new_thread().into(), note: None, enabled: true, status: None }];
+        let mut rows = vec![Row {
+            id: None,
+            label: lang.new_thread().into(),
+            note: None,
+            enabled: true,
+            status: None,
+        }];
         rows.extend(items.into_iter().map(|(id, title, status)| Row {
             id: Some(id),
             label: title,
@@ -295,12 +308,39 @@ impl Picker {
         Self { level: Level::Agents, rows, cursor: 0, top: 0, loading: false }
     }
 
+    /// Where to put a plugin about to be fetched.
+    ///
+    /// **The machine is first** because it is what people mean nearly always — a plugin in the
+    /// project has to be committed or gitignored, which is a decision of its own.
+    pub fn plugin_target(source: String, lang: crate::lang::Lang) -> Self {
+        let rows = vec![
+            Row {
+                id: Some("machine".into()),
+                label: lang.plugin_where_machine().into(),
+                note: Some(lang.plugin_where_machine_note().into()),
+                enabled: true,
+                status: None,
+            },
+            Row {
+                id: Some("project".into()),
+                label: lang.plugin_where_project().into(),
+                note: Some(lang.plugin_where_project_note().into()),
+                enabled: true,
+                status: None,
+            },
+        ];
+        Self { level: Level::PluginTarget { source }, rows, cursor: 0, top: 0, loading: false }
+    }
+
     /// The slash-command list. Opens when `/` is typed.
     ///
     /// **The list comes from the single `command::catalogue()`** — writing it here too lets one go stale.
     /// The language is decided by the screen (`State.lang`).
-    pub fn commands(lang: crate::lang::Lang) -> Self {
-        let rows = crate::command::catalogue(lang)
+    ///
+    /// `added` is what the plugins bring (`plugin::commands`). **They come after the built-ins** so
+    /// that the commands this app is answerable for are the ones read first.
+    pub fn commands(lang: crate::lang::Lang, added: &[crate::plugin::PluginCommand]) -> Self {
+        let mut rows: Vec<Row> = crate::command::catalogue(lang)
             .into_iter()
             .map(|(name, note)| Row {
                 id: Some(name.to_string()),
@@ -310,15 +350,32 @@ impl Picker {
                 status: None,
             })
             .collect();
+        rows.extend(added.iter().map(|c| Row {
+            id: Some(format!("/{}", c.name)),
+            label: format!("/{}", c.name),
+            // **Which plugin it came from is part of the description.** A command that runs
+            // somebody else's prompt should say whose.
+            note: Some(match c.description.is_empty() {
+                true => c.plugin.clone(),
+                false => format!("{} · {}", c.description, c.plugin),
+            }),
+            enabled: true,
+            status: None,
+        }));
         Self { level: Level::Commands, rows, cursor: 0, top: 0, loading: false }
     }
 
     /// Narrows the list by typed text. If nothing remains, leaves it as is — an empty list looks broken.
-    pub fn narrow(&mut self, typed: &str, lang: crate::lang::Lang) {
+    pub fn narrow(
+        &mut self,
+        typed: &str,
+        lang: crate::lang::Lang,
+        added: &[crate::plugin::PluginCommand],
+    ) {
         if !matches!(self.level, Level::Commands) {
             return;
         }
-        *self = Picker::commands(lang);
+        *self = Picker::commands(lang, added);
         self.rows.retain(|r| r.label.starts_with(typed));
         self.cursor = 0;
     }
@@ -366,7 +423,12 @@ impl Picker {
             (Level::Projects, None) => Some(Pick::NewProject),
             (Level::Agents, Some(name)) => Some(Pick::UseAgent { name: name.clone() }),
             (Level::Commands, Some(text)) => Some(Pick::TypeCommand { text: text.clone() }),
-            (Level::Agents, None) | (Level::Commands, None) => None,
+            (Level::PluginTarget { source }, Some(where_to)) => {
+                Some(Pick::InstallPlugin { source: source.clone(), project: where_to == "project" })
+            }
+            (Level::Agents, None)
+            | (Level::Commands, None)
+            | (Level::PluginTarget { .. }, None) => None,
         }
     }
 
@@ -377,6 +439,7 @@ impl Picker {
             Level::Sessions { project_name, .. } => lang.threads_in(project_name),
             Level::Agents => lang.agents().into(),
             Level::Commands => lang.commands().into(),
+            Level::PluginTarget { .. } => lang.plugin_where_title().into(),
         }
     }
 }
@@ -588,7 +651,7 @@ mod tests {
     /// Lists without a create row (agents·commands) get no rule.
     #[test]
     fn a_list_without_a_create_row_has_no_rule() {
-        let got = lay(&Picker::commands(crate::lang::Lang::Ko).rows, 0, 20);
+        let got = lay(&Picker::commands(crate::lang::Lang::Ko, &[]).rows, 0, 20);
         assert!(!got.contains(&Slot::Rule), "{got:?}");
     }
 
@@ -596,8 +659,12 @@ mod tests {
         Picker::agents(
             ["Main Agent", "Zyris Code"]
                 .into_iter()
-                .map(|n| {
-                    Row { id: Some(n.into()), label: n.into(), note: None, enabled: true, status: None }
+                .map(|n| Row {
+                    id: Some(n.into()),
+                    label: n.into(),
+                    note: None,
+                    enabled: true,
+                    status: None,
                 })
                 .collect(),
         )
@@ -614,7 +681,7 @@ mod tests {
     /// **If the list and parser diverge, the pick doesn't work.** The list comes from `command::catalogue()`.
     #[test]
     fn every_command_row_is_something_the_parser_knows() {
-        for row in Picker::commands(crate::lang::Lang::Ko).rows {
+        for row in Picker::commands(crate::lang::Lang::Ko, &[]).rows {
             assert!(crate::command::parse(&row.label).is_some(), "{}", row.label);
         }
     }
@@ -622,19 +689,19 @@ mod tests {
     /// **Picking only puts it in the input field; it doesn't run.** `/mode` takes arguments.
     #[test]
     fn picking_a_command_only_types_it() {
-        let p = Picker::commands(crate::lang::Lang::Ko);
+        let p = Picker::commands(crate::lang::Lang::Ko, &[]);
         assert_eq!(p.pick(), Some(Pick::TypeCommand { text: "/help".into() }));
     }
 
     /// Narrowed by typed text. Without it, you'd have to find it by eye in the list.
     #[test]
     fn typing_narrows_the_command_rows() {
-        let mut p = Picker::commands(crate::lang::Lang::Ko);
-        p.narrow("/mo", crate::lang::Lang::Ko);
+        let mut p = Picker::commands(crate::lang::Lang::Ko, &[]);
+        p.narrow("/mo", crate::lang::Lang::Ko, &[]);
         assert_eq!(p.rows.len(), 1, "{:?}", p.rows);
         assert_eq!(p.rows[0].label, "/mode");
         // Widening again must bring it back — if deleting one character lost it, it's unusable.
-        p.narrow("/m", crate::lang::Lang::Ko);
+        p.narrow("/m", crate::lang::Lang::Ko, &[]);
         assert!(p.rows.iter().any(|r| r.label == "/mcp"), "{:?}", p.rows);
     }
 

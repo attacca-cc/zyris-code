@@ -336,6 +336,9 @@ pub struct State {
     /// Should the answer filled in by submitting the question be sent right away? The I/O
     /// side sees it and clears it.
     pub submit_now: bool,
+    /// The slash commands the plugins add (`plugin::commands`). **Read once at startup** — they
+    /// are files on disk, and re-reading them per keystroke would put disk access in the draw loop.
+    pub plugin_commands: Vec<crate::plugin::PluginCommand>,
     /// The open project/session list.
     pub picker: Option<crate::picker::Picker>,
     /// Cached last-turn outcome per session id, so the picker's real-time refresh does not
@@ -484,6 +487,7 @@ impl Default for State {
             ask_area: None,
             activity_row: None,
             submit_now: false,
+            plugin_commands: Vec::new(),
             picker: None,
             thread_status: std::collections::HashMap::new(),
             thread_was_running: std::collections::HashMap::new(),
@@ -924,8 +928,14 @@ pub fn apply(state: &mut State, action: &Action) {
     // which already drop the highlight while keeping the copied text.
     if !matches!(
         action,
-        Action::Press(..) | Action::DragTo(..) | Action::Release | Action::OpenLink(_)
-            | Action::Wheel(_) | Action::Page(_) | Action::Repaint | Action::ClearSelection
+        Action::Press(..)
+            | Action::DragTo(..)
+            | Action::Release
+            | Action::OpenLink(_)
+            | Action::Wheel(_)
+            | Action::Page(_)
+            | Action::Repaint
+            | Action::ClearSelection
     ) && (state.drag.is_some() || state.selection.is_some())
     {
         state.drag = None;
@@ -1444,10 +1454,9 @@ fn apply_frame(state: &mut State, frame: &Frame) {
         // **It is dropped if the list has moved on.** A slow project list arriving after the
         // person already went into a project would throw them back out.
         Frame::Picker { picker, thread_was_running } => {
-            let same = state
-                .picker
-                .as_ref()
-                .is_some_and(|cur| std::mem::discriminant(&cur.level) == std::mem::discriminant(&picker.level));
+            let same = state.picker.as_ref().is_some_and(|cur| {
+                std::mem::discriminant(&cur.level) == std::mem::discriminant(&picker.level)
+            });
             if same {
                 let (cursor, top) =
                     state.picker.as_ref().map(|cur| (cur.cursor, cur.top)).unwrap_or((0, 0));
@@ -1598,8 +1607,8 @@ fn follow_the_slash(state: &mut State) {
         matches!(state.picker.as_ref().map(|p| &p.level), Some(crate::picker::Level::Commands));
     match (opening, showing) {
         (true, _) => {
-            let mut p = crate::picker::Picker::commands(state.lang);
-            p.narrow(&typed, state.lang);
+            let mut p = crate::picker::Picker::commands(state.lang, &state.plugin_commands);
+            p.narrow(&typed, state.lang, &state.plugin_commands);
             // If narrowing leaves nothing, close the list — an empty window looks broken,
             // and it only covers the screen while typing a non-command like `/home/...`.
             state.picker = (!p.rows.is_empty()).then_some(p);
@@ -1685,6 +1694,24 @@ pub fn run_command(state: &mut State, text: &str) -> Option<crate::command::Comm
         // Letting an unknown one pass quietly means getting it wrong again next time. Say
         // what does exist alongside.
         Command::Unknown(what) => {
+            // **A plugin's command is looked for before it is called unknown.** The parser knows
+            // only the built-in table — anything a plugin adds arrives here, and this is where it
+            // stops being a typo and starts being a command.
+            //
+            // What it does is send its prompt. A command is a prompt (`plugin::PluginCommand`), so
+            // running one is typing what the plugin author wrote and pressing Enter — reusing the
+            // ordinary send path rather than inventing a second way for text to reach the server.
+            if let Some(found) = state.plugin_commands.iter().find(|c| c.name == *what) {
+                let prompt = found.prompt.clone();
+                if prompt.is_empty() {
+                    state.timeline.say(state.lang.plugin_command_empty(what));
+                    return Some(cmd);
+                }
+                state.input.take();
+                state.input.insert_str(&prompt);
+                state.submit_now = true;
+                return Some(cmd);
+            }
             state
                 .timeline
                 .say(state.lang.unknown_command(what, &crate::command::help_text(state.lang)));
@@ -2193,6 +2220,9 @@ async fn run_inner(
     if let Some(mode) = state.config.default_mode {
         state.mode = mode;
     }
+    // **Read once, here.** The `/` list is built on every keystroke, and reading the plugin
+    // directories from the draw loop would put disk access on the typing path.
+    state.plugin_commands = crate::plugin::commands(&crate::plugin::discover(&state.cwd));
 
     // **Attach the screen first.** The enrollment code window has to reach it even before
     // the first connection — `enroll::ScreenEnroll` sends `Frame::Enroll` here.
@@ -3129,9 +3159,7 @@ fn spawn_agents(api: &Arc<AttaccaApiClient>, tx: &mpsc::UnboundedSender<AppMsg>)
                     thread_was_running: None,
                 }
             }
-            Err(e) => {
-                Frame::PickerFailed(crate::lang::current().agent_list_error(&e.to_string()))
-            }
+            Err(e) => Frame::PickerFailed(crate::lang::current().agent_list_error(&e.to_string())),
         };
         let _ = tx.send((None, Action::Frame(frame)));
     });
@@ -3142,11 +3170,7 @@ fn spawn_agents(api: &Arc<AttaccaApiClient>, tx: &mpsc::UnboundedSender<AppMsg>)
 /// **Tagged with the session id.** Switching again while this is in flight leaves an answer
 /// nobody wants any more, and `frame_is_current` drops it — otherwise the loser would land on
 /// top of the thread the person actually chose.
-fn spawn_history(
-    api: &Arc<AttaccaApiClient>,
-    tx: &mpsc::UnboundedSender<AppMsg>,
-    id: String,
-) {
+fn spawn_history(api: &Arc<AttaccaApiClient>, tx: &mpsc::UnboundedSender<AppMsg>, id: String) {
     let (api, tx) = (Arc::clone(api), tx.clone());
     tokio::spawn(async move {
         let frame = match crate::conn::history(&api, &id).await {
@@ -3219,6 +3243,24 @@ async fn pick(
             state.usage.clear();
             state.picker = None;
             let _ = agent_id;
+        }
+        // **Fetching is the moment somebody else's code lands on this machine**, so it happens
+        // only once the person has said where — never as a side effect of typing the address.
+        Pick::InstallPlugin { source, project } => {
+            state.picker = None;
+            let into = if project {
+                state.cwd.join(".zyris-code/plugins")
+            } else {
+                crate::plugin::install_dir()
+            };
+            let said = match crate::plugin::install_into(&into, &source).await {
+                Ok(p) => {
+                    let contents = state.lang.plugin_contents_text(&p);
+                    state.lang.plugin_added(&p, &contents)
+                }
+                Err(why) => why,
+            };
+            state.timeline.say(said);
         }
         Pick::UseAgent { name } => {
             state.picker = None;
@@ -3306,7 +3348,8 @@ fn switch(
     let (api, tx, sid) = (Arc::clone(api), tx.clone(), id);
     tokio::spawn(async move {
         let title = crate::conn::session_title(&api, &sid).await;
-        let _ = tx.send((Some(Origin::asked(sid)), Action::Frame(Frame::Poll { usage: None, title })));
+        let _ =
+            tx.send((Some(Origin::asked(sid)), Action::Frame(Frame::Poll { usage: None, title })));
     });
 }
 
@@ -3354,9 +3397,8 @@ async fn finish_command(
             };
             // **Only what was discovered can be switched.** A server written down for this app
             // always runs, so saying "off" about one would be a promise this cannot keep.
-            let known = crate::mcp::discovery::found(&state.cwd)
-                .into_iter()
-                .any(|f| f.spec.slug == slug);
+            let known =
+                crate::mcp::discovery::found(&state.cwd).into_iter().any(|f| f.spec.slug == slug);
             if !known {
                 state.timeline.say(state.lang.mcp_not_found(&slug));
                 return;
@@ -3409,7 +3451,12 @@ async fn finish_command(
                 }
                 other => {
                     let said = run_plugin(state, other).await;
-                    state.timeline.say(said);
+                    // **An empty answer means the command opened something instead of finishing.**
+                    // `/plugin add` puts up the where-to list; saying nothing there would add a
+                    // blank line to the transcript under the box.
+                    if !said.is_empty() {
+                        state.timeline.say(said);
+                    }
                 }
             }
         }
@@ -3544,13 +3591,13 @@ async fn run_plugin(state: &mut State, what: crate::command::Plugin) -> String {
         // **The list is a panel now** (`finish_command` routes it there) — this arm
         // is only a safety net for a direct call.
         P::List => state.lang.plugin_list_text(&plugin::discover(&state.cwd)),
-        P::Add(source) => match plugin::install(&source).await {
-            Ok(p) => {
-                let contents = state.lang.plugin_contents_text(&p);
-                state.lang.plugin_added(&p, &contents)
-            }
-            Err(why) => why,
-        },
+        // **Asks where before fetching anything.** On this machine it is there for every project;
+        // in the project it travels with the repo and shows up in `git status`. The address cannot
+        // say which of those was wanted, so the person does (`Pick::InstallPlugin`).
+        P::Add(source) => {
+            state.picker = Some(crate::picker::Picker::plugin_target(source, state.lang));
+            String::new()
+        }
         P::Remove(name) => match plugin::remove(&name) {
             Ok(()) => state.lang.plugin_removed(&name),
             Err(why) => why,
@@ -4527,7 +4574,10 @@ mod tests {
             }),
         );
         assert!(
-            matches!(s.picker.as_ref().map(|p| &p.level), Some(crate::picker::Level::Sessions { .. })),
+            matches!(
+                s.picker.as_ref().map(|p| &p.level),
+                Some(crate::picker::Level::Sessions { .. })
+            ),
             "the thread list was replaced by a stale project list"
         );
     }
@@ -4623,7 +4673,6 @@ mod tests {
         })
     }
 
-
     /// The fold key Ctrl+O targets — the last card's head.
     fn last_card_key(s: &mut State) -> i64 {
         let item = s
@@ -4699,11 +4748,8 @@ mod tests {
     fn link_at_is_none_outside_the_transcript() {
         let mut s = state();
         s.view_origin = (0, 0);
-        s.view_links = vec![vec![crate::markdown::Link {
-            start: 0,
-            end: 2,
-            url: "https://e.com/".into(),
-        }]];
+        s.view_links =
+            vec![vec![crate::markdown::Link { start: 0, end: 2, url: "https://e.com/".into() }]];
         assert_eq!(s.link_at(1, 5), None, "line beyond the transcript");
         assert_eq!(s.link_at(1, 0), Some("https://e.com/".to_string()));
         assert_eq!(s.view_links.len(), 1);
@@ -4855,7 +4901,10 @@ mod tests {
     fn an_opened_card_is_never_folded_behind_the_users_back() {
         let mut s = state();
         apply(&mut s, &work_start(1));
-        apply(&mut s, &Action::Frame(Frame::Delta { kind: ZDeltaKind::Reasoning, text: "생각".into() }));
+        apply(
+            &mut s,
+            &Action::Frame(Frame::Delta { kind: ZDeltaKind::Reasoning, text: "생각".into() }),
+        );
         apply(&mut s, &Action::ToggleFold);
         let key = last_card_key(&mut s);
         assert!(s.folds[&key].open, "one Ctrl+O unfolds the card");
@@ -4866,7 +4915,6 @@ mod tests {
         }
         assert!(s.folds[&key].open, "a delta folded a card the person opened");
     }
-
 
     #[test]
     fn ctrl_o_toggles_the_latest_card() {
@@ -5323,13 +5371,15 @@ mod tests {
                 todo: None,
             }),
         );
-        apply(&mut s, &Action::Frame(Frame::Delta { kind: ZDeltaKind::Reasoning, text: "새 생각".into() }));
+        apply(
+            &mut s,
+            &Action::Frame(Frame::Delta { kind: ZDeltaKind::Reasoning, text: "새 생각".into() }),
+        );
         let second = last_card_key(&mut s);
         assert_ne!(second, first, "speaking must have opened a new card");
         let f = s.folds.get(&second).copied().unwrap_or_default();
         assert!(!f.user_touched, "a fresh card must not be the person's choice");
     }
-
 
     // ── Tool approval ──────────────────────────────────────────────────
 

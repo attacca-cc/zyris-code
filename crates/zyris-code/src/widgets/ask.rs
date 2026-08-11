@@ -65,7 +65,8 @@ pub fn draw(frame: &mut Frame, area: Rect, a: &Answering, lang: crate::lang::Lan
 
     for (i, row) in a.rows().into_iter().enumerate() {
         let on = i == a.cursor && !a.typing;
-        let caret = Span::styled(if on { "❯ " } else { "  " }, Style::default().fg(theme::accent()));
+        let caret =
+            Span::styled(if on { "❯ " } else { "  " }, Style::default().fg(theme::accent()));
         match row {
             RowKind::Option(j) => {
                 let opt = &step.options[j];
@@ -151,7 +152,8 @@ pub fn draw(frame: &mut Frame, area: Rect, a: &Answering, lang: crate::lang::Lan
     }
 
     let hint = if a.typing { lang.typing_keys() } else { lang.choosing_keys() };
-    lines.push(Line::from(Span::styled(hint.to_string(), Style::default().fg(theme::text_muted()))));
+    lines
+        .push(Line::from(Span::styled(hint.to_string(), Style::default().fg(theme::text_muted()))));
 
     frame.render_widget(Paragraph::new(lines), area);
 }
@@ -204,7 +206,11 @@ fn draw_review(
                 Span::styled(format!("{q}  "), Style::default().fg(theme::text_muted())),
                 Span::styled(
                     ans,
-                    Style::default().fg(if skipped { theme::border_light() } else { theme::text() }),
+                    Style::default().fg(if skipped {
+                        theme::border_light()
+                    } else {
+                        theme::text()
+                    }),
                 ),
             ],
             area.width as usize,

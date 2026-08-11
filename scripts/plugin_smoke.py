@@ -105,6 +105,10 @@ try:
     check(until("플러그인이 없습니다", 8, "빈 목록"), "처음엔 비어 있다고 말한다")
     close_panel()
     buf.clear(); send(f"/plugin add {ORIGIN}")
+    # **It asks where before it fetches.** On this machine it is there for every project; in the
+    # project it lands in the repo. Enter takes the first row, which is the machine.
+    check(until("어디에", 8, "설치 위치"), "어디에 받을지 먼저 묻는다")
+    send("\r")
     until("받았습니다", 25, "설치")
     shown = snapshot()
     check("시험플러그인" in shown, "로컬 리포에서 받는다")
@@ -120,11 +124,12 @@ try:
     check(until("지웠습니다", 10, "삭제"), "보이는 이름으로 지운다")
     check(not os.path.exists(f"{HOME}/.config/zyris-code/plugins/원본플러그인"), "디스크에서 실제로 사라진다")
     buf.clear(); send("/plugin add 없는사람/없는리포")
+    send("\r")
     check(until("git", 25, "실패 사유") or until("찾", 3, "x"), "못 받으면 사유를 말한다")
 finally:
     if proc.poll() is None: proc.send_signal(signal.SIGKILL)
     os.close(p)
     # The real home was used, so it must be cleaned up.
     shutil.rmtree(f"{HOME}/.config/zyris-code/plugins/원본플러그인", ignore_errors=True)
-print(f"\n{n}/11 통과")
-sys.exit(0 if ok and n == 11 else 1)
+print(f"\n{n}/12 통과")
+sys.exit(0 if ok and n == 12 else 1)

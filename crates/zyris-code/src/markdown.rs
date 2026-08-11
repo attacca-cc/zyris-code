@@ -118,7 +118,10 @@ pub fn render_rich(src: &str, width: u16) -> Rendered {
                 in_code = true;
             }
             Event::End(TagEnd::CodeBlock) => {
-                out.push(Line::from(Span::styled("└─", Style::default().fg(theme::border_light()))));
+                out.push(Line::from(Span::styled(
+                    "└─",
+                    Style::default().fg(theme::border_light()),
+                )));
                 out_links.push(Vec::new());
                 in_code = false;
             }
