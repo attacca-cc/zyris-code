@@ -46,6 +46,13 @@ pub enum Frame {
     ExecStart {
         id: u64,
         command: String,
+        /// **Which conversation asked for it**, when the server said. This node runs one account's
+        /// tools for every session on it at once, so without this the activity line narrates work
+        /// another window asked for as though it were this one's.
+        ///
+        /// `None` means the server did not say — an older attacca, which sends the node nothing
+        /// but the arguments. Then the guess in `apply` stands in for it.
+        session: Option<String>,
     },
     ExecDone {
         id: u64,
@@ -127,6 +134,21 @@ pub enum Frame {
     EnrollPhase(EnrollPhase),
     /// Approved, and the credential was stored. Close the window.
     EnrollDone,
+}
+
+impl Frame {
+    /// Which conversation this frame is about, when it is about one at all.
+    ///
+    /// **Almost every frame the bridge sends belongs to the window rather than to a conversation**
+    /// — enrollment, git, a shell running in this process — and answers `None` so it always
+    /// reaches the screen. Only work the server attributed to a session answers otherwise, and
+    /// `Bridge::send` turns that into the `Origin` that `frame_is_current` filters on.
+    pub fn session(&self) -> Option<String> {
+        match self {
+            Frame::ExecStart { session, .. } => session.clone(),
+            _ => None,
+        }
+    }
 }
 
 /// What to draw in the enrollment code window.
@@ -1719,23 +1741,26 @@ fn apply_frame(state: &mut State, frame: &Frame) {
         }
         // The time is not carried in the frame but stamped where it is received — same way
         // as `status_at`.
-        Frame::ExecStart { id, command } => {
-            // **Only what this conversation asked for.** A tool call carries no session — attacca
-            // knows which session made it (`route.rs`'s `target.session_id`) but sends the node
-            // nothing but the arguments — so this window runs commands for every session on the
-            // account, including ones open in another window. Drawn without asking, the activity
-            // line narrated somebody else's work as though it were this conversation's.
+        Frame::ExecStart { id, command, session } => {
+            // **Only what this conversation asked for.** This window runs commands for every
+            // session on the account, including ones open in another window, so drawn without
+            // asking the activity line narrates somebody else's work as this conversation's.
             //
-            // A turn of ours running is what makes a call ours. While this window is idle every
-            // call arriving is by definition another session's. It is not exact — our turn and
-            // another session's call can overlap — but it is right in the case that actually
-            // happens, and being exact needs the server to say who called.
+            // **When the server says who asked, that is already settled before here.** The frame
+            // carries an `Origin` built from `session`, and `frame_is_current` drops a foreign one
+            // exactly the way it drops a foreign turn-stream frame — so a `session` that survived
+            // to this point is ours, whatever the turn state happens to be.
             //
-            // **Shells and background jobs are not filtered this way** (`ShellOpened`,
+            // Only an older attacca leaves it `None`, and then the guess stands in: a turn of ours
+            // running is what makes a call ours, because while this window is idle every call
+            // arriving is by definition another session's. Not exact — our turn and another
+            // session's call can overlap — but right in the case that actually happens.
+            //
+            // **Shells and background jobs are not filtered either way** (`ShellOpened`,
             // `JobStart`). Those are not a narration, they are processes living in *this*
             // process: hiding one leaves the person quitting the app unaware and taking a build
             // down with it.
-            if state.running {
+            if session.is_some() || state.running {
                 state.running_exec = Some((*id, command.clone(), Instant::now()));
             }
         }
@@ -5934,17 +5959,54 @@ mod tests {
     fn a_command_this_conversation_did_not_ask_for_is_not_shown() {
         let mut s = state();
         s.connected = true;
-        apply(&mut s, &Action::Frame(Frame::ExecStart { id: 1, command: "sleep 30".into() }));
+        apply(&mut s, &Action::Frame(Frame::ExecStart { id: 1, command: "sleep 30".into(), session: None }));
         let (_, text, hint) = crate::widgets::activity_parts_at(&s, std::time::Instant::now());
         assert!(!text.contains("sleep 30"), "somebody else's command was narrated: {text}");
         assert_eq!(hint, "", "this session has no turn to stop");
 
         // Ours, though, is exactly what this line is for.
         apply(&mut s, &Action::Frame(Frame::Status { running: true }));
-        apply(&mut s, &Action::Frame(Frame::ExecStart { id: 2, command: "cargo test".into() }));
+        apply(&mut s, &Action::Frame(Frame::ExecStart { id: 2, command: "cargo test".into(), session: None }));
         let (_, text, hint) = crate::widgets::activity_parts_at(&s, std::time::Instant::now());
         assert!(text.contains("cargo test"), "{text}");
         assert_eq!(hint, s.lang.esc_stops());
+    }
+
+    /// **When the server says who asked, the guess steps aside.**
+    ///
+    /// The rule above — a turn of ours is running, so the call is ours — is a stand-in for a fact
+    /// nobody was sending. attacca has held `session_id` all along and now puts it on the call
+    /// (`Envelope::Req`'s `meta`), so a command can be attributed instead of inferred.
+    ///
+    /// Two things have to hold, and they pull in opposite directions. A named command from
+    /// **another** conversation must not be drawn even while our own turn runs — the case the
+    /// guess gets wrong, because it reads any call arriving during our turn as ours. And a named
+    /// command from **this** conversation must be drawn even when no turn of ours is running —
+    /// the case the guess also gets wrong, since a call can land in the gap before `Status`.
+    #[test]
+    fn a_named_command_is_judged_by_who_asked_not_by_what_we_are_doing() {
+        let mut s = state();
+        s.connected = true;
+        // The conversation on screen. It lives on `Session`, which the loop holds beside `State`,
+        // and it is what `frame_is_current` weighs an arriving frame against.
+        let on_screen = Some("ours");
+
+        // Ours, and no turn of ours is running: the fact wins over the guess.
+        let mine =
+            Frame::ExecStart { id: 1, command: "cargo test".into(), session: Some("ours".into()) };
+        assert!(frame_is_current(&mine.session().map(Origin::asked), on_screen, 0));
+        apply(&mut s, &Action::Frame(mine));
+        let (_, text, _) = crate::widgets::activity_parts_at(&s, std::time::Instant::now());
+        assert!(text.contains("cargo test"), "our own command was withheld: {text}");
+
+        // Another conversation's, while our turn is running: the guess would have shown it.
+        apply(&mut s, &Action::Frame(Frame::Status { running: true }));
+        let theirs =
+            Frame::ExecStart { id: 2, command: "rm -rf /".into(), session: Some("theirs".into()) };
+        assert!(
+            !frame_is_current(&theirs.session().map(Origin::asked), on_screen, 0),
+            "a command another conversation asked for reached this screen"
+        );
     }
 
     /// **A question opens only on the conversation that was asked.** `state.asking` is set from

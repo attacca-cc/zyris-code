@@ -14,8 +14,8 @@ members = ["crates/zyris-code"]
 # `cargo metadata` failed. At the time zyris-code leaned on code **only we knew about**, and with a
 # single copy there was nothing to recover with. Open a PR, merge it, and write that commit here — never attach by path.
 [workspace.dependencies]
-zyris = { git = "https://github.com/attacca-cc/zyris", rev = "31a2ae616957522ccbcb49c485854de62a89d333", features = ["enroll"] }
-zyris-attacca = { git = "https://github.com/attacca-cc/zyris", rev = "31a2ae616957522ccbcb49c485854de62a89d333" }
+zyris = { git = "https://github.com/attacca-cc/zyris", rev = "9666c215ee70cf2f26bd8c6ea56d561cdfdeca85", features = ["enroll"] }
+zyris-attacca = { git = "https://github.com/attacca-cc/zyris", rev = "9666c215ee70cf2f26bd8c6ea56d561cdfdeca85" }
 # The capability declarations (caps) and their implementation (capkit). **Must be the same rev** —
 # otherwise the same crate gets linked twice, causing a "same type but the types differ" error.
 #
@@ -24,8 +24,8 @@ zyris-attacca = { git = "https://github.com/attacca-cc/zyris", rev = "31a2ae6169
 #
 # capkit's default features are only `file-io` and `terminal`, so no display dependencies come along.
 # Enabling `desktop` makes xcap require X11/Wayland dev packages, blocking the build on this machine.
-zyris-caps = { git = "https://github.com/attacca-cc/zyris", rev = "31a2ae616957522ccbcb49c485854de62a89d333" }
-zyris-capkit = { git = "https://github.com/attacca-cc/zyris", rev = "31a2ae616957522ccbcb49c485854de62a89d333" }
+zyris-caps = { git = "https://github.com/attacca-cc/zyris", rev = "9666c215ee70cf2f26bd8c6ea56d561cdfdeca85" }
+zyris-capkit = { git = "https://github.com/attacca-cc/zyris", rev = "9666c215ee70cf2f26bd8c6ea56d561cdfdeca85" }
 
 # The `rev` above (31a2ae6) is a commit on `main`. It used to be 8f25c02 on the `feat/enrollment-ui`
 # branch, held there for the `EnrollmentUi` hook (`Enroller::with_ui`, PR #6) — that merged, so this

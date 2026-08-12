@@ -225,8 +225,19 @@ impl Bridge {
     }
 
     fn send(&self, action: Action) -> Option<()> {
-        // What leaves the bridge is screen-external — sent without a session tag.
-        self.0.to_app.lock().unwrap().as_ref()?.send((None, action)).ok()
+        // **Most of what leaves the bridge belongs to the window, not to a conversation** — the
+        // enrollment box, MCP notices, a shell that is running in this process — and goes untagged
+        // so it always reaches the screen.
+        //
+        // A frame that names a session is the exception, and the tag is **derived from the frame**
+        // rather than passed alongside it. Two carriers of the same fact drift: one of them gets
+        // set at a new call site and the other does not, and the frame is then filtered as one
+        // session's while it draws another's.
+        let from = match &action {
+            Action::Frame(frame) => frame.session().map(crate::app::Origin::asked),
+            _ => None,
+        };
+        self.0.to_app.lock().unwrap().as_ref()?.send((from, action)).ok()
     }
 }
 

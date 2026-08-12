@@ -1850,7 +1850,7 @@ fn a_running_command_is_named_in_the_activity_line() {
     let mut s = State::new();
     s.connected = true;
     s.running = true;
-    apply(&mut s, &Action::Frame(AppFrame::ExecStart { id: 1, command: "cargo build -j2".into() }));
+    apply(&mut s, &Action::Frame(AppFrame::ExecStart { id: 1, command: "cargo build -j2".into(), session: None }));
     let screen = dump(&mut s, 80, 12);
     assert!(screen.contains("cargo build -j2"), "what is running is not visible:\n{screen}");
     assert!(
@@ -1866,7 +1866,7 @@ fn a_finished_command_leaves_the_activity_line() {
     s.lang = zyris_code::lang::Lang::Ko;
     s.connected = true;
     s.running = true;
-    apply(&mut s, &Action::Frame(AppFrame::ExecStart { id: 1, command: "cargo build".into() }));
+    apply(&mut s, &Action::Frame(AppFrame::ExecStart { id: 1, command: "cargo build".into(), session: None }));
     apply(&mut s, &Action::Frame(AppFrame::ExecDone { id: 1 }));
     let screen = dump(&mut s, 80, 12);
     assert!(!screen.contains("cargo build"), "a finished command is still shown:\n{screen}");
@@ -1882,7 +1882,7 @@ fn finishing_another_command_does_not_clear_the_running_one() {
     let mut s = State::new();
     s.connected = true;
     s.running = true;
-    apply(&mut s, &Action::Frame(AppFrame::ExecStart { id: 2, command: "cargo test".into() }));
+    apply(&mut s, &Action::Frame(AppFrame::ExecStart { id: 2, command: "cargo test".into(), session: None }));
     apply(&mut s, &Action::Frame(AppFrame::ExecDone { id: 1 }));
     let screen = dump(&mut s, 80, 12);
     assert!(screen.contains("cargo test"), "the wrong id was cleared:\n{screen}");
@@ -1896,7 +1896,7 @@ fn the_activity_line_counts_the_seconds() {
     s.lang = zyris_code::lang::Lang::Ko;
     s.connected = true;
     s.running = true;
-    apply(&mut s, &Action::Frame(AppFrame::ExecStart { id: 1, command: "sleep 30".into() }));
+    apply(&mut s, &Action::Frame(AppFrame::ExecStart { id: 1, command: "sleep 30".into(), session: None }));
     let start = s.running_exec.as_ref().unwrap().2;
     let (_, label, _) = zyris_code::widgets::activity_parts_at(&s, start + Duration::from_secs(12));
     assert!(label.contains("12초"), "{label}");
