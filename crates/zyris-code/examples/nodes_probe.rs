@@ -63,7 +63,15 @@ async fn main() -> ExitCode {
     // **The question this whole file exists for.** A second window that registers a node of its
     // own and connects with that node's token — does the server treat it as a different node, or
     // does it still displace the first?
-    let child = register_a_child(creds.clone()).await;
+    // **Registering is opt-in.** There is no way to delete a node from here, so a probe that
+    // made one every run would fill the account with rubbish nobody can clear except by hand.
+    let child = match std::env::var_os("PROBE_REGISTER").is_some() {
+        true => register_a_child(creds.clone()).await,
+        false => {
+            println!("(set PROBE_REGISTER=1 to register a child node)\n");
+            None
+        }
+    };
 
     let first = dial("first (the enrolled credential)", creds.clone());
     tokio::time::sleep(Duration::from_secs(3)).await;
