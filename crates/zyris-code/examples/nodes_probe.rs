@@ -50,6 +50,13 @@ async fn main() -> ExitCode {
         }
     };
 
+    // **Does the server know the methods that would make one credential several nodes?**
+    //
+    // The scope is not needed to find out. `MethodNotFound` means never implemented; anything
+    // else — a permission refusal, a validation complaint — means it exists and only the scope is
+    // missing. That difference is the whole answer, and it costs nothing to ask.
+    ask_about_the_methods(creds.clone()).await;
+
     // Two share one credential — the same shape as two windows reading the same file.
     let first = dial("first", creds.clone());
     tokio::time::sleep(Duration::from_secs(3)).await;
@@ -63,6 +70,69 @@ async fn main() -> ExitCode {
     second.abort();
     ExitCode::SUCCESS
 }
+
+/// Connects once and asks whether `list_nodes` and `register_node` exist.
+async fn ask_about_the_methods(creds: Arc<dyn Credentials>) {
+    use zyris_attacca::{AttaccaApi, AttaccaApiClient};
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let task = tokio::spawn(async move {
+        let runner = Runner::new(RunConfig::from_env(), creds).kind(NodeKind::Service).on_connect(
+            move |conn| {
+                let tx = tx.clone();
+                async move {
+                    let Ok(api) = conn.wait_capability::<AttaccaApiClient>(WAIT).await else {
+                        let _ = tx.send(vec![("attacca_api".into(), "never announced".into())]);
+                        return;
+                    };
+                    let mut out = Vec::new();
+                    out.push(("list_nodes".to_string(), say(api.list_nodes().await.err())));
+                    out.push((
+                        "register_node".to_string(),
+                        say(api
+                            .register_node(zyris_attacca::ZNewNode {
+                                name: "probe (not kept)".into(),
+                                platform: Some("linux".into()),
+                                scopes: Vec::new(),
+                            })
+                            .await
+                            .err()),
+                    ));
+                    let _ = tx.send(out);
+                }
+            },
+        );
+        let _ = runner.try_run().await;
+    });
+    match tokio::time::timeout(Duration::from_secs(30), rx.recv()).await {
+        Ok(Some(answers)) => {
+            for (name, verdict) in answers {
+                println!("{name}: {verdict}");
+            }
+        }
+        _ => println!("could not ask about the methods (no connection)"),
+    }
+    task.abort();
+    println!();
+}
+
+/// **`MethodNotFound` is the only answer that means "not implemented".** Everything else — a
+/// refusal, a complaint about the arguments — means the method is there.
+fn say(err: Option<zyris::WireError>) -> String {
+    match err {
+        None => "it worked — the method exists and this credential may use it".into(),
+        Some(e) => {
+            let why = e.to_string();
+            if why.contains("unknown method") || why.contains("MethodNotFound") {
+                format!("NOT IMPLEMENTED on the server ({why})")
+            } else {
+                format!("exists, refused for another reason — {why}")
+            }
+        }
+    }
+}
+
+/// How long to wait for the server to announce `attacca_api`.
+const WAIT: Duration = Duration::from_secs(5);
 
 fn dial(label: &'static str, creds: Arc<dyn Credentials>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
