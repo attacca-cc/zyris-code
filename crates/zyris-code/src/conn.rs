@@ -510,15 +510,42 @@ pub fn window_profile(base: &str, slot: usize) -> String {
 /// The cost is one browser approval the first time a slot is used. It is paid once per slot, not
 /// per launch — the credential is kept like any other.
 pub fn claim_window(config_dir: &std::path::Path, base: &str) -> Window {
-    for slot in 1..=MAX_WINDOWS {
-        let profile = window_profile(base, slot);
+    // **A slot that has been used before is preferred over a fresh one.**
+    //
+    // Taking simply the lowest free slot made a window's identity depend on what else happened to
+    // be running when it started: open a second window, close the first, start a third, and it
+    // lands somewhere new — a profile with no credential, so an approval screen. Someone doing
+    // ordinary things was asked to approve again and again, which is not a cost anybody agreed to.
+    //
+    // Reaching first for a slot whose credential is already on disk makes the identity settle:
+    // once a machine has enrolled slots 1 and 2, those two are what its windows keep using.
+    let free: Vec<usize> = (1..=MAX_WINDOWS)
+        .filter(|slot| !another_instance_alive(config_dir, &window_profile(base, *slot)))
+        .collect();
+    let known = free.iter().find(|slot| has_credential(config_dir, &window_profile(base, **slot)));
+    for slot in known.into_iter().chain(free.iter()) {
+        let profile = window_profile(base, *slot);
         if let Some(lock) = claim_instance_lock(config_dir, &profile) {
-            return Window { profile, slot, lock: Some(lock) };
+            return Window { profile, slot: *slot, lock: Some(lock) };
         }
     }
     // Out of slots. **Starting anyway beats refusing** — sharing is what this app did for its
     // whole life, and the window that loses the race still draws, still talks, still reads.
     Window { profile: base.to_string(), slot: 1, lock: None }
+}
+
+/// Is there already a credential filed under this profile?
+///
+/// **The file name is upstream's** (`wss-<server>-<profile>.json`) and we only recognise it, the
+/// same way `migrate_credentials` does — so `slugify_profile` has to keep matching zyris's rule or
+/// this quietly answers "no" and hands out a slot that asks for approval it did not need to.
+pub fn has_credential(config_dir: &std::path::Path, profile: &str) -> bool {
+    let suffix = format!("-{}.json", slugify_profile(profile));
+    let Ok(entries) = std::fs::read_dir(config_dir) else { return false };
+    entries.flatten().any(|entry| {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        name.starts_with("wss-") && name.ends_with(&suffix)
+    })
 }
 
 #[cfg(unix)]
@@ -1351,6 +1378,50 @@ mod tests {
         drop(first);
         let third = claim_window(dir.path(), "test");
         assert_eq!(third.slot, 1, "a freed slot must be reused");
+    }
+
+    /// **A window goes back to a slot it has used before.**
+    ///
+    /// Taking simply the lowest free slot made identity depend on what else happened to be running:
+    /// open a second window, close the first, start a third, and it lands on a profile with no
+    /// credential — an approval screen, for doing nothing unusual. That is what "it asks me to
+    /// approve every time I open it" was.
+    #[test]
+    fn a_window_returns_to_a_slot_it_has_already_enrolled() {
+        let dir = tempfile::tempdir().unwrap();
+        // Slot 1 has never been used; slot 2 has.
+        std::fs::write(dir.path().join("wss-attacca-cc-test-2.json"), "{}").unwrap();
+
+        let window = claim_window(dir.path(), "test");
+        assert_eq!(window.slot, 2, "it went somewhere that would have to enrol again");
+        assert_eq!(window.profile, "test-2");
+
+        // A second window alongside it takes the free one, credential or not — the point of the
+        // slots is that two windows are never the same node.
+        let second = claim_window(dir.path(), "test");
+        assert_ne!(second.slot, window.slot, "both windows took the same identity");
+        assert!(second.lock.is_some());
+    }
+
+    /// With nothing enrolled anywhere, the first window is still slot 1 — anything else would
+    /// abandon the credential every existing install already has.
+    #[test]
+    fn with_nothing_enrolled_the_first_window_is_still_the_first_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(claim_window(dir.path(), "test").slot, 1);
+    }
+
+    /// The file name is upstream's, and we only recognise it. If `slugify_profile` drifts from
+    /// zyris's rule this answers "no" and hands out a slot that asks for an approval it did not need.
+    #[test]
+    fn a_credential_on_disk_is_recognised_by_its_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!has_credential(dir.path(), "test"));
+        std::fs::write(dir.path().join("wss-attacca-cc-api-zyris-v1-ws-test.json"), "{}").unwrap();
+        assert!(has_credential(dir.path(), "test"));
+        // **Not another profile's.** `-test-2.json` ends with `-2.json`, not `-test.json`.
+        assert!(!has_credential(dir.path(), "test-2"));
+        assert!(!has_credential(dir.path(), "other"));
     }
 
     /// **Past the last slot the windows share, as they always did.** Refusing to start would be

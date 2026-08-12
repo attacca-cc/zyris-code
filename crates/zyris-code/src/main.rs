@@ -95,12 +95,16 @@ async fn main() -> ExitCode {
     // The profile, the credential file, and the node name all hang off this, so it has to be
     // settled first. **The handle lives as long as `main`** — dropping it removes the lock file,
     // and a window that gave up its slot early would hand its identity to the next one to start.
+    // **A profile the person pinned is their identity, not ours to number.** With `$ZYRIS_PROFILE`
+    // set, a slot is still claimed so two windows do not fight over the lock, but neither the
+    // profile nor the node name is renamed underneath them.
+    let pinned = std::env::var_os("ZYRIS_PROFILE").is_some();
     let window = zyris_code::conn::credential_dir().map(|dir| {
         let base =
             std::env::var("ZYRIS_PROFILE").unwrap_or_else(|_| zyris_code::conn::APP.to_string());
         zyris_code::conn::claim_window(&dir, &base)
     });
-    let slot = window.as_ref().map_or(1, |w| w.slot);
+    let slot = if pinned { 1 } else { window.as_ref().map_or(1, |w| w.slot) };
 
     // The profile splits again inside that directory. **A profile the person gave wins** — then
     // they have said which identity this window is, and taking a slot on top would file the
