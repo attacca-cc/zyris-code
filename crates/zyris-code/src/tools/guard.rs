@@ -49,8 +49,15 @@ impl<C: ServeCapability> ServeCapability for Gate<C> {
         // what is running. Then leave it as the empty value and take the decision.
         let args = call.params.to_json().unwrap_or(Value::Null);
         let target = target_of(&self.capability, &call.tool, &args);
-        let outside = escaping_path(&self.bridge.root(), &self.capability, &call.tool, &args);
-        let gated = Call::new(&self.capability, &call.tool, target).leaving(outside);
+        let root = self.bridge.root();
+        let outside = escaping_path(&root, &self.capability, &call.tool, &args);
+        // **Where this app's credentials live.** Read per call rather than held, because it is a
+        // pure function of the environment and holding it would be one more thing to keep in step.
+        let secret = crate::conn::app_dir().and_then(|dir| {
+            crate::tools::gate::secret_path(&dir, &root, &self.capability, &call.tool, &args)
+        });
+        let gated =
+            Call::new(&self.capability, &call.tool, target).leaving(outside).reaching_for(secret);
 
         match self.bridge.decide(&gated) {
             Decision::Run => {}

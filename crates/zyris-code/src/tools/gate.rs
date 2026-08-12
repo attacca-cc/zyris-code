@@ -27,15 +27,29 @@ pub struct Call {
     pub target: String,
     /// Path leading outside the working directory. The policy decides what happens to it.
     pub outside: Option<PathBuf>,
+    /// A credential file this call is reaching for. **No policy makes this allowed** — see
+    /// `decide`.
+    pub secret: Option<PathBuf>,
 }
 
 impl Call {
     pub fn new(capability: &str, tool: &str, target: String) -> Call {
-        Call { capability: capability.to_string(), tool: tool.to_string(), target, outside: None }
+        Call {
+            capability: capability.to_string(),
+            tool: tool.to_string(),
+            target,
+            outside: None,
+            secret: None,
+        }
     }
 
     pub fn leaving(mut self, outside: Option<PathBuf>) -> Call {
         self.outside = outside;
+        self
+    }
+
+    pub fn reaching_for(mut self, secret: Option<PathBuf>) -> Call {
+        self.secret = secret;
         self
     }
 
@@ -89,6 +103,24 @@ pub fn decide(mode: Mode, config: &Config, call: &Call) -> Decision {
                 .into(),
         );
     }
+    // **A credential is refused whatever the setting says.**
+    //
+    // `dir_access: allow` exists so an agent can work across directories, and that is a reasonable
+    // thing to want. It is not a reason to hand over the file holding this node's refresh token —
+    // with that, anything can attach to attacca as this machine — or the GitHub tokens beside it.
+    // Nobody turning on "let it read other directories" was agreeing to that.
+    //
+    // **This is a fence, not a wall**, for the same reason `escaping_path` is: `terminal.exec`
+    // runs arbitrary programs and no reading of the text can be sure what they touch. It stops the
+    // straightforward path — the agent asking to read the file — and leaves the shell's own
+    // sandboxing to the operating system, which is where it belongs.
+    if let Some(path) = &call.secret {
+        return Decision::Refuse(format!(
+            "`{}`은(는) 이 앱의 자격 파일이라 도구로는 읽거나 바꿀 수 없습니다. \
+             설정과 무관하게 언제나 막힙니다.",
+            path.display()
+        ));
+    }
     // **Outside the working directory, the setting decides.** `deny` (the default) refuses;
     // `allow` runs it. Nothing inside is ever refused — refusing every time only broke the
     // flow (2026-08-02).
@@ -118,16 +150,48 @@ const PATH_KEYS: &[&str] =
 /// there is no way to read the text and know what it touches — one `sh -c` line does anything. What
 /// this does is filter visible absolute paths — a net to catch **accidentally leaving**, not a wall.
 pub fn escaping_path(root: &Path, capability: &str, tool: &str, args: &Value) -> Option<PathBuf> {
-    let outside = |p: &str| {
-        let full = zyris_capkit::resolve_under(root, p);
-        escapes(root, &full).then_some(full)
-    };
+    candidates(root, capability, tool, args).into_iter().find(|p| escapes(root, p))
+}
 
+/// Whether this call is reaching for one of **this app's credential files**.
+///
+/// `app_dir` is `conn::app_dir()`. Only the credentials are named, not the whole directory — the
+/// skills and plugins that live beside them are ordinary files somebody may well be editing, and
+/// blocking those would be a fence around the wrong thing.
+pub fn secret_path(
+    app_dir: &Path,
+    root: &Path,
+    capability: &str,
+    tool: &str,
+    args: &Value,
+) -> Option<PathBuf> {
+    candidates(root, capability, tool, args).into_iter().find(|p| is_secret_file(app_dir, p))
+}
+
+/// The files that must never be handed to a tool.
+///
+/// - `wss-*.json` — the node's own credentials. **Whoever holds one can attach to attacca as this
+///   machine**, which is every bit as bad as it sounds.
+/// - `github.json` — the GitHub tokens (`github::auth`).
+/// - `mcp.json` — server definitions, which routinely carry API keys in `env`.
+pub fn is_secret_file(app_dir: &Path, path: &Path) -> bool {
+    if path.parent() != Some(app_dir) {
+        return false;
+    }
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else { return false };
+    name == "github.json"
+        || name == "mcp.json"
+        || (name.starts_with("wss-") && name.ends_with(".json"))
+}
+
+/// Every path this call visibly points at, resolved. **Shared by both checks** — a scanner that
+/// found the paths leaving the directory but not the ones reaching for a credential would be two
+/// scanners, and the second one would be the one nobody remembered to update.
+fn candidates(root: &Path, capability: &str, tool: &str, args: &Value) -> Vec<PathBuf> {
+    let mut out = Vec::new();
     for key in PATH_KEYS {
         if let Some(p) = args.get(*key).and_then(Value::as_str).filter(|s| !s.is_empty()) {
-            if let Some(out) = outside(p) {
-                return Some(out);
-            }
+            out.push(zyris_capkit::resolve_under(root, p));
         }
     }
     // Visible paths inside a shell command. Looks after stripping quotes and common separators.
@@ -138,27 +202,26 @@ pub fn escaping_path(root: &Path, capability: &str, tool: &str, args: &Value) ->
     // because **the gate only sees the tools it knows about**.
     let runs_a_shell =
         matches!((capability, tool), ("terminal", "exec") | ("wait", "start") | ("wait", "until"));
-    if runs_a_shell {
-        let command = args.get("command").and_then(Value::as_str).unwrap_or_default();
-        for word in command.split_whitespace() {
-            let bare = word.trim_matches(|c| matches!(c, '\'' | '"' | '(' | ')' | ';' | ',' | '`'));
-            if !looks_like_a_path(bare) {
-                continue;
-            }
-            // Asking about things pointing at executables like `/bin/ls` would trip on every command.
-            if points_at_a_program(bare) {
-                continue;
-            }
-            let bare = match strip_home_prefix(bare) {
-                Some(rest) => home().join(rest).to_string_lossy().into_owned(),
-                None => bare.to_string(),
-            };
-            if let Some(out) = outside(&bare) {
-                return Some(out);
-            }
-        }
+    if !runs_a_shell {
+        return out;
     }
-    None
+    let command = args.get("command").and_then(Value::as_str).unwrap_or_default();
+    for word in command.split_whitespace() {
+        let bare = word.trim_matches(|c| matches!(c, '\'' | '"' | '(' | ')' | ';' | ',' | '`'));
+        if !looks_like_a_path(bare) {
+            continue;
+        }
+        // Asking about things pointing at executables like `/bin/ls` would trip on every command.
+        if points_at_a_program(bare) {
+            continue;
+        }
+        let bare = match strip_home_prefix(bare) {
+            Some(rest) => home().join(rest).to_string_lossy().into_owned(),
+            None => bare.to_string(),
+        };
+        out.push(zyris_capkit::resolve_under(root, &bare));
+    }
+    out
 }
 
 /// Whether a shell token is shaped like a path at all — the scan's first filter.
@@ -289,6 +352,81 @@ mod tests {
 
     fn out(cap: &str, tool: &str, path: &str) -> Call {
         call(cap, tool, path).leaving(escaping_path(root(), cap, tool, &json!({"path": path})))
+    }
+
+    const APP: &str = "/home/ruma/.config/zyris-code";
+
+    fn app() -> &'static Path {
+        Path::new(APP)
+    }
+
+    /// A call as the gate really builds one: both scans run over the same arguments.
+    fn reaching(cap: &str, tool: &str, args: serde_json::Value) -> Call {
+        call(cap, tool, "")
+            .leaving(escaping_path(root(), cap, tool, &args))
+            .reaching_for(secret_path(app(), root(), cap, tool, &args))
+    }
+
+    /// **A credential is refused however the directory setting is set.**
+    ///
+    /// `dir_access: allow` means "work across directories", which is a reasonable thing to want. It
+    /// is not agreement to hand over the file holding this node's refresh token — anything holding
+    /// one can attach to attacca as this machine.
+    #[test]
+    fn no_setting_makes_a_credential_readable() {
+        let allow = Config { dir_access: DirAccess::Allow, ..Config::default() };
+        let deny = Config::default();
+        for file in [
+            "wss-attacca-cc-api-zyris-v1-ws-zyris-code.json",
+            "wss-attacca-cc-api-zyris-v1-ws-zyris-code-2.json",
+            "github.json",
+            "mcp.json",
+        ] {
+            let path = format!("{APP}/{file}");
+            let asked = reaching("file_io", "read", json!({ "path": path }));
+            for config in [&allow, &deny] {
+                assert!(
+                    matches!(decide(Mode::Normal, config, &asked), Decision::Refuse(_)),
+                    "{file} was handed over with dir_access {:?}",
+                    config.dir_access
+                );
+            }
+        }
+    }
+
+    /// **The shell is scanned for it too.** Wrapping a capability in the gate is not enough when
+    /// the obvious way round is one `cat` away.
+    #[test]
+    fn reading_a_credential_through_the_shell_is_refused_as_well() {
+        let allow = Config { dir_access: DirAccess::Allow, ..Config::default() };
+        for command in [
+            "cat /home/ruma/.config/zyris-code/github.json",
+            "cat ~/.config/zyris-code/github.json",
+            "cp ~/.config/zyris-code/wss-attacca-cc-api-zyris-v1-ws-zyris-code.json /tmp/x",
+        ] {
+            let asked = reaching("terminal", "exec", json!({ "command": command }));
+            assert!(
+                matches!(decide(Mode::Normal, &allow, &asked), Decision::Refuse(_)),
+                "`{command}` went through"
+            );
+        }
+    }
+
+    /// **Only the credentials, not the directory.** Skills and plugins live beside them and are
+    /// ordinary files somebody may well be editing — a fence around those is a fence around the
+    /// wrong thing.
+    #[test]
+    fn what_sits_beside_the_credentials_is_not_itself_a_credential() {
+        for path in [
+            "/home/ruma/.config/zyris-code/skills/mine/SKILL.md",
+            "/home/ruma/.config/zyris-code/plugins/p/commands/x.md",
+            "/home/ruma/.config/zyris-code/config.json",
+            "/home/ruma/.config/zyris-code/mcp-enabled.json",
+            // A file named like a credential somewhere else is not one.
+            "/home/ruma/zyris-code/github.json",
+        ] {
+            assert!(!is_secret_file(app(), Path::new(path)), "{path}");
+        }
     }
 
     /// **Plan mode can't wake sub-agents.** `work.start` creates work on the server and opens
