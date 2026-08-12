@@ -373,17 +373,11 @@ pub fn node_name() -> String {
 
 /// What this window registers as when nobody said otherwise.
 pub fn default_node_name() -> String {
-    slot_node_name(1)
-}
-
-/// What the window holding `slot` registers as. Slot 1 is the window that owns the device
-/// credential; the rest dial with a node of their own and need a name that does not collide.
-pub fn slot_node_name(slot: usize) -> String {
     let host = zyris::machine_name().unwrap_or_else(|| "node".to_string());
     let dir = std::env::current_dir()
         .ok()
         .and_then(|d| d.file_name().map(|n| n.to_string_lossy().into_owned()));
-    compose_name(&host, dir.as_deref(), slot)
+    compose_name(&host, dir.as_deref())
 }
 
 /// The pure decision that builds the name. `dir` is the last fragment of the working directory.
@@ -393,46 +387,18 @@ pub fn slot_node_name(slot: usize) -> String {
 /// Since the slug truncates at 16 characters, the directory only survives in the display name (the slug is always
 /// of the form `arch-zyris-code`). When the directory equals the app name (running in this repo), it's not
 /// appended — no reason to say the same thing twice.
-/// **A window past the first carries its number, and the number has to survive the slug.** That is
-/// the whole reason the order is not fixed. `arch zyris-code 2 · zyris-daemon` reads exactly right
-/// and slugs to `arch-zyris-code` — the 16 characters run out before the `2`, so the second window
-/// would land on the same slug as the first and the server would separate them by attach order,
-/// which is what having a node each was for. When the number cannot survive in the natural order,
-/// the distinguishing part moves to the front (`zyris-code 2 · arch · zyris-daemon` →
-/// `zyris-code-2-arc`). On a short hostname the natural order fits and is kept.
-fn compose_name(host: &str, dir: Option<&str>, slot: usize) -> String {
-    let dir = dir.filter(|d| !d.is_empty() && *d != SUFFIX);
-    let tail = match dir {
-        Some(dir) => format!(" · {dir}"),
-        None => String::new(),
+fn compose_name(host: &str, dir: Option<&str>) -> String {
+    let suffix = dir.filter(|d| !d.is_empty() && *d != SUFFIX);
+    let natural = match suffix {
+        Some(dir) => format!("{host} {SUFFIX} · {dir}"),
+        None => format!("{host} {SUFFIX}"),
     };
-    if slot <= 1 {
-        let natural = format!("{host} {SUFFIX}{tail}");
-        return if slug_of(&natural).contains(SUFFIX) {
-            natural
-        } else {
-            // Truncated away the app name. Reversing the order at least keeps what it is.
-            format!("{SUFFIX} {host}")
-        };
+    if slug_of(&natural).contains(SUFFIX) {
+        natural
+    } else {
+        // Truncated away the app name. Reversing the order at least keeps what it is.
+        format!("{SUFFIX} {host}")
     }
-    for candidate in [
-        format!("{host} {SUFFIX} {slot}{tail}"),
-        format!("{SUFFIX} {slot} · {host}{tail}"),
-        format!("{SUFFIX} {slot}"),
-    ] {
-        if slug_keeps_slot(&slug_of(&candidate), slot) {
-            return candidate;
-        }
-    }
-    // Nothing kept the number. Say it as plainly as possible and let the server disambiguate —
-    // this only happens if the rule above is changed and the app name stops fitting at all.
-    format!("{SUFFIX} {slot}")
-}
-
-/// Whether the number survived as a fragment of its own. **A digit swallowed into another word
-/// does not count** — `arch2` and `arch22` would both "contain" a 2 while naming one node.
-fn slug_keeps_slot(slug: &str, slot: usize) -> bool {
-    slug.split('-').any(|part| part == slot.to_string())
 }
 
 /// The slug attacca gives this node. It's the middle fragment of tool names.
@@ -505,19 +471,8 @@ pub fn claim_instance_lock(config_dir: &std::path::Path, profile: &str) -> Optio
 /// see `claim_instance_lock`.
 pub struct Window {
     /// The profile its credentials are filed under (`wss-<server>-<profile>.json`).
-    ///
-    /// **Every window shares one profile**, because every window shares one device credential.
-    /// Splitting the credential per window was tried and taken out (2026-08-12): identity then
-    /// depended on what else happened to be running, and ordinary use asked for approval again
-    /// and again. What varies per window is the node it dials as, not the credential it holds.
     pub profile: String,
-    /// Which window this is: 1 for the one that owns the device credential, 2 upward for the rest.
-    ///
-    /// **The number is the slot, not the order of arrival.** A window that starts after two others
-    /// have closed takes slot 1 again — and with it the cached identity that slot already had.
-    pub slot: usize,
-    /// `None` when every slot up to the cap is held. Then this window shares the first window's
-    /// identity, and says so.
+    /// `None` when another window already holds it. That window is the one the server routes to.
     pub lock: Option<InstanceLock>,
 }
 
@@ -527,31 +482,7 @@ pub struct Window {
 /// keeps the connection that arrived last (`insert(node_id, connection)`), and there is nothing a
 /// node can do about that — so the second window runs, and says so.
 pub fn claim_window(config_dir: &std::path::Path, base: &str) -> Window {
-    for slot in 1..=MAX_SLOTS {
-        if let Some(lock) = claim_instance_lock(config_dir, &slot_profile(base, slot)) {
-            return Window { profile: base.to_string(), slot, lock: Some(lock) };
-        }
-    }
-    // Every slot is taken. Rather than refuse to start, share the first window's identity — the
-    // server keeps whichever connection arrived last, and this window says so on screen.
-    Window { profile: base.to_string(), slot: 1, lock: None }
-}
-
-/// How many windows get an identity of their own.
-///
-/// **A runaway guard, not a policy.** Nothing about a person's work says four windows are enough,
-/// and a slot costs one node on the account that gets reused forever after. What this stops is a
-/// bug in the loop above from registering nodes without end.
-pub const MAX_SLOTS: usize = 64;
-
-/// The lock name for a slot. Slot 1 keeps the bare profile so an existing lock file — and every
-/// window written before slots existed — still means what it used to.
-fn slot_profile(base: &str, slot: usize) -> String {
-    if slot <= 1 {
-        base.to_string()
-    } else {
-        format!("{base}-{slot}")
-    }
+    Window { profile: base.to_string(), lock: claim_instance_lock(config_dir, base) }
 }
 
 #[cfg(unix)]
@@ -1324,80 +1255,26 @@ mod tests {
         assert!(slug.len() <= 16, "{slug}");
     }
 
-    /// **The working directory goes into the name.** Different directories on the same machine
-    /// must be distinguishable. The slug truncates at 16 characters, so it only survives in the
-    /// display name.
+    /// Two windows on one credential are one node to the server, and the registry keeps the
+    /// connection that arrived last — so the earlier window's socket lives on while every tool
+    /// call goes to the other one. Splitting the credential is what makes them separate nodes;
+    /// this is the name half of it.
+    ///
+    /// The distinguishing part goes **first**, because the slug is cut at 16 characters: putting
+    /// the number on the end (`arch zyris-code 2`) is trimmed straight back to `arch-zyris-code`
+    /// Taking simply the lowest free slot made identity depend on what else happened to be running:
+    /// open a second window, close the first, start a third, and it lands on a profile with no
+    /// credential — an approval screen, for doing nothing unusual. That is what "it asks me to
+    /// **The working directory goes into the name.** Different directories on the same machine must be distinguishable.
+    /// The slug truncates at 16 characters, so it only survives in the display name.
     #[test]
     fn the_node_name_carries_the_working_directory() {
-        assert_eq!(compose_name("arch", Some("zyris-daemon"), 1), "arch zyris-code · zyris-daemon");
+        assert_eq!(compose_name("arch", Some("zyris-daemon")), "arch zyris-code · zyris-daemon");
         assert_eq!(slug_of("arch zyris-code · zyris-daemon"), "arch-zyris-code");
         // A directory equal to the app name isn't appended — it's a duplicate.
-        assert_eq!(compose_name("arch", Some("zyris-code"), 1), "arch zyris-code");
+        assert_eq!(compose_name("arch", Some("zyris-code")), "arch zyris-code");
         // Without a directory (e.g. root) it's the usual name.
-        assert_eq!(compose_name("arch", None, 1), "arch zyris-code");
-    }
-
-    /// **Two windows must not slug to the same thing.** Each dials as a node of its own, and the
-    /// slug is the middle fragment of every tool name the agent reads — two nodes sharing one
-    /// means the server separates them by attach order, which is exactly what having a node each
-    /// was meant to end.
-    ///
-    /// The natural order (`arch zyris-code 2 · …`) reads best and is tried first, but its slug is
-    /// cut at 16 characters and the number falls off the end. So on this hostname the number goes
-    /// to the front instead.
-    #[test]
-    fn every_window_slugs_to_something_of_its_own() {
-        // The premise, so this test says why the order is not simply fixed: written the way it
-        // reads best, the second window's slug is the first window's slug.
-        assert_eq!(slug_of("arch zyris-code 2 · zyris-daemon"), slug_of("arch zyris-code"));
-
-        let names: Vec<String> =
-            (1..=4).map(|slot| compose_name("arch", Some("zyris-daemon"), slot)).collect();
-        let slugs: Vec<String> = names.iter().map(|n| slug_of(n)).collect();
-        for (i, slug) in slugs.iter().enumerate() {
-            assert!(slug.contains("zyris"), "the app name got truncated away: {slug}");
-            assert!(slug.len() <= 16, "{slug}");
-            for (j, other) in slugs.iter().enumerate() {
-                assert!(i == j || slug != other, "slots {} and {} share {slug}", i + 1, j + 1);
-            }
-        }
-        // The shape this lands on, spelled out — a change here changes the tool names an agent
-        // reads, and that must never happen by accident.
-        assert_eq!(names[1], "zyris-code 2 · arch · zyris-daemon");
-        assert_eq!(slugs[1], "zyris-code-2-arc");
-    }
-
-    /// **The natural order is kept whenever it fits.** On a short hostname the number survives to
-    /// the end of the slug, and `arch zyris-code 2` reads better than the reversal does.
-    #[test]
-    fn a_short_hostname_keeps_the_number_where_it_reads_best() {
-        assert_eq!(compose_name("pi", None, 2), "pi zyris-code 2");
-        assert_eq!(slug_of("pi zyris-code 2"), "pi-zyris-code-2");
-    }
-
-    /// A digit that landed inside another word is not the slot. `arch2` would otherwise pass for
-    /// window 2 while naming a machine.
-    #[test]
-    fn a_digit_swallowed_into_a_word_is_not_the_number() {
-        assert!(slug_keeps_slot("zyris-code-2-arc", 2));
-        assert!(!slug_keeps_slot("arch2-zyris-code", 2));
-        assert!(!slug_keeps_slot("zyris-code-22", 2));
-    }
-
-    /// **Slots are taken lowest first, and a slot is free again when its window closes.** The
-    /// number is a place, not an arrival order — otherwise the third window opened today would
-    /// register a third node when two are already going spare.
-    #[test]
-    fn a_window_takes_the_lowest_free_slot() {
-        let dir = tempfile::tempdir().unwrap();
-        let first = claim_window(dir.path(), "test");
-        let second = claim_window(dir.path(), "test");
-        assert_eq!((first.slot, second.slot), (1, 2));
-        assert!(first.lock.is_some() && second.lock.is_some());
-
-        drop(first);
-        let third = claim_window(dir.path(), "test");
-        assert_eq!(third.slot, 1, "a slot that was let go must be handed out again");
+        assert_eq!(compose_name("arch", None), "arch zyris-code");
     }
 
     /// A dead window's trace is not a living window. PID 0 must be treated as dead, since kill(0, 0)

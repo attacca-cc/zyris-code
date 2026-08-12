@@ -81,12 +81,10 @@ async fn main() -> ExitCode {
         }
     }
 
-    // **One credential, one node each.** Every window holds the same device credential — splitting
-    // that per window was tried (2026-08-12) and taken out, because identity then depended on what
-    // else happened to be running and ordinary use asked for approval again and again. What varies
-    // is the *node*: a window past the first dials with one `register_node` minted under this same
-    // device (`nodes.rs`), so the server routes its session's tool calls to it rather than handing
-    // everything to whichever connection arrived last.
+    // **One credential, one node.** Splitting it per window was tried (2026-08-12) and taken out:
+    // it made a window's identity depend on what else happened to be running when it started, so
+    // ordinary use produced an approval screen again and again. What remains is the lock, which
+    // says whether another window is already up.
     //
     // **The handle lives as long as `main`** — dropping it removes the lock file, and a window
     // that let go early would look absent to the next one to start.
@@ -133,13 +131,8 @@ async fn main() -> ExitCode {
     // machine's other nodes** — if `zyris-daemon` runs alongside, both attach as `arch`, and attacca
     // separates them by appending `-2` to one, but which one keeps `arch` depends on attach order.
     // Then the tool names the agent reads (`zyris__arch__…`) change from run to run.
-    //
-    // **The slot goes in the name.** Two windows are two nodes, and a node list where both are
-    // called `arch zyris-code` tells nobody which is which — `conn::compose_name` puts the number
-    // where the slug will still carry it.
-    let slot = window.as_ref().map_or(1, |w| w.slot);
     if std::env::var_os("ZYRIS_NODE_NAME").is_none() {
-        std::env::set_var("ZYRIS_NODE_NAME", zyris_code::conn::slot_node_name(slot));
+        std::env::set_var("ZYRIS_NODE_NAME", zyris_code::conn::default_node_name());
     }
 
     // **The app is raised before the runner.** That way the enrollment code window is on screen from
@@ -190,49 +183,28 @@ async fn main() -> ExitCode {
     // another window can touch this computer too. The only thing blocking is `tools::guard::Gate`.
     let cwd = zyris_code::tools::working_dir();
 
-    // **Every window past the first dials as a node of its own** (`nodes.rs`).
+    // **Every window is its own node** (`conn::claim_window`, taken at the top of `main`).
     //
-    // It used to be one node for all of them, because identity is the credential and they share
+    // It used to be one node for all of them, because identity is the credential and they shared
     // one. The server registry is keyed by node id (`insert(node_id, connection)`), so the second
     // window replaced the first's connection and the first was handed no tool calls at all while
-    // its socket stayed up. This app could only say so and carry on.
+    // its socket stayed up. This app could only say so and carry on. Now each window takes a slot,
+    // files its credentials under a profile of its own, and registers under a name of its own —
+    // so a tool call lands in the window whose session made it.
     //
     // **The judgment still belongs to the window that received the call** (plan mode, `/config`
-    // dir access). That is now the same window whose session asked, which is what it always
-    // should have been.
+    // dir access). That is now the same window that asked, which is what it always should have been.
     //
     // **The handle has to live as long as the window does.** Bound inside a block it was dropped at
     // the closing brace, and `Drop` deletes the very file it had just written — so no window ever
     // left a lock behind and no later window ever found one.
     //
-    // **This waits, and it waits where the screen can say so.** Only the first window can register
-    // (it is the one holding a connection), so a second window leaves a request and watches for
-    // the answer. Failing to get one is not failing to start — it shares, and says so.
-    let mut sharing = window.as_ref().is_some_and(|w| w.lock.is_none());
-    if slot > 1 && !sharing {
-        let dir = zyris_code::conn::credential_dir();
-        let name = zyris_code::conn::node_name();
-        match &dir {
-            Some(dir) => match zyris_code::nodes::obtain(dir, slot, &name).await {
-                Some(child) => {
-                    tracing::info!(slot, node = %child.node_id, name = %child.name, "this window has a node of its own");
-                    std::env::set_var("ZYRIS_NODE_TOKEN", &child.token);
-                }
-                None => sharing = true,
-            },
-            None => sharing = true,
-        }
-        if sharing {
-            // Back to the first window's name. Dialling on the shared credential makes this the
-            // same node whatever the name says, and a name claiming otherwise only misleads
-            // whoever reads the log.
-            std::env::set_var("ZYRIS_NODE_NAME", zyris_code::conn::default_node_name());
-        }
-    }
-    // **Told once, and only when it is true.** With one node between them the server keeps the
+    // Here is where the screen exists to say what the slot means. **A window past the first enrols
+    // once** — an approval window with no explanation reads as the app having logged itself out.
+    // **The second window is told, and told once.** With one credential the server keeps the
     // connection that arrived last, so this window has just taken the tool calls from the other
     // one — see `### 창 여럿` in CLAUDE.md.
-    if sharing {
+    if window.as_ref().is_some_and(|w| w.lock.is_none()) {
         tracing::warn!(
             "another zyris-code window is attached with the same credentials. tool calls go to \
              whichever window the server picked."
@@ -289,10 +261,9 @@ async fn main() -> ExitCode {
     // **The list lives in one place** (`conn::REQUIRED_SCOPES`). If what's requested and what's
     // checked after attaching diverge, you'd either deny something you never asked for or stay silent about something missing.
     .request_scopes(zyris_code::conn::REQUIRED_SCOPES)
-    // **Windows are split by registering, not by the server.** `register_node` answered
-    // `MethodNotFound` when this was first tried (2026-08-03) and answers properly now
-    // (2026-08-12) — the old note here said the server would have to do it, and the server did.
-    // `nodes.rs` holds that; by this point `$ZYRIS_NODE_TOKEN` already names which node this is.
+    // **Splitting windows is the server's job.** The node has nothing to offer — neither `.instance(…)`
+    // nor registering siblings via `register_node` exists on the real server (measured 2026-08-03). So
+    // here it just attaches, and the day the server starts splitting nodes, it happens by itself.
     .on_connect({
         let bridge = bridge.clone();
         let notice = notice.clone();
@@ -335,36 +306,6 @@ async fn main() -> ExitCode {
             }
         }
     });
-
-    // **The first window answers the others.** A window past the first cannot register for itself
-    // without opening a second connection on the shared credential, which is the very displacement
-    // all of this exists to avoid — so it leaves a request file and this loop services it.
-    //
-    // It runs only while connected, and starts over on every reconnect: the client is handed over
-    // through the same watch channel the screen reads.
-    if slot == 1 {
-        if let Some(dir) = zyris_code::conn::credential_dir() {
-            let mut api_rx = api_rx.clone();
-            tokio::spawn(async move {
-                loop {
-                    let client = api_rx.borrow_and_update().clone();
-                    if let Some(api) = client {
-                        zyris_code::nodes::serve_requests(
-                            &api,
-                            &dir,
-                            &zyris_code::conn::REQUIRED_SCOPES,
-                        )
-                        .await;
-                    }
-                    // **Polled, not watched.** A request arrives as a file another process wrote,
-                    // and two seconds of waiting is invisible against a window that is still
-                    // drawing "connecting…". Watching the directory would mean a platform-specific
-                    // dependency for a file that appears at most once per window.
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                }
-            });
-        }
-    }
 
     // **MCP attaches in the background.** Servers fetched with `npx` take seconds, and the screen
     // must not wait for that. Once they're up, `Capabilities::add` announces again.
