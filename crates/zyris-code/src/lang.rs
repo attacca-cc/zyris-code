@@ -1893,13 +1893,12 @@ impl Lang {
         match self {
             Lang::Ko => format!(
                 "**권한이 모자랍니다: {missing}**. 다시 승인받을 수 있도록 이 컴퓨터의 자격을 비웠습니다.\n\n\
-                 다시 연결되면 등록 코드 창이 뜨니, 승인 화면에서 권한을 **모두** 체크해 주세요. \
-                 지금 연결은 그대로 쓸 수 있습니다."
+                 잠시 뒤 등록 코드 창이 뜹니다. 승인 화면에서 권한을 **모두** 체크해 주세요."
             ),
             Lang::En => format!(
                 "**Not enough permissions: {missing}**. Dropped this machine's credentials so \
-                 you can be approved again.\n\nA fresh enrollment-code window appears on reconnect \
-                 — check **every** scope there. The current connection keeps working."
+                 you can be approved again.\n\nThe enrolment-code window appears in a moment — \
+                 check **every** scope there."
             ),
         }
     }

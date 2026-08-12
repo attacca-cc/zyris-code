@@ -83,7 +83,7 @@ pub const DEFAULT_AGENT: &str = "Main Agent";
 /// POST /api/zyris/v1/device/authorize {"scopes":[…,"nodes:write"], …}
 ///   → 422 … unknown variant `nodes:write`, expected one of `agents:read`, … `events:read`
 /// ```
-pub const REQUIRED_SCOPES: [&str; 10] = [
+pub const REQUIRED_SCOPES: [&str; 11] = [
     "agents:read",
     "projects:read",
     // Used by the project form. Re-added after checking the deployed build on 2026-08-03 — it was 200.
@@ -103,6 +103,15 @@ pub const REQUIRED_SCOPES: [&str; 10] = [
     // POST /api/zyris/v1/device/authorize {"scopes":[…,"jobs:read","jobs:write"], …}
     //   → 200 {"device_code":"zdc_…","user_code":"…"}
     // ```
+    // Registering a node of this window's own (`register_node`). **Answered 422 on 2026-08-03 and
+    // was taken back out**; re-measured 2026-08-12 and the whole list authorizes (200), with
+    // `register_node` and `list_nodes` answering `ForbiddenScope` rather than `MethodNotFound` —
+    // the methods are there, only the grant was missing.
+    //
+    // This is the way out of two windows fighting over one node: the server keys its registry by
+    // node id, so a second window on the same credential takes every tool call from the first, and
+    // nothing on this side can change that. A node of its own can.
+    "nodes:write",
     "jobs:read",
     "jobs:write",
 ];

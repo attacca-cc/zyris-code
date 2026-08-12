@@ -2562,6 +2562,15 @@ async fn run_inner(
                     None => false,
                 };
             let said = if asked_again {
+                // **Drop the connection so the enrolment window comes up now.** The old text said
+                // "start it again", which was written when the code went to stdout and would have
+                // been buried under the running TUI. It draws on screen now (`ScreenEnroll`), so
+                // there is nothing to wait for: the runner redials, finds an emptied store, and
+                // asks — the same path `/account logout` takes.
+                if let Some(conn) = bridge.connection() {
+                    state.reconnecting = true;
+                    conn.close("re-enrolling for a scope that was not granted");
+                }
                 crate::conn::scopes_will_be_asked_again(&missing)
             } else {
                 crate::conn::missing_scopes_message(&missing)
