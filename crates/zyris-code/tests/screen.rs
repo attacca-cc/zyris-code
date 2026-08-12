@@ -1826,6 +1826,41 @@ fn enroll_view() -> zyris_code::app::EnrollView {
     }
 }
 
+/// **The address in the enrolment window is Ctrl+clickable.**
+///
+/// Links used to be found only inside the conversation (`view_links`), so the one URL a person has
+/// to open — the page where the code goes — was the one URL they could not click. An overlay's
+/// links are registered in absolute screen cells as it draws (`State::screen_links`).
+#[test]
+fn the_address_in_the_enroll_window_can_be_opened() {
+    let mut s = State::new();
+    apply(&mut s, &Action::Frame(AppFrame::Enroll(enroll_view())));
+    let screen = dump(&mut s, 80, 24);
+    let uri = "https://attacca.example/settings/zyris/device";
+    assert!(screen.contains(uri), "{screen}");
+
+    let found = s.screen_links.iter().find(|l| l.url == uri).expect("no link was registered");
+    // **Clickable where it is drawn.** Registering a link on a row nothing was painted on would
+    // open a URL from a click on whatever is really there.
+    assert_eq!(s.link_at(found.start, found.row).as_deref(), Some(uri));
+    assert_eq!(s.link_at(found.end - 1, found.row).as_deref(), Some(uri));
+    assert_eq!(s.link_at(found.end, found.row), None, "past the end of the link");
+    assert_eq!(s.link_at(found.start, found.row + 1), None, "a different row");
+}
+
+/// **A closed overlay leaves nothing clickable behind.** The registry is rebuilt every frame, so a
+/// cell it used to own goes back to whatever is under it.
+#[test]
+fn closing_the_enroll_window_takes_its_link_with_it() {
+    let mut s = State::new();
+    apply(&mut s, &Action::Frame(AppFrame::Enroll(enroll_view())));
+    let _ = dump(&mut s, 80, 24);
+    assert!(!s.screen_links.is_empty());
+    apply(&mut s, &Action::EnrollClose);
+    let _ = dump(&mut s, 80, 24);
+    assert!(s.screen_links.is_empty(), "{:?}", s.screen_links);
+}
+
 /// The enrollment code appears in a box in the middle of the screen — not the old stdout box.
 #[test]
 fn the_enroll_window_shows_the_code_and_the_address() {

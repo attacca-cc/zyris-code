@@ -16,7 +16,14 @@ use ratatui::Frame;
 use crate::app::{EnrollPhase, EnrollView};
 use crate::theme;
 
-pub fn draw(frame: &mut Frame, area: Rect, view: &EnrollView, lang: crate::lang::Lang) {
+/// Draws the window. **Answers where the link landed** so the caller can register it — the widget
+/// cannot reach into `State`, and `apply` is pure and cannot know where anything was drawn.
+pub fn draw(
+    frame: &mut Frame,
+    area: Rect,
+    view: &EnrollView,
+    lang: crate::lang::Lang,
+) -> Option<crate::app::ScreenLink> {
     // A box in the center of the screen. The code must show large, so give it more room than the list window.
     let h = 10.min(area.height.saturating_sub(2)).max(5);
     let w = 56.min(area.width.saturating_sub(4)).max(30);
@@ -43,6 +50,8 @@ pub fn draw(frame: &mut Frame, area: Rect, view: &EnrollView, lang: crate::lang:
     frame.render_widget(block, box_area);
 
     let mut lines: Vec<Line<'static>> = Vec::new();
+    // Which drawn line holds the URL, so its cells can be handed back as a link.
+    let mut uri_row: Option<usize> = None;
 
     match view.phase {
         EnrollPhase::Waiting => {
@@ -57,9 +66,13 @@ pub fn draw(frame: &mut Frame, area: Rect, view: &EnrollView, lang: crate::lang:
                 format!("   {}   ", view.code),
                 Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD),
             )));
+            // **Where the code goes, said and underlined.** A bare URL on its own line reads as
+            // decoration; this says it is the thing to open. Ctrl+click opens it, and the link is
+            // registered below so that actually works over an overlay.
+            uri_row = Some(lines.len());
             lines.push(Line::from(Span::styled(
                 view.uri.clone(),
-                Style::default().fg(theme::tool()),
+                Style::default().fg(theme::tool()).add_modifier(Modifier::UNDERLINED),
             )));
             lines.push(Line::from(""));
             let remaining = view.expires_at.saturating_duration_since(std::time::Instant::now());
@@ -88,5 +101,22 @@ pub fn draw(frame: &mut Frame, area: Rect, view: &EnrollView, lang: crate::lang:
         Style::default().fg(theme::border_light()),
     )));
 
+    let link = uri_row.and_then(|row| {
+        let y = inner.y.checked_add(row as u16)?;
+        // **Only if it is actually on screen.** A short terminal cuts the box, and a link
+        // registered on a row that was never drawn would be clickable over whatever is there.
+        if y >= inner.y.saturating_add(inner.height) {
+            return None;
+        }
+        let width = crate::markdown::display_width(&view.uri).min(inner.width as usize) as u16;
+        Some(crate::app::ScreenLink {
+            row: y,
+            start: inner.x,
+            end: inner.x.saturating_add(width),
+            url: view.uri.clone(),
+        })
+    });
+
     frame.render_widget(Paragraph::new(lines), inner);
+    link
 }

@@ -78,6 +78,9 @@ pub fn draw(frame: &mut Frame, state: &mut State) {
         ])
         .split(area);
 
+    // **Rebuilt every frame.** An overlay that closed must not leave a clickable cell behind, and
+    // one that moved must not be clickable where it used to be.
+    state.screen_links.clear();
     transcript::draw(frame, chunks[0], state);
     // A click on this row opens the plan, and `apply` is pure — so where it landed is written
     // down here.
@@ -118,7 +121,12 @@ pub fn draw(frame: &mut Frame, state: &mut State) {
     // **The enrollment code window overlaps on top of that.** Nothing else may be done while viewing
     // the code — key handling also gives it top priority (`on_key`).
     if let Some(view) = &state.enroll {
-        enroll::draw(frame, full, view, state.lang);
+        // **The window is drawn from a borrow of `state`**, so the link it hands back is stored
+        // after that borrow ends.
+        let link = enroll::draw(frame, full, view, state.lang);
+        if let Some(link) = link {
+            state.screen_links.push(link);
+        }
     }
 
     // **The popup panel is drawn on top of everything.** It only opens from a slash

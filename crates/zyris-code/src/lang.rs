@@ -463,8 +463,8 @@ impl Lang {
     }
     pub fn enroll_steps(self) -> &'static str {
         self.pick(
-            "브라우저에서 이 주소를 열고, 아래 코드를 입력해 승인해 주세요:",
-            "Open this address in your browser and enter the code below:",
+            "아래 코드를 복사해 이 주소에서 승인해 주세요 (Ctrl+클릭으로 열립니다):",
+            "Copy the code below and approve it at this address (Ctrl+click opens it):",
         )
     }
     pub fn enroll_expires(self, secs: u64) -> String {
@@ -1153,8 +1153,10 @@ impl Lang {
             }
         };
         match self {
-            Lang::Ko => format!("{head}\n\n{url} 을 열고 이 코드를 넣어 주세요:\n\n**{code}**"),
-            Lang::En => format!("{head}\n\nOpen {url} and enter this code:\n\n**{code}**"),
+            Lang::Ko => {
+                format!("{head}\n\n[{url}]({url}) 을 열고 이 코드를 넣어 주세요:\n\n**{code}**")
+            }
+            Lang::En => format!("{head}\n\nOpen [{url}]({url}) and enter this code:\n\n**{code}**"),
         }
     }
     pub fn github_logged_in(self, login: &str, role: crate::github::auth::Role) -> String {
@@ -1172,8 +1174,8 @@ impl Lang {
     pub fn github_logged_out(self, role: crate::github::auth::Role) -> String {
         use crate::github::auth::Role;
         let revoke = self.pick(
-            "GitHub 쪽 권한은 남아 있으니 github.com/settings/applications 에서 직접 해제해 주세요.",
-            "The authorisation still stands on GitHub — revoke it at github.com/settings/applications.",
+            "GitHub 쪽 권한은 남아 있으니 [github.com/settings/applications](https://github.com/settings/applications) 에서 직접 해제해 주세요.",
+            "The authorisation still stands on GitHub — revoke it at [github.com/settings/applications](https://github.com/settings/applications).",
         );
         let head = match (self, role) {
             (Lang::Ko, Role::User) => "GitHub 자격을 지웠습니다.",

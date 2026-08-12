@@ -313,6 +313,14 @@ pub struct State {
     /// `transcript::draw` fills it from the rows cache; `widgets::draw` wraps those cells
     /// in OSC 8 so the terminal makes them Ctrl+clickable.
     pub view_links: Vec<Vec<crate::markdown::Link>>,
+    /// Links drawn by whatever is laid **over** the conversation — the enrolment window and any
+    /// other overlay with a URL in it.
+    ///
+    /// **In absolute screen cells**, unlike `view_links`, because an overlay is centred on the
+    /// screen rather than anchored to the transcript. It is rebuilt every frame by the drawing
+    /// side, the same way `view_total` and `activity_row` are, because `apply` is pure and cannot
+    /// know where anything landed.
+    pub screen_links: Vec<ScreenLink>,
     /// The selected range, in **screen** coordinates. **It survives releasing the mouse** — if
     /// it vanished on release there would be no moment to press Ctrl+C. Scrolling drops it
     /// (`Action::Wheel`): it is anchored to the screen, so the text under it would no longer
@@ -486,6 +494,7 @@ impl Default for State {
             view_cards: std::collections::HashMap::new(),
             view_open: std::collections::HashMap::new(),
             view_links: Vec::new(),
+            screen_links: Vec::new(),
             drag: None,
             dragging: false,
             screen: Vec::new(),
@@ -655,6 +664,17 @@ impl State {
     /// one at `view_origin`), and each `Link`'s columns are in that line's display columns —
     /// so the only mapping needed is the `view_origin` offset, exactly like `inject_links`.
     pub fn link_at(&self, x: u16, y: u16) -> Option<String> {
+        // **What is drawn on top is what gets clicked.** An overlay covers the transcript, so a
+        // cell it painted belongs to it — checking the transcript first would open whatever URL
+        // happens to be hidden underneath.
+        if let Some(found) = self
+            .screen_links
+            .iter()
+            .find(|l| l.row == y && x >= l.start && x < l.end)
+            .map(|l| l.url.clone())
+        {
+            return Some(found);
+        }
         let (ox, oy) = self.view_origin;
         if x < ox || y < oy {
             return None;
@@ -667,6 +687,17 @@ impl State {
             .find(|l| col >= l.start && col < l.end)
             .map(|l| l.url.clone())
     }
+}
+
+/// A clickable URL somewhere on the screen, in absolute cells.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScreenLink {
+    pub row: u16,
+    /// First column, inclusive.
+    pub start: u16,
+    /// One past the last column.
+    pub end: u16,
+    pub url: String,
 }
 
 pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
