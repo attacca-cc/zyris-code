@@ -1720,7 +1720,24 @@ fn apply_frame(state: &mut State, frame: &Frame) {
         // The time is not carried in the frame but stamped where it is received — same way
         // as `status_at`.
         Frame::ExecStart { id, command } => {
-            state.running_exec = Some((*id, command.clone(), Instant::now()));
+            // **Only what this conversation asked for.** A tool call carries no session — attacca
+            // knows which session made it (`route.rs`'s `target.session_id`) but sends the node
+            // nothing but the arguments — so this window runs commands for every session on the
+            // account, including ones open in another window. Drawn without asking, the activity
+            // line narrated somebody else's work as though it were this conversation's.
+            //
+            // A turn of ours running is what makes a call ours. While this window is idle every
+            // call arriving is by definition another session's. It is not exact — our turn and
+            // another session's call can overlap — but it is right in the case that actually
+            // happens, and being exact needs the server to say who called.
+            //
+            // **Shells and background jobs are not filtered this way** (`ShellOpened`,
+            // `JobStart`). Those are not a narration, they are processes living in *this*
+            // process: hiding one leaves the person quitting the app unaware and taking a build
+            // down with it.
+            if state.running {
+                state.running_exec = Some((*id, command.clone(), Instant::now()));
+            }
         }
         // **Only clear the one that finished.** With overlapping runs, a later one clearing
         // an earlier one makes the screen lie.
@@ -5903,15 +5920,64 @@ mod tests {
         assert_ne!(theirs, mine, "and it must not be painted as this conversation's");
     }
 
-    /// The same rule for `exec`, which used to hand out the hint unconditionally.
+    /// **A command this conversation did not ask for is not narrated at all.**
+    ///
+    /// It used to be shown without the stop hint, on the grounds that the machine really was
+    /// busy. But the activity line says what *this conversation* is doing, and a command from a
+    /// session open in another window read exactly like this one's work — the person watching
+    /// had no way to tell whose it was. A bounded `exec` is also nothing this window could stop.
+    ///
+    /// Backgrounded jobs stay visible under a different rule
+    /// (`work_that_is_not_this_conversations_gets_no_stop_hint`): those outlive the turn and die
+    /// with the app, so hiding one takes a build down with a window nobody knew was holding it.
     #[test]
-    fn a_command_running_for_someone_else_gets_no_stop_hint() {
+    fn a_command_this_conversation_did_not_ask_for_is_not_shown() {
         let mut s = state();
         s.connected = true;
         apply(&mut s, &Action::Frame(Frame::ExecStart { id: 1, command: "sleep 30".into() }));
         let (_, text, hint) = crate::widgets::activity_parts_at(&s, std::time::Instant::now());
-        assert!(text.contains("sleep 30"), "{text}");
+        assert!(!text.contains("sleep 30"), "somebody else's command was narrated: {text}");
         assert_eq!(hint, "", "this session has no turn to stop");
+
+        // Ours, though, is exactly what this line is for.
+        apply(&mut s, &Action::Frame(Frame::Status { running: true }));
+        apply(&mut s, &Action::Frame(Frame::ExecStart { id: 2, command: "cargo test".into() }));
+        let (_, text, hint) = crate::widgets::activity_parts_at(&s, std::time::Instant::now());
+        assert!(text.contains("cargo test"), "{text}");
+        assert_eq!(hint, s.lang.esc_stops());
+    }
+
+    /// **A question opens only on the conversation that was asked.** `state.asking` is set from
+    /// one place — a `Question` entry inside `Frame::Event` — and every such frame carries the
+    /// session it came from, so one aimed at a thread that is not on screen is dropped before it
+    /// is ever applied (`frame_is_current`). This is the half that was reported as windows
+    /// interfering; the tool-approval box that really did leak is gone.
+    #[test]
+    fn a_question_for_another_thread_never_opens_here() {
+        let asked = |seq: i64| {
+            Action::Frame(Frame::Event {
+                cursor: seq,
+                entry: Some(crate::event::Entry {
+                    seq,
+                    kind: EntryKind::Question {
+                        steps: vec![crate::question::Step {
+                            header: None,
+                            question: "which one?".into(),
+                            multi: false,
+                            options: vec![],
+                        }],
+                        answered: false,
+                    },
+                }),
+                todo: None,
+            })
+        };
+        // Aimed at another thread: dropped at the door, so nothing is applied here.
+        assert!(!frame_is_current(&Some(Origin::asked("other")), Some("mine"), 1));
+
+        let mut s = state();
+        apply(&mut s, &asked(7));
+        assert!(s.asking.is_some(), "a question for the thread on screen does open");
     }
 
     /// **What a conversation had to say goes with it.** "could not send" from the thread just
