@@ -180,8 +180,19 @@ pub enum Action {
     Backspace,
     Delete,
     DeleteWord,
+    /// The narrower word, stopping at punctuation (`Alt+Backspace`·`Alt+D`). `DeleteWord`
+    /// (`Ctrl+W`) takes a whole path; these take it a segment at a time. readline binds both.
+    DeleteWordBefore,
+    DeleteWordAfter,
+    /// From the cursor to the end (`Ctrl+K`). Its backward half is `KillToStart`.
+    KillToEnd,
+    /// Puts back what the last kill took (`Ctrl+Y`). **The only way back from a kill** — this
+    /// input has no undo, so a kill with nowhere to put the text loses a long draft outright.
+    Yank,
     Left,
     Right,
+    WordLeft,
+    WordRight,
     Home,
     End,
     Submit(String),
@@ -242,8 +253,9 @@ pub enum Action {
     /// form edits a draft instead of the live settings.
     ConfigSave,
     CycleMode,
-    /// Wipe everything typed.
-    ClearInput,
+    /// From the start of the draft up to the cursor (`Ctrl+U`). With the cursor at the end —
+    /// where it nearly always is — that is the whole draft, which is what this used to be.
+    KillToStart,
     /// Walk one step back through what was sent and bring it back.
     RecallOlder,
     /// Walk one step forward out of the recall. Past the bottom the input clears.
@@ -784,9 +796,16 @@ pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
             KeyCode::Right => vec![Action::Right],
             KeyCode::Home => vec![Action::Home],
             KeyCode::End => vec![Action::End],
-            // **Ctrl+U clears the token.** Retyping a pasted token that went in wrong is not a
-            // thing anyone should have to do character by character.
-            KeyCode::Char('u') if ctrl => vec![Action::ClearInput],
+            // **The same editing keys as the main input.** Retyping a pasted token that went in
+            // wrong is not a thing anyone should have to do character by character, and a field
+            // that answers `Ctrl+W` in one place and ignores it in another is worse than one
+            // that never answered it.
+            KeyCode::Char('u') if ctrl => vec![Action::KillToStart],
+            KeyCode::Char('k') if ctrl => vec![Action::KillToEnd],
+            KeyCode::Char('w') if ctrl => vec![Action::DeleteWord],
+            KeyCode::Char('y') if ctrl => vec![Action::Yank],
+            KeyCode::Char('a') if ctrl => vec![Action::Home],
+            KeyCode::Char('e') if ctrl => vec![Action::End],
             KeyCode::Char(c) if !ctrl => vec![Action::Insert(c)],
             _ => vec![],
         };
@@ -806,6 +825,13 @@ pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
             KeyCode::Right => vec![Action::Right],
             KeyCode::Home => vec![Action::Home],
             KeyCode::End => vec![Action::End],
+            // Same editing keys as everywhere else — see the GitHub form above.
+            KeyCode::Char('u') if ctrl => vec![Action::KillToStart],
+            KeyCode::Char('k') if ctrl => vec![Action::KillToEnd],
+            KeyCode::Char('w') if ctrl => vec![Action::DeleteWord],
+            KeyCode::Char('y') if ctrl => vec![Action::Yank],
+            KeyCode::Char('a') if ctrl => vec![Action::Home],
+            KeyCode::Char('e') if ctrl => vec![Action::End],
             KeyCode::Char(c) if !ctrl => vec![Action::Insert(c)],
             _ => vec![],
         };
@@ -902,18 +928,53 @@ pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
         // untouched — it is not one of the bytes a tty reserves.
         KeyCode::Char('t') if ctrl => vec![Action::ToggleTodos],
         KeyCode::BackTab => vec![Action::CycleMode],
+        // **The line-editing keys every terminal already teaches.** People arrive here with
+        // twenty years of `readline` in their fingers; a text field that ignores them feels
+        // broken in a way that is hard to name. Measured against `bash -ic 'bind -p'` and
+        // `zsh -c bindkey` on this machine rather than recalled, because the two shells do not
+        // agree everywhere — see `Ctrl+U` below.
         KeyCode::Char('w') if ctrl => vec![Action::DeleteWord],
-        // **Wipe everything typed.** `Ctrl+U` is the canonical one — readline, bash and zsh
-        // all do it, and the terminal just sends one 0x15 byte, so **it arrives everywhere.**
+        // **`Ctrl+U` keeps what is ahead of the cursor** — `bash`'s `unix-line-discard`, not
+        // `zsh`'s `kill-whole-line`. The shells really differ, and they agree exactly where the
+        // cursor usually is, at the end, so the everyday press still wipes the draft. Mid-draft
+        // `zsh` would also throw away the text *ahead*, which nobody asked it to.
         //
-        // `Ctrl+Backspace` is taken too. That one only comes when the terminal reports it —
-        // many terminals send the same byte as plain Backspace, leaving no way to tell them
-        // apart. It is a bonus.
-        KeyCode::Char('u') if ctrl => vec![Action::ClearInput],
-        KeyCode::Backspace if ctrl => vec![Action::ClearInput],
+        // Whatever it takes is recoverable with `Ctrl+Y`. That matters more here than in a shell:
+        // there is no undo for this field.
+        KeyCode::Char('u') if ctrl => vec![Action::KillToStart],
+        KeyCode::Char('k') if ctrl => vec![Action::KillToEnd],
+        KeyCode::Char('y') if ctrl => vec![Action::Yank],
+        // **`Ctrl+Backspace` deletes a word, it does not wipe the draft.** It used to wipe it,
+        // which is what no other program does — every GUI editor and browser deletes one word.
+        // The wipe still lives on `Ctrl+U`, where a terminal person looks for it.
+        //
+        // It only arrives when the terminal distinguishes it; many send plain Backspace's byte
+        // and there is no telling them apart. A bonus, never the only way to do this.
+        KeyCode::Backspace if ctrl => vec![Action::DeleteWord],
+        KeyCode::Backspace if alt => vec![Action::DeleteWordBefore],
         // readline convention. Moving has to work where there are no arrow keys.
         KeyCode::Char('a') if ctrl => vec![Action::Home],
         KeyCode::Char('e') if ctrl => vec![Action::End],
+        KeyCode::Char('b') if ctrl => vec![Action::Left],
+        KeyCode::Char('f') if ctrl => vec![Action::Right],
+        // **`Ctrl+B` is not `←`.** The arrow opens the list when the draft is empty; this one
+        // only ever moves. A key that sometimes moves and sometimes changes the screen is worse
+        // than one that does less.
+        KeyCode::Char('b') if alt => vec![Action::WordLeft],
+        KeyCode::Char('f') if alt => vec![Action::WordRight],
+        KeyCode::Char('d') if alt => vec![Action::DeleteWordAfter],
+        // **`Ctrl+D` deletes forward and never quits.** In a shell it ends the session on an
+        // empty line; here `Ctrl+C` is the one key that stops or quits, and a second way out —
+        // reachable by one keystroke on an empty draft — is exactly the accident that rule
+        // exists to prevent.
+        KeyCode::Char('d') if ctrl => vec![Action::Delete],
+        // History, same rules as the arrows. In a shell these always reach for history, but
+        // here that would throw away a draft in progress, so they follow `↑`/`↓` exactly rather
+        // than inventing a second set of conditions.
+        KeyCode::Char('p') if ctrl && (state.input.text.is_empty() || state.recalling()) => {
+            vec![Action::RecallOlder]
+        }
+        KeyCode::Char('n') if ctrl && state.recalling() => vec![Action::RecallNewer],
         // With a selection up, Esc clears it. This comes before cancelling a running turn —
         // what is in front of you comes first.
         KeyCode::Esc if state.selection.is_some() => vec![Action::ClearSelection],
@@ -940,6 +1001,14 @@ pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
         //
         // It only opens when the input is empty. With text there, moving the cursor comes
         // first.
+        // **Modified arrows move by word.** `Ctrl+←` is what terminals and editors have taught,
+        // `Alt+←` is the same thing on macOS — both are bound because which one a terminal
+        // actually delivers is not something the person pressing it can be expected to know.
+        //
+        // These come **before** the empty-input arm below: a modified arrow is a movement, never
+        // a request to open the list, and opening it on `Ctrl+←` would be startling.
+        KeyCode::Left if ctrl || alt => vec![Action::WordLeft],
+        KeyCode::Right if ctrl || alt => vec![Action::WordRight],
         KeyCode::Left if state.input.text.is_empty() => vec![Action::OpenPicker],
         KeyCode::Left => vec![Action::Left],
         KeyCode::Right => vec![Action::Right],
@@ -1016,6 +1085,10 @@ pub fn apply(state: &mut State, action: &Action) {
             | Action::Backspace
             | Action::Delete
             | Action::DeleteWord
+            | Action::DeleteWordBefore
+            | Action::DeleteWordAfter
+            | Action::KillToEnd
+            | Action::Yank
     ) {
         state.recall = None;
     }
@@ -1093,7 +1166,7 @@ pub fn apply(state: &mut State, action: &Action) {
                     field.end();
                 }
             }
-            Action::ClearInput => {
+            Action::KillToStart => {
                 if let Some(field) = form.typing() {
                     field.take();
                 }
@@ -1171,8 +1244,14 @@ pub fn apply(state: &mut State, action: &Action) {
         }
         Action::Delete => state.editor().delete(),
         Action::DeleteWord => state.editor().delete_word(),
+        Action::DeleteWordBefore => state.editor().delete_word_before(),
+        Action::DeleteWordAfter => state.editor().delete_word_after(),
+        Action::KillToEnd => state.editor().kill_to_end(),
+        Action::Yank => state.editor().yank(),
         Action::Left => state.editor().left(),
         Action::Right => state.editor().right(),
+        Action::WordLeft => state.editor().word_left(),
+        Action::WordRight => state.editor().word_right(),
         Action::Home => state.input.home(),
         Action::End => state.input.end(),
         Action::Submit(text) => {
@@ -1488,8 +1567,8 @@ pub fn apply(state: &mut State, action: &Action) {
         // happened.
         Action::PickBack => {}
         Action::CycleMode => state.mode = state.mode.next(),
-        Action::ClearInput => {
-            state.editor().take();
+        Action::KillToStart => {
+            state.editor().kill_to_start();
             state.recall = None;
         }
         // Recall. **A queued message comes first** — it is the only one still editable.
@@ -5678,28 +5757,90 @@ mod tests {
         assert_eq!(s.status_at(later), None, "it should be gone once time passes");
     }
 
-    /// Ctrl+U wipes everything typed. Wherever the cursor is, nothing may remain.
+    /// **Ctrl+U still wipes a draft**, because the cursor is at the end of one — every path that
+    /// puts text in the field leaves it there (typing, and `RecallOlder`/`RecallNewer`, which
+    /// both call `end`). That is why taking `bash`'s narrower meaning costs nothing in the
+    /// everyday case while doing the right thing mid-draft.
     #[test]
-    fn ctrl_u_wipes_the_whole_input() {
+    fn ctrl_u_wipes_a_draft_but_spares_what_is_ahead_of_the_cursor() {
         let mut s = state();
         for c in "지울 말".chars() {
             apply(&mut s, &Action::Insert(c));
         }
-        s.input.home();
         let actions = on_key(&s, key(KeyCode::Char('u'), KeyModifiers::CONTROL));
-        assert_eq!(actions, vec![Action::ClearInput]);
-        apply(&mut s, &Action::ClearInput);
-        assert_eq!(s.input.text, "");
-        assert_eq!(s.input.cursor, 0);
+        assert_eq!(actions, vec![Action::KillToStart]);
+        apply(&mut s, &Action::KillToStart);
+        assert_eq!(s.input.text, "", "the everyday press still clears the draft");
+
+        // Mid-draft it takes only what is behind. The old behaviour threw away the rest too.
+        let mut s = state();
+        for c in "앞 뒤".chars() {
+            apply(&mut s, &Action::Insert(c));
+        }
+        s.input.home();
+        apply(&mut s, &Action::Right);
+        apply(&mut s, &Action::KillToStart);
+        assert_eq!(s.input.text, " 뒤");
+
+        // And what it took can be put back — the only way back, since this field has no undo.
+        apply(&mut s, &Action::Yank);
+        assert_eq!(s.input.text, "앞 뒤");
     }
 
-    /// As long as the terminal reports it, Ctrl+Backspace does the same thing.
+    /// **Ctrl+Backspace deletes a word.** It used to wipe the whole draft, which no other program
+    /// does — every GUI editor and browser deletes one word. The wipe kept its own key.
     #[test]
-    fn ctrl_backspace_wipes_it_too() {
+    fn ctrl_backspace_deletes_a_word_the_way_every_editor_does() {
         let s = state();
         assert_eq!(
             on_key(&s, key(KeyCode::Backspace, KeyModifiers::CONTROL)),
-            vec![Action::ClearInput]
+            vec![Action::DeleteWord]
+        );
+    }
+
+    /// **The keys a terminal already taught, all of them reaching the field.** Bound against what
+    /// `bash -ic 'bind -p'` and `zsh -c bindkey` actually report on this machine, not from memory
+    /// — the two shells disagree about `Ctrl+U`, and guessing is how that gets missed.
+    #[test]
+    fn the_readline_keys_a_terminal_person_already_knows_all_arrive() {
+        let mut s = state();
+        for c in "alpha beta".chars() {
+            apply(&mut s, &Action::Insert(c));
+        }
+        let ctrl = |c| on_key(&s, key(KeyCode::Char(c), KeyModifiers::CONTROL));
+        let alt = |c| on_key(&s, key(KeyCode::Char(c), KeyModifiers::ALT));
+        assert_eq!(ctrl('k'), vec![Action::KillToEnd]);
+        assert_eq!(ctrl('y'), vec![Action::Yank]);
+        assert_eq!(ctrl('w'), vec![Action::DeleteWord]);
+        assert_eq!(ctrl('a'), vec![Action::Home]);
+        assert_eq!(ctrl('e'), vec![Action::End]);
+        assert_eq!(ctrl('b'), vec![Action::Left]);
+        assert_eq!(ctrl('f'), vec![Action::Right]);
+        assert_eq!(alt('b'), vec![Action::WordLeft]);
+        assert_eq!(alt('f'), vec![Action::WordRight]);
+        assert_eq!(alt('d'), vec![Action::DeleteWordAfter]);
+        assert_eq!(
+            on_key(&s, key(KeyCode::Backspace, KeyModifiers::ALT)),
+            vec![Action::DeleteWordBefore]
+        );
+
+        // Modified arrows move by word, and must not open the list — that arm sits below.
+        assert_eq!(on_key(&s, key(KeyCode::Left, KeyModifiers::CONTROL)), vec![Action::WordLeft]);
+        assert_eq!(on_key(&s, key(KeyCode::Right, KeyModifiers::ALT)), vec![Action::WordRight]);
+        let empty = state();
+        assert_eq!(
+            on_key(&empty, key(KeyCode::Left, KeyModifiers::CONTROL)),
+            vec![Action::WordLeft],
+            "a modified arrow moves; only a bare one opens the list"
+        );
+
+        // **Ctrl+D deletes forward and never quits.** A shell ends the session on an empty line;
+        // here a second one-keystroke way out would be exactly the accident Ctrl+C's rule avoids.
+        assert_eq!(ctrl('d'), vec![Action::Delete]);
+        assert_eq!(
+            on_key(&empty, key(KeyCode::Char('d'), KeyModifiers::CONTROL)),
+            vec![Action::Delete],
+            "on an empty draft it still deletes nothing rather than quitting"
         );
     }
 
