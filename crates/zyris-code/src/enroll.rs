@@ -118,15 +118,29 @@ impl Reauth {
         self.spent.load(Ordering::SeqCst)
     }
 
-    /// Discards the credentials. True if something was actually discarded.
+    /// Discards the credentials **at most once per process.** True if something was discarded.
     ///
-    /// **The connection currently running is left alone.** Cutting it here would make upstream pop
-    /// enrollment onto the screen, and the person sees the code **on the screen** — it doesn't leak
-    /// to the terminal as before. The credentials are still emptied, so the next launch (or when the connection drops and reattaches) asks cleanly.
+    /// The limit is for the automatic path: when the granted scopes come back short
+    /// (`conn::needs_reenrollment`), asking again every time would demand a browser on every
+    /// reconnect, because the person may approve narrowly again.
+    ///
+    /// **A person asking to log out is not that path** — see `discard`.
     pub async fn discard_once(&self) -> bool {
         if self.spent.swap(true, Ordering::SeqCst) {
             return false;
         }
+        self.discard().await
+    }
+
+    /// Discards the credentials, however many times it is asked.
+    ///
+    /// **`/account logout` must not be silently refused.** It used to go through `discard_once`,
+    /// so once the automatic scope check had spent the one allowance, pressing logout cleared
+    /// nothing and reported failure — with the credentials still on disk and still working. A
+    /// person asking to log out means it every time.
+    pub async fn discard(&self) -> bool {
+        // Anything automatic afterwards would be pointless: there is nothing left to discard.
+        self.spent.store(true, Ordering::SeqCst);
         match self.store.clear().await {
             Ok(()) => true,
             Err(e) => {
@@ -134,6 +148,44 @@ impl Reauth {
                 false
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests_discard {
+    use super::*;
+    use zyris::enroll::{CredentialStore, MemoryCredentialStore};
+
+    fn stored() -> zyris::enroll::StoredCredential {
+        zyris::enroll::StoredCredential::new(
+            "a".into(),
+            "r".into(),
+            "n".into(),
+            "arch zyris-code".into(),
+            "e@example.com".into(),
+            i64::MAX,
+        )
+    }
+
+    /// **A person asking to log out means it every time.**
+    ///
+    /// Logging out went through `discard_once`, which allows one discard per process for the
+    /// automatic scope check. Once that allowance was spent, pressing logout cleared nothing and
+    /// reported failure — with the credentials still on disk and still working.
+    #[tokio::test]
+    async fn asking_to_log_out_twice_still_logs_out() {
+        let store = std::sync::Arc::new(MemoryCredentialStore::default());
+        store.save(&stored()).await.unwrap();
+        let reauth = Reauth { store: store.clone(), spent: Arc::new(AtomicBool::new(false)) };
+
+        // The automatic path spends its one allowance.
+        assert!(reauth.discard_once().await);
+        assert!(!reauth.discard_once().await, "the automatic path is once per process");
+
+        // A person can still log out afterwards.
+        store.save(&stored()).await.unwrap();
+        assert!(reauth.discard().await, "logging out was refused");
+        assert!(store.load().await.unwrap().is_none(), "the credential is still there");
     }
 }
 

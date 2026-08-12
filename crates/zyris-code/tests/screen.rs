@@ -601,6 +601,53 @@ fn the_plan_unfolds_under_the_line_that_counts_it() {
     assert!(lines[lines.len() - 1].contains("일반"), "the bottom bar moved:\n{screen}");
 }
 
+/// **The `/github` screen draws both rows and never the token.** A form whose pure side is right
+/// is no use if the widget does not put it on screen, and a token on screen is a token in every
+/// screenshot and scrollback of this session.
+#[test]
+fn the_github_screen_shows_both_rows_and_hides_the_token() {
+    let mut s = State::new();
+    s.lang = zyris_code::lang::Lang::Ko;
+    s.github_form = Some(zyris_code::githubform::Form::new(Some("ruma".into()), None));
+    let screen = dump(&mut s, 80, 20);
+    assert!(screen.contains("ruma"), "the connected account is missing:\n{screen}");
+    assert!(screen.contains("리뷰 계정"), "the reviewer row is missing:\n{screen}");
+
+    // Paste a token into the reviewer row and it must not appear.
+    apply(&mut s, &Action::FormNext);
+    apply(&mut s, &Action::Paste("github_pat_11ABCDE_secretsecret".into()));
+    let screen = dump(&mut s, 80, 20);
+    assert!(!screen.contains("secretsecret"), "the token was drawn:\n{screen}");
+    assert!(screen.contains("github_pat_"), "the token's kind is not shown:\n{screen}");
+}
+
+/// **The person's row takes no typing.** Letting it swallow keys would look like a field that
+/// never fills, and the keys would be gone.
+#[test]
+fn typing_on_the_account_row_of_the_github_screen_goes_nowhere() {
+    let mut s = State::new();
+    s.github_form = Some(zyris_code::githubform::Form::new(None, None));
+    apply(&mut s, &Action::Insert('x'));
+    let form = s.github_form.as_ref().expect("the screen closed");
+    assert!(form.token.text.is_empty(), "{:?}", form.token.text);
+}
+
+/// Esc closes it, and Enter on the reviewer row asks the I/O side for what was pasted.
+#[test]
+fn the_github_screen_hands_a_pasted_token_to_the_io_side() {
+    let mut s = State::new();
+    s.github_form = Some(zyris_code::githubform::Form::new(Some("ruma".into()), None));
+    apply(&mut s, &Action::FormNext);
+    apply(&mut s, &Action::Paste("github_pat_abc".into()));
+    apply(&mut s, &Action::FormConfirm);
+    assert_eq!(
+        s.github_out,
+        Some(zyris_code::githubform::Ask::SetReviewer("github_pat_abc".into()))
+    );
+    apply(&mut s, &Action::FormCancel);
+    assert!(s.github_form.is_none(), "Esc must close it");
+}
+
 /// The quit hint must show before anything else.
 #[test]
 fn the_quit_hint_wins_over_everything_else() {

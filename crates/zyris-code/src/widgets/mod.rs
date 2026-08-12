@@ -28,6 +28,7 @@
 pub mod activity;
 mod ask;
 mod enroll;
+mod githubform;
 mod input;
 mod newproject;
 mod panel;
@@ -106,6 +107,12 @@ pub fn draw(frame: &mut Frame, state: &mut State) {
     // to close returns to the same spot.
     if let Some(form) = &state.new_project {
         newproject::draw(frame, full, form, state.lang);
+    }
+
+    // **The GitHub screen sits at the same level as the new-project form** — both are opened from
+    // one place, and neither can be open while the other is.
+    if let Some(form) = &state.github_form {
+        githubform::draw(frame, full, form, state.lang);
     }
 
     // **The enrollment code window overlaps on top of that.** Nothing else may be done while viewing

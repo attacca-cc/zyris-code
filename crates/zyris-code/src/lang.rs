@@ -647,10 +647,9 @@ impl Lang {
     /// the credentials are empty, so the next launch asks cleanly.
     pub fn account_logged_out(self) -> &'static str {
         self.pick(
-            "로그아웃했습니다. 저장된 자격을 지웠습니다 — 다음 실행 때 다시 승인 화면이 나옵니다. \
-             지금 연결은 그대로입니다.",
-            "Logged out. The stored credentials are cleared — the next launch shows the approval \
-             screen again. The current connection stays as is.",
+            "로그아웃했습니다. 자격을 지우고 연결을 끊었습니다 — 잠시 뒤 등록 코드 창이 뜹니다.",
+            "Logged out. The credentials are cleared and the connection dropped — the enrolment \
+             code appears in a moment.",
         )
     }
     /// What `/account logout` says when there is nothing to discard — a token given directly
@@ -1052,6 +1051,48 @@ impl Lang {
             }
         }
     }
+    // ── GitHub screen (`/github`)
+    pub fn github_form_title(self) -> &'static str {
+        self.pick("GitHub", "GitHub")
+    }
+    pub fn github_row_user(self) -> &'static str {
+        self.pick("내 계정", "My account")
+    }
+    /// **The reviewer row is named for what it does, not for what it holds.** "Token" would say
+    /// how it is filled in; this says why it exists.
+    pub fn github_row_reviewer(self) -> &'static str {
+        self.pick("리뷰 계정", "Reviews as")
+    }
+    pub fn github_not_connected(self) -> &'static str {
+        self.pick("이어져 있지 않음", "not connected")
+    }
+    pub fn github_paste_token(self) -> &'static str {
+        self.pick("토큰을 붙여넣으세요", "paste a token")
+    }
+    pub fn github_enter_browser(self) -> &'static str {
+        self.pick("Enter — 브라우저로 잇습니다", "Enter — connect through the browser")
+    }
+    pub fn github_enter_disconnect(self) -> &'static str {
+        self.pick("Enter — 끊습니다", "Enter — disconnect")
+    }
+    /// **Says which kind of token and why.** A fine-grained token can be limited to one repository
+    /// and to pull requests alone; the browser route hands out the same broad access the person has.
+    pub fn github_reviewer_help(self) -> &'static str {
+        self.pick(
+            "fine-grained 토큰을 붙여넣고 Enter. 리포 하나 · Pull requests 쓰기만 주면 됩니다.",
+            "Paste a fine-grained token and press Enter. One repository, Pull requests: write, is enough.",
+        )
+    }
+    pub fn github_working(self) -> &'static str {
+        self.pick("GitHub에 물어보는 중…", "asking GitHub…")
+    }
+    pub fn github_form_keys(self) -> &'static str {
+        self.pick(
+            "↑↓ 이동 · Enter 실행 · Ctrl+U 지우기 · Esc 닫기",
+            "↑↓ move · Enter · Ctrl+U clear · Esc close",
+        )
+    }
+
     // ── GitHub (`/github`)
     /// Both slots. **The reviewer is named even when there isn't one** — which account a review
     /// goes out under is the whole point of having two, and silence there reads as "the same one".
@@ -1148,6 +1189,14 @@ impl Lang {
     }
     pub fn github_nothing_to_log_out(self) -> &'static str {
         self.pick("이어져 있는 GitHub 계정이 없습니다.", "No GitHub account is connected.")
+    }
+    /// A pasted token GitHub would not accept. **Checked before it is kept** — a bad token has to
+    /// fail here, where it can be pasted again.
+    pub fn github_token_refused(self, why: &str) -> String {
+        match self {
+            Lang::Ko => format!("이 토큰은 GitHub이 받지 않습니다: {why}"),
+            Lang::En => format!("GitHub would not take that token: {why}"),
+        }
     }
     pub fn github_login_failed(self, why: &str) -> String {
         match self {

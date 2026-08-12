@@ -359,6 +359,12 @@ pub struct State {
     /// The new-project form. Opens when "＋ 새 프로젝트" is chosen from the ← list.
     /// **The list stays underneath**, so closing with Esc returns right to that spot.
     pub new_project: Option<crate::newproject::Form>,
+    /// The `/github` screen. **Where a reviewer token gets pasted** — device flow cannot produce a
+    /// fine-grained token, and a fine-grained one is the only kind that can be narrowed to pull
+    /// requests on one repository.
+    pub github_form: Option<crate::githubform::Form>,
+    /// What that screen asked the I/O side to do. Cleared once taken, the way `project_out` is.
+    pub github_out: Option<crate::githubform::Ask>,
     /// The popup panel `/mode`·`/mcp`·`/skills`·`/plugin`·`/account`·`/status` open.
     /// `None` is the ordinary state; Esc or Enter closes it.
     pub panel: Option<crate::panel::Panel>,
@@ -494,6 +500,8 @@ impl Default for State {
             project_name: None,
             loading_history: false,
             new_project: None,
+            github_form: None,
+            github_out: None,
             panel: None,
             project_out: None,
             usage: crate::usage::Usage::default(),
@@ -690,6 +698,28 @@ pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
         if !(ctrl && matches!(key.code, KeyCode::Char('c'))) {
             return ask_key(a, key, ctrl);
         }
+    }
+
+    // **The GitHub screen takes the keys the same way the new-project form does.** Ctrl+C is the
+    // one exception everywhere: stopping or quitting must never be trapped behind a screen.
+    if state.github_form.is_some() && !(ctrl && matches!(key.code, KeyCode::Char('c'))) {
+        return match key.code {
+            KeyCode::Enter => vec![Action::FormConfirm],
+            KeyCode::Esc => vec![Action::FormCancel],
+            KeyCode::Tab | KeyCode::Down => vec![Action::FormNext],
+            KeyCode::BackTab | KeyCode::Up => vec![Action::FormPrev],
+            KeyCode::Backspace => vec![Action::Backspace],
+            KeyCode::Delete => vec![Action::Delete],
+            KeyCode::Left => vec![Action::Left],
+            KeyCode::Right => vec![Action::Right],
+            KeyCode::Home => vec![Action::Home],
+            KeyCode::End => vec![Action::End],
+            // **Ctrl+U clears the token.** Retyping a pasted token that went in wrong is not a
+            // thing anyone should have to do character by character.
+            KeyCode::Char('u') if ctrl => vec![Action::ClearInput],
+            KeyCode::Char(c) if !ctrl => vec![Action::Insert(c)],
+            _ => vec![],
+        };
     }
 
     // **The new-project form sits on top of the list.** The list stays open underneath, so
@@ -940,6 +970,77 @@ pub fn apply(state: &mut State, action: &Action) {
     {
         state.drag = None;
         state.selection = None;
+    }
+
+    // **With the GitHub screen open, keys belong to it.** Only the reviewer row takes text — the
+    // person's row is a button, so a keystroke there is not swallowed into an invisible field.
+    if let Some(form) = state.github_form.as_mut() {
+        match action {
+            Action::Insert(c) => {
+                if let Some(field) = form.typing() {
+                    field.insert(*c);
+                }
+            }
+            // **A pasted token arrives whole** (`EnableBracketedPaste`), so a token with a newline
+            // on the end does not submit halfway through.
+            Action::Paste(text) => {
+                if let Some(field) = form.typing() {
+                    field.insert_str(text.trim());
+                }
+            }
+            Action::Backspace => {
+                if let Some(field) = form.typing() {
+                    field.backspace();
+                }
+            }
+            Action::Delete => {
+                if let Some(field) = form.typing() {
+                    field.delete();
+                }
+            }
+            Action::DeleteWord => {
+                if let Some(field) = form.typing() {
+                    field.delete_word();
+                }
+            }
+            Action::Left => {
+                if let Some(field) = form.typing() {
+                    field.left();
+                }
+            }
+            Action::Right => {
+                if let Some(field) = form.typing() {
+                    field.right();
+                }
+            }
+            Action::Home => {
+                if let Some(field) = form.typing() {
+                    field.home();
+                }
+            }
+            Action::End => {
+                if let Some(field) = form.typing() {
+                    field.end();
+                }
+            }
+            Action::ClearInput => {
+                if let Some(field) = form.typing() {
+                    field.take();
+                }
+            }
+            Action::FormNext => form.next(),
+            Action::FormPrev => form.prev(),
+            Action::FormConfirm => {
+                if let Some(ask) = form.submit() {
+                    form.busy = true;
+                    form.note = None;
+                    state.github_out = Some(ask);
+                }
+            }
+            Action::FormCancel => state.github_form = None,
+            _ => {}
+        }
+        return;
     }
 
     // **With the new-project form open, character keys go to the form's active field.**
@@ -2723,6 +2824,13 @@ async fn run_inner(
                         }
                     }
 
+                    // **What the GitHub screen asked for.** Same shape as the project form: the
+                    // pure side records the ask, this side does it, and the answer goes back onto
+                    // the screen so it can be corrected and retried without reopening anything.
+                    if let Some(ask) = state.github_out.take() {
+                        run_github_ask(&mut state, ask).await;
+                    }
+
                     // **Everything to do after a mode change is gathered here in one place.**
                     // There are two ways in (Shift+Tab through `apply`, `/mode` through the
                     // `finish_command` just above), and fixing them separately means one day
@@ -3534,17 +3642,36 @@ async fn finish_command(
             }
             Err(e) => state.timeline.say(state.lang.account_error(&e.to_string())),
         },
-        // **Logging out drops the stored credentials.** The current connection is left
-        // alone (`discard_once`) — the next launch asks for approval again.
+        // **Logging out drops the credentials and then drops the connection**, so the enrolment
+        // window comes up on the spot.
+        //
+        // It used to clear the file and say "restart the app". That was written when the
+        // enrolment code went to stdout, where it would have been buried under the running TUI —
+        // it now draws on screen (`enroll::ScreenEnroll`), so there is nothing left to protect
+        // against and nothing to explain: closing the socket makes the runner redial, the redial
+        // finds no credential, and the code appears exactly as it does on a first launch.
+        //
+        // It also went through `discard_once`, which allows one discard per process for the
+        // automatic scope check. Once that allowance was spent, pressing logout **cleared nothing
+        // and reported failure** while the credentials stayed on disk and kept working.
         Command::Account(Some(AccountAction::Logout(_))) => {
             let said = match bridge.reauth() {
                 // Where a token was given directly there is nothing to discard.
                 None => state.lang.account_logout_nothing().to_string(),
                 Some(reauth) => {
-                    if reauth.discard_once().await {
+                    if reauth.discard().await {
+                        // **Only after the credentials are gone.** Cutting first would let the
+                        // redial succeed with the credential still there and reconnect as if
+                        // nothing had been asked for.
+                        // Not attached means there is nothing to cut — the next attempt already
+                        // has no credential to use.
+                        if let Some(conn) = bridge.connection() {
+                            state.reconnecting = true;
+                            conn.close("logged out from /account");
+                        }
+                        state.panel = None;
                         state.lang.account_logged_out().to_string()
                     } else {
-                        // Already discarded this process, or the file could not be cleared.
                         state.lang.account_logout_failed().to_string()
                     }
                 }
@@ -3572,16 +3699,16 @@ async fn run_github(state: &mut State, action: Option<crate::command::AccountAct
     match action {
         // Both slots at once. **Saying only the user's would hide which account reviews go out
         // under**, which is the one thing the two-slot arrangement exists to make visible.
+        // **`/github` on its own opens the screen.** A wall of text saying who is connected is
+        // not something anyone can act on; the screen is, and it is the only place a reviewer
+        // token can be pasted.
         None => {
             let accounts = auth::Accounts::load();
-            match accounts.exactly(auth::Role::User) {
-                Some(user) => state.lang.github_signed_in(
-                    &user.login,
-                    accounts.exactly(auth::Role::Reviewer).map(|r| r.login.as_str()),
-                ),
-                None if auth::client_id().is_none() => state.lang.github_no_app().to_string(),
-                None => state.lang.github_signed_out().to_string(),
-            }
+            state.github_form = Some(crate::githubform::Form::new(
+                accounts.exactly(auth::Role::User).map(|a| a.login.clone()),
+                accounts.exactly(auth::Role::Reviewer).map(|a| a.login.clone()),
+            ));
+            String::new()
         }
         Some(crate::command::AccountAction::Logout(role)) => {
             if auth::Accounts::forget(role) {
@@ -3634,6 +3761,93 @@ async fn run_github(state: &mut State, action: Option<crate::command::AccountAct
             }
         }
     }
+}
+
+/// Carries out what the `/github` screen asked for.
+///
+/// **Every path ends with the screen updated**, because the screen is what the person is looking
+/// at — a silent success reads exactly like a key that did not register.
+async fn run_github_ask(state: &mut State, ask: crate::githubform::Ask) {
+    use crate::github::auth;
+    use crate::githubform::Ask;
+
+    match ask {
+        // The browser route. `run_github` already knows how to wait on a code, and it puts the
+        // code in the transcript — so the screen steps aside while that happens.
+        Ask::LoginUser => {
+            state.github_form = None;
+            let said =
+                run_github(state, Some(crate::command::AccountAction::Login(auth::Role::User)))
+                    .await;
+            if !said.is_empty() {
+                state.timeline.say(said);
+            }
+            // Reopen it with whatever the sign-in settled on, so the screen is never stale.
+            reopen_github(state);
+        }
+        Ask::LogoutUser => {
+            let worked = auth::Accounts::forget(auth::Role::User);
+            let note = match worked {
+                true => state.lang.github_logged_out(auth::Role::User),
+                false => state.lang.github_nothing_to_log_out().to_string(),
+            };
+            settle_github(state, note, worked);
+        }
+        Ask::ClearReviewer => {
+            let worked = auth::Accounts::forget(auth::Role::Reviewer);
+            let note = match worked {
+                true => state.lang.github_logged_out(auth::Role::Reviewer),
+                false => state.lang.github_nothing_to_log_out().to_string(),
+            };
+            settle_github(state, note, worked);
+        }
+        // **A pasted token is checked before it is kept.** A token that does not work must fail
+        // here, where it can be pasted again, and not at the first review weeks later.
+        Ask::SetReviewer(token) => {
+            let login = match crate::github::api::Github::new(token.clone()) {
+                Ok(client) => client.me().await,
+                Err(e) => Err(anyhow::anyhow!(e.to_string())),
+            };
+            match login {
+                Ok(login) => {
+                    let mut accounts = auth::Accounts::load();
+                    accounts.set(
+                        auth::Role::Reviewer,
+                        Some(auth::Account { token, login: login.clone() }),
+                    );
+                    let note = match accounts.save() {
+                        Ok(()) => state.lang.github_logged_in(&login, auth::Role::Reviewer),
+                        Err(e) => state.lang.github_login_failed(&e.to_string()),
+                    };
+                    settle_github(state, note, true);
+                }
+                Err(e) => {
+                    let note = state.lang.github_token_refused(&e.to_string());
+                    settle_github(state, note, false);
+                }
+            }
+        }
+    }
+}
+
+/// Puts the answer on the screen and re-reads who is connected.
+fn settle_github(state: &mut State, note: String, worked: bool) {
+    let accounts = crate::github::auth::Accounts::load();
+    if let Some(form) = state.github_form.as_mut() {
+        form.user = accounts.exactly(crate::github::auth::Role::User).map(|a| a.login.clone());
+        form.reviewer =
+            accounts.exactly(crate::github::auth::Role::Reviewer).map(|a| a.login.clone());
+        form.settled(note, worked);
+    }
+}
+
+/// Opens the screen again after something that had to close it.
+fn reopen_github(state: &mut State) {
+    let accounts = crate::github::auth::Accounts::load();
+    state.github_form = Some(crate::githubform::Form::new(
+        accounts.exactly(crate::github::auth::Role::User).map(|a| a.login.clone()),
+        accounts.exactly(crate::github::auth::Role::Reviewer).map(|a| a.login.clone()),
+    ));
 }
 
 /// Switches the agent. **If it cannot be found, nothing changes.**
