@@ -34,7 +34,11 @@ const SCOPES: &str = "repo read:user";
 ///
 /// Empty here means no app has been registered yet, and `client_id` says so rather than sending a
 /// request that GitHub answers with an unreadable 404.
-const BUILT_IN_CLIENT_ID: &str = "";
+///
+/// **There is no client secret anywhere in this repository, and there must never be one.** Device
+/// flow does not use one — that is the whole reason it is the right flow for an app that ships to
+/// other people. A secret committed beside a public client id would be a secret published.
+const BUILT_IN_CLIENT_ID: &str = "Ov23liqynev6toh0Lyd8";
 
 /// The client id to sign in with. `$ZYRIS_CODE_GITHUB_CLIENT_ID` wins, so a build can be pointed at
 /// another OAuth app without recompiling.
@@ -49,6 +53,41 @@ fn store() -> Option<PathBuf> {
     crate::conn::credential_dir().map(|dir| dir.join("github.json"))
 }
 
+/// Which of the two identities a call speaks as.
+///
+/// **Reading a repository and reviewing it are different jobs.** Reading, committing and opening a
+/// pull request are things the person does, and they should be signed by the person. A review is a
+/// second opinion, and a second opinion signed by the author is worth nothing — GitHub agrees, and
+/// refuses to let anyone approve their own pull request.
+///
+/// So there are two slots. Nothing forces the second to be filled: with only the person signed in,
+/// reviews go out under their name exactly as before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    /// The person. Everything that is not a review.
+    User,
+    /// The account reviews are signed by. Usually a machine account with access to the repository.
+    Reviewer,
+}
+
+impl Role {
+    /// From what was typed after `/github login`.
+    pub fn parse(text: &str) -> Option<Role> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "" | "user" | "me" | "사용자" | "본인" => Some(Role::User),
+            "reviewer" | "review" | "bot" | "리뷰어" => Some(Role::Reviewer),
+            _ => None,
+        }
+    }
+
+    pub fn code(self) -> &'static str {
+        match self {
+            Role::User => "user",
+            Role::Reviewer => "reviewer",
+        }
+    }
+}
+
 /// A signed-in GitHub account.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Account {
@@ -58,16 +97,54 @@ pub struct Account {
     pub login: String,
 }
 
-impl Account {
-    pub fn load() -> Option<Account> {
-        let at = store()?;
-        let text = std::fs::read_to_string(at).ok()?;
-        let account: Account = serde_json::from_str(&text).ok()?;
-        (!account.token.is_empty()).then_some(account)
+/// Both slots, as they sit on disk.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Accounts {
+    #[serde(default)]
+    pub user: Option<Account>,
+    #[serde(default)]
+    pub reviewer: Option<Account>,
+}
+
+impl Accounts {
+    pub fn load() -> Accounts {
+        let Some(at) = store() else { return Accounts::default() };
+        let Ok(text) = std::fs::read_to_string(at) else { return Accounts::default() };
+        let mut accounts: Accounts = serde_json::from_str(&text).unwrap_or_default();
+        // An empty token is not a sign-in. Keeping one would fail every call afterwards with
+        // an authentication error instead of the plain "nobody is signed in".
+        accounts.user = accounts.user.filter(|a| !a.token.is_empty());
+        accounts.reviewer = accounts.reviewer.filter(|a| !a.token.is_empty());
+        accounts
     }
 
-    /// Writes the token out. **Owner-only where the platform can say so** — it is a credential for
-    /// every repository the person can reach.
+    /// The account to speak as. **The reviewer falls back to the person** — with only one sign-in,
+    /// reviews go out under their name, which is what the app did before there were two slots.
+    pub fn for_role(&self, role: Role) -> Option<&Account> {
+        match role {
+            Role::User => self.user.as_ref(),
+            Role::Reviewer => self.reviewer.as_ref().or(self.user.as_ref()),
+        }
+    }
+
+    /// What is filled in this slot, with no falling back — what `/github` reports and what
+    /// `logout` acts on.
+    pub fn exactly(&self, role: Role) -> Option<&Account> {
+        match role {
+            Role::User => self.user.as_ref(),
+            Role::Reviewer => self.reviewer.as_ref(),
+        }
+    }
+
+    pub fn set(&mut self, role: Role, account: Option<Account>) {
+        match role {
+            Role::User => self.user = account,
+            Role::Reviewer => self.reviewer = account,
+        }
+    }
+
+    /// Writes both out. **Owner-only where the platform can say so** — these are credentials for
+    /// every repository those accounts can reach.
     pub fn save(&self) -> Result<()> {
         let at = store().context("there is nowhere to keep the token")?;
         if let Some(dir) = at.parent() {
@@ -82,10 +159,17 @@ impl Account {
         Ok(())
     }
 
-    /// Forgets it. **The token is not revoked at GitHub** — that needs the app's secret, which a
-    /// device-flow client does not have, so `/github` says where to revoke it by hand.
-    pub fn forget() -> bool {
-        store().is_some_and(|at| std::fs::remove_file(at).is_ok())
+    /// Empties one slot. **The token is not revoked at GitHub** — that needs the app's secret,
+    /// which a device-flow client does not have, so the screen says where to revoke it by hand.
+    ///
+    /// Answers whether there was anything there.
+    pub fn forget(role: Role) -> bool {
+        let mut accounts = Accounts::load();
+        if accounts.exactly(role).is_none() {
+            return false;
+        }
+        accounts.set(role, None);
+        accounts.save().is_ok()
     }
 }
 
@@ -248,6 +332,44 @@ mod tests {
     #[test]
     fn an_empty_token_is_not_a_sign_in() {
         assert_eq!(read_poll(&json!({"access_token": ""}), 5), Poll::Waiting { interval: 5 });
+    }
+
+    /// **The reviewer falls back to the person.** With one sign-in, reviews go out under their
+    /// name — which is what the app did before there were two slots, and the right default.
+    #[test]
+    fn a_review_falls_back_to_the_person_when_no_reviewer_is_connected() {
+        let me = Account { token: "t-me".into(), login: "ruma".into() };
+        let bot = Account { token: "t-bot".into(), login: "reviewer".into() };
+
+        let alone = Accounts { user: Some(me.clone()), reviewer: None };
+        assert_eq!(alone.for_role(Role::Reviewer).map(|a| &a.login), Some(&"ruma".to_string()));
+        // **`exactly` does not fall back**, so `/github` can say there is no separate reviewer.
+        assert_eq!(alone.exactly(Role::Reviewer), None);
+
+        let both = Accounts { user: Some(me), reviewer: Some(bot) };
+        assert_eq!(both.for_role(Role::Reviewer).map(|a| &a.login), Some(&"reviewer".to_string()));
+        assert_eq!(both.for_role(Role::User).map(|a| &a.login), Some(&"ruma".to_string()));
+    }
+
+    /// **Logging the reviewer out must not log the person out.** They are separate credentials and
+    /// one command should not take both.
+    #[test]
+    fn the_two_slots_are_forgotten_separately() {
+        let mut both = Accounts {
+            user: Some(Account { token: "t-me".into(), login: "ruma".into() }),
+            reviewer: Some(Account { token: "t-bot".into(), login: "bot".into() }),
+        };
+        both.set(Role::Reviewer, None);
+        assert_eq!(both.exactly(Role::Reviewer), None);
+        assert!(both.exactly(Role::User).is_some(), "the person was logged out too");
+    }
+
+    #[test]
+    fn a_role_is_read_from_what_was_typed() {
+        assert_eq!(Role::parse(""), Some(Role::User));
+        assert_eq!(Role::parse("reviewer"), Some(Role::Reviewer));
+        assert_eq!(Role::parse("리뷰어"), Some(Role::Reviewer));
+        assert_eq!(Role::parse("someone-else"), None);
     }
 
     /// **A build with no OAuth app registered says so plainly**, rather than sending a request

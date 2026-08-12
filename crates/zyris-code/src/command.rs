@@ -60,10 +60,13 @@ pub enum Command {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AccountAction {
     /// Forgets the stored credentials. The next launch asks for approval again.
-    Logout,
+    ///
+    /// The role is GitHub's — `/account logout` passes `Role::User` and ignores it, since the
+    /// node has only ever had one identity.
+    Logout(crate::github::auth::Role),
     /// Signs in. **Only GitHub uses this** — the node's own credentials are made on first launch,
     /// so there is nothing for `/account login` to do.
-    Login,
+    Login(crate::github::auth::Role),
 }
 
 /// What `/config` can set after the command word.
@@ -187,17 +190,32 @@ pub fn parse(text: &str) -> Option<Command> {
             }
             _ => Command::Unknown(format!("jobs {arg}")),
         },
-        "/github" => match arg {
-            "" | "status" => Command::Github(None),
-            "login" | "signin" | "sign in" | "로그인" => {
-                Command::Github(Some(AccountAction::Login))
+        // `/github login [reviewer]` · `/github logout [reviewer]`. **The role rides on the verb**
+        // rather than being a separate command, because it is the same act either way — the only
+        // difference is which slot the token lands in.
+        "/github" => {
+            let (verb, who) = match arg.split_once(char::is_whitespace) {
+                Some((v, r)) => (v, r.trim()),
+                None => (arg, ""),
+            };
+            let role = crate::github::auth::Role::parse(who);
+            match (verb, role) {
+                ("" | "status", _) => Command::Github(None),
+                (_, None) => return Some(Command::Unknown(format!("github {verb} {who}"))),
+                ("login" | "signin" | "로그인", Some(role)) => {
+                    Command::Github(Some(AccountAction::Login(role)))
+                }
+                ("logout" | "로그아웃", Some(role)) => {
+                    Command::Github(Some(AccountAction::Logout(role)))
+                }
+                (other, _) => return Some(Command::Unknown(format!("github {other}"))),
             }
-            "logout" | "log out" | "로그아웃" => Command::Github(Some(AccountAction::Logout)),
-            other => return Some(Command::Unknown(format!("github {other}"))),
-        },
+        }
         "/account" => match arg {
             "" => Command::Account(None),
-            "logout" | "log out" | "로그아웃" => Command::Account(Some(AccountAction::Logout)),
+            "logout" | "log out" | "로그아웃" => {
+                Command::Account(Some(AccountAction::Logout(crate::github::auth::Role::User)))
+            }
             other => return Some(Command::Unknown(format!("account {other}"))),
         },
         "/status" => Command::Status,
@@ -362,8 +380,8 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "/github",
         aliases: &["gh"],
-        note_ko: "GitHub 계정을 잇고 끊습니다 (login · logout)",
-        note_en: "Connect or disconnect a GitHub account (login · logout)",
+        note_ko: "GitHub 계정을 잇고 끊습니다 (login · login reviewer · logout)",
+        note_en: "Connect or disconnect GitHub (login · login reviewer · logout)",
     },
     CommandSpec {
         name: "/account",
@@ -732,12 +750,48 @@ mod tests {
     }
 
     /// When it's unclear what's being asked, **don't pick just anything.** Falling into the closing side would be the worst.
+    /// **The two GitHub slots are told apart by the word after the verb.** Getting this wrong
+    /// would sign the wrong account in, which looks exactly like it worked.
+    #[test]
+    fn github_login_takes_a_role_and_refuses_a_word_it_does_not_know() {
+        use crate::github::auth::Role;
+        assert_eq!(parse("/github"), Some(Command::Github(None)));
+        assert_eq!(
+            parse("/github login"),
+            Some(Command::Github(Some(AccountAction::Login(Role::User))))
+        );
+        assert_eq!(
+            parse("/github login reviewer"),
+            Some(Command::Github(Some(AccountAction::Login(Role::Reviewer))))
+        );
+        assert_eq!(
+            parse("/github logout reviewer"),
+            Some(Command::Github(Some(AccountAction::Logout(Role::Reviewer))))
+        );
+        assert_eq!(parse("/gh login 리뷰어"), parse("/github login reviewer"));
+        // **A role nobody knows is refused, not taken as the person.** Signing the wrong account
+        // in is the one mistake here that looks like success.
+        assert_eq!(
+            parse("/github login 아무거나"),
+            Some(Command::Unknown("github login 아무거나".into()))
+        );
+    }
+
     #[test]
     fn account_shows_by_default_and_logs_out_only_when_asked() {
         assert_eq!(parse("/account"), Some(Command::Account(None)));
-        assert_eq!(parse("/account logout"), Some(Command::Account(Some(AccountAction::Logout))));
-        assert_eq!(parse("/account log out"), Some(Command::Account(Some(AccountAction::Logout))));
-        assert_eq!(parse("/account 로그아웃"), Some(Command::Account(Some(AccountAction::Logout))));
+        assert_eq!(
+            parse("/account logout"),
+            Some(Command::Account(Some(AccountAction::Logout(crate::github::auth::Role::User))))
+        );
+        assert_eq!(
+            parse("/account log out"),
+            Some(Command::Account(Some(AccountAction::Logout(crate::github::auth::Role::User))))
+        );
+        assert_eq!(
+            parse("/account 로그아웃"),
+            Some(Command::Account(Some(AccountAction::Logout(crate::github::auth::Role::User))))
+        );
         // An unknown argument never falls into the logging-out side.
         assert_eq!(parse("/account stop"), Some(Command::Unknown("account stop".into())));
     }

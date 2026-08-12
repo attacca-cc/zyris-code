@@ -3536,7 +3536,7 @@ async fn finish_command(
         },
         // **Logging out drops the stored credentials.** The current connection is left
         // alone (`discard_once`) — the next launch asks for approval again.
-        Command::Account(Some(AccountAction::Logout)) => {
+        Command::Account(Some(AccountAction::Logout(_))) => {
             let said = match bridge.reauth() {
                 // Where a token was given directly there is nothing to discard.
                 None => state.lang.account_logout_nothing().to_string(),
@@ -3570,29 +3570,38 @@ async fn run_github(state: &mut State, action: Option<crate::command::AccountAct
     use crate::github::auth;
 
     match action {
-        // What the account is now.
-        None => match auth::Account::load() {
-            Some(account) => state.lang.github_signed_in(&account.login),
-            None if auth::client_id().is_none() => state.lang.github_no_app().to_string(),
-            None => state.lang.github_signed_out().to_string(),
-        },
-        Some(crate::command::AccountAction::Logout) => {
-            if auth::Account::forget() {
-                state.lang.github_logged_out().to_string()
+        // Both slots at once. **Saying only the user's would hide which account reviews go out
+        // under**, which is the one thing the two-slot arrangement exists to make visible.
+        None => {
+            let accounts = auth::Accounts::load();
+            match accounts.exactly(auth::Role::User) {
+                Some(user) => state.lang.github_signed_in(
+                    &user.login,
+                    accounts.exactly(auth::Role::Reviewer).map(|r| r.login.as_str()),
+                ),
+                None if auth::client_id().is_none() => state.lang.github_no_app().to_string(),
+                None => state.lang.github_signed_out().to_string(),
+            }
+        }
+        Some(crate::command::AccountAction::Logout(role)) => {
+            if auth::Accounts::forget(role) {
+                state.lang.github_logged_out(role)
             } else {
                 state.lang.github_nothing_to_log_out().to_string()
             }
         }
-        Some(crate::command::AccountAction::Login) => {
+        Some(crate::command::AccountAction::Login(role)) => {
             let pending = match auth::begin().await {
                 Ok(p) => p,
                 Err(why) => return state.lang.github_login_failed(&why.to_string()),
             };
             // **The code goes on screen before the wait starts.** It is the only thing the person
             // can act on, and printing it after the polling loop would be printing it too late.
-            state
-                .timeline
-                .say(state.lang.github_code(&pending.user_code, &pending.verification_uri));
+            state.timeline.say(state.lang.github_code(
+                &pending.user_code,
+                &pending.verification_uri,
+                role,
+            ));
             let deadline =
                 std::time::Instant::now() + std::time::Duration::from_secs(pending.expires_in);
             let mut wait = std::time::Duration::from_secs(pending.interval);
@@ -3614,11 +3623,12 @@ async fn run_github(state: &mut State, action: Option<crate::command::AccountAct
                             Ok(client) => client.me().await.unwrap_or_default(),
                             Err(_) => String::new(),
                         };
-                        let account = auth::Account { token, login: login.clone() };
-                        if let Err(e) = account.save() {
+                        let mut accounts = auth::Accounts::load();
+                        accounts.set(role, Some(auth::Account { token, login: login.clone() }));
+                        if let Err(e) = accounts.save() {
                             return state.lang.github_login_failed(&e.to_string());
                         }
-                        return state.lang.github_logged_in(&login);
+                        return state.lang.github_logged_in(&login, role);
                     }
                 }
             }

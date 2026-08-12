@@ -32,13 +32,14 @@ impl GithubTools {
     ///
     /// **Read at call time, not held.** Signing in with `/github login` has to take effect without
     /// restarting, and a client built at startup would have captured "not signed in" for good.
-    fn client(&self) -> zyris::Result<Github> {
-        let Some(account) = auth::Account::load() else {
+    fn client(&self, role: auth::Role) -> zyris::Result<Github> {
+        let accounts = auth::Accounts::load();
+        let Some(account) = accounts.for_role(role) else {
             return Err(zyris::WireError::invalid_params(
                 "not signed in to GitHub — the person running this node needs to run `/github login`",
             ));
         };
-        Github::new(account.token).map_err(|e| zyris::WireError::internal(e.to_string()))
+        Github::new(account.token.clone()).map_err(|e| zyris::WireError::internal(e.to_string()))
     }
 
     /// Which repository a call is about.
@@ -95,8 +96,12 @@ fn err(e: anyhow::Error) -> zyris::WireError {
 
 #[zyris::capability(name = "github", version = 1)]
 pub trait GithubCap {
-    /// Which GitHub account this node is signed in as. Answers the login, or says nobody is signed
-    /// in — call it first if a later call fails on authentication.
+    /// Which GitHub accounts this node is signed in as, and which repository it is sitting in.
+    ///
+    /// **There are two slots.** Everything is done as `user`; a review is done as `reviewer` when
+    /// one is signed in, because a second opinion signed by the author is worth nothing — GitHub
+    /// refuses to let anyone approve their own pull request. With no reviewer signed in, reviews
+    /// go out as the user.
     async fn me(&self) -> zyris::Result<Value>;
 
     /// Issues on a repository, newest first. `repo` is `owner/name`; leave it empty for the
@@ -185,36 +190,45 @@ pub struct ReviewNote {
 #[async_trait::async_trait]
 impl GithubCap for GithubTools {
     async fn me(&self) -> zyris::Result<Value> {
-        let login = self.client()?.me().await.map_err(err)?;
+        let login = self.client(auth::Role::User)?.me().await.map_err(err)?;
         let here = repo_of(&self.cwd).map(|r| format!("{}/{}", r.owner, r.name));
-        Ok(json!({"login": login, "repository_here": here}))
+        // **Named without a round trip.** The login was asked for when the token was saved, so
+        // reporting the reviewer costs nothing — and a call per slot would double the wait.
+        let accounts = auth::Accounts::load();
+        let reviewer = accounts.exactly(auth::Role::Reviewer).map(|a| a.login.clone());
+        Ok(json!({
+            "login": login,
+            "reviews_as": reviewer.clone().unwrap_or_else(|| login.clone()),
+            "separate_reviewer": reviewer.is_some(),
+            "repository_here": here,
+        }))
     }
 
     async fn issues(&self, repo: String, state: String, limit: u32) -> zyris::Result<Value> {
         let repo = self.repo(&repo)?;
         let state = normalise_state(&state);
-        self.client()?.issues(&repo, &state, limit_of(limit)).await.map_err(err)
+        self.client(auth::Role::User)?.issues(&repo, &state, limit_of(limit)).await.map_err(err)
     }
 
     async fn issue(&self, repo: String, number: u32) -> zyris::Result<Value> {
         let repo = self.repo(&repo)?;
-        self.client()?.issue(&repo, number as u64).await.map_err(err)
+        self.client(auth::Role::User)?.issue(&repo, number as u64).await.map_err(err)
     }
 
     async fn pulls(&self, repo: String, state: String, limit: u32) -> zyris::Result<Value> {
         let repo = self.repo(&repo)?;
         let state = normalise_state(&state);
-        self.client()?.pulls(&repo, &state, limit_of(limit)).await.map_err(err)
+        self.client(auth::Role::User)?.pulls(&repo, &state, limit_of(limit)).await.map_err(err)
     }
 
     async fn pull(&self, repo: String, number: u32) -> zyris::Result<Value> {
         let repo = self.repo(&repo)?;
-        self.client()?.pull(&repo, number as u64).await.map_err(err)
+        self.client(auth::Role::User)?.pull(&repo, number as u64).await.map_err(err)
     }
 
     async fn pull_diff(&self, repo: String, number: u32) -> zyris::Result<String> {
         let repo = self.repo(&repo)?;
-        self.client()?.pull_diff(&repo, number as u64).await.map_err(err)
+        self.client(auth::Role::User)?.pull_diff(&repo, number as u64).await.map_err(err)
     }
 
     async fn comment(&self, repo: String, number: u32, body: String) -> zyris::Result<Value> {
@@ -222,7 +236,7 @@ impl GithubCap for GithubTools {
             return Err(zyris::WireError::invalid_params("a comment with no words in it"));
         }
         let repo = self.repo(&repo)?;
-        self.client()?.comment(&repo, number as u64, &body).await.map_err(err)
+        self.client(auth::Role::User)?.comment(&repo, number as u64, &body).await.map_err(err)
     }
 
     async fn create_issue(
@@ -236,7 +250,10 @@ impl GithubCap for GithubTools {
             return Err(zyris::WireError::invalid_params("an issue needs a title"));
         }
         let repo = self.repo(&repo)?;
-        self.client()?.create_issue(&repo, &title, &body, &labels).await.map_err(err)
+        self.client(auth::Role::User)?
+            .create_issue(&repo, &title, &body, &labels)
+            .await
+            .map_err(err)
     }
 
     async fn create_pull(
@@ -254,7 +271,10 @@ impl GithubCap for GithubTools {
             ));
         }
         let repo = self.repo(&repo)?;
-        self.client()?.create_pull(&repo, &title, &body, &head, &base, draft).await.map_err(err)
+        self.client(auth::Role::User)?
+            .create_pull(&repo, &title, &body, &head, &base, draft)
+            .await
+            .map_err(err)
     }
 
     async fn review(
@@ -278,7 +298,10 @@ impl GithubCap for GithubTools {
             ));
         }
         let repo = self.repo(&repo)?;
-        self.client()?.review(&repo, number as u64, event, &body, &comments).await.map_err(err)
+        self.client(auth::Role::Reviewer)?
+            .review(&repo, number as u64, event, &body, &comments)
+            .await
+            .map_err(err)
     }
 
     async fn request_review(
@@ -291,7 +314,10 @@ impl GithubCap for GithubTools {
             return Err(zyris::WireError::invalid_params("no one to ask"));
         }
         let repo = self.repo(&repo)?;
-        self.client()?.request_review(&repo, number as u64, &reviewers).await.map_err(err)
+        self.client(auth::Role::Reviewer)?
+            .request_review(&repo, number as u64, &reviewers)
+            .await
+            .map_err(err)
     }
 }
 
@@ -400,8 +426,8 @@ mod tests {
         // Only meaningful on a machine with no token; on one with a token this is vacuous, which
         // is why the message is asserted rather than the branch.
         let tools = GithubTools::new(std::path::PathBuf::from("/"));
-        if auth::Account::load().is_none() {
-            let Err(why) = tools.client() else { panic!("it must refuse") };
+        if auth::Accounts::load().for_role(auth::Role::User).is_none() {
+            let Err(why) = tools.client(auth::Role::User) else { panic!("it must refuse") };
             let why = why.to_string();
             assert!(why.contains("/github login"), "{why}");
         }

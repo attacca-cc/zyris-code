@@ -1053,12 +1053,28 @@ impl Lang {
         }
     }
     // ── GitHub (`/github`)
-    pub fn github_signed_in(self, login: &str) -> String {
-        match self {
-            Lang::Ko => {
-                format!("GitHub에 `{login}`으로 이어져 있습니다. `/github logout`으로 끊습니다.")
-            }
-            Lang::En => format!("Connected to GitHub as `{login}`. `/github logout` disconnects."),
+    /// Both slots. **The reviewer is named even when there isn't one** — which account a review
+    /// goes out under is the whole point of having two, and silence there reads as "the same one".
+    pub fn github_signed_in(self, login: &str, reviewer: Option<&str>) -> String {
+        match (self, reviewer) {
+            (Lang::Ko, Some(r)) => format!(
+                "GitHub에 `{login}`으로 이어져 있습니다.\n리뷰는 `{r}` 이름으로 나갑니다.\n\n\
+                 `/github logout`·`/github logout reviewer`로 끊습니다."
+            ),
+            (Lang::Ko, None) => format!(
+                "GitHub에 `{login}`으로 이어져 있습니다.\n리뷰어를 따로 잇지 않아 리뷰도 \
+                 `{login}` 이름으로 나갑니다 — 자기 PR은 승인할 수 없습니다.\n\n\
+                 `/github login reviewer`로 리뷰 전용 계정을 잇습니다."
+            ),
+            (Lang::En, Some(r)) => format!(
+                "Connected to GitHub as `{login}`.\nReviews go out as `{r}`.\n\n\
+                 `/github logout` and `/github logout reviewer` disconnect."
+            ),
+            (Lang::En, None) => format!(
+                "Connected to GitHub as `{login}`.\nNo separate reviewer is connected, so reviews \
+                 go out as `{login}` too — and nobody can approve their own pull request.\n\n\
+                 `/github login reviewer` connects an account just for reviews."
+            ),
         }
     }
     pub fn github_signed_out(self) -> &'static str {
@@ -1078,33 +1094,57 @@ impl Lang {
         )
     }
     /// The code to type, and where. **Both, together** — a code with nowhere to put it is no use.
-    pub fn github_code(self, code: &str, url: &str) -> String {
+    pub fn github_code(self, code: &str, url: &str, role: crate::github::auth::Role) -> String {
+        use crate::github::auth::Role;
+        // **The reviewer line says to use a logged-out window.** Approving in the everyday browser
+        // signs in as yourself, which is the one mistake this arrangement exists to prevent — and
+        // it looks exactly like it worked.
+        let head = match (self, role) {
+            (Lang::Ko, Role::User) => "이 창을 GitHub 계정에 잇습니다.",
+            (Lang::Ko, Role::Reviewer) => {
+                "리뷰 전용 계정을 잇습니다. **시크릿 창에서 그 계정으로 로그인한 뒤** 승인해 주세요 \
+                 — 평소 브라우저로 하면 본인 계정으로 이어집니다."
+            }
+            (Lang::En, Role::User) => "Connecting this window to a GitHub account.",
+            (Lang::En, Role::Reviewer) => {
+                "Connecting the account reviews go out under. **Approve from a private window \
+                 signed in as that account** — your everyday browser would connect you instead."
+            }
+        };
         match self {
-            Lang::Ko => format!(
-                "{url} 을 열고 이 코드를 넣어 주세요:\n\n**{code}**\n\n승인하면 이어집니다."
-            ),
-            Lang::En => format!(
-                "Open {url} and enter this code:\n\n**{code}**\n\nIt connects once you approve."
-            ),
+            Lang::Ko => format!("{head}\n\n{url} 을 열고 이 코드를 넣어 주세요:\n\n**{code}**"),
+            Lang::En => format!("{head}\n\nOpen {url} and enter this code:\n\n**{code}**"),
         }
     }
-    pub fn github_logged_in(self, login: &str) -> String {
-        match (self, login.is_empty()) {
-            (Lang::Ko, false) => format!("GitHub에 `{login}`으로 이었습니다."),
-            (Lang::Ko, true) => "GitHub에 이었습니다.".to_string(),
-            (Lang::En, false) => format!("Connected to GitHub as `{login}`."),
-            (Lang::En, true) => "Connected to GitHub.".to_string(),
+    pub fn github_logged_in(self, login: &str, role: crate::github::auth::Role) -> String {
+        use crate::github::auth::Role;
+        let who = if login.is_empty() { "GitHub" } else { login };
+        match (self, role) {
+            (Lang::Ko, Role::User) => format!("GitHub에 `{who}`으로 이었습니다."),
+            (Lang::Ko, Role::Reviewer) => format!("리뷰는 이제 `{who}` 이름으로 나갑니다."),
+            (Lang::En, Role::User) => format!("Connected to GitHub as `{who}`."),
+            (Lang::En, Role::Reviewer) => format!("Reviews now go out as `{who}`."),
         }
     }
     /// **Says the token is not revoked at GitHub.** Device flow has no secret to revoke with, and
     /// leaving that unsaid would let someone think a live token had been destroyed.
-    pub fn github_logged_out(self) -> &'static str {
-        self.pick(
-            "GitHub 자격을 지웠습니다. GitHub 쪽 권한은 남아 있으니 \
-             github.com/settings/applications 에서 직접 해제해 주세요.",
-            "The GitHub credential is gone from this machine. The authorisation still stands on \
-             GitHub — revoke it at github.com/settings/applications.",
-        )
+    pub fn github_logged_out(self, role: crate::github::auth::Role) -> String {
+        use crate::github::auth::Role;
+        let revoke = self.pick(
+            "GitHub 쪽 권한은 남아 있으니 github.com/settings/applications 에서 직접 해제해 주세요.",
+            "The authorisation still stands on GitHub — revoke it at github.com/settings/applications.",
+        );
+        let head = match (self, role) {
+            (Lang::Ko, Role::User) => "GitHub 자격을 지웠습니다.",
+            (Lang::Ko, Role::Reviewer) => {
+                "리뷰어 자격을 지웠습니다. 이제 리뷰도 본인 계정으로 나갑니다."
+            }
+            (Lang::En, Role::User) => "The GitHub credential is gone from this machine.",
+            (Lang::En, Role::Reviewer) => {
+                "The reviewer credential is gone; reviews go out as you again."
+            }
+        };
+        format!("{head} {revoke}")
     }
     pub fn github_nothing_to_log_out(self) -> &'static str {
         self.pick("이어져 있는 GitHub 계정이 없습니다.", "No GitHub account is connected.")
