@@ -23,6 +23,7 @@ pub mod markdown;
 pub mod mcp;
 pub mod mode;
 pub mod newproject;
+pub mod nodes;
 pub mod notice;
 pub mod panel;
 pub mod picker;
