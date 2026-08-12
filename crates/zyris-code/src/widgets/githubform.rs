@@ -13,9 +13,19 @@ use crate::githubform::{masked, Field, Form};
 use crate::markdown::display_width;
 use crate::theme;
 
-pub fn draw(frame: &mut Frame, area: Rect, form: &Form, lang: crate::lang::Lang) {
-    // Two rows, a blank, the hint, and a note when there is one — plus the two border lines.
-    let h = 7u16.saturating_add(form.note.is_some() as u16);
+/// Draws the screen. **Answers where the approval address landed** so the caller can register it
+/// as a link — the widget cannot reach into `State`.
+pub fn draw(
+    frame: &mut Frame,
+    area: Rect,
+    form: &Form,
+    lang: crate::lang::Lang,
+) -> Option<crate::app::ScreenLink> {
+    // Two rows, a blank, the hint, and a note when there is one — plus the two border lines. A
+    // code being waited on takes three more.
+    let h = 7u16
+        .saturating_add(form.note.is_some() as u16)
+        .saturating_add(if form.pending.is_some() { 3 } else { 0 });
     let h = h.min(area.height.saturating_sub(2)).max(6);
     let w = 66.min(area.width.saturating_sub(4)).max(28);
     let box_area = Rect {
@@ -70,12 +80,29 @@ pub fn draw(frame: &mut Frame, area: Rect, form: &Form, lang: crate::lang::Lang)
         width,
     ));
 
+    // **A code being waited on comes before the hint**, because it is the only thing on the
+    // screen the person can act on and it stops being any use when it expires.
+    let mut uri_row = None;
+    if let Some((code, uri)) = &form.pending {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("   {code}   "),
+            Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD),
+        )));
+        uri_row = Some(lines.len());
+        lines.push(Line::from(Span::styled(
+            uri.clone(),
+            Style::default().fg(theme::tool()).add_modifier(Modifier::UNDERLINED),
+        )));
+    }
+
     lines.push(Line::from(""));
     // What the row under the cursor would do, so Enter is never a guess.
     lines.push(Line::from(Span::styled(
-        match form.busy {
-            true => lang.github_working().to_string(),
-            false => match form.field {
+        match (form.busy, form.pending.is_some()) {
+            (_, true) => lang.github_approve_it().to_string(),
+            (true, _) => lang.github_working().to_string(),
+            _ => match form.field {
                 Field::User => match form.user.is_some() {
                     true => lang.github_enter_disconnect().to_string(),
                     false => lang.github_enter_browser().to_string(),
@@ -96,7 +123,24 @@ pub fn draw(frame: &mut Frame, area: Rect, form: &Form, lang: crate::lang::Lang)
         Style::default().fg(theme::border_light()),
     )));
 
+    let link = uri_row.zip(form.pending.as_ref()).and_then(|(row, (_, uri))| {
+        let y = inner.y.checked_add(row as u16)?;
+        // Only when it really is on screen — a short terminal cuts the box, and a link on a row
+        // that was never drawn would fire on a click over whatever is there instead.
+        if y >= inner.y.saturating_add(inner.height) {
+            return None;
+        }
+        let width = display_width(uri).min(inner.width as usize) as u16;
+        Some(crate::app::ScreenLink {
+            row: y,
+            start: inner.x,
+            end: inner.x.saturating_add(width),
+            url: uri.clone(),
+        })
+    });
+
     frame.render_widget(Paragraph::new(lines), inner);
+    link
 }
 
 /// One row: a fixed-width label, then the value.

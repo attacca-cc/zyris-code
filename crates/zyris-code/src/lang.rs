@@ -1083,6 +1083,14 @@ impl Lang {
             "Paste a fine-grained token and press Enter. One repository, Pull requests: write, is enough.",
         )
     }
+    /// While a code is waiting. **Says to open it, not just that something is happening** — the
+    /// address right above is the only thing that moves this along.
+    pub fn github_approve_it(self) -> &'static str {
+        self.pick(
+            "위 주소를 열고(Ctrl+클릭) 이 코드를 넣어 승인해 주세요. 승인하면 저절로 이어집니다.",
+            "Open the address above (Ctrl+click), enter this code and approve. It connects by itself.",
+        )
+    }
     pub fn github_working(self) -> &'static str {
         self.pick("GitHub에 물어보는 중…", "asking GitHub…")
     }

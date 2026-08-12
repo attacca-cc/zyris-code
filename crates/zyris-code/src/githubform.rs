@@ -53,6 +53,12 @@ pub struct Form {
     pub note: Option<String>,
     /// Whether something is in flight, so the screen can say so and the keys can stand down.
     pub busy: bool,
+    /// A device code waiting to be approved, and where to approve it.
+    ///
+    /// **Drawn on the screen that asked for it**, because that is where the person is looking.
+    /// The sign-in itself runs off the draw loop — waiting on it here froze the app for as long
+    /// as the code was good for.
+    pub pending: Option<(String, String)>,
 }
 
 impl Form {
@@ -110,6 +116,7 @@ impl Form {
     /// serves nothing.
     pub fn settled(&mut self, note: String, worked: bool) {
         self.busy = false;
+        self.pending = None;
         self.note = Some(note);
         if worked {
             self.token = Input::new();

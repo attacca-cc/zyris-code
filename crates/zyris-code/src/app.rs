@@ -91,6 +91,13 @@ pub enum Frame {
     },
     /// A list could not be fetched. The list closes and the reason is said once.
     PickerFailed(String),
+    /// News from the GitHub sign-in, which runs **off the loop**.
+    ///
+    /// Device flow is a wait: ask for a code, then poll until somebody approves it in a browser,
+    /// for up to fifteen minutes. Doing that on the draw loop froze the whole app — no keys, no
+    /// redraw, not even the code it was waiting on. That is the trap `CLAUDE.md` records for the
+    /// lists, and this fell straight into it.
+    Github(GithubNews),
     /// A session's history, replayed into the screen. Sent by the task that fetched it, so
     /// switching threads never blocks the loop. Tagged with the session id, so a switch made
     /// while an older one was still loading drops the loser (`frame_is_current`).
@@ -689,6 +696,16 @@ impl State {
     }
 }
 
+/// What the background GitHub work has to say.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GithubNews {
+    /// A code to approve, and where. **Shown the moment it arrives** — it is the only thing the
+    /// person can act on, and it is worthless after it expires.
+    Code { code: String, uri: String },
+    /// It finished, one way or the other. The screen says so and re-reads who is connected.
+    Settled { note: String, worked: bool },
+}
+
 /// A clickable URL somewhere on the screen, in absolute cells.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScreenLink {
@@ -1005,7 +1022,7 @@ pub fn apply(state: &mut State, action: &Action) {
 
     // **With the GitHub screen open, keys belong to it.** Only the reviewer row takes text — the
     // person's row is a button, so a keystroke there is not swallowed into an invisible field.
-    if let Some(form) = state.github_form.as_mut() {
+    if let Some(form) = state.github_form.as_mut().filter(|_| !matches!(action, Action::Frame(_))) {
         match action {
             Action::Insert(c) => {
                 if let Some(field) = form.typing() {
@@ -1077,7 +1094,12 @@ pub fn apply(state: &mut State, action: &Action) {
     // **With the new-project form open, character keys go to the form's active field.**
     // They must not leak into the input below — the form is a different place. Creating does
     // not call the server here; it only fills `project_out` — the I/O side actually creates.
-    if state.new_project.is_some() {
+    // **A frame is not a keystroke and must never be swallowed here.** A form takes the keys, not
+    // the server's news: dropping frames while one is open loses timeline events and stops
+    // `last_cursor` advancing, so resuming picks up from the wrong place. It is also how the
+    // GitHub screen's own device code failed to reach it — sent as a frame, eaten by the screen
+    // it was meant for.
+    if state.new_project.is_some() && !matches!(action, Action::Frame(_)) {
         match action {
             Action::Insert(c) => {
                 state.new_project.as_mut().expect("just checked it").active().insert(*c)
@@ -1640,6 +1662,35 @@ fn apply_frame(state: &mut State, frame: &Frame) {
             state.picker = None;
             state.loading_history = false;
             state.set_error(why.clone());
+        }
+        // **The screen may have been closed while this was in flight.** Esc closes it and the
+        // sign-in carries on in the background — so the code goes to the transcript as well, and
+        // that is where it is read from if the window is gone.
+        Frame::Github(news) => {
+            match news {
+                GithubNews::Code { code, uri } => {
+                    if let Some(form) = state.github_form.as_mut() {
+                        form.pending = Some((code.clone(), uri.clone()));
+                    }
+                }
+                GithubNews::Settled { note, worked } => {
+                    let accounts = crate::github::auth::Accounts::load();
+                    if let Some(form) = state.github_form.as_mut() {
+                        form.pending = None;
+                        form.user = accounts
+                            .exactly(crate::github::auth::Role::User)
+                            .map(|a| a.login.clone());
+                        form.reviewer = accounts
+                            .exactly(crate::github::auth::Role::Reviewer)
+                            .map(|a| a.login.clone());
+                        form.settled(note.clone(), *worked);
+                    } else {
+                        // Nowhere to put it, so it goes where everything else that has no window
+                        // goes rather than being dropped.
+                        state.timeline.say(note.clone());
+                    }
+                }
+            }
         }
         // A session's history. It arrives whole, so the screen it replaces is torn down here
         // rather than at the moment of the click — until this lands, the previous thread is
@@ -2859,7 +2910,7 @@ async fn run_inner(
                     // pure side records the ask, this side does it, and the answer goes back onto
                     // the screen so it can be corrected and retried without reopening anything.
                     if let Some(ask) = state.github_out.take() {
-                        run_github_ask(&mut state, ask).await;
+                        run_github_ask(&mut state, ask, &tx);
                     }
 
                     // **Everything to do after a mode change is gathered here in one place.**
@@ -3798,24 +3849,22 @@ async fn run_github(state: &mut State, action: Option<crate::command::AccountAct
 ///
 /// **Every path ends with the screen updated**, because the screen is what the person is looking
 /// at — a silent success reads exactly like a key that did not register.
-async fn run_github_ask(state: &mut State, ask: crate::githubform::Ask) {
+fn run_github_ask(
+    state: &mut State,
+    ask: crate::githubform::Ask,
+    tx: &mpsc::UnboundedSender<AppMsg>,
+) {
     use crate::github::auth;
     use crate::githubform::Ask;
 
     match ask {
-        // The browser route. `run_github` already knows how to wait on a code, and it puts the
-        // code in the transcript — so the screen steps aside while that happens.
-        Ask::LoginUser => {
-            state.github_form = None;
-            let said =
-                run_github(state, Some(crate::command::AccountAction::Login(auth::Role::User)))
-                    .await;
-            if !said.is_empty() {
-                state.timeline.say(said);
-            }
-            // Reopen it with whatever the sign-in settled on, so the screen is never stale.
-            reopen_github(state);
-        }
+        // **Off the loop.** Device flow is a wait of up to fifteen minutes; doing it here froze
+        // the app so completely that the code it was waiting on never reached the screen.
+        Ask::LoginUser => spawn_github_login(auth::Role::User, state.lang, tx),
+        // One request, but with a twenty-second timeout on it — long enough that holding the draw
+        // loop would read as a hang.
+        Ask::SetReviewer(token) => spawn_github_token(token, state.lang, tx),
+        // These only touch a file, so they finish here.
         Ask::LogoutUser => {
             let worked = auth::Accounts::forget(auth::Role::User);
             let note = match worked {
@@ -3832,33 +3881,121 @@ async fn run_github_ask(state: &mut State, ask: crate::githubform::Ask) {
             };
             settle_github(state, note, worked);
         }
-        // **A pasted token is checked before it is kept.** A token that does not work must fail
-        // here, where it can be pasted again, and not at the first review weeks later.
-        Ask::SetReviewer(token) => {
-            let login = match crate::github::api::Github::new(token.clone()) {
-                Ok(client) => client.me().await,
-                Err(e) => Err(anyhow::anyhow!(e.to_string())),
-            };
-            match login {
+    }
+}
+
+/// Runs the browser sign-in in the background, reporting through `Frame::Github`.
+///
+/// **Nothing here touches the screen directly.** It cannot: the screen is on the other side of the
+/// loop this was moved off. The code goes back as news the moment GitHub hands it over.
+fn spawn_github_login(
+    role: crate::github::auth::Role,
+    lang: crate::lang::Lang,
+    tx: &mpsc::UnboundedSender<AppMsg>,
+) {
+    use crate::github::auth;
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let say = |news: GithubNews| {
+            let _ = tx.send((None, Action::Frame(Frame::Github(news))));
+        };
+        let pending = match auth::begin().await {
+            Ok(p) => p,
+            Err(why) => {
+                return say(GithubNews::Settled {
+                    note: lang.github_login_failed(&why.to_string()),
+                    worked: false,
+                })
+            }
+        };
+        say(GithubNews::Code {
+            code: pending.user_code.clone(),
+            uri: pending.verification_uri.clone(),
+        });
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(pending.expires_in);
+        let mut wait = std::time::Duration::from_secs(pending.interval);
+        loop {
+            if std::time::Instant::now() >= deadline {
+                return say(GithubNews::Settled {
+                    note: lang.github_login_failed("the code expired"),
+                    worked: false,
+                });
+            }
+            tokio::time::sleep(wait).await;
+            match auth::poll(&pending).await {
+                auth::Poll::Waiting { interval } => wait = std::time::Duration::from_secs(interval),
+                auth::Poll::Failed(why) => {
+                    return say(GithubNews::Settled {
+                        note: lang.github_login_failed(&why),
+                        worked: false,
+                    })
+                }
+                auth::Poll::Done(token) => {
+                    // **The login is asked for straight away** so the screen can name the account
+                    // without another round trip, and a token that does not work is caught here
+                    // rather than at the first tool call.
+                    let login = match crate::github::api::Github::new(token.clone()) {
+                        Ok(client) => client.me().await.unwrap_or_default(),
+                        Err(_) => String::new(),
+                    };
+                    let mut accounts = auth::Accounts::load();
+                    accounts.set(role, Some(auth::Account { token, login: login.clone() }));
+                    return say(match accounts.save() {
+                        Ok(()) => GithubNews::Settled {
+                            note: lang.github_logged_in(&login, role),
+                            worked: true,
+                        },
+                        Err(e) => GithubNews::Settled {
+                            note: lang.github_login_failed(&e.to_string()),
+                            worked: false,
+                        },
+                    });
+                }
+            }
+        }
+    });
+}
+
+/// Checks a pasted token and keeps it, in the background.
+///
+/// **Checked before it is kept.** A token that does not work has to fail here, where it can be
+/// pasted again, and not weeks later at the first review.
+fn spawn_github_token(token: String, lang: crate::lang::Lang, tx: &mpsc::UnboundedSender<AppMsg>) {
+    use crate::github::auth;
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let news = match crate::github::api::Github::new(token.clone()) {
+            Ok(client) => match client.me().await {
                 Ok(login) => {
                     let mut accounts = auth::Accounts::load();
                     accounts.set(
                         auth::Role::Reviewer,
                         Some(auth::Account { token, login: login.clone() }),
                     );
-                    let note = match accounts.save() {
-                        Ok(()) => state.lang.github_logged_in(&login, auth::Role::Reviewer),
-                        Err(e) => state.lang.github_login_failed(&e.to_string()),
-                    };
-                    settle_github(state, note, true);
+                    match accounts.save() {
+                        Ok(()) => GithubNews::Settled {
+                            note: lang.github_logged_in(&login, auth::Role::Reviewer),
+                            worked: true,
+                        },
+                        Err(e) => GithubNews::Settled {
+                            note: lang.github_login_failed(&e.to_string()),
+                            worked: false,
+                        },
+                    }
                 }
-                Err(e) => {
-                    let note = state.lang.github_token_refused(&e.to_string());
-                    settle_github(state, note, false);
-                }
-            }
-        }
-    }
+                Err(e) => GithubNews::Settled {
+                    note: lang.github_token_refused(&e.to_string()),
+                    worked: false,
+                },
+            },
+            Err(e) => GithubNews::Settled {
+                note: lang.github_login_failed(&e.to_string()),
+                worked: false,
+            },
+        };
+        let _ = tx.send((None, Action::Frame(Frame::Github(news))));
+    });
 }
 
 /// Puts the answer on the screen and re-reads who is connected.
@@ -3870,15 +4007,6 @@ fn settle_github(state: &mut State, note: String, worked: bool) {
             accounts.exactly(crate::github::auth::Role::Reviewer).map(|a| a.login.clone());
         form.settled(note, worked);
     }
-}
-
-/// Opens the screen again after something that had to close it.
-fn reopen_github(state: &mut State) {
-    let accounts = crate::github::auth::Accounts::load();
-    state.github_form = Some(crate::githubform::Form::new(
-        accounts.exactly(crate::github::auth::Role::User).map(|a| a.login.clone()),
-        accounts.exactly(crate::github::auth::Role::Reviewer).map(|a| a.login.clone()),
-    ));
 }
 
 /// Switches the agent. **If it cannot be found, nothing changes.**

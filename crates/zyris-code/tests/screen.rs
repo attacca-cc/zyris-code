@@ -648,6 +648,107 @@ fn the_github_screen_hands_a_pasted_token_to_the_io_side() {
     assert!(s.github_form.is_none(), "Esc must close it");
 }
 
+/// **Signing in must not freeze the app.** Device flow is a wait of up to fifteen minutes, and
+/// running it on the draw loop took the whole screen down — including the code it was waiting on.
+/// The code arrives as a frame instead, from a task off the loop.
+#[test]
+fn the_device_code_reaches_the_github_screen_as_a_frame() {
+    use zyris_code::app::GithubNews;
+    let mut s = State::new();
+    s.lang = zyris_code::lang::Lang::Ko;
+    s.github_form = Some(zyris_code::githubform::Form::new(None, None));
+    apply(&mut s, &Action::FormConfirm);
+    assert_eq!(s.github_out, Some(zyris_code::githubform::Ask::LoginUser));
+
+    apply(
+        &mut s,
+        &Action::Frame(AppFrame::Github(GithubNews::Code {
+            code: "WXQR-7KBD".into(),
+            uri: "https://github.com/login/device".into(),
+        })),
+    );
+    let screen = dump(&mut s, 80, 24);
+    assert!(screen.contains("WXQR-7KBD"), "the code is not on screen:\n{screen}");
+    assert!(screen.contains("github.com/login/device"), "{screen}");
+    // And the address is Ctrl+clickable, like the enrolment window's.
+    let link = s
+        .screen_links
+        .iter()
+        .find(|l| l.url == "https://github.com/login/device")
+        .expect("the address was not registered as a link");
+    assert_eq!(s.link_at(link.start, link.row).as_deref(), Some("https://github.com/login/device"));
+}
+
+/// When it settles, the code goes and the answer takes its place.
+#[test]
+fn the_github_screen_takes_the_answer_when_the_sign_in_settles() {
+    use zyris_code::app::GithubNews;
+    let mut s = State::new();
+    s.lang = zyris_code::lang::Lang::Ko;
+    let mut form = zyris_code::githubform::Form::new(None, None);
+    form.pending = Some(("WXQR-7KBD".into(), "https://github.com/login/device".into()));
+    form.busy = true;
+    s.github_form = Some(form);
+    apply(
+        &mut s,
+        &Action::Frame(AppFrame::Github(GithubNews::Settled {
+            note: "이었습니다".into(),
+            worked: true,
+        })),
+    );
+    let form = s.github_form.as_ref().expect("the screen closed");
+    assert!(form.pending.is_none(), "the spent code is still up");
+    assert!(!form.busy);
+    let screen = dump(&mut s, 80, 24);
+    assert!(!screen.contains("WXQR-7KBD"), "{screen}");
+    assert!(screen.contains("이었습니다"), "{screen}");
+}
+
+/// **Closing the screen must not lose the answer.** Esc closes it while the sign-in carries on in
+/// the background, so what it has to say goes where everything without a window goes.
+#[test]
+fn an_answer_that_arrives_after_the_screen_closed_is_still_said() {
+    use zyris_code::app::GithubNews;
+    let mut s = State::new();
+    s.lang = zyris_code::lang::Lang::Ko;
+    apply(
+        &mut s,
+        &Action::Frame(AppFrame::Github(GithubNews::Settled {
+            note: "이었습니다".into(),
+            worked: true,
+        })),
+    );
+    let screen = dump(&mut s, 80, 14);
+    assert!(screen.contains("이었습니다"), "{screen}");
+}
+
+/// **A form takes the keys, never the server's news.**
+///
+/// Both forms returned early for every action, frames included — so while one was open, timeline
+/// events were dropped and `last_cursor` stopped advancing, which puts a resume in the wrong
+/// place. It is also how the GitHub screen's own device code failed to reach it.
+#[test]
+fn a_form_being_open_does_not_swallow_what_the_server_says() {
+    for open_a_form in [0, 1] {
+        let mut s = State::new();
+        if open_a_form == 0 {
+            s.new_project = Some(zyris_code::newproject::Form::new());
+        } else {
+            s.github_form = Some(zyris_code::githubform::Form::new(None, None));
+        }
+        apply(
+            &mut s,
+            &Action::Frame(AppFrame::Event {
+                cursor: 42,
+                entry: Some(Entry { seq: 42, kind: EntryKind::Agent("들어온 말".into()) }),
+                todo: None,
+            }),
+        );
+        assert_eq!(s.last_cursor, Some(42), "the resume position was lost (form {open_a_form})");
+        assert_eq!(s.timeline.items().len(), 1, "the event was dropped (form {open_a_form})");
+    }
+}
+
 /// The quit hint must show before anything else.
 #[test]
 fn the_quit_hint_wins_over_everything_else() {
