@@ -81,39 +81,23 @@ async fn main() -> ExitCode {
         }
     }
 
-    // **Which window this is, decided before anything that depends on it.**
+    // **One credential, one node.** Splitting it per window was tried (2026-08-12) and taken out:
+    // it made a window's identity depend on what else happened to be running when it started, so
+    // ordinary use produced an approval screen again and again. What remains is the lock, which
+    // says whether another window is already up.
     //
-    // Two windows on one credential are **one node** to the server, and its registry keeps the
-    // connection that arrived last — so the earlier window keeps a live socket and is handed no
-    // tool calls at all. The node side cannot route around that; the only way out is to stop being
-    // the same node, and identity here is the credential. So each window takes a slot and files
-    // its credentials under a profile of its own (`conn::claim_window`).
-    //
-    // **Splitting by working directory is not enough** — running several windows in one directory
-    // is ordinary, and they would collide exactly as before.
-    //
-    // The profile, the credential file, and the node name all hang off this, so it has to be
-    // settled first. **The handle lives as long as `main`** — dropping it removes the lock file,
-    // and a window that gave up its slot early would hand its identity to the next one to start.
-    // **A profile the person pinned is their identity, not ours to number.** With `$ZYRIS_PROFILE`
-    // set, a slot is still claimed so two windows do not fight over the lock, but neither the
-    // profile nor the node name is renamed underneath them.
-    let pinned = std::env::var_os("ZYRIS_PROFILE").is_some();
+    // **The handle lives as long as `main`** — dropping it removes the lock file, and a window
+    // that let go early would look absent to the next one to start.
     let window = zyris_code::conn::credential_dir().map(|dir| {
         let base =
             std::env::var("ZYRIS_PROFILE").unwrap_or_else(|_| zyris_code::conn::APP.to_string());
         zyris_code::conn::claim_window(&dir, &base)
     });
-    let slot = if pinned { 1 } else { window.as_ref().map_or(1, |w| w.slot) };
 
-    // The profile splits again inside that directory. **A profile the person gave wins** — then
-    // they have said which identity this window is, and taking a slot on top would file the
-    // credentials somewhere they did not ask for.
+    // The profile splits again inside that directory. Unset just leaves it `default`, and now
+    // that `default` is ours.
     if std::env::var_os("ZYRIS_PROFILE").is_none() {
-        let profile = window
-            .as_ref()
-            .map_or_else(|| zyris_code::conn::APP.to_string(), |w| w.profile.clone());
-        std::env::set_var("ZYRIS_PROFILE", profile);
+        std::env::set_var("ZYRIS_PROFILE", zyris_code::conn::APP);
     }
 
     // What's left in the old place is **moved over** (not copied). If two live refresh tokens
@@ -147,12 +131,8 @@ async fn main() -> ExitCode {
     // machine's other nodes** — if `zyris-daemon` runs alongside, both attach as `arch`, and attacca
     // separates them by appending `-2` to one, but which one keeps `arch` depends on attach order.
     // Then the tool names the agent reads (`zyris__arch__…`) change from run to run.
-    //
-    // **The window slot goes in the name too.** Separate credentials already make them separate
-    // nodes, but with equal names attacca's `slug_with_suffix` decides which keeps the bare slug by
-    // attach order — and then the tool names the agent reads move between runs.
     if std::env::var_os("ZYRIS_NODE_NAME").is_none() {
-        std::env::set_var("ZYRIS_NODE_NAME", zyris_code::conn::default_node_name(slot));
+        std::env::set_var("ZYRIS_NODE_NAME", zyris_code::conn::default_node_name());
     }
 
     // **The app is raised before the runner.** That way the enrollment code window is on screen from
@@ -221,25 +201,17 @@ async fn main() -> ExitCode {
     //
     // Here is where the screen exists to say what the slot means. **A window past the first enrols
     // once** — an approval window with no explanation reads as the app having logged itself out.
-    match window.as_ref() {
-        Some(w) if w.slot > 1 => {
-            tracing::info!(slot = w.slot, profile = %w.profile, "this window registers as a node of its own");
-            bridge.frame(zyris_code::app::Frame::Notice(
-                zyris_code::lang::current().window_slot_notice(w.slot),
-            ));
-        }
-        // Every slot was taken, so this window shares the first one's identity and the old tangle
-        // is back: the server hands tool calls to whichever connection arrived last.
-        Some(w) if w.lock.is_none() => {
-            tracing::warn!(
-                "every window slot is taken, so this window shares a credential. tool calls go to \
-                 whichever window the server picked."
-            );
-            bridge.frame(zyris_code::app::Frame::Notice(
-                zyris_code::lang::current().another_window_notice().to_string(),
-            ));
-        }
-        _ => {}
+    // **The second window is told, and told once.** With one credential the server keeps the
+    // connection that arrived last, so this window has just taken the tool calls from the other
+    // one — see `### 창 여럿` in CLAUDE.md.
+    if window.as_ref().is_some_and(|w| w.lock.is_none()) {
+        tracing::warn!(
+            "another zyris-code window is attached with the same credentials. tool calls go to \
+             whichever window the server picked."
+        );
+        bridge.frame(zyris_code::app::Frame::Notice(
+            zyris_code::lang::current().another_window_notice().to_string(),
+        ));
     }
     let _instance_lock = window;
     //
