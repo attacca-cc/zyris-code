@@ -183,6 +183,54 @@ impl Github {
         Ok(slim_issue(&created))
     }
 
+    /// Submits a review. **A different endpoint from a comment** — this one carries a verdict and
+    /// can hang remarks off particular lines of the diff.
+    pub async fn review(
+        &self,
+        repo: &Repo,
+        number: u64,
+        event: &str,
+        body: &str,
+        comments: &[crate::github::ReviewNote],
+    ) -> Result<Value> {
+        let mut payload = json!({"event": event, "body": body});
+        if !comments.is_empty() {
+            payload["comments"] = json!(comments
+                .iter()
+                .map(|c| json!({"path": c.path, "line": c.line, "body": c.body}))
+                .collect::<Vec<_>>());
+        }
+        let posted = self
+            .post(&format!("/repos/{}/{}/pulls/{number}/reviews", repo.owner, repo.name), payload)
+            .await?;
+        Ok(json!({
+            "state": posted.get("state").and_then(Value::as_str).unwrap_or_default(),
+            "url": posted.get("html_url").and_then(Value::as_str).unwrap_or_default(),
+        }))
+    }
+
+    /// Asks people to review. **Answers who is now on the hook**, because GitHub silently drops a
+    /// name it will not accept — someone without access to the repository, or the author.
+    pub async fn request_review(
+        &self,
+        repo: &Repo,
+        number: u64,
+        reviewers: &[String],
+    ) -> Result<Value> {
+        let posted = self
+            .post(
+                &format!("/repos/{}/{}/pulls/{number}/requested_reviewers", repo.owner, repo.name),
+                json!({ "reviewers": reviewers }),
+            )
+            .await?;
+        let asked: Vec<String> = posted
+            .get("requested_reviewers")
+            .and_then(Value::as_array)
+            .map(|r| r.iter().map(|u| text_at(u, "login")).collect())
+            .unwrap_or_default();
+        Ok(json!({ "requested": asked }))
+    }
+
     pub async fn create_pull(
         &self,
         repo: &Repo,

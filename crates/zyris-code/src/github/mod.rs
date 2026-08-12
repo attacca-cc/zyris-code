@@ -140,6 +140,46 @@ pub trait GithubCap {
         base: String,
         draft: bool,
     ) -> zyris::Result<Value>;
+
+    /// Submits a review on a pull request. **Not the same as a comment** — a review carries a
+    /// verdict and can hang remarks off particular lines.
+    ///
+    /// `event` is `comment`, `approve` or `request_changes`. Each entry in `comments` needs a file
+    /// path and a line number **as the diff numbers it**, which is what `pull_diff` shows.
+    ///
+    /// **You cannot approve your own pull request.** GitHub refuses, and this node acts as the
+    /// person who signed in — use `comment` there.
+    async fn review(
+        &self,
+        repo: String,
+        number: u32,
+        event: String,
+        body: String,
+        comments: Vec<ReviewNote>,
+    ) -> zyris::Result<Value>;
+
+    /// Asks people to review a pull request. `reviewers` are GitHub logins.
+    ///
+    /// **Accounts and teams only.** There is no way to name an app: an OAuth app is not an
+    /// identity of its own, it acts as whoever signed in.
+    async fn request_review(
+        &self,
+        repo: String,
+        number: u32,
+        reviewers: Vec<String>,
+    ) -> zyris::Result<Value>;
+}
+
+/// One remark against a line of the diff.
+#[derive(
+    Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+pub struct ReviewNote {
+    /// The file, as the diff names it.
+    pub path: String,
+    /// The line **in the diff**, not in the file on disk — `pull_diff` is where to read it from.
+    pub line: u32,
+    pub body: String,
 }
 
 #[async_trait::async_trait]
@@ -216,6 +256,43 @@ impl GithubCap for GithubTools {
         let repo = self.repo(&repo)?;
         self.client()?.create_pull(&repo, &title, &body, &head, &base, draft).await.map_err(err)
     }
+
+    async fn review(
+        &self,
+        repo: String,
+        number: u32,
+        event: String,
+        body: String,
+        comments: Vec<ReviewNote>,
+    ) -> zyris::Result<Value> {
+        let event = review_event(&event).ok_or_else(|| {
+            zyris::WireError::invalid_params(format!(
+                "`{event}` is not a review verdict — use comment, approve or request_changes"
+            ))
+        })?;
+        // **A verdict with nothing to say is fine; a comment with nothing at all is not.** GitHub
+        // rejects an empty COMMENT review, and the message it gives back says nothing useful.
+        if event == "COMMENT" && body.trim().is_empty() && comments.is_empty() {
+            return Err(zyris::WireError::invalid_params(
+                "a review with no words and no line remarks says nothing",
+            ));
+        }
+        let repo = self.repo(&repo)?;
+        self.client()?.review(&repo, number as u64, event, &body, &comments).await.map_err(err)
+    }
+
+    async fn request_review(
+        &self,
+        repo: String,
+        number: u32,
+        reviewers: Vec<String>,
+    ) -> zyris::Result<Value> {
+        if reviewers.is_empty() {
+            return Err(zyris::WireError::invalid_params("no one to ask"));
+        }
+        let repo = self.repo(&repo)?;
+        self.client()?.request_review(&repo, number as u64, &reviewers).await.map_err(err)
+    }
 }
 
 /// **An unknown state is `open`, not an error.** A model that writes `"opened"` should get the
@@ -225,6 +302,17 @@ fn normalise_state(given: &str) -> String {
         "closed" | "close" => "closed".into(),
         "all" | "any" | "*" => "all".into(),
         _ => "open".into(),
+    }
+}
+
+/// What GitHub calls the verdict. **An unknown word is refused rather than guessed at** — the
+/// difference between `approve` and `request_changes` is not something to be generous about.
+fn review_event(given: &str) -> Option<&'static str> {
+    match given.trim().to_ascii_lowercase().replace([' ', '-'], "_").as_str() {
+        "comment" | "" => Some("COMMENT"),
+        "approve" | "approved" => Some("APPROVE"),
+        "request_changes" | "changes" | "reject" => Some("REQUEST_CHANGES"),
+        _ => None,
     }
 }
 
@@ -288,6 +376,21 @@ mod tests {
         std::fs::write(dir.path().join(".git/config"), "[remote \"origin\"]\n\turl = /srv/bare\n")
             .unwrap();
         assert_eq!(repo_of(dir.path()), None);
+    }
+
+    /// **A verdict is not guessed at.** The difference between approving a change and asking for
+    /// more work is exactly the sort of thing to be strict about; being generous here would let a
+    /// typo approve something.
+    #[test]
+    fn a_review_verdict_is_read_strictly() {
+        assert_eq!(review_event("approve"), Some("APPROVE"));
+        assert_eq!(review_event("request changes"), Some("REQUEST_CHANGES"));
+        assert_eq!(review_event("request-changes"), Some("REQUEST_CHANGES"));
+        assert_eq!(review_event("comment"), Some("COMMENT"));
+        // **An unset verdict is a plain comment**, the one that changes nothing.
+        assert_eq!(review_event(""), Some("COMMENT"));
+        assert_eq!(review_event("lgtm"), None);
+        assert_eq!(review_event("yes"), None);
     }
 
     /// **Not signed in is said, not failed at further down.** The message has to name the thing
