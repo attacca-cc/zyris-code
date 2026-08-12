@@ -289,9 +289,10 @@ async fn main() -> ExitCode {
     // **The list lives in one place** (`conn::REQUIRED_SCOPES`). If what's requested and what's
     // checked after attaching diverge, you'd either deny something you never asked for or stay silent about something missing.
     .request_scopes(zyris_code::conn::REQUIRED_SCOPES)
-    // **Splitting windows is the server's job.** The node has nothing to offer — neither `.instance(…)`
-    // nor registering siblings via `register_node` exists on the real server (measured 2026-08-03). So
-    // here it just attaches, and the day the server starts splitting nodes, it happens by itself.
+    // **Windows are split by registering, not by the server.** `register_node` answered
+    // `MethodNotFound` when this was first tried (2026-08-03) and answers properly now
+    // (2026-08-12) — the old note here said the server would have to do it, and the server did.
+    // `nodes.rs` holds that; by this point `$ZYRIS_NODE_TOKEN` already names which node this is.
     .on_connect({
         let bridge = bridge.clone();
         let notice = notice.clone();
