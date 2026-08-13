@@ -97,6 +97,7 @@ pub fn draw(
         crate::picker::Level::Agents
         | crate::picker::Level::Commands
         | crate::picker::Level::Files { .. }
+        | crate::picker::Level::History { .. }
         | crate::picker::Level::PluginTarget { .. } => lang.picker_esc_close(),
     };
     lines.push(Line::from(Span::styled(

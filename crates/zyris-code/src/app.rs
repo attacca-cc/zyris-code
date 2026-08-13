@@ -188,6 +188,15 @@ pub enum Action {
     DeleteWordAfter,
     /// From the cursor to the end (`Ctrl+K`). Its backward half is `KillToStart`.
     KillToEnd,
+    /// Opens the search over what has been sent (`Ctrl+R`).
+    OpenHistory,
+    /// A character typed into a list that carries its own query (the history search).
+    ///
+    /// **Separate from `Insert`** precisely because it must not reach the draft: the `/` and `@`
+    /// lists narrow from what is being written, and this one narrows without disturbing it.
+    PickType(char),
+    /// Erases one character of that query.
+    PickErase,
     /// Puts back what the last kill took (`Ctrl+Y`). **The only way back from a kill** — this
     /// input has no undo, so a kill with nowhere to put the text loses a long draft outright.
     Yank,
@@ -896,6 +905,22 @@ pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
             state.picker.as_ref().map(|p| &p.level),
             Some(crate::picker::Level::Commands | crate::picker::Level::Files { .. })
         );
+        // **The history search types into itself, not into the draft.** It is opened over
+        // whatever is being written — often a half-finished message — and a search that ate those
+        // keystrokes would destroy the very draft someone opened it to help finish.
+        let searching =
+            matches!(state.picker.as_ref().map(|p| &p.level), Some(crate::picker::Level::History { .. }));
+        if searching {
+            return match key.code {
+                KeyCode::Up => vec![Action::PickUp],
+                KeyCode::Down => vec![Action::PickDown],
+                KeyCode::Enter => vec![Action::PickConfirm],
+                KeyCode::Backspace => vec![Action::PickErase],
+                KeyCode::Esc => vec![Action::PickBack],
+                KeyCode::Char(c) if !ctrl => vec![Action::PickType(c)],
+                _ => vec![],
+            };
+        }
         return match key.code {
             KeyCode::Up => vec![Action::PickUp],
             KeyCode::Down => vec![Action::PickDown],
@@ -989,6 +1014,10 @@ pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
         // History, same rules as the arrows. In a shell these always reach for history, but
         // here that would throw away a draft in progress, so they follow `↑`/`↓` exactly rather
         // than inventing a second set of conditions.
+        // **`Ctrl+R` searches everything sent, where `↑` only walks back.** Walking is fine for
+        // the last message and useless by the tenth, which is exactly when someone wants the one
+        // they wrote twenty turns ago.
+        KeyCode::Char('r') if ctrl => vec![Action::OpenHistory],
         KeyCode::Char('p') if ctrl && (state.input.text.is_empty() || state.recalling()) => {
             vec![Action::RecallOlder]
         }
@@ -1268,6 +1297,30 @@ pub fn apply(state: &mut State, action: &Action) {
         Action::DeleteWordAfter => state.editor().delete_word_after(),
         Action::KillToEnd => state.editor().kill_to_end(),
         Action::Yank => state.editor().yank(),
+        // **Nothing sent yet means nothing to search.** An empty box reads as broken, and there
+        // is no wrong guess to make here — the key simply has nothing to do.
+        Action::OpenHistory => {
+            if !state.sent.is_empty() {
+                state.picker = Some(crate::picker::Picker::history(&state.sent, ""));
+            }
+        }
+        Action::PickType(c) => {
+            if let Some(crate::picker::Level::History { query }) =
+                state.picker.as_ref().map(|p| &p.level)
+            {
+                let query = format!("{query}{c}");
+                state.picker = Some(crate::picker::Picker::history(&state.sent, &query));
+            }
+        }
+        Action::PickErase => {
+            if let Some(crate::picker::Level::History { query }) =
+                state.picker.as_ref().map(|p| &p.level)
+            {
+                let mut query = query.clone();
+                query.pop();
+                state.picker = Some(crate::picker::Picker::history(&state.sent, &query));
+            }
+        }
         Action::Left => state.editor().left(),
         Action::Right => state.editor().right(),
         Action::WordLeft => state.editor().word_left(),
@@ -2008,6 +2061,23 @@ fn insert_path(state: &mut State, at: usize, path: &str) {
     // No trailing space: the path may well be mid-sentence, and a space that is not wanted is
     // harder to notice than one that is missing.
     state.input.cursor = cut + path.chars().count();
+}
+
+/// Puts a message picked out of the history search back into the draft.
+///
+/// **Replaces the draft outright.** It was chosen from a search over whole messages, so that
+/// message is what is wanted — spliced into a half-written line it would be a sentence nobody
+/// wrote. The cursor lands at the end, ready to edit before sending.
+///
+/// Pure, so it lives here rather than in `pick`, and the test drives the real thing rather than a
+/// copy of it.
+fn use_history(state: &mut State, text: String) {
+    state.picker = None;
+    state.input.text = text;
+    state.input.end();
+    // Leaving the recall pointing somewhere else would make the next ↓ jump to an unrelated
+    // message — picking here *is* the choice of where in the history to be.
+    state.recall = None;
 }
 
 fn follow_the_slash(state: &mut State) {
@@ -3758,6 +3828,10 @@ async fn pick(
         // so the path goes exactly where the reference was — and only that span, because the rest
         // of the sentence is still wanted.
         Pick::InsertPath { at, path } => insert_path(state, at, &path),
+        // **Replaces the draft outright.** It was chosen from a search over whole messages, so
+        // that message is what is wanted — merging it into a half-written line would make a
+        // sentence nobody wrote. The cursor lands at the end, ready to edit before sending.
+        Pick::UseHistory { text } => use_history(state, text),
     }
 }
 
@@ -6719,5 +6793,103 @@ mod file_reference {
         let p = crate::picker::Picker::files(&all, "app", 0);
         let labels: Vec<&str> = p.rows.iter().map(|r| r.label.as_str()).collect();
         assert_eq!(labels, vec!["src/app.rs", "src/happy.rs", "docs/apparatus/notes.md"]);
+    }
+}
+
+#[cfg(test)]
+mod history_search {
+    use super::*;
+
+    fn state() -> State {
+        State::new()
+    }
+
+    fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, mods)
+    }
+
+    fn with_history(sent: &[&str]) -> State {
+        let mut s = state();
+        s.sent = sent.iter().map(|t| t.to_string()).collect();
+        s
+    }
+
+    /// **The search types into itself, never into the draft.** It is opened over a message being
+    /// written — that is when someone reaches for something they said before — so a search that
+    /// swallowed those keystrokes into the draft would wreck the very thing it was opened to help.
+    #[test]
+    fn searching_the_history_leaves_the_draft_untouched() {
+        let mut s = with_history(&["fix the parser", "run the tests", "fix the picker"]);
+        for c in "half-written".chars() {
+            apply(&mut s, &Action::Insert(c));
+        }
+        apply(&mut s, &Action::OpenHistory);
+
+        // A character now goes to the query, not to the draft.
+        assert_eq!(
+            on_key(&s, key(KeyCode::Char('f'), KeyModifiers::NONE)),
+            vec![Action::PickType('f')]
+        );
+        for c in "fix".chars() {
+            apply(&mut s, &Action::PickType(c));
+        }
+        assert_eq!(s.input.text, "half-written", "the search ate the draft");
+
+        let p = s.picker.as_ref().unwrap();
+        let labels: Vec<&str> = p.rows.iter().map(|r| r.label.as_str()).collect();
+        assert_eq!(labels, vec!["fix the picker", "fix the parser"], "newest first");
+
+        // Backspace widens the search rather than editing the draft.
+        apply(&mut s, &Action::PickErase);
+        assert_eq!(s.picker.as_ref().unwrap().rows.len(), 2, "still both `fi…` messages");
+        for _ in 0..2 {
+            apply(&mut s, &Action::PickErase);
+        }
+        assert_eq!(s.picker.as_ref().unwrap().rows.len(), 3, "an empty query is everything");
+        assert_eq!(s.input.text, "half-written");
+    }
+
+    /// **Picking replaces the draft.** What was searched for was a whole message, so that is what
+    /// comes back — spliced into the half-written line it would be a sentence nobody wrote.
+    #[test]
+    fn picking_from_the_history_replaces_the_draft_and_leaves_the_cursor_at_the_end() {
+        let mut s = with_history(&["run the tests"]);
+        for c in "scrap this".chars() {
+            apply(&mut s, &Action::Insert(c));
+        }
+        apply(&mut s, &Action::OpenHistory);
+        let pick = s.picker.as_ref().unwrap().pick().unwrap();
+        assert_eq!(pick, crate::picker::Pick::UseHistory { text: "run the tests".into() });
+        pick_history(&mut s, pick);
+        assert_eq!(s.input.text, "run the tests");
+        assert_eq!(s.input.cursor, "run the tests".chars().count(), "ready to edit before sending");
+        assert!(s.picker.is_none());
+    }
+
+    /// Nothing sent yet means nothing to search — an empty box reads as broken.
+    #[test]
+    fn the_search_does_not_open_with_nothing_to_search() {
+        let mut s = state();
+        apply(&mut s, &Action::OpenHistory);
+        assert!(s.picker.is_none());
+    }
+
+    /// **A multi-line message is flattened for the row, not for the pick.** It would otherwise
+    /// take over the list, and what comes back has to be the message as it was written.
+    #[test]
+    fn a_multi_line_message_stays_one_row_but_comes_back_whole() {
+        let mut s = with_history(&["first line\nsecond line"]);
+        apply(&mut s, &Action::OpenHistory);
+        let p = s.picker.as_ref().unwrap();
+        assert_eq!(p.rows[0].label, "first line second line");
+        let pick = p.pick().unwrap();
+        pick_history(&mut s, pick);
+        assert_eq!(s.input.text, "first line\nsecond line");
+    }
+
+    /// Drives the real thing rather than a copy of it.
+    fn pick_history(state: &mut State, pick: crate::picker::Pick) {
+        let crate::picker::Pick::UseHistory { text } = pick else { unreachable!() };
+        use_history(state, text);
     }
 }

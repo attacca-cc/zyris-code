@@ -54,6 +54,15 @@ pub enum Level {
     Agents,
     /// The slash-command list shown when typing `/`.
     Commands,
+    /// What has been sent, searched (`Ctrl+R`).
+    ///
+    /// **This one carries its own query**, unlike the `/` and `@` lists which narrow from the
+    /// draft. Those are *being typed into* the draft; a history search is not — the draft is
+    /// often already full, and the search must not touch it. What is typed while this is up goes
+    /// here instead.
+    History {
+        query: String,
+    },
     /// The file list shown when typing `@`. **`at` is where the `@` sits**, as a character index
     /// into the draft — picking replaces everything from there to the cursor, and without it the
     /// insertion would have to guess which of several `@`s in a sentence it belongs to.
@@ -88,6 +97,12 @@ pub enum Pick {
     TypeCommand { text: String },
     /// Fetches a plugin into the machine's directory or this project's.
     InstallPlugin { source: String, project: bool },
+    /// Puts a message that was sent back into the draft, replacing whatever is there.
+    ///
+    /// **Replaces rather than inserts.** It was picked out of a search of whole messages, so what
+    /// is wanted is that message — merging it into a half-written draft would produce a sentence
+    /// nobody wrote.
+    UseHistory { text: String },
     /// Puts this path into the draft, replacing the `@…` that was being typed.
     ///
     /// **The `@` does not survive.** It is a way of asking for the list, not a marker the agent
@@ -378,6 +393,33 @@ impl Picker {
         Self { level: Level::Commands, rows, cursor: 0, top: 0, loading: false }
     }
 
+    /// What has been sent, most recent first, narrowed by `query`.
+    ///
+    /// **Most recent first, because that is what is being looked for.** `↑` already walks back one
+    /// at a time and gives up being useful around the third press; this is for the message from
+    /// twenty turns ago, and the ones nearest the end are still the likeliest.
+    ///
+    /// **A newline becomes a space in the label only.** A multi-line message would otherwise take
+    /// over the list, and the row still carries the real text — what is picked is never the
+    /// flattened version.
+    pub fn history(sent: &[String], query: &str) -> Self {
+        let needle = query.to_lowercase();
+        let rows = sent
+            .iter()
+            .rev()
+            .filter(|text| needle.is_empty() || text.to_lowercase().contains(&needle))
+            .take(Self::FILE_ROWS)
+            .map(|text| Row {
+                id: Some(text.clone()),
+                label: text.replace('\n', " "),
+                note: None,
+                enabled: true,
+                status: None,
+            })
+            .collect();
+        Self { level: Level::History { query: query.to_string() }, rows, cursor: 0, top: 0, loading: false }
+    }
+
     /// An empty file list waiting for the walk.
     ///
     /// **The box goes up before the answer does**, same as the project list. Walking a tree is
@@ -495,6 +537,7 @@ impl Picker {
             (Level::Projects, None) => Some(Pick::NewProject),
             (Level::Agents, Some(name)) => Some(Pick::UseAgent { name: name.clone() }),
             (Level::Commands, Some(text)) => Some(Pick::TypeCommand { text: text.clone() }),
+            (Level::History { .. }, Some(text)) => Some(Pick::UseHistory { text: text.clone() }),
             (Level::Files { at }, Some(path)) => {
                 Some(Pick::InsertPath { at: *at, path: path.clone() })
             }
@@ -503,6 +546,7 @@ impl Picker {
             }
             (Level::Agents, None)
             | (Level::Commands, None)
+            | (Level::History { .. }, None)
             | (Level::Files { .. }, None)
             | (Level::PluginTarget { .. }, None) => None,
         }
@@ -516,6 +560,12 @@ impl Picker {
             Level::Agents => lang.agents().into(),
             Level::Commands => lang.commands().into(),
             Level::Files { .. } => lang.files().into(),
+            // The query is shown in the title, since it lives here rather than in the draft —
+            // typing with no sign of what was typed reads as a list narrowing on its own.
+            Level::History { query } => match query.is_empty() {
+                true => lang.history().into(),
+                false => format!("{} · {query}", lang.history()),
+            },
             Level::PluginTarget { .. } => lang.plugin_where_title().into(),
         }
     }

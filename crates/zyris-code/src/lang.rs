@@ -364,6 +364,10 @@ impl Lang {
     pub fn files(self) -> &'static str {
         self.pick("파일", "Files")
     }
+    /// Title of the list `Ctrl+R` opens.
+    pub fn history(self) -> &'static str {
+        self.pick("보낸 말", "History")
+    }
     pub fn new_project(self) -> &'static str {
         self.pick("＋ 새 프로젝트", "+ New project")
     }
