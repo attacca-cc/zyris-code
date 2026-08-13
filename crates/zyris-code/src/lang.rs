@@ -360,6 +360,10 @@ impl Lang {
     pub fn commands(self) -> &'static str {
         self.pick("명령", "Commands")
     }
+    /// Title of the list `@` opens.
+    pub fn files(self) -> &'static str {
+        self.pick("파일", "Files")
+    }
     pub fn new_project(self) -> &'static str {
         self.pick("＋ 새 프로젝트", "+ New project")
     }

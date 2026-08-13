@@ -113,6 +113,8 @@ pub enum Frame {
         /// carries, converted off the loop and replayed back through it.
         entries: Vec<(i64, Option<crate::event::Entry>, Option<crate::todos::Change>)>,
     },
+    /// **Every file under the working directory**, walked off the loop for the `@` list.
+    Files(Vec<String>),
     /// **What git says about the working directory.** Same reason as `Poll`: reading it needs
     /// a process, and awaiting that on the draw loop would stall keys and drawing. The
     /// background arm sends the answer in and the strip above the input picks it up. `None`
@@ -483,6 +485,15 @@ pub struct State {
     /// takes `command_out` — and forgetting to carry a setting to `bridge.sync` is exactly
     /// how `/mode` once left the gate on the old mode.
     pub config_out: bool,
+    /// Every file under the working directory, walked once and kept for the rest of the run.
+    ///
+    /// **Empty means "not walked yet", which is why the walk is asked for at most once.** A
+    /// directory with no files at all would ask again on each `@`, which costs a spawn and shows
+    /// the same empty box — a fair trade for not carrying a second flag to say the same thing.
+    pub files: Vec<String>,
+    /// Set when the file list is wanted and has not been walked. **`apply` is pure, so it cannot
+    /// walk** — the I/O loop takes this down, the same way it takes `command_out`.
+    pub files_wanted: bool,
 }
 
 /// One row for a job running in the background.
@@ -573,6 +584,8 @@ impl Default for State {
             config: crate::config::Config::default(),
             reconnecting: false,
             config_out: false,
+            files: Vec::new(),
+            files_wanted: false,
         }
     }
 }
@@ -876,8 +889,13 @@ pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
         // **The command list is chosen by typing.** If characters were taken as movement
         // keys (k/j), `/skills` could not be typed — here a character is plain input and the
         // list narrows.
-        let typing =
-            matches!(state.picker.as_ref().map(|p| &p.level), Some(crate::picker::Level::Commands));
+        // **The file list is chosen by typing too.** Both lists narrow from the draft rather than
+        // from a search box of their own, so a character has to reach the draft — taken as `k`/`j`
+        // movement, neither `/skills` nor `@picker` could be typed at all.
+        let typing = matches!(
+            state.picker.as_ref().map(|p| &p.level),
+            Some(crate::picker::Level::Commands | crate::picker::Level::Files { .. })
+        );
         return match key.code {
             KeyCode::Up => vec![Action::PickUp],
             KeyCode::Down => vec![Action::PickDown],
@@ -1232,6 +1250,7 @@ pub fn apply(state: &mut State, action: &Action) {
         Action::Insert(c) => {
             state.editor().insert(*c);
             follow_the_slash(state);
+            follow_the_at(state);
         }
         Action::Paste(text) => {
             // Newlines inside go in verbatim. The slash command list does not open — a
@@ -1241,6 +1260,7 @@ pub fn apply(state: &mut State, action: &Action) {
         Action::Backspace => {
             state.editor().backspace();
             follow_the_slash(state);
+            follow_the_at(state);
         }
         Action::Delete => state.editor().delete(),
         Action::DeleteWord => state.editor().delete_word(),
@@ -1703,6 +1723,19 @@ fn apply_frame(state: &mut State, frame: &Frame) {
         // Replace, never merge. Leaving a repository behind has to clear the strip, and the
         // background arm only sends this when the value actually changed.
         Frame::Git(got) => state.repo = got.clone(),
+        Frame::Files(paths) => {
+            state.files = paths.clone();
+            // **Only fill in the list if it is still the one waiting.** The walk takes as long as
+            // it takes, and by the time it lands the person may have dismissed it with `Esc` —
+            // which leaves the `@…` sitting in the draft, so the reference alone cannot say
+            // whether the list is still wanted. Only the list still being up can.
+            if matches!(
+                state.picker.as_ref().map(|p| &p.level),
+                Some(crate::picker::Level::Files { .. })
+            ) {
+                follow_the_at(state);
+            }
+        }
         // A list that finished loading. **The cursor is preserved** — a refresh landing while
         // someone is choosing must not yank their selection out from under them.
         //
@@ -1901,6 +1934,82 @@ fn typed_a_whole_command(state: &State) -> bool {
 ///
 /// With a question or an approval open, leave it alone — something else already owns that
 /// spot.
+/// The `@…` being typed at the cursor, as `(where the `@` is, what follows it)`.
+///
+/// **A pure function, and the only place that decides what counts as an `@`.** Three conditions,
+/// each earning its place:
+///
+/// - the `@` starts a word — otherwise `you@example.com` would open a file list mid-address;
+/// - nothing between it and the cursor is whitespace — the reference ends where the word does,
+///   so going back to type more of the sentence closes the list rather than reopening it;
+/// - the cursor is at or after the `@` — a cursor moved back in front of one is not typing it.
+fn at_token(text: &str, cursor: usize) -> Option<(usize, String)> {
+    let chars: Vec<char> = text.chars().collect();
+    let cursor = cursor.min(chars.len());
+    let mut i = cursor;
+    while i > 0 {
+        let c = chars[i - 1];
+        if c == '@' {
+            let starts_a_word = i == 1 || chars[i - 2].is_whitespace();
+            return starts_a_word.then(|| (i - 1, chars[i..cursor].iter().collect()));
+        }
+        if c.is_whitespace() {
+            return None;
+        }
+        i -= 1;
+    }
+    None
+}
+
+/// Opens, narrows or closes the file list as the `@` is typed.
+///
+/// **The walk is not repeated per keystroke.** It happens once, off the loop, and lands in
+/// `state.files`; narrowing after that is local. Walking a checkout on every character would put
+/// the disk back on the draw loop, which is the thing `### 목록과 히스토리는 루프 밖에서 읽는다`
+/// exists to prevent.
+fn follow_the_at(state: &mut State) {
+    if state.asking.is_some() {
+        return;
+    }
+    let showing =
+        matches!(state.picker.as_ref().map(|p| &p.level), Some(crate::picker::Level::Files { .. }));
+    let Some((at, query)) = at_token(&state.input.text, state.input.cursor) else {
+        if showing {
+            state.picker = None;
+        }
+        return;
+    };
+    // Nothing walked yet: put the box up, say it is loading, and ask for the walk once. The ask
+    // is a flag rather than a call because `apply` is pure — the I/O side picks it up, the same
+    // way `command_out` and `config_out` are carried across.
+    if state.files.is_empty() {
+        state.files_wanted = !showing;
+        state.picker = Some(crate::picker::Picker::loading_files(at));
+        return;
+    }
+    state.picker = Some(crate::picker::Picker::files(&state.files, &query, at));
+}
+
+/// Puts a chosen path where the `@…` was.
+///
+/// **Replaces that span, and only that span.** The draft is a sentence being written, so what
+/// comes after the reference is still wanted — appending would leave the `@app` sitting in front
+/// of the path it stands for.
+///
+/// Pure, so it lives here rather than in `pick`: it is string handling, and nothing about it
+/// needs the network or the disk.
+fn insert_path(state: &mut State, at: usize, path: &str) {
+    state.picker = None;
+    let chars: Vec<char> = state.input.text.chars().collect();
+    let cut = at.min(chars.len());
+    let head: String = chars[..cut].iter().collect();
+    let tail: String = chars[state.input.cursor.min(chars.len())..].iter().collect();
+    state.input.text = format!("{head}{path}{tail}");
+    // No trailing space: the path may well be mid-sentence, and a space that is not wanted is
+    // harder to notice than one that is missing.
+    state.input.cursor = cut + path.chars().count();
+}
+
 fn follow_the_slash(state: &mut State) {
     if state.asking.is_some() {
         return;
@@ -2479,6 +2588,42 @@ fn repaint(terminal: &mut ratatui::DefaultTerminal) {
     }
 }
 
+/// Walks the working directory for the `@` list and sends the paths in as one frame.
+///
+/// **Off the loop, and blocking work off the async threads.** `ignore::Walk` is synchronous and
+/// hits the disk for every directory; on a large checkout it takes long enough to be felt, and
+/// awaiting it on the draw loop would freeze keys and drawing — the trap `### 목록과 히스토리는
+/// 루프 밖에서 읽는다` records for the project and thread lists.
+///
+/// **`.gitignore` is honoured and `require_git` is off**, exactly as `tools::search` does it: the
+/// default only reads ignore files inside a git repository, so a directory that is not one would
+/// have its `target/` walked in full — tens of seconds on this machine.
+fn spawn_files(cwd: &std::path::Path, tx: &mpsc::UnboundedSender<AppMsg>) {
+    /// A ceiling on what one walk collects. Reached only by a tree far larger than anything
+    /// `@` is useful on, and the alternative is holding an unbounded list for the whole run.
+    const MAX: usize = 20_000;
+
+    let cwd = cwd.to_path_buf();
+    let tx = tx.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut paths: Vec<String> = ignore::WalkBuilder::new(&cwd)
+            .hidden(false)
+            .require_git(false)
+            .filter_entry(|e| e.file_name() != std::ffi::OsStr::new(".git"))
+            .build()
+            .filter_map(Result::ok)
+            // Directories are not what `@` is for — every tool here takes a file.
+            .filter(|e| e.file_type().is_some_and(|t| t.is_file()))
+            .filter_map(|e| {
+                e.path().strip_prefix(&cwd).ok().map(|p| p.to_string_lossy().into_owned())
+            })
+            .take(MAX)
+            .collect();
+        paths.sort();
+        let _ = tx.send((None, Action::Frame(Frame::Files(paths))));
+    });
+}
+
 /// Kicks off one `git status` in the background and sends the answer back as a frame.
 ///
 /// **Both loops in `run_inner` go through this one definition.** The pre-connection loop draws a
@@ -3005,6 +3150,13 @@ async fn run_inner(
                         // directory policy makes to the gate.
                         crate::theme::set(state.config.theme.resolve());
                         bridge.sync(state.mode, &state.config);
+                    }
+
+                    // **The `@` list asked for a walk.** `apply` set the flag and put the
+                    // loading box up; the disk is touched here, and only the first `@` of the
+                    // run pays for it.
+                    if std::mem::take(&mut state.files_wanted) {
+                        spawn_files(&state.cwd, &tx);
                     }
 
                     // **Creating a new project.** When the form takes Enter, it is created
@@ -3602,6 +3754,10 @@ async fn pick(
             state.input.take();
             state.input.insert_str(&format!("{text} "));
         }
+        // **Replaces the `@…`, it does not append to it.** The draft is a sentence being written,
+        // so the path goes exactly where the reference was — and only that span, because the rest
+        // of the sentence is still wanted.
+        Pick::InsertPath { at, path } => insert_path(state, at, &path),
     }
 }
 
@@ -6437,5 +6593,131 @@ mod tests {
         }
         // It must pass quietly — only the failed feature is lost, the screen still comes up.
         terminal_feature("unsupported", Unsupported);
+    }
+}
+
+#[cfg(test)]
+mod file_reference {
+    use super::*;
+
+    fn state() -> State {
+        State::new()
+    }
+
+    fn drafted(text: &str) -> State {
+        let mut s = state();
+        for c in text.chars() {
+            apply(&mut s, &Action::Insert(c));
+        }
+        s
+    }
+
+    /// **An `@` that is part of a word is not a reference.** Email addresses are written in
+    /// drafts, and opening a file list in the middle of one would fight the person typing.
+    #[test]
+    fn only_an_at_that_starts_a_word_asks_for_a_file() {
+        assert_eq!(at_token("@app", 4), Some((0, "app".into())));
+        assert_eq!(at_token("look at @src/a", 14), Some((8, "src/a".into())));
+        assert_eq!(at_token("@", 1), Some((0, String::new())), "the bare @ opens the whole list");
+
+        assert_eq!(at_token("you@example.com", 15), None, "an address is not a reference");
+        // The reference ends at the whitespace. Carrying on with the sentence closes the list
+        // rather than leaving it up over words that have nothing to do with it.
+        assert_eq!(at_token("@src/a and then", 15), None);
+        // A cursor moved in front of the `@` is not typing it.
+        assert_eq!(at_token("@app", 0), None);
+    }
+
+    /// **The walk is asked for once and only off the loop.** `apply` is pure, so all it can do is
+    /// raise the flag; walking a checkout on the draw loop is the freeze that
+    /// `### 목록과 히스토리는 루프 밖에서 읽는다` exists to prevent.
+    #[test]
+    fn the_first_at_asks_for_the_walk_and_shows_that_it_is_loading() {
+        let mut s = drafted("@");
+        assert!(s.files_wanted, "the walk was never asked for");
+        let p = s.picker.as_ref().expect("the box goes up before the answer does");
+        assert!(p.loading);
+        assert!(matches!(p.level, crate::picker::Level::Files { at: 0 }));
+
+        // Typing more while it is still out must not ask again — one walk per run.
+        s.files_wanted = false;
+        apply(&mut s, &Action::Insert('a'));
+        assert!(!s.files_wanted, "the walk was asked for twice");
+
+        // When it lands, the list fills in and narrows to what has been typed so far.
+        apply(
+            &mut s,
+            &Action::Frame(Frame::Files(vec!["src/app.rs".into(), "README.md".into()])),
+        );
+        let p = s.picker.as_ref().unwrap();
+        assert!(!p.loading);
+        // Both hold an "a"; the one whose *name* starts with it comes first.
+        assert_eq!(p.rows[0].label, "src/app.rs", "rows: {:?}", p.rows);
+
+        // Typing on narrows further, with no second walk.
+        apply(&mut s, &Action::Insert('p'));
+        let p = s.picker.as_ref().unwrap();
+        assert_eq!(p.rows.len(), 1, "narrowed to what follows the @: {:?}", p.rows);
+        assert!(!s.files_wanted, "narrowing must not walk the disk again");
+    }
+
+    /// **A walk that lands on a screen that moved on is kept, not drawn.** It takes as long as it
+    /// takes, and the interesting case is `Esc`: the list is dismissed while the `@…` is still
+    /// sitting in the draft, so the reference alone cannot say whether the list is wanted. Only
+    /// the list still being up can. Putting it back would undo a dismissal the person just made.
+    #[test]
+    fn a_walk_that_arrives_after_the_list_was_dismissed_does_not_reopen_it() {
+        let mut s = drafted("@a");
+        s.picker = None; // what Esc leaves behind: no list, but the `@a` is still typed
+        apply(&mut s, &Action::Frame(Frame::Files(vec!["src/app.rs".into()])));
+        assert!(s.picker.is_none(), "the late answer put a dismissed list back up");
+        assert_eq!(s.files.len(), 1, "but it is kept, so the next @ needs no second walk");
+
+        // Erasing the reference closes it too, and that one `follow_the_at` handles on its own.
+        let mut s = drafted("@a");
+        apply(&mut s, &Action::Backspace);
+        apply(&mut s, &Action::Backspace);
+        assert!(s.picker.is_none(), "erasing the @ closes the list");
+    }
+
+    /// **Picking replaces the reference in place.** The draft is a sentence being written, so the
+    /// path goes exactly where the `@…` was and the rest of the sentence survives.
+    #[test]
+    fn picking_a_file_replaces_the_reference_and_leaves_the_sentence() {
+        let mut s = drafted("read @app please");
+        // Put the cursor back inside the reference, where it was when the list opened.
+        for _ in 0.." please".len() {
+            apply(&mut s, &Action::Left);
+        }
+        s.files = vec!["crates/zyris-code/src/app.rs".into()];
+        follow_the_at(&mut s);
+        let pick = s.picker.as_ref().unwrap().pick().unwrap();
+        assert_eq!(
+            pick,
+            crate::picker::Pick::InsertPath {
+                at: 5,
+                path: "crates/zyris-code/src/app.rs".into()
+            }
+        );
+        let crate::picker::Pick::InsertPath { at, path } = &pick else { unreachable!() };
+        insert_path(&mut s, *at, path);
+        assert_eq!(s.input.text, "read crates/zyris-code/src/app.rs please");
+        assert_eq!(s.input.cursor, "read crates/zyris-code/src/app.rs".chars().count());
+        assert!(s.picker.is_none(), "the list closes once it has been used");
+    }
+
+    /// **A hit on the file's own name beats one anywhere in the path.** Typing `app` means
+    /// `app.rs`; a path that merely contains those letters is a worse answer, and putting it
+    /// first makes the list feel like it ignored what was typed.
+    #[test]
+    fn the_file_you_named_ranks_above_a_path_that_merely_contains_it() {
+        let all: Vec<String> = vec![
+            "docs/apparatus/notes.md".into(),
+            "src/app.rs".into(),
+            "src/happy.rs".into(),
+        ];
+        let p = crate::picker::Picker::files(&all, "app", 0);
+        let labels: Vec<&str> = p.rows.iter().map(|r| r.label.as_str()).collect();
+        assert_eq!(labels, vec!["src/app.rs", "src/happy.rs", "docs/apparatus/notes.md"]);
     }
 }

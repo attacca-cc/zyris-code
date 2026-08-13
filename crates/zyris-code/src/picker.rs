@@ -54,6 +54,12 @@ pub enum Level {
     Agents,
     /// The slash-command list shown when typing `/`.
     Commands,
+    /// The file list shown when typing `@`. **`at` is where the `@` sits**, as a character index
+    /// into the draft — picking replaces everything from there to the cursor, and without it the
+    /// insertion would have to guess which of several `@`s in a sentence it belongs to.
+    Files {
+        at: usize,
+    },
     /// Where to put a plugin that is about to be fetched. **Asked rather than assumed**: on this
     /// machine it is there for every project, and in the project it travels with the repo — and
     /// which of those someone wants is not something the address can say.
@@ -82,6 +88,13 @@ pub enum Pick {
     TypeCommand { text: String },
     /// Fetches a plugin into the machine's directory or this project's.
     InstallPlugin { source: String, project: bool },
+    /// Puts this path into the draft, replacing the `@…` that was being typed.
+    ///
+    /// **The `@` does not survive.** It is a way of asking for the list, not a marker the agent
+    /// reads — nothing downstream resolves one, so leaving it in would send a sigil the other end
+    /// has to guess about. What goes in is the plain relative path, which every tool here already
+    /// takes.
+    InsertPath { at: usize, path: String },
     /// A row that can't be picked. Says why.
     Unavailable(String),
 }
@@ -365,6 +378,65 @@ impl Picker {
         Self { level: Level::Commands, rows, cursor: 0, top: 0, loading: false }
     }
 
+    /// An empty file list waiting for the walk.
+    ///
+    /// **The box goes up before the answer does**, same as the project list. Walking a tree is
+    /// not instant on a big checkout, and with nothing on screen the `@` looks like it did
+    /// nothing at all.
+    pub fn loading_files(at: usize) -> Self {
+        Self { level: Level::Files { at }, rows: Vec::new(), cursor: 0, top: 0, loading: true }
+    }
+
+    /// The file list, narrowed by what has been typed after the `@`.
+    ///
+    /// **Ranked, not merely filtered.** Someone typing `app` means `app.rs`, not the first path
+    /// that happens to contain those letters somewhere — so a hit on the file's own name outranks
+    /// one anywhere else in the path, and a name that *starts* with it outranks both. Sorted by
+    /// path within a rank so the order does not jump around as the query grows.
+    ///
+    /// **At most [`Picker::FILE_ROWS`] rows are built.** This runs on every keystroke, and a
+    /// checkout with thousands of files would otherwise pay for thousands of `String`s per press
+    /// to show twenty.
+    pub fn files(all: &[String], query: &str, at: usize) -> Self {
+        let needle = query.to_lowercase();
+        let mut hits: Vec<(u8, &String)> = all
+            .iter()
+            .filter_map(|path| {
+                let lower = path.to_lowercase();
+                let name = lower.rsplit('/').next().unwrap_or(&lower);
+                let rank = if needle.is_empty() {
+                    2
+                } else if name.starts_with(&needle) {
+                    0
+                } else if name.contains(&needle) {
+                    1
+                } else if lower.contains(&needle) {
+                    2
+                } else {
+                    return None;
+                };
+                Some((rank, path))
+            })
+            .collect();
+        hits.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
+        let rows = hits
+            .into_iter()
+            .take(Self::FILE_ROWS)
+            .map(|(_, path)| Row {
+                id: Some(path.clone()),
+                label: path.clone(),
+                note: None,
+                enabled: true,
+                status: None,
+            })
+            .collect();
+        Self { level: Level::Files { at }, rows, cursor: 0, top: 0, loading: false }
+    }
+
+    /// How many file rows are built per keystroke. The list scrolls, so more than this is not
+    /// reachable in any useful way before narrowing further.
+    pub const FILE_ROWS: usize = 200;
+
     /// Narrows the list by typed text. If nothing remains, leaves it as is — an empty list looks broken.
     pub fn narrow(
         &mut self,
@@ -423,11 +495,15 @@ impl Picker {
             (Level::Projects, None) => Some(Pick::NewProject),
             (Level::Agents, Some(name)) => Some(Pick::UseAgent { name: name.clone() }),
             (Level::Commands, Some(text)) => Some(Pick::TypeCommand { text: text.clone() }),
+            (Level::Files { at }, Some(path)) => {
+                Some(Pick::InsertPath { at: *at, path: path.clone() })
+            }
             (Level::PluginTarget { source }, Some(where_to)) => {
                 Some(Pick::InstallPlugin { source: source.clone(), project: where_to == "project" })
             }
             (Level::Agents, None)
             | (Level::Commands, None)
+            | (Level::Files { .. }, None)
             | (Level::PluginTarget { .. }, None) => None,
         }
     }
@@ -439,6 +515,7 @@ impl Picker {
             Level::Sessions { project_name, .. } => lang.threads_in(project_name),
             Level::Agents => lang.agents().into(),
             Level::Commands => lang.commands().into(),
+            Level::Files { .. } => lang.files().into(),
             Level::PluginTarget { .. } => lang.plugin_where_title().into(),
         }
     }
