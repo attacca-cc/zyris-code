@@ -358,9 +358,23 @@ mod tests {
         assert!(out.contains("image"), "it must say what is missing: {out}");
     }
 
+    /// Is `python3` actually runnable? The fake server is a Python script, and Python is not
+    /// guaranteed to be installed — on some Windows boxes `python3.exe` is only the Microsoft
+    /// Store stub, which reports an error instead of running anything.
+    fn python3_available() -> bool {
+        std::process::Command::new("python3")
+            .arg("-c")
+            .arg("print(1)")
+            .output()
+            .is_ok_and(|o| o.status.success())
+    }
+
     /// **Spawns a real process.** A mock wouldn't catch stdio framing mistakes.
     #[tokio::test]
     async fn it_talks_to_a_real_stdio_server() {
+        if !python3_available() {
+            return;
+        }
         let (_dir, script) = fake_server();
         let mut c = McpClient::spawn("python3", &[script], &HashMap::new())
             .await
@@ -381,6 +395,9 @@ mod tests {
     /// If the server returns an error, its words must come through unchanged — swallowing them hides the cause.
     #[tokio::test]
     async fn a_server_error_comes_back_as_an_error() {
+        if !python3_available() {
+            return;
+        }
         let (_dir, script) = fake_server();
         let mut c = McpClient::spawn("python3", &[script], &HashMap::new()).await.unwrap();
         let e = c.call("boom", json!({})).await.unwrap_err();
@@ -391,6 +408,9 @@ mod tests {
     /// Mistaking a notification wedged between replies for the reply shifts everything after it by one.
     #[tokio::test]
     async fn a_notification_between_replies_does_not_shift_anything() {
+        if !python3_available() {
+            return;
+        }
         let (_dir, script) = fake_server();
         let mut c = McpClient::spawn("python3", &[script], &HashMap::new()).await.unwrap();
         // The fake server sends one notification first for every tools/call.

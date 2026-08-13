@@ -170,7 +170,7 @@ pub fn source(text: &str) -> Option<(String, String)> {
         text.to_string()
     } else if let Some(rest) = text.strip_prefix("~/") {
         home().join(rest).to_string_lossy().into_owned()
-    } else if text.starts_with('/') || text.starts_with("./") || text.starts_with("../") {
+    } else if is_local_path(text) {
         text.to_string()
     } else {
         // The `owner/repo` shortcut. There must be exactly two pieces — to tell it apart from a given path.
@@ -184,6 +184,26 @@ pub fn source(text: &str) -> Option<(String, String)> {
     let last = url.rsplit(['/', ':']).next()?.trim_end_matches(".git");
     let name = sanitize(last);
     (!name.is_empty()).then_some((url, name))
+}
+
+/// Is this a local filesystem path rather than a remote or an `owner/repo`?
+///
+/// The Unix shapes (`/…`, `./…`, `../…`, `~/…`) were always accepted. Windows adds a
+/// drive-letter absolute path (`C:\…`, `C:/…`) and backslash-relative shapes (`.\…`, `..\…`).
+/// Without those, `/plugin add C:\path\to\plugin` was refused on Windows.
+fn is_local_path(text: &str) -> bool {
+    text.starts_with('/')
+        || text.starts_with("./")
+        || text.starts_with("../")
+        || text.starts_with(".\\")
+        || text.starts_with("..\\")
+        || is_drive_absolute(text)
+}
+
+/// `C:\…` or `C:/…` — a Windows drive-letter absolute path.
+fn is_drive_absolute(text: &str) -> bool {
+    let b = text.as_bytes();
+    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'/' || b[2] == b'\\')
 }
 
 /// Washes a name until it can serve as one directory name.
