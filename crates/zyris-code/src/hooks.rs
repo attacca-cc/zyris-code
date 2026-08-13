@@ -336,10 +336,18 @@ mod tests {
 
     /// **Exit code 2 is the one thing a hook can decide.** Everything else it might print is its
     /// own business.
+    ///
+    /// The command is a shell snippet, so it must be written per platform — `cmd /C` runs the
+    /// hook on Windows and does not speak bash (`;`, `exit 2`, single quotes are all different).
     #[tokio::test]
     async fn a_hook_that_exits_two_refuses_the_call_and_says_why() {
         let dir = tempfile::tempdir().unwrap();
-        let hooks = vec![hook("echo 'not on my watch' >&2; exit 2", When::Before, dir.path())];
+        let command = if cfg!(windows) {
+            "echo not on my watch 1>&2 & exit /b 2"
+        } else {
+            "echo 'not on my watch' >&2; exit 2"
+        };
+        let hooks = vec![hook(command, When::Before, dir.path())];
         let verdict = run(&hooks, When::Before, "terminal.exec", &json!({})).await;
         match verdict {
             Verdict::Refused(why) => assert!(why.contains("not on my watch"), "{why}"),
@@ -385,7 +393,14 @@ mod tests {
     async fn the_call_is_handed_to_the_hook_on_stdin() {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("seen.json");
-        let hooks = vec![hook(&format!("cat > {}", out.display()), When::Before, dir.path())];
+        // `cat >` is bash; on Windows the hook runs under `cmd /C`, where `more` is the
+        // stdin-to-stdout copy that works non-interactively.
+        let command = if cfg!(windows) {
+            format!("more > {}", out.display())
+        } else {
+            format!("cat > {}", out.display())
+        };
+        let hooks = vec![hook(&command, When::Before, dir.path())];
         run(&hooks, When::Before, "terminal.exec", &json!({"command": "ls"})).await;
         let seen: Value = serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
         assert_eq!(seen["tool_name"], json!("terminal.exec"));

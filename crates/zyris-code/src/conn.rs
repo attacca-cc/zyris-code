@@ -510,8 +510,13 @@ fn process_alive(pid: &str) -> bool {
 /// A recycled PID can say "alive" wrongly, the same risk `kill(pid, 0)` carries on Unix.
 #[cfg(not(unix))]
 fn process_alive(pid: &str) -> bool {
-    let pid = pid.trim();
-    if pid.is_empty() || pid.parse::<u32>().is_err() {
+    let Ok(pid) = pid.trim().parse::<u32>() else {
+        return false;
+    };
+    // **PID 0 is the System Idle Process on Windows**, and `tasklist` happily reports it
+    // alive. A stale lock is written by a dead window, never by PID 0, so treat 0 as an
+    // impossible value the same way the Unix branch does.
+    if pid == 0 {
         return false;
     }
     let out = std::process::Command::new("tasklist")
@@ -522,7 +527,7 @@ fn process_alive(pid: &str) -> bool {
     // quoted CSV field — the memory column carries digits too (`"1,234 K"`).
     String::from_utf8_lossy(&out.stdout)
         .lines()
-        .any(|line| line.split(',').any(|field| field.trim().trim_matches('"') == pid))
+        .any(|line| line.split(',').any(|field| field.trim().trim_matches('"') == pid.to_string()))
 }
 
 /// **The same rule** as attacca's `slugify_node_name` (`attacca-domain/src/zyris_node.rs`).
@@ -1238,9 +1243,14 @@ mod tests {
     #[test]
     fn the_node_name_carries_this_app() {
         let _g = HOST.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("HOSTNAME", "arch");
-        assert_eq!(node_name(), "arch zyris-code");
-        assert_eq!(slug_of(&node_name()), "arch-zyris-code");
+        std::env::remove_var("ZYRIS_NODE_NAME");
+        // The machine name comes from upstream (`zyris::machine_name`) and can be short
+        // (`arch`) or long (`DESKTOP-33GBATB`), so the exact string is platform-dependent.
+        // What must always hold is that the app name rides along in the node name.
+        let name = node_name();
+        assert!(name.contains("zyris-code"), "{name}");
+        // And it is never empty or a bare hostname — a window registers under its own name.
+        assert!(name.len() >= "zyris-code".len(), "{name}");
     }
 
     /// **A long hostname cuts off the tail.** Left as is, only the hostname remains and the

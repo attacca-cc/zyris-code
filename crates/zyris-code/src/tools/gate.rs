@@ -399,11 +399,17 @@ mod tests {
     #[test]
     fn reading_a_credential_through_the_shell_is_refused_as_well() {
         let allow = Config { dir_access: DirAccess::Allow, ..Config::default() };
-        for command in [
-            "cat /home/ruma/.config/zyris-code/github.json",
-            "cat ~/.config/zyris-code/github.json",
-            "cp ~/.config/zyris-code/wss-attacca-cc-api-zyris-v1-ws-zyris-code.json /tmp/x",
-        ] {
+        // The `~` and `/tmp` forms resolve through the **real** home, which on Windows is not
+        // the fake `/home/ruma` the constants above use — so only the `APP`-relative absolute
+        // form is portable. The `~` shape is checked on Unix, where it expands to the same place.
+        #[cfg_attr(not(unix), allow(unused_mut))]
+        let mut commands: Vec<String> = vec![format!("cat {APP}/github.json")];
+        #[cfg(unix)]
+        commands.extend([
+            "cat ~/.config/zyris-code/github.json".into(),
+            format!("cp ~/.config/zyris-code/wss-attacca-cc-api-zyris-v1-ws-zyris-code.json /tmp/x"),
+        ]);
+        for command in commands {
             let asked = reaching("terminal", "exec", json!({ "command": command }));
             assert!(
                 matches!(decide(Mode::Normal, &allow, &asked), Decision::Refuse(_)),

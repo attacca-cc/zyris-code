@@ -268,6 +268,12 @@ impl Search for LocalSearch {
 mod tests {
     use super::*;
 
+    /// Normalizes an expected `/`-separated path to this platform's separator — the search
+    /// tool returns OS-native paths (`src/app.rs` on Unix, `src\app.rs` on Windows).
+    fn p(s: &str) -> String {
+        s.replace('/', &std::path::MAIN_SEPARATOR.to_string())
+    }
+
     /// Makes a tree. **Must be real files** — a mock filesystem wouldn't catch mistakes in
     /// `.gitignore` interpretation and path normalization.
     fn tree() -> tempfile::TempDir {
@@ -289,8 +295,8 @@ mod tests {
         let d = tree();
         let s = LocalSearch::new(d.path().to_path_buf());
         let out = s.glob("**/*.rs".into(), None, None).await.unwrap();
-        assert!(out.iter().any(|p| p == "src/app.rs"), "{out:?}");
-        assert!(!out.iter().any(|p| p.starts_with("target/")), "gitignore did not apply: {out:?}");
+        assert!(out.iter().any(|x| x == &p("src/app.rs")), "{out:?}");
+        assert!(!out.iter().any(|x| x.starts_with(p("target/").as_str())), "gitignore did not apply: {out:?}");
     }
 
     /// **Paths are relative.** Given an absolute path, the home directory name rides on every result.
@@ -309,7 +315,7 @@ mod tests {
         let s = LocalSearch::new(d.path().to_path_buf());
         let f = s.grep("fn scroll".into(), None, None, None).await.unwrap();
         assert_eq!(f.hits.len(), 1, "{:?}", f.hits);
-        assert_eq!(f.hits[0].path, "src/app.rs");
+        assert_eq!(f.hits[0].path, p("src/app.rs"));
         assert_eq!(f.hits[0].line, 2, "counting must start at 1");
         assert!(f.hits[0].text.contains("fn scroll"));
         assert!(!f.truncated);
@@ -322,7 +328,7 @@ mod tests {
         let s = LocalSearch::new(d.path().to_path_buf());
         let f = s.grep("fn draw".into(), None, Some("**/rows.rs".into()), None).await.unwrap();
         assert_eq!(f.hits.len(), 1, "{:?}", f.hits);
-        assert_eq!(f.hits[0].path, "src/rows.rs");
+        assert_eq!(f.hits[0].path, p("src/rows.rs"));
     }
 
     /// **If truncated, it must say so.** Otherwise the agent reads it as "absent".

@@ -294,10 +294,20 @@ mod tests {
         }
     }
 
+    /// A stdio echo command usable as a stand-in MCP server, or `None` when there is none.
+    /// The bridge tests stand the server up with `cat`, which Windows does not ship, and no
+    /// Python (the other option) is not guaranteed either.
+    fn echo_server() -> Option<&'static str> {
+        if cfg!(windows) { None } else { Some("cat") }
+    }
+
     /// **MCP's inputSchema must become the request_schema as-is.**
     /// Otherwise the agent can't construct arguments.
     #[tokio::test]
     async fn the_descriptor_carries_each_tools_schema() {
+        if echo_server().is_none() {
+            return;
+        }
         let cap = cap_of("github", vec![tool("create-issue")]).await;
         let d = cap.descriptor();
         assert_eq!(d.name, "mcp_github");
@@ -312,6 +322,9 @@ mod tests {
     /// and that tool was never called. **A place we got wrong twice.**
     #[tokio::test]
     async fn the_wire_name_still_splits_into_four() {
+        if echo_server().is_none() {
+            return;
+        }
         for slug in ["my__server", "연습", "--", "깃 허브", "github"] {
             let cap = cap_of(slug, vec![tool("create-issue")]).await;
             let d = cap.descriptor();
@@ -333,6 +346,9 @@ mod tests {
     /// Names that collide after sanitizing must be split apart — collided, the later one is buried.
     #[tokio::test]
     async fn two_servers_that_wash_to_the_same_name_are_split() {
+        if echo_server().is_none() {
+            return;
+        }
         let specs = vec![
             ServerSpec {
                 slug: "연습".into(),
@@ -385,6 +401,9 @@ mod tests {
     /// **If one fails to start, the rest still start.** The app must not come to a full stop.
     #[tokio::test]
     async fn a_server_that_fails_to_start_does_not_stop_the_others() {
+        if echo_server().is_none() {
+            return;
+        }
         let specs = vec![
             ServerSpec {
                 slug: "없는놈".into(),
