@@ -271,7 +271,7 @@ mod tests {
     /// Normalizes an expected `/`-separated path to this platform's separator — the search
     /// tool returns OS-native paths (`src/app.rs` on Unix, `src\app.rs` on Windows).
     fn p(s: &str) -> String {
-        s.replace('/', &std::path::MAIN_SEPARATOR.to_string())
+        s.replace('/', std::path::MAIN_SEPARATOR_STR)
     }
 
     /// Makes a tree. **Must be real files** — a mock filesystem wouldn't catch mistakes in

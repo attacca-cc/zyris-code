@@ -407,7 +407,8 @@ mod tests {
         #[cfg(unix)]
         commands.extend([
             "cat ~/.config/zyris-code/github.json".into(),
-            format!("cp ~/.config/zyris-code/wss-attacca-cc-api-zyris-v1-ws-zyris-code.json /tmp/x"),
+            "cp ~/.config/zyris-code/wss-attacca-cc-api-zyris-v1-ws-zyris-code.json /tmp/x"
+                .to_string(),
         ]);
         for command in commands {
             let asked = reaching("terminal", "exec", json!({ "command": command }));
