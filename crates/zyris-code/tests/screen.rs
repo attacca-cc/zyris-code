@@ -1159,6 +1159,43 @@ fn a_question_opens_for_answering_and_shows_its_options() {
     assert!(screen.contains("직접 입력"), "no free-input alternative\n{screen}");
 }
 
+/// **A question with no options is a question all the same.** The tool asks for a free-text step by
+/// leaving `options` out, and that is what an open-ended question looks like on the wire — drawn as
+/// anything but an answerable screen, there is no way to reply to it.
+///
+/// It arrives here the way the reported one did: with its wait already run out. A `timeout` result
+/// is an ordinary success meaning "nobody replied yet", so the question is still open and the
+/// screen has to come up — reopening the thread is the only way back to it.
+#[test]
+fn an_open_ended_question_whose_wait_ran_out_is_still_answerable() {
+    let asked = AppFrame::Event {
+        cursor: 1,
+        entry: zyris_code::event::entry_from(&zyris_attacca::ZSessionEvent {
+            seq: 1,
+            cursor: 1,
+            kind: "tool_call".into(),
+            payload: serde_json::json!({
+                "kind": "tool_call", "name": "question",
+                "arguments": {"questions": [
+                    {"header": "푸시 알림 대상", "question": "계정 UUID를 알려주세요"}
+                ]},
+                "result": {"status": "timeout", "waited_secs": 600}, "error": null
+            }),
+            created_at: None,
+        }),
+        todo: None,
+    };
+
+    let mut s = State::new();
+    s.lang = zyris_code::lang::Lang::Ko;
+    apply(&mut s, &Action::Frame(asked));
+    assert!(s.asking.is_some(), "a question that timed out is still waiting to be answered");
+
+    let screen = dump(&mut s, 70, 16);
+    assert!(screen.contains("계정 UUID를 알려주세요"), "\n{screen}");
+    assert!(screen.contains("직접 입력"), "an open-ended question is all free input\n{screen}");
+}
+
 /// An already-answered question must not reopen.
 #[test]
 fn an_answered_question_does_not_reopen() {

@@ -1743,12 +1743,21 @@ fn apply_frame(state: &mut State, frame: &Frame) {
             // A question awaiting an answer puts us straight into answering mode. The turn
             // is blocked, so there is no reason to make the user open it. A question that
             // was already answered does not reopen.
+            //
+            // **History comes through here too**, so reopening a thread reopens whatever it is
+            // waiting on — a question asked while nobody was watching is otherwise unanswerable,
+            // there being no other way to reach it.
+            //
+            // Where several went unanswered the **last** one holds the screen, and that is judged
+            // by `seq` rather than by arrival: a question's event is updated in place when its
+            // wait runs out, so an older one's frame can land after a newer one's. Comparing seq
+            // also leaves the question being typed into alone when its own frame comes round again.
             if let EntryKind::Question { steps, answered } = &entry.kind {
                 if *answered {
                     if state.asking.as_ref().is_some_and(|(q, _)| *q == entry.seq) {
                         state.asking = None;
                     }
-                } else if state.asking.is_none() {
+                } else if state.asking.as_ref().is_none_or(|(q, _)| *q < entry.seq) {
                     state.asking =
                         Some((entry.seq, crate::question::Answering::new(steps.clone())));
                 }
@@ -6436,6 +6445,51 @@ mod tests {
         let mut s = state();
         apply(&mut s, &asked(7));
         assert!(s.asking.is_some(), "a question for the thread on screen does open");
+    }
+
+    /// **Reopening a thread must reopen the question it is waiting on.** History replays every
+    /// event through this same path, so a thread left with an unanswered question comes back with
+    /// its screen up — and where several went unanswered, the one that stands is the **last**, not
+    /// whichever happened to be replayed first.
+    ///
+    /// The judgement is by `seq` rather than by arrival: a question's event is updated in place
+    /// when its wait runs out, so the older one's frame can arrive after the newer one's.
+    #[test]
+    fn the_last_unanswered_question_is_the_one_left_on_screen() {
+        let asked = |seq: i64, q: &str, answered: bool| {
+            Action::Frame(Frame::Event {
+                cursor: seq,
+                entry: Some(crate::event::Entry {
+                    seq,
+                    kind: EntryKind::Question {
+                        steps: vec![crate::question::Step {
+                            header: None,
+                            question: q.into(),
+                            multi: false,
+                            options: vec![],
+                        }],
+                        answered,
+                    },
+                }),
+                todo: None,
+            })
+        };
+        let showing = |s: &State| s.asking.as_ref().unwrap().1.current().question.clone();
+
+        let mut s = state();
+        apply(&mut s, &asked(3, "first", false));
+        apply(&mut s, &asked(9, "second", false));
+        assert_eq!(showing(&s), "second", "a newer question takes the screen");
+
+        // The first one's event is updated in place afterwards — it must not pull the screen back.
+        apply(&mut s, &asked(3, "first", false));
+        assert_eq!(showing(&s), "second", "an older question does not take it back");
+
+        // Answering is what closes it, and only the one that was open.
+        apply(&mut s, &asked(3, "first", true));
+        assert_eq!(showing(&s), "second", "answering an older one leaves this one alone");
+        apply(&mut s, &asked(9, "second", true));
+        assert!(s.asking.is_none(), "answering the open one closes it");
     }
 
     /// **What a conversation had to say goes with it.** "could not send" from the thread just
