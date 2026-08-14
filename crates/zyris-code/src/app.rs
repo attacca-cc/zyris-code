@@ -1276,21 +1276,13 @@ pub fn apply(state: &mut State, action: &Action) {
         return;
     }
     match action {
-        Action::Insert(c) => {
-            state.editor().insert(*c);
-            follow_the_slash(state);
-            follow_the_at(state);
-        }
+        Action::Insert(c) => state.editor().insert(*c),
         Action::Paste(text) => {
             // Newlines inside go in verbatim. The slash command list does not open — a
             // paste must not change the mode. The matches! above releases the recall.
             state.editor().insert_str(text);
         }
-        Action::Backspace => {
-            state.editor().backspace();
-            follow_the_slash(state);
-            follow_the_at(state);
-        }
+        Action::Backspace => state.editor().backspace(),
         Action::Delete => state.editor().delete(),
         Action::DeleteWord => state.editor().delete_word(),
         Action::DeleteWordBefore => state.editor().delete_word_before(),
@@ -1696,6 +1688,39 @@ pub fn apply(state: &mut State, action: &Action) {
         // intercepts them. They still have to be listed to be exhaustive.
         Action::FormNext | Action::FormPrev | Action::FormConfirm | Action::FormCancel => {}
         Action::Frame(frame) => apply_frame(state, frame),
+    }
+
+    // **Every edit re-decides the lists, from one place.**
+    //
+    // These used to hang off `Insert` and `Backspace` alone, which was true only while those were
+    // the only ways to change a draft. They are not: `Ctrl+U` over `@app` left a file list up
+    // with nothing to pick for, `Ctrl+W` back over `/rules` left the command list, and moving the
+    // cursor never re-decided anything — so walking back into a reference did not bring its list
+    // back. Hanging the rule off each new editing key is how the next one gets forgotten.
+    //
+    // **`Paste` is left out on purpose.** A paste must not change the mode: text arriving from
+    // the clipboard that happens to start with `/` or hold an `@` is not somebody reaching for a
+    // list.
+    if matches!(
+        action,
+        Action::Insert(_)
+            | Action::Backspace
+            | Action::Delete
+            | Action::DeleteWord
+            | Action::DeleteWordBefore
+            | Action::DeleteWordAfter
+            | Action::KillToStart
+            | Action::KillToEnd
+            | Action::Yank
+            | Action::Left
+            | Action::Right
+            | Action::WordLeft
+            | Action::WordRight
+            | Action::Home
+            | Action::End
+    ) {
+        follow_the_slash(state);
+        follow_the_at(state);
     }
 }
 
@@ -6891,5 +6916,58 @@ mod history_search {
     fn pick_history(state: &mut State, pick: crate::picker::Pick) {
         let crate::picker::Pick::UseHistory { text } = pick else { unreachable!() };
         use_history(state, text);
+    }
+}
+
+#[cfg(test)]
+mod polish {
+    use super::*;
+
+    fn state() -> State {
+        State::new()
+    }
+
+    /// **Any edit to the draft re-decides the list, not just typing and backspace.** `Ctrl+U` on
+    /// `@app` leaves no reference behind, so a file list still sitting there is pointing at a
+    /// question that is no longer being asked.
+    #[test]
+    fn cutting_the_reference_away_closes_the_list_too() {
+        let mut s = state();
+        s.files = vec!["src/app.rs".into()];
+        for c in "@app".chars() {
+            apply(&mut s, &Action::Insert(c));
+        }
+        assert!(s.picker.is_some(), "the @ opened the list");
+        apply(&mut s, &Action::KillToStart);
+        assert_eq!(s.input.text, "");
+        assert!(s.picker.is_none(), "the list outlived the reference it was for");
+    }
+
+    /// The same for the slash list — `Ctrl+W` back over `/rules` leaves no command being typed.
+    #[test]
+    fn cutting_a_command_away_closes_the_command_list() {
+        let mut s = state();
+        for c in "/rules".chars() {
+            apply(&mut s, &Action::Insert(c));
+        }
+        assert!(s.picker.is_some());
+        apply(&mut s, &Action::DeleteWord);
+        assert!(s.picker.is_none(), "the command list outlived the command");
+    }
+
+    /// **Moving the cursor out of a reference closes the list.** The reference ends at the word,
+    /// so a cursor that walked off it is no longer typing one.
+    #[test]
+    fn walking_the_cursor_off_the_reference_closes_the_list() {
+        let mut s = state();
+        s.files = vec!["src/app.rs".into()];
+        for c in "@app x".chars() {
+            apply(&mut s, &Action::Insert(c));
+        }
+        assert!(s.picker.is_none(), "the space already ended the reference");
+        for _ in 0..2 {
+            apply(&mut s, &Action::Left);
+        }
+        assert!(s.picker.is_some(), "back inside the reference, the list is wanted again");
     }
 }
