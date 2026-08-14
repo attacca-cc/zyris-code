@@ -1964,6 +1964,31 @@ fn enroll_view() -> zyris_code::app::EnrollView {
     }
 }
 
+/// **Approving is the moment this computer changes hands**, so the window that shows the code is
+/// where whose account it is has to be said. Afterwards there is nothing left to warn about.
+///
+/// It also draws whole. Both sentences here are longer than the box, and the first one used to run
+/// off the right border and simply stop — reported 2026-08-14 as the notice at the top being cut.
+#[test]
+fn the_enroll_window_says_whose_account_to_approve_with_and_says_it_whole() {
+    for lang in [zyris_code::lang::Lang::Ko, zyris_code::lang::Lang::En] {
+        let mut s = State::new();
+        s.lang = lang;
+        apply(&mut s, &Action::Frame(AppFrame::Enroll(enroll_view())));
+        let screen = dump(&mut s, 80, 30);
+
+        // Every word of both sentences reached the screen — not just the start of them.
+        for sentence in [lang.enroll_steps(), lang.enroll_warning()] {
+            for word in sentence.split_whitespace() {
+                assert!(screen.contains(word), "{word:?} never made it onto the screen\n{screen}");
+            }
+        }
+        // The code and the address are still there — the warning did not push them off.
+        assert!(screen.contains("WXQR-7KBD"), "\n{screen}");
+        assert!(screen.contains("https://attacca.example/settings/zyris/device"), "\n{screen}");
+    }
+}
+
 /// **The address in the enrolment window is Ctrl+clickable.**
 ///
 /// Links used to be found only inside the conversation (`view_links`), so the one URL a person has

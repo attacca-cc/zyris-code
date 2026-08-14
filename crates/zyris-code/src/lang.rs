@@ -475,6 +475,16 @@ impl Lang {
             "Copy the code below and approve it at this address (Ctrl+click opens it):",
         )
     }
+    /// **Said where the code is, because that is where it is decided.** Approving hands this
+    /// computer's files and shell to whichever account approved — so whose account it is matters
+    /// more here than anywhere else in the app, and afterwards there is nothing to warn about.
+    pub fn enroll_warning(self) -> &'static str {
+        self.pick(
+            "다른 사람의 계정과 연결하지 마세요. 승인한 계정이 이 컴퓨터의 파일과 셸을 쓰게 됩니다.",
+            "Do not connect this to someone else's account. Whoever approves it gets to read and \
+             change this computer's files and run commands on it.",
+        )
+    }
     pub fn enroll_expires(self, secs: u64) -> String {
         let minutes = secs.div_ceil(60);
         match self {
@@ -2135,6 +2145,7 @@ mod tests {
             (ko.esc_stops(), en.esc_stops()),
             (ko.enroll_title(), en.enroll_title()),
             (ko.enroll_steps(), en.enroll_steps()),
+            (ko.enroll_warning(), en.enroll_warning()),
             (ko.enroll_lapsed(), en.enroll_lapsed()),
             (ko.enroll_denied(), en.enroll_denied()),
             (ko.enroll_keys(), en.enroll_keys()),
@@ -2194,6 +2205,7 @@ mod tests {
             en.lang_changed(),
             en.enroll_title(),
             en.enroll_steps(),
+            en.enroll_warning(),
             en.enroll_lapsed(),
             en.enroll_denied(),
             en.enroll_keys(),
