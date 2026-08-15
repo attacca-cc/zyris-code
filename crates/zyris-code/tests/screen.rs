@@ -2205,16 +2205,36 @@ fn a_terminal_that_cannot_read_osc8_is_not_sent_any() {
     assert!(syms.iter().any(|sym| sym == "문"), "the link text went missing: {syms:?}");
 }
 
-/// Draws one agent answer holding a link and hands back the cell symbols, with the terminal
-/// declared able to read OSC 8 or not.
-fn link_cells(hyperlinks: bool) -> Vec<String> {
+/// **Whoever draws the link owns its decoration.** A terminal that reads OSC 8 styles hyperlinks
+/// itself, and most of them underline on hover — so the renderer's own underline sat underneath
+/// that permanently and read as a doubled underline that never went away.
+///
+/// Where no sequence was sent there is nothing to style the link with, so the underline stays and
+/// is the only sign the text is a link at all.
+#[test]
+fn the_underline_is_ours_only_where_the_terminal_was_sent_no_link() {
+    let underlined = |hyperlinks: bool| {
+        link_buffer(hyperlinks)
+            .content
+            .iter()
+            .any(|c| c.modifier.contains(ratatui::style::Modifier::UNDERLINED))
+    };
+    assert!(!underlined(true), "our underline stacked under the terminal's own");
+    assert!(underlined(false), "a link with no sequence and no underline is invisible");
+}
+
+/// Draws one agent answer holding a link, with the terminal declared able to read OSC 8 or not.
+fn link_buffer(hyperlinks: bool) -> ratatui::buffer::Buffer {
     let mut s = State::new();
     s.caps.hyperlinks = hyperlinks;
     said(&mut s, 1, EntryKind::Agent("[문서](https://example.com/x) 끝".into()));
     let mut term = Terminal::new(TestBackend::new(60, 12)).unwrap();
     term.draw(|f| widgets::draw(f, &mut s)).unwrap();
-    let buf = term.backend().buffer().clone();
-    buf.content.iter().map(|c| c.symbol().to_string()).collect()
+    term.backend().buffer().clone()
+}
+
+fn link_cells(hyperlinks: bool) -> Vec<String> {
+    link_buffer(hyperlinks).content.iter().map(|c| c.symbol().to_string()).collect()
 }
 
 /// A bare URL in plain text is not wrapped — the terminal detects those itself.
