@@ -296,6 +296,10 @@ pub struct State {
     pub scroll: Scroll,
     pub running: bool,
     pub connected: bool,
+    /// Whether anything has attached **at any point in this run**. Distinct from `connected`: what
+    /// the screen can offer depends on there having been a session at all, not on there being one
+    /// right now, so a brief drop must not take the whole screen away.
+    pub ever_connected: bool,
     /// What to say and when it was said. **It fades on its own once time passes.**
     ///
     /// Holding on to a past circumstance ("Zyris로는 아직 만들 수 없습니다") means that
@@ -535,6 +539,7 @@ impl Default for State {
             scroll: Scroll::new(),
             running: false,
             connected: false,
+            ever_connected: false,
             status: None,
             mode: Mode::default(),
             agent: String::new(),
@@ -791,6 +796,10 @@ pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
     // interrupt it.
     if state.enroll.is_some() && !(ctrl && matches!(key.code, KeyCode::Char('c'))) {
         return match key.code {
+            // **With nothing attached, this window is the whole app.** Putting it away then left a
+            // dead shell — nothing to type into, no list that would open, and no way back to the
+            // code but restarting. Being attached is what makes there be something behind it.
+            KeyCode::Esc if !state.connected => vec![Action::Quit],
             KeyCode::Esc => vec![Action::EnrollClose],
             _ => vec![],
         };
@@ -1123,6 +1132,24 @@ fn enter_becomes_newline(state: &State, key: &KeyEvent, in_burst: bool) -> bool 
 }
 
 pub fn apply(state: &mut State, action: &Action) {
+    // **Nothing reaches outward before the first connection.** Sending, the project and thread
+    // lists, the slash commands — all of it goes through a session that does not exist yet, so
+    // offering them answers with an empty window or with silence, and that reads as the app being
+    // broken rather than as it waiting for somebody to approve it.
+    //
+    // **Only what reaches outward.** Typing, the editing keys and Shift+Tab are this screen's own
+    // and stay — first enrolment sits here for as long as it takes to walk to a browser, and a
+    // mode picked in that time is meant to reach the gate
+    // (`a_mode_picked_before_connecting_still_reaches_the_gate`).
+    //
+    // **The first connection, not the current one.** Judging by `connected` would take the screen
+    // away on every brief drop, and by then there is a conversation to read and scroll.
+    if !state.ever_connected
+        && matches!(action, Action::Submit(_) | Action::OpenPicker | Action::OpenHistory)
+    {
+        return;
+    }
+
     // Editing a character leaves the recall right away. Otherwise one ↓ loses the edit —
     // and editing a recalled message before sending it is the whole point of the feature.
     if matches!(
@@ -1701,7 +1728,11 @@ pub fn apply(state: &mut State, action: &Action) {
     // **`Paste` is left out on purpose.** A paste must not change the mode: text arriving from
     // the clipboard that happens to start with `/` or hold an `@` is not somebody reaching for a
     // list.
-    if matches!(
+    //
+    // Neither list opens before the first connection, for the reason at the top of this function —
+    // the commands behind one of them have no session to act on.
+    if state.ever_connected
+        && matches!(
         action,
         Action::Insert(_)
             | Action::Backspace
@@ -1718,7 +1749,8 @@ pub fn apply(state: &mut State, action: &Action) {
             | Action::WordRight
             | Action::Home
             | Action::End
-    ) {
+        )
+    {
         follow_the_slash(state);
         follow_the_at(state);
     }
@@ -2892,6 +2924,7 @@ async fn run_inner(
 
     let mut api = api;
     state.connected = true;
+    state.ever_connected = true;
     // **Keep "connecting…" from freezing on the screen.** Always redraw once attached —
     // the last frame the wait loop drew is still pre-connection, and with `dirty` left off
     // "connecting…" stays until some key is pressed (it really did stay).
@@ -3380,6 +3413,7 @@ async fn run_inner(
                 if let Some(fresh) = api_of(&api_rx) {
                     api = fresh;
                     state.connected = true;
+                    state.ever_connected = true;
                     // A drop and reattach shows on screen too — connecting → connected →
                     // idle.
                     state.set_status(state.lang.connected());
@@ -4650,8 +4684,12 @@ mod tests {
     use crate::event::{Entry, EntryKind};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+    /// **Attached, unless a test says otherwise.** Almost every test here is about an app with a
+    /// session behind it, and before the first connection nothing reaches outward by design.
     fn state() -> State {
-        State::new()
+        let mut s = State::new();
+        s.ever_connected = true;
+        s
     }
 
     fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
@@ -4774,6 +4812,8 @@ mod tests {
     #[test]
     fn the_enroll_window_closes_only_with_esc() {
         let mut s = state();
+        // Still attached — there is a conversation behind the window to go back to.
+        s.connected = true;
         apply(&mut s, &Action::Frame(Frame::Enroll(enroll())));
         assert!(s.enroll.is_some());
 
@@ -4790,6 +4830,65 @@ mod tests {
         assert_eq!(on_key(&s, key(KeyCode::Esc, KeyModifiers::NONE)), vec![Action::EnrollClose]);
         apply(&mut s, &Action::EnrollClose);
         assert!(s.enroll.is_none(), "Esc should close it");
+    }
+
+    /// **Closing the last thing on screen has to end the app.** With no connection the enrollment
+    /// window is the whole of what this process can do; Esc used to put it away and leave a dead
+    /// shell — a conversation that cannot be typed into, lists that cannot be opened, and no way
+    /// back to the code short of restarting.
+    ///
+    /// The judgement is whether a connection is up, not whether a credential exists. Being attached
+    /// is what makes there be something behind the window worth returning to.
+    #[test]
+    fn esc_ends_the_app_when_the_enroll_window_is_all_there_is() {
+        let mut s = state();
+        apply(&mut s, &Action::Frame(Frame::Enroll(enroll())));
+        assert!(!s.connected, "nothing has attached yet");
+        assert_eq!(on_key(&s, key(KeyCode::Esc, KeyModifiers::NONE)), vec![Action::Quit]);
+    }
+
+    /// **Nothing reaches outward before the first connection.** Sending, the project and thread
+    /// lists, the slash commands and the history all go through a session that does not exist yet,
+    /// so offering them answers with an empty window or with silence — which reads as the app being
+    /// broken rather than as it waiting for somebody to approve it.
+    ///
+    /// What belongs to this screen alone stays. Typing and the editing keys are how a first message
+    /// gets written while the wait goes on, and a mode picked here is meant to reach the gate.
+    #[test]
+    fn nothing_reaches_outward_before_the_first_connection() {
+        let mut s = state();
+        s.ever_connected = false;
+        s.sent.push("earlier".into());
+
+        // Typed, but there is nowhere to send it and no list to offer.
+        for c in "/help".chars() {
+            apply(&mut s, &Action::Insert(c));
+        }
+        assert_eq!(s.input.text, "/help", "typing is this screen's own");
+        assert!(s.picker.is_none(), "the command list opened with no session to run against");
+
+        apply(&mut s, &Action::Insert(' '));
+        apply(&mut s, &Action::Insert('@'));
+        assert!(s.picker.is_none(), "the file list opened before there was anything to send to");
+
+        apply(&mut s, &Action::Submit("hello".into()));
+        assert!(!s.submit_now, "a message went out before anything had attached");
+
+        apply(&mut s, &Action::OpenPicker);
+        assert!(s.picker.is_none(), "the project list opened with nothing to read it from");
+        apply(&mut s, &Action::OpenHistory);
+        assert!(s.picker.is_none(), "the history list opened");
+
+        // Changing mode is this screen's own and must still land — first enrolment sits here for
+        // as long as it takes to walk to a browser.
+        let was = s.mode;
+        apply(&mut s, &Action::CycleMode);
+        assert_ne!(s.mode, was, "the mode did not change while waiting");
+
+        // Once something has attached it all answers again.
+        s.ever_connected = true;
+        apply(&mut s, &Action::OpenPicker);
+        assert!(s.picker.is_some(), "the list must open once attached");
     }
 
     /// **The way out is not blocked even with the enrollment code window up.** Ctrl+C always
@@ -4851,7 +4950,7 @@ mod tests {
     /// **Slash commands never reach the server.** One typo must not spend credits.
     #[test]
     fn a_slash_command_never_reaches_the_server() {
-        let mut s = State::new();
+        let mut s = state();
         apply(&mut s, &Action::Submit("/cwd".into()));
         assert_eq!(s.command_out.as_deref(), Some("/cwd"));
         assert!(s.queued.is_empty(), "the command leaked into the queue");
@@ -4860,7 +4959,7 @@ mod tests {
     /// A command runs now even mid-work — changing the mode has no reason to wait for a turn.
     #[test]
     fn a_command_runs_even_while_a_turn_is_going() {
-        let mut s = State::new();
+        let mut s = state();
         s.running = true;
         apply(&mut s, &Action::Submit("/mode 계획".into()));
         assert_eq!(s.command_out.as_deref(), Some("/mode 계획"));
@@ -4872,7 +4971,7 @@ mod tests {
     /// moment the mode changed and quietly open a new session. That really was confusing.
     #[test]
     fn restage_keeps_the_active_conversation() {
-        let mut s = State::new();
+        let mut s = state();
         s.lang = crate::lang::Lang::Ko;
         let mut session = Session::new(None);
         session.switch_to("지금-세션".into(), None);
@@ -4887,14 +4986,14 @@ mod tests {
     #[test]
     fn changing_the_mode_says_nothing_on_screen() {
         for mode in [crate::mode::Mode::Work, crate::mode::Mode::Job, crate::mode::Mode::Plan] {
-            let mut s = State::new();
+            let mut s = state();
             let mut session = Session::new(None);
             s.mode = mode;
             restage(&s, &mut session);
             assert!(s.timeline.items().is_empty(), "{mode:?} left something on screen");
 
             // And the same with a conversation already in progress.
-            let mut s = State::new();
+            let mut s = state();
             let mut session = Session::new(None);
             session.switch_to("지금-세션".into(), None);
             s.mode = mode;
@@ -4907,7 +5006,7 @@ mod tests {
     /// or job.
     #[test]
     fn restage_stages_an_open_only_without_a_conversation() {
-        let mut s = State::new();
+        let mut s = state();
         let mut session = Session::new(None);
         s.mode = crate::mode::Mode::Job;
         restage(&s, &mut session);
@@ -4917,7 +5016,7 @@ mod tests {
     /// An ordinary message still goes to the server.
     #[test]
     fn a_normal_message_still_goes_to_the_server() {
-        let mut s = State::new();
+        let mut s = state();
         apply(&mut s, &Action::Submit("안녕".into()));
         assert!(s.command_out.is_none());
     }
@@ -4927,13 +5026,13 @@ mod tests {
     /// know.
     #[test]
     fn the_mode_command_changes_the_mode_and_says_so() {
-        let mut s = State::new();
+        let mut s = state();
         s.lang = crate::lang::Lang::Ko;
         run_command(&mut s, "/mode 계획");
         assert_eq!(s.mode, crate::mode::Mode::Plan);
         assert!(last_system(&mut s).contains("계획"), "{}", last_system(&mut s));
 
-        let mut s = State::new();
+        let mut s = state();
         s.lang = crate::lang::Lang::En;
         run_command(&mut s, "/mode plan");
         assert_eq!(s.mode, crate::mode::Mode::Plan);
@@ -4945,7 +5044,7 @@ mod tests {
     /// nothing was dumped into the conversation.
     #[test]
     fn mode_without_an_argument_opens_a_panel() {
-        let mut s = State::new();
+        let mut s = state();
         s.mode = crate::mode::Mode::Job;
         run_command(&mut s, "/mode");
         let panel = s.panel.as_ref().expect("the mode panel should be up");
@@ -4962,7 +5061,7 @@ mod tests {
     /// is hidden behind it, so scrolling that instead would move unseen text.
     #[test]
     fn keys_and_wheel_scroll_the_panel() {
-        let mut s = State::new();
+        let mut s = state();
         run_command(&mut s, "/mode");
         for a in on_key(&s, key(KeyCode::Down, KeyModifiers::NONE)) {
             apply(&mut s, &a);
@@ -4980,7 +5079,7 @@ mod tests {
     /// it — the same path as typing `/account logout`, not a second logout flow.
     #[test]
     fn the_account_button_focuses_with_tab_and_activates_with_enter() {
-        let mut s = State::new();
+        let mut s = state();
         s.panel = Some(crate::panel::account(
             crate::lang::Lang::Ko,
             "루마",
@@ -5006,7 +5105,7 @@ mod tests {
     /// A panel without a button keeps the old keys — Tab does nothing, Enter closes.
     #[test]
     fn a_buttonless_panel_ignores_tab_and_enter_closes() {
-        let mut s = State::new();
+        let mut s = state();
         run_command(&mut s, "/mode");
         let actions = on_key(&s, key(KeyCode::Tab, KeyModifiers::NONE));
         assert!(actions.is_empty(), "no button: Tab must not focus anything: {actions:?}");
@@ -5020,7 +5119,7 @@ mod tests {
     /// next time.
     #[test]
     fn an_unknown_command_lists_what_exists() {
-        let mut s = State::new();
+        let mut s = state();
         run_command(&mut s, "/nope");
         assert!(last_system(&mut s).contains("/help"), "{}", last_system(&mut s));
     }
@@ -5029,7 +5128,7 @@ mod tests {
     /// both languages, and a session-less state says so honestly.
     #[test]
     fn status_shows_the_session_picture() {
-        let mut s = State::new();
+        let mut s = state();
         s.lang = crate::lang::Lang::Ko;
         let mut session = Session::new(None);
         session.switch_to("세션-1".into(), Some("프로젝트-1".into()));
@@ -5045,7 +5144,7 @@ mod tests {
         assert!(said.contains("1.23"), "{said}");
 
         // The English screen says the same things, and a session-less state says so honestly.
-        let mut s = State::new();
+        let mut s = state();
         s.lang = crate::lang::Lang::En;
         s.agent = "Main Agent".into();
         let session = Session::new(None);
@@ -5057,7 +5156,7 @@ mod tests {
     /// `/clear` empties **only the screen.** Clearing must not read as the session being gone.
     #[test]
     fn clearing_says_the_session_is_still_there() {
-        let mut s = State::new();
+        let mut s = state();
         apply(&mut s, &work_start(1));
         run_command(&mut s, "/clear");
         assert!(last_system(&mut s).contains("thread"), "{}", last_system(&mut s));
@@ -5068,7 +5167,7 @@ mod tests {
     /// the settings is looking at the panel.
     #[test]
     fn the_config_command_opens_the_settings_panel() {
-        let mut s = State::new();
+        let mut s = state();
         s.lang = crate::lang::Lang::Ko;
         run_command(&mut s, "/config");
         assert!(s.panel.is_some(), "the panel must open");
@@ -5087,7 +5186,7 @@ mod tests {
     /// saving itself to the I/O side, which is what `config_out` says.
     #[test]
     fn the_settings_form_takes_the_arrows_and_enter_saves() {
-        let mut s = State::new();
+        let mut s = state();
         s.lang = crate::lang::Lang::Ko;
         run_command(&mut s, "/config");
         assert_eq!(s.config.dir_access, crate::config::DirAccess::Deny, "the default");
@@ -5119,7 +5218,7 @@ mod tests {
     /// experiments in.
     #[test]
     fn esc_closes_the_settings_form_and_changes_nothing() {
-        let mut s = State::new();
+        let mut s = state();
         s.lang = crate::lang::Lang::Ko;
         let before = s.config;
         run_command(&mut s, "/config");
@@ -5137,7 +5236,7 @@ mod tests {
     /// scroll — it is built to fit.
     #[test]
     fn the_settings_form_swallows_everything_else() {
-        let mut s = State::new();
+        let mut s = state();
         run_command(&mut s, "/config");
         press(&mut s, KeyCode::Char('x'));
         press(&mut s, KeyCode::Backspace);
@@ -5149,7 +5248,7 @@ mod tests {
     /// `option value` changes the setting and says so — the panel only shows.
     #[test]
     fn the_config_command_sets_and_reports_settings() {
-        let mut s = State::new();
+        let mut s = state();
         s.lang = crate::lang::Lang::Ko;
         run_command(&mut s, "/config dir allow");
         assert_eq!(s.config.dir_access, crate::config::DirAccess::Allow);
@@ -5165,7 +5264,7 @@ mod tests {
     /// `/config lang` changes the screen language.
     #[test]
     fn the_config_command_changes_the_language() {
-        let mut s = State::new();
+        let mut s = state();
         run_command(&mut s, "/config lang en");
         assert_eq!(s.lang, crate::lang::Lang::En);
     }
@@ -5174,7 +5273,7 @@ mod tests {
     /// stopped there too.
     #[test]
     fn the_quit_command_asks_the_io_side_to_leave() {
-        let mut s = State::new();
+        let mut s = state();
         assert!(!s.quitting);
         run_command(&mut s, "/quit");
         assert!(s.quitting);
@@ -5224,7 +5323,7 @@ mod tests {
     /// exist.
     #[test]
     fn typing_a_slash_opens_the_command_list() {
-        let mut s = State::new();
+        let mut s = state();
         typed(&mut s, "/");
         assert!(s.picker.is_some(), "the list did not come up");
         assert!(matches!(
@@ -5236,7 +5335,7 @@ mod tests {
     /// It has to narrow as typing goes on for picking to be worth anything.
     #[test]
     fn typing_narrows_the_command_list() {
-        let mut s = State::new();
+        let mut s = state();
         typed(&mut s, "/mo");
         let rows = &s.picker.as_ref().expect("there is no list").rows;
         assert_eq!(rows.len(), 1, "{rows:?}");
@@ -5247,7 +5346,7 @@ mod tests {
     /// movement keys, `/skills` could not be typed.
     #[test]
     fn letters_still_type_while_the_command_list_is_open() {
-        let mut s = State::new();
+        let mut s = state();
         typed(&mut s, "/s");
         assert_eq!(
             on_key(&s, key(KeyCode::Char('k'), KeyModifiers::NONE)),
@@ -5262,7 +5361,7 @@ mod tests {
     /// **Typing a path has to make the list go away.** `/home/...` is not a command.
     #[test]
     fn a_path_closes_the_command_list() {
-        let mut s = State::new();
+        let mut s = state();
         typed(&mut s, "/home");
         assert!(s.picker.is_none(), "the list is still up on a path");
     }
@@ -5270,7 +5369,7 @@ mod tests {
     /// Once an argument starts, the list has done its job.
     #[test]
     fn the_command_list_closes_once_an_argument_starts() {
-        let mut s = State::new();
+        let mut s = state();
         typed(&mut s, "/mode ");
         assert!(s.picker.is_none(), "the list covers the screen while typing an argument");
     }
@@ -5280,7 +5379,7 @@ mod tests {
     /// the same text and do nothing.
     #[test]
     fn a_fully_typed_command_runs_on_the_first_enter() {
-        let mut s = State::new();
+        let mut s = state();
         typed(&mut s, "/rules");
         assert!(s.picker.is_some(), "the situation has to be one where the list is up");
         assert_eq!(
@@ -5292,7 +5391,7 @@ mod tests {
     /// Something not fully typed is right to pick from the list.
     #[test]
     fn a_half_typed_command_still_picks_from_the_list() {
-        let mut s = State::new();
+        let mut s = state();
         typed(&mut s, "/ru");
         assert_eq!(on_key(&s, key(KeyCode::Enter, KeyModifiers::NONE)), vec![Action::PickConfirm]);
     }
@@ -5300,7 +5399,7 @@ mod tests {
     /// Submitting closes the list. Left open it covers the screen while the answer arrives.
     #[test]
     fn submitting_closes_the_command_list() {
-        let mut s = State::new();
+        let mut s = state();
         typed(&mut s, "/cwd");
         apply(&mut s, &Action::Submit("/cwd".into()));
         assert!(s.picker.is_none(), "the list is still there");
@@ -5309,7 +5408,7 @@ mod tests {
     /// Erasing it all closes the list too.
     #[test]
     fn erasing_the_slash_closes_the_list() {
-        let mut s = State::new();
+        let mut s = state();
         typed(&mut s, "/m");
         apply(&mut s, &Action::Backspace);
         apply(&mut s, &Action::Backspace);
@@ -6616,7 +6715,7 @@ mod tests {
     /// What the strip shows is replaced wholesale, never merged.
     #[test]
     fn a_git_frame_replaces_what_the_strip_shows() {
-        let mut s = State::new();
+        let mut s = state();
         assert_eq!(s.repo, None);
         let got = crate::repo::Repo { branch: "main".into(), staged: 1, ..Default::default() };
         apply(&mut s, &Action::Frame(Frame::Git(Some(got.clone()))));
@@ -6753,8 +6852,12 @@ mod tests {
 mod file_reference {
     use super::*;
 
+    /// **Attached, unless a test says otherwise.** Almost every test here is about an app with a
+    /// session behind it, and before the first connection nothing reaches outward by design.
     fn state() -> State {
-        State::new()
+        let mut s = State::new();
+        s.ever_connected = true;
+        s
     }
 
     fn drafted(text: &str) -> State {
@@ -6879,8 +6982,12 @@ mod file_reference {
 mod history_search {
     use super::*;
 
+    /// **Attached, unless a test says otherwise.** Almost every test here is about an app with a
+    /// session behind it, and before the first connection nothing reaches outward by design.
     fn state() -> State {
-        State::new()
+        let mut s = State::new();
+        s.ever_connected = true;
+        s
     }
 
     fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
@@ -6977,8 +7084,12 @@ mod history_search {
 mod polish {
     use super::*;
 
+    /// **Attached, unless a test says otherwise.** Almost every test here is about an app with a
+    /// session behind it, and before the first connection nothing reaches outward by design.
     fn state() -> State {
-        State::new()
+        let mut s = State::new();
+        s.ever_connected = true;
+        s
     }
 
     /// **Any edit to the draft re-decides the list, not just typing and backspace.** `Ctrl+U` on

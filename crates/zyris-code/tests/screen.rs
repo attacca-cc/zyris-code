@@ -141,6 +141,8 @@ fn a_user_message_appears_above_the_input() {
 #[test]
 fn what_was_just_submitted_is_on_screen_without_waiting_for_the_server() {
     let mut s = State::new();
+    // Attached — nothing is sent before the first connection.
+    s.ever_connected = true;
     apply(&mut s, &Action::Submit("이걸 해 주세요".into()));
     let screen = dump(&mut s, 40, 10);
     assert!(screen.contains("이걸 해 주세요"), "\n{screen}");
@@ -1732,6 +1734,8 @@ fn usage_is_dropped_when_the_bottom_bar_is_too_narrow() {
 #[test]
 fn the_bottom_bar_says_how_many_messages_are_waiting() {
     let mut s = State::new();
+    // Attached — nothing is sent, or queued to be sent, before the first connection.
+    s.ever_connected = true;
     s.lang = zyris_code::lang::Lang::Ko;
     s.agent = "Main Agent".into();
     s.running = true;
