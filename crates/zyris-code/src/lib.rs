@@ -32,6 +32,7 @@ pub mod repo;
 pub mod rows;
 pub mod scroll;
 pub mod selection;
+pub mod term;
 pub mod theme;
 pub mod timeline;
 pub mod todos;

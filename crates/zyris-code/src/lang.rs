@@ -1449,6 +1449,19 @@ impl Lang {
         }
     }
     /// Said while `/reconnect` is reattaching.
+    /// Said **once** when a selection could not reach the system clipboard, because this terminal
+    /// was not found to read OSC 52. Copying looks like it worked otherwise — the text is held in
+    /// the app and pastes back into it — so without a word the paste into another window is where
+    /// it is discovered, and by then the reason is nowhere in sight.
+    pub fn copy_stayed_here(self) -> &'static str {
+        self.pick(
+            "복사한 글이 이 앱 안에만 있습니다 — 이 터미널이 시스템 클립보드 쓰기를 안 받습니다. \
+             ZYRIS_CODE_OSC52=1로 켜 보거나, ZYRIS_CODE_MOUSE=0으로 터미널이 직접 긁게 하세요.",
+            "The copy stayed inside this app — this terminal was not found to accept clipboard \
+             writes. Try ZYRIS_CODE_OSC52=1, or ZYRIS_CODE_MOUSE=0 to let the terminal select \
+             text itself.",
+        )
+    }
     pub fn reconnecting(self) -> &'static str {
         self.pick("다시 붙는 중…", "attaching again…")
     }
@@ -2146,6 +2159,7 @@ mod tests {
             (ko.enroll_title(), en.enroll_title()),
             (ko.enroll_steps(), en.enroll_steps()),
             (ko.enroll_warning(), en.enroll_warning()),
+            (ko.copy_stayed_here(), en.copy_stayed_here()),
             (ko.enroll_lapsed(), en.enroll_lapsed()),
             (ko.enroll_denied(), en.enroll_denied()),
             (ko.enroll_keys(), en.enroll_keys()),
@@ -2206,6 +2220,7 @@ mod tests {
             en.enroll_title(),
             en.enroll_steps(),
             en.enroll_warning(),
+            en.copy_stayed_here(),
             en.enroll_lapsed(),
             en.enroll_denied(),
             en.enroll_keys(),

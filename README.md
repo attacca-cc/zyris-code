@@ -388,6 +388,9 @@ Messages typed while a turn is running are queued and sent in order when it ends
 | `ZYRIS_NODE_TOKEN` | — | Dial with a fixed node token instead of enrolling |
 | `ZYRIS_CODE_LOG` | `/tmp/zyris-code.log` | Log file. Logs never go to the terminal — they would land in the middle of the UI |
 | `ZYRIS_CODE_WIRE_DEADLINE_SECS` | `55` | Answer the wire before the server gives up on a call; `0` disables it |
+| `ZYRIS_CODE_MOUSE` | on | `0` hands the mouse back to the terminal, so copy-on-select and the scrollback drag work as they do everywhere else. Click-to-fold, drag-to-copy and Ctrl+click go with it |
+| `ZYRIS_CODE_HYPERLINKS` | detected | Force OSC 8 link markup on or off. Only terminals known to read it are sent any, because one that does not prints the escape bytes across the screen. Links stay Ctrl+clickable either way — the app opens them itself |
+| `ZYRIS_CODE_OSC52` | detected | Force system-clipboard writes on or off. Terminals differ, and several that draw links keep clipboard writes switched off until told otherwise |
 | `RUST_LOG` | `zyris_code=info,zyris=warn` | Log filter |
 | `NO_COLOR` | — | Suppress colour in the messages printed before the UI starts |
 

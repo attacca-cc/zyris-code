@@ -296,6 +296,14 @@ pub struct State {
     pub scroll: Scroll,
     pub running: bool,
     pub connected: bool,
+    /// What this terminal was found to be able to do (`term.rs`). Read once at startup — the
+    /// answer cannot change while the process runs, and looking it up per frame would put an
+    /// environment read inside the draw loop.
+    pub caps: crate::term::Caps,
+    /// Whether the "your copy stayed in here" word has been said. **Once per run** — it is the
+    /// same sentence every time, and a notice that repeats on every drag is one that gets in the
+    /// way of the thing being copied.
+    pub said_clipboard_note: bool,
     /// Whether anything has attached **at any point in this run**. Distinct from `connected`: what
     /// the screen can offer depends on there having been a session at all, not on there being one
     /// right now, so a brief drop must not take the whole screen away.
@@ -540,6 +548,8 @@ impl Default for State {
             running: false,
             connected: false,
             ever_connected: false,
+            caps: crate::term::Caps::detect(),
+            said_clipboard_note: false,
             status: None,
             mode: Mode::default(),
             agent: String::new(),
@@ -2577,6 +2587,52 @@ fn kitty_probe_ok(resp: &[u8]) -> bool {
 /// ("approve in the browser and it continues…") is all you see. Restoring in one chunk
 /// would also leave a trailing `EnableLineWrap` un-sent, so the shell's line wrap stays
 /// off.
+/// Mouse tracking, asking for less than crossterm's own command does.
+///
+/// `EnableMouseCapture` turns on five modes at once: `1000` (buttons), `1002` (drag), **`1003`
+/// (every movement)**, `1015` (urxvt coordinates) and `1006` (SGR coordinates). Only the first,
+/// second and last are wanted here.
+///
+/// **`1003` reports the pointer whenever it moves at all**, button or no button. Nothing in this
+/// app reads a bare hover, so every one of those reports is decoded and thrown away — and over
+/// SSH they are bytes on the wire for nothing. It is also the mode emulators handle least
+/// consistently. `1015` is the pre-SGR encoding that `1006` replaced; asking for both leaves it to
+/// the terminal which one it answers in, and crossterm parses either, so the older one buys
+/// nothing but ambiguity.
+///
+/// **Windows keeps crossterm's version.** There the console is driven through the WinAPI rather
+/// than escape sequences, so a hand-written ANSI string would reach nothing at all — this is one
+/// of the places where writing it ourselves is strictly worse.
+#[derive(Debug, Clone, Copy)]
+enum MouseCapture {
+    On,
+    Off,
+}
+
+impl crossterm::Command for MouseCapture {
+    fn write_ansi(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
+        match self {
+            // Highest mode first when enabling, so a terminal that only knows the older ones
+            // still lands somewhere useful; reverse order when disabling.
+            MouseCapture::On => write!(f, "\x1b[?1006h\x1b[?1002h\x1b[?1000h"),
+            MouseCapture::Off => write!(f, "\x1b[?1000l\x1b[?1002l\x1b[?1006l"),
+        }
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> std::io::Result<()> {
+        match self {
+            MouseCapture::On => crossterm::event::EnableMouseCapture.execute_winapi(),
+            MouseCapture::Off => crossterm::event::DisableMouseCapture.execute_winapi(),
+        }
+    }
+
+    #[cfg(windows)]
+    fn is_ansi_code_supported(&self) -> bool {
+        crossterm::event::EnableMouseCapture.is_ansi_code_supported()
+    }
+}
+
 fn terminal_feature(label: &'static str, command: impl crossterm::Command) {
     if let Err(e) = execute!(io::stdout(), command) {
         tracing::warn!(label, error = %e, "terminal feature change failed — continuing without that feature");
@@ -2595,7 +2651,14 @@ pub async fn run(
     // Turn terminal features on **one at a time** — if any one fails, the screen still
     // comes up (see `terminal_feature`). On Windows the kitty keyboard protocol always
     // fails, so the line-wrap-off below must still be reached.
-    terminal_feature("mouse capture", crossterm::event::EnableMouseCapture);
+    // **Taking the mouse takes the terminal's own selection with it.** While tracking is on the
+    // emulator hands every click and drag to us instead of highlighting text, so copy-on-select
+    // and the scrollback drag stop working — that is the price of click-to-fold and drag-to-copy,
+    // and `$ZYRIS_CODE_MOUSE=0` is how somebody declines to pay it.
+    let caps = crate::term::Caps::detect();
+    if caps.mouse {
+        terminal_feature("mouse capture", MouseCapture::On);
+    }
     // Coming back from another window, the terminal sometimes does not restore the
     // screen for us. We have to know focus came back to redraw the whole thing.
     terminal_feature("focus change", crossterm::event::EnableFocusChange);
@@ -2641,7 +2704,9 @@ pub async fn run(
     // Turn off one by one. Restoring also tolerates failure — if one command dies
     // (on Windows `PopKeyboardEnhancementFlags` fails), the ones after it must still go
     // out, or line wrap stays off in the shell and long lines look cut.
-    terminal_feature("mouse capture off", crossterm::event::DisableMouseCapture);
+    // Turned off whether or not we turned it on — a previous run that died without restoring
+    // leaves the terminal tracking, and one more `l` costs nothing.
+    terminal_feature("mouse capture off", MouseCapture::Off);
     terminal_feature("focus change off", crossterm::event::DisableFocusChange);
     terminal_feature("bracketed paste off", crossterm::event::DisableBracketedPaste);
     terminal_feature("kitty keyboard protocol off", crossterm::event::PopKeyboardEnhancementFlags);
@@ -3254,10 +3319,20 @@ async fn run_inner(
                     // released.** There is no key to press — leaving Ctrl+C as the one stop
                     // key is less confusing when it matters. `apply` sets the range, so
                     // this has to come after it. Exporting is I/O, hence here. A terminal
-                    // that does not know OSC 52 ignores it quietly, at no cost.
+                    // that does not know OSC 52 ignores it quietly, at no cost — but one that
+                    // was never going to read it is not asked at all (`caps.osc52`), because a
+                    // terminal old enough to print the bytes instead would spray them over the
+                    // transcript. The in-app clipboard is filled either way.
                     if matches!(action, Action::Release) {
                         if let Some(text) = &state.selection {
-                            crate::clipboard::export(text);
+                            if state.caps.osc52 {
+                                crate::clipboard::export(text);
+                            } else if !std::mem::replace(&mut state.said_clipboard_note, true) {
+                                // **Silence here is the worst answer.** The copy looks to have
+                                // worked — it pastes back into this app — so left unsaid it is
+                                // found out in another window, where the reason is nowhere near.
+                                state.set_status(state.lang.copy_stayed_here());
+                            }
                         }
                     }
 

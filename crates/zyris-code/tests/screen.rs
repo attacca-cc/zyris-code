@@ -2177,12 +2177,7 @@ fn without_git_the_rule_resumes_right_after_the_path() {
 /// the buffer directly, because `dump` counts the escape bytes as width and skips cells.
 #[test]
 fn a_link_in_an_answer_is_wrapped_in_osc8() {
-    let mut s = State::new();
-    said(&mut s, 1, EntryKind::Agent("[문서](https://example.com/x) 끝".into()));
-    let mut term = Terminal::new(TestBackend::new(60, 12)).unwrap();
-    term.draw(|f| widgets::draw(f, &mut s)).unwrap();
-    let buf = term.backend().buffer().clone();
-    let syms: Vec<String> = buf.content.iter().map(|c| c.symbol().to_string()).collect();
+    let syms = link_cells(true);
     assert!(
         syms.iter().any(|sym| sym.starts_with("\u{1b}]8;;https://example.com/x")),
         "no OSC 8 open sequence: {syms:?}"
@@ -2191,6 +2186,35 @@ fn a_link_in_an_answer_is_wrapped_in_osc8() {
         syms.iter().any(|sym| sym.contains("\u{1b}]8;;\u{1b}\\")),
         "no OSC 8 close sequence: {syms:?}"
     );
+}
+
+/// **A terminal that never learned OSC 8 prints the bytes.** Then the sequence is not merely
+/// ignored — it lands across the transcript as rubbish, and the diff believes those cells are
+/// right, so it stays until something forces a full repaint.
+///
+/// Nothing is lost by holding it back: the app opens URLs itself on Ctrl+click (`open_url`)
+/// rather than leaving it to the emulator, so the link still works and only the underline goes.
+#[test]
+fn a_terminal_that_cannot_read_osc8_is_not_sent_any() {
+    let syms = link_cells(false);
+    assert!(
+        !syms.iter().any(|sym| sym.contains("\u{1b}]8;;")),
+        "escape bytes went to a terminal that would have printed them: {syms:?}"
+    );
+    // The text itself is untouched — it is the sequence around it that is held back.
+    assert!(syms.iter().any(|sym| sym == "문"), "the link text went missing: {syms:?}");
+}
+
+/// Draws one agent answer holding a link and hands back the cell symbols, with the terminal
+/// declared able to read OSC 8 or not.
+fn link_cells(hyperlinks: bool) -> Vec<String> {
+    let mut s = State::new();
+    s.caps.hyperlinks = hyperlinks;
+    said(&mut s, 1, EntryKind::Agent("[문서](https://example.com/x) 끝".into()));
+    let mut term = Terminal::new(TestBackend::new(60, 12)).unwrap();
+    term.draw(|f| widgets::draw(f, &mut s)).unwrap();
+    let buf = term.backend().buffer().clone();
+    buf.content.iter().map(|c| c.symbol().to_string()).collect()
 }
 
 /// A bare URL in plain text is not wrapped — the terminal detects those itself.

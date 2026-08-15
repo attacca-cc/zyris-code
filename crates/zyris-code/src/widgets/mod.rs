@@ -219,7 +219,12 @@ fn inject_links(frame: &mut Frame, state: &State) {
     use ratatui::buffer::CellDiffOption;
     use std::num::NonZeroU16;
 
-    if state.view_links.is_empty() {
+    // **A terminal that never learned OSC 8 prints the bytes.** Then a link is not merely
+    // un-clickable — the escape sequence lands across the transcript as rubbish, and the diff
+    // believes those cells are right, so it stays until a full repaint. Ctrl+click still opens
+    // the URL without this, because the app opens it itself (`open_url`) rather than leaving it
+    // to the emulator, so the cost of guessing "no" is the underline and nothing else.
+    if !state.caps.hyperlinks || state.view_links.is_empty() {
         return;
     }
     let (ox, oy) = state.view_origin;
