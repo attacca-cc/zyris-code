@@ -2485,44 +2485,97 @@ fn open_url(url: &str) {
     }
 }
 
-/// How long we wait for the answer to the kitty keyboard protocol support question.
+/// The backstop for the kitty question, for a terminal that answers **neither** of the two
+/// things asked.
 ///
-/// A terminal that does not know the question never answers it, so silence for this long
-/// means no support. If the answer arrives later than this on a slow SSH link, crossterm
-/// quietly skips the leftover bytes (the public `Event` has no keyboard-flags variant) —
-/// the app does not break.
-const KITTY_PROBE_TIMEOUT: Duration = Duration::from_millis(150);
+/// It is no longer what decides the ordinary case: the device-attributes question does that, and
+/// it comes back in single-digit milliseconds. Silence this long now means a terminal that does
+/// not answer DA1 either — a pty in a test harness, or a pipe. If a real answer arrives after
+/// this, crossterm quietly skips the leftover bytes (its public `Event` has no keyboard-flags
+/// variant), so nothing breaks.
+const KITTY_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
+
+/// What the terminal has said so far about the kitty keyboard protocol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KittyVerdict {
+    /// `CSI ? <flags> u` came back — only a terminal that knows the protocol answers that.
+    Supported,
+    /// The device-attributes answer came back **first**, so the question before it went
+    /// unanswered. Settled: no support, and no reason to keep waiting.
+    Unsupported,
+    /// Nothing conclusive yet.
+    Waiting,
+}
+
+/// Reads whatever has arrived so far and says whether it settles the question.
+///
+/// **Two questions go out, and the order of the answers is the whole trick.** `CSI ? u` asks for
+/// the kitty flags and `CSI c` asks for device attributes; a terminal answers them in the order
+/// they were asked. So the *first* `CSI ?` reply that arrives decides it — ending in `u` means
+/// the protocol is there, ending in `c` means the kitty question was ignored and only the
+/// universally-answered one came back.
+///
+/// That second question is what removes the guesswork. Waiting for silence cannot tell "this
+/// terminal has no protocol" apart from "this answer is late", so on a slow link a supporting
+/// terminal was being written off — and the flags value itself is never examined, because we
+/// pushed flag 1 in ourselves and an answer arriving at all is the evidence.
+///
+/// A reply is found even with typed characters mixed in front; typing right at startup is not
+/// rare. Parameter bytes are digits, `;` and `:` — anything else means this is not a reply to
+/// either question, so it is skipped rather than trusted.
+fn kitty_verdict(resp: &[u8]) -> KittyVerdict {
+    let mut rest = resp;
+    while let Some(i) = rest.windows(3).position(|w| w == b"\x1b[?") {
+        let tail = &rest[i + 3..];
+        let end = tail.iter().position(|b| !(b.is_ascii_digit() || *b == b';' || *b == b':'));
+        match end.map(|e| tail[e]) {
+            Some(b'u') => return KittyVerdict::Supported,
+            Some(b'c') => return KittyVerdict::Unsupported,
+            // Some other final byte: not an answer to either question. Look past it.
+            Some(_) => rest = &tail[end.unwrap() + 1..],
+            // Still mid-sequence — the final byte has not arrived yet.
+            None => return KittyVerdict::Waiting,
+        }
+    }
+    KittyVerdict::Waiting
+}
 
 /// Asks **at startup** whether the terminal supports the kitty keyboard protocol.
 ///
-/// Shift+Enter only arrives distinguishable from Enter (CSI-u) on a terminal with the
-/// protocol on. A terminal without it sends Shift+Enter as the very same single `\r` byte
-/// as Enter, so there is no way to tell them apart from the bytes the app receives. Send
-/// `CSI ? u`, and a `CSI ? <flags> u` answer means a supporting terminal — only a terminal
-/// that knows the protocol can answer that question.
+/// Shift+Enter only arrives distinguishable from Enter (CSI-u) on a terminal with the protocol
+/// on. A terminal without it sends Shift+Enter as the very same single `\r` byte as Enter, so
+/// there is no telling them apart from the bytes the app receives.
 ///
-/// **This reads stdin directly rather than going through crossterm.** At this point the
-/// event source is not open yet (`EventStream` is created in `run_inner`), so there is no
-/// competitor. If the answer arrives late, crossterm quietly skips it, so it is safe.
-fn probe_kitty_keyboard() -> bool {
+/// **Device attributes ride along so silence never has to be the answer** — see `kitty_verdict`.
+///
+/// **crossterm has `supports_keyboard_enhancement()` and it is not used here.** Its comment
+/// describes this very technique, but it polls for the keyboard-flags event alone, so the
+/// device-attributes reply never satisfies the filter and it burns its whole 2000ms budget before
+/// answering `Err`. Measured on a pty that answers nothing: ours 149ms, crossterm 2002ms — that is
+/// two seconds of frozen startup on every terminal without the protocol, which is most of them.
+///
+/// **This reads stdin directly rather than going through crossterm.** At this point the event
+/// source is not open yet (`EventStream` is built in `run_inner`), so there is no competitor for
+/// the bytes. If an answer arrives after we stop reading, crossterm quietly skips it.
+pub fn probe_kitty_keyboard() -> bool {
     #[cfg(unix)]
     {
         use std::io::{Read, Write};
         use std::os::fd::AsRawFd;
 
         let mut out = io::stdout();
-        if write!(out, "\x1b[?u").is_err() || out.flush().is_err() {
+        if write!(out, "\x1b[?u\x1b[c").is_err() || out.flush().is_err() {
             return false;
         }
 
         let fd = io::stdin().as_raw_fd();
         let deadline = Instant::now() + KITTY_PROBE_TIMEOUT;
-        let mut resp = Vec::with_capacity(16);
+        let mut resp = Vec::with_capacity(32);
         let mut byte = [0u8; 1];
-        while Instant::now() < deadline && resp.len() < 32 {
+        while Instant::now() < deadline && resp.len() < 64 {
             let left = deadline.saturating_duration_since(Instant::now());
             let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
-            // 0 = timed out, <0 = error. Either way it means "not a supporting terminal".
+            // 0 = timed out, <0 = error. Either way, nothing more is coming.
             if unsafe { libc::poll(&mut pfd, 1, left.as_millis() as libc::c_int) } <= 0 {
                 break;
             }
@@ -2530,41 +2583,59 @@ fn probe_kitty_keyboard() -> bool {
                 Ok(0) | Err(_) => break,
                 Ok(_) => {
                     resp.push(byte[0]);
-                    // The answer ends with `u`. Even read in pieces, the last byte decides.
-                    if resp.ends_with(b"u") {
-                        break;
+                    match kitty_verdict(&resp) {
+                        KittyVerdict::Supported => return true,
+                        KittyVerdict::Unsupported => return false,
+                        KittyVerdict::Waiting => {}
                     }
                 }
             }
         }
-        kitty_probe_ok(&resp)
+        // Neither answer came. A terminal with the protocol would have replied to the first
+        // question, so the honest reading of silence is "no".
+        false
     }
     #[cfg(not(unix))]
     {
         // The Windows console carries modifiers in the input record as-is, so Shift+Enter
         // arrives as Enter+SHIFT even without the protocol — count it as supported. (We do
         // not send the question, since the answer could leak in as input.)
+        //
+        // crossterm's `supports_keyboard_enhancement()` answers a flat `Ok(false)` here, which
+        // would take Shift+Enter away on the platform where it actually works.
         true
     }
 }
 
-/// Is the answer to `CSI ? u` one from a supporting terminal? The answer format is
-/// `CSI ? <flags> u`.
+/// What a mouse event asks the app to do.
 ///
-/// The flags value itself is not examined — we just pushed flag 1 in, and the answer returns
-/// that current state, so accepting on format alone yields no false positives. Even off the
-/// format check, "an answer came at all" is itself evidence of support. (A terminal that
-/// does not know it never answers.)
-fn kitty_probe_ok(resp: &[u8]) -> bool {
-    // It is found even with characters the user typed mixed in front — typing right at
-    // startup is not rare.
-    let i = resp.windows(3).position(|w| w == b"\x1b[?");
-    i.is_some_and(|i| {
-        let tail = &resp[i + 3..];
-        !tail.is_empty()
-            && tail.ends_with(b"u")
-            && tail[..tail.len() - 1].iter().all(|b| b.is_ascii_digit() || *b == b';' || *b == b':')
-    })
+/// **Both loops go through here.** `run_inner` has two — the one that waits for the first
+/// connection and the main one — and the waiting one used to drop mouse events on the floor
+/// (`_ => {}`), so nothing on the screen it draws could be selected or copied. That screen is
+/// where first enrolment lives, which made the one window a person most needs to copy out of
+/// (the code) the one window they could not. Keeping the mapping in one place is the same rule
+/// the git strip above it already follows.
+fn mouse_actions(state: &State, m: crossterm::event::MouseEvent) -> Vec<Action> {
+    match m.kind {
+        MouseEventKind::ScrollUp => vec![Action::Wheel(1)],
+        MouseEventKind::ScrollDown => vec![Action::Wheel(-1)],
+        MouseEventKind::Down(MouseButton::Left) => {
+            // **A Ctrl+click opens a link instead of starting a drag.** The terminal is expected
+            // to open OSC 8 hyperlinks on Ctrl+click — but with mouse capture on, Alacritty
+            // forwards the click to the app rather than opening it (alacritty#8129). Opening it
+            // here makes the feature work in every emulator identically, and it is the whole
+            // reason a terminal that cannot read OSC 8 loses nothing but the underline.
+            if m.modifiers.contains(KeyModifiers::CONTROL) {
+                if let Some(url) = state.link_at(m.column, m.row) {
+                    return vec![Action::OpenLink(url)];
+                }
+            }
+            vec![Action::Press(m.column, m.row)]
+        }
+        MouseEventKind::Drag(MouseButton::Left) => vec![Action::DragTo(m.column, m.row)],
+        MouseEventKind::Up(MouseButton::Left) => vec![Action::Release],
+        _ => vec![],
+    }
 }
 
 /// The one and only I/O place.
@@ -2944,6 +3015,23 @@ async fn run_inner(
                     TermEvent::Paste(text) => {
                         apply(&mut state, &Action::Paste(text));
                     }
+                    // **This screen is selectable too.** Dropping mouse events here left the
+                    // enrolment window — the one thing on it worth copying — impossible to drag
+                    // across, while every other screen in the app could be.
+                    TermEvent::Mouse(m) => {
+                        for action in mouse_actions(&state, m) {
+                            apply(&mut state, &action);
+                        }
+                        // Releasing exports what was selected, the same as in the main loop.
+                        if let Some(text) = state.selection.clone() {
+                            if state.caps.osc52 {
+                                crate::clipboard::export(&text);
+                            }
+                        }
+                    }
+                    // Coming back to the window, redraw without clearing — the same trick the
+                    // main loop uses, for a wait that can last as long as a walk to a browser.
+                    TermEvent::FocusGained => state.force_update = true,
                     TermEvent::Resize(w, h) if last_size != Some((w, h)) => {
                         last_size = Some((w, h));
                         repaint(terminal);
@@ -3169,31 +3257,7 @@ async fn run_inner(
                         focus_back_at = None;
                         vec![]
                     }
-                    TermEvent::Mouse(m) => match m.kind {
-                        MouseEventKind::ScrollUp => vec![Action::Wheel(1)],
-                        MouseEventKind::ScrollDown => vec![Action::Wheel(-1)],
-                        MouseEventKind::Down(MouseButton::Left) => {
-                            // **A Ctrl+click opens a link instead of starting a drag.** The
-                            // terminal is expected to open OSC 8 hyperlinks on Ctrl+click —
-                            // but with mouse capture on, Alacritty forwards the click to the
-                            // app rather than opening it (alacritty#8129). Opening it here
-                            // makes the feature work in every emulator identically.
-                            if m.modifiers.contains(KeyModifiers::CONTROL) {
-                                if let Some(url) = state.link_at(m.column, m.row) {
-                                    vec![Action::OpenLink(url)]
-                                } else {
-                                    vec![Action::Press(m.column, m.row)]
-                                }
-                            } else {
-                                vec![Action::Press(m.column, m.row)]
-                            }
-                        }
-                        MouseEventKind::Drag(MouseButton::Left) => {
-                            vec![Action::DragTo(m.column, m.row)]
-                        }
-                        MouseEventKind::Up(MouseButton::Left) => vec![Action::Release],
-                        _ => vec![],
-                    },
+                    TermEvent::Mouse(m) => mouse_actions(&state, m),
                     // On regaining focus, redraw but **do not clear.** The focus event
                     // arrives every time the keyboard opens and closes on mobile SSH
                     // (Termius) — clearing everything each time makes the screen flash.
@@ -4818,17 +4882,68 @@ mod tests {
         );
     }
 
+    /// **Every screen is draggable, overlays included.** The mapping lives in one function so the
+    /// two loops in `run_inner` cannot drift — the waiting one dropped mouse events entirely,
+    /// which made the enrolment window the one screen whose text could not be selected, and it is
+    /// the screen with the code on it.
+    #[test]
+    fn a_press_starts_a_drag_wherever_it_lands() {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+        let s = state();
+        let at = |kind, col, row, modifiers| MouseEvent { kind, column: col, row, modifiers };
+
+        let press = at(MouseEventKind::Down(MouseButton::Left), 12, 9, KeyModifiers::NONE);
+        assert_eq!(mouse_actions(&s, press), vec![Action::Press(12, 9)]);
+        let drag = at(MouseEventKind::Drag(MouseButton::Left), 20, 9, KeyModifiers::NONE);
+        assert_eq!(mouse_actions(&s, drag), vec![Action::DragTo(20, 9)]);
+        let up = at(MouseEventKind::Up(MouseButton::Left), 20, 9, KeyModifiers::NONE);
+        assert_eq!(mouse_actions(&s, up), vec![Action::Release]);
+
+        // Ctrl over nothing clickable still starts a drag — otherwise holding Ctrl would make
+        // parts of the screen unselectable for no reason the person can see.
+        let ctrl = at(MouseEventKind::Down(MouseButton::Left), 12, 9, KeyModifiers::CONTROL);
+        assert_eq!(mouse_actions(&s, ctrl), vec![Action::Press(12, 9)]);
+    }
+
     /// Deciding on the answer to `CSI ? u`. The format is `CSI ? <flags> u` — only a terminal
     /// that knows the protocol can answer, so the format alone is enough.
     #[test]
-    fn kitty_probe_ok_accepts_flag_responses() {
-        assert!(kitty_probe_ok(b"\x1b[?1u"), "flag 1 as-is");
-        assert!(kitty_probe_ok(b"\x1b[?3u"), "several flags");
-        assert!(kitty_probe_ok(b"\x1b[?1;2u"), "event type too");
-        assert!(kitty_probe_ok(b"x\x1b[?1u"), "even with typed characters in front");
-        assert!(!kitty_probe_ok(b""), "no answer");
-        assert!(!kitty_probe_ok(b"abc"), "plain text");
-        assert!(!kitty_probe_ok(b"\x1b[?zzu"), "non-numeric flags");
+    fn a_flags_reply_settles_it_as_supported() {
+        use KittyVerdict::*;
+        assert_eq!(kitty_verdict(b"\x1b[?1u"), Supported, "flag 1 as-is");
+        assert_eq!(kitty_verdict(b"\x1b[?3u"), Supported, "several flags");
+        assert_eq!(kitty_verdict(b"\x1b[?1;2u"), Supported, "event type too");
+        assert_eq!(kitty_verdict(b"x\x1b[?1u"), Supported, "typed characters in front");
+    }
+
+    /// **The device-attributes reply is what makes silence unnecessary.** Both questions go out
+    /// together and a terminal answers them in order, so a DA reply arriving first means the
+    /// kitty question was ignored — settled, without waiting out the clock.
+    ///
+    /// Without this the only signal was silence, which cannot tell "no protocol here" from "this
+    /// answer is late": a supporting terminal on a slow link was written off, and every terminal
+    /// without the protocol paid the full timeout at startup.
+    #[test]
+    fn a_device_attributes_reply_arriving_first_settles_it_as_unsupported() {
+        use KittyVerdict::*;
+        assert_eq!(kitty_verdict(b"\x1b[?62;1;6c"), Unsupported, "xterm-style attributes");
+        assert_eq!(kitty_verdict(b"\x1b[?6c"), Unsupported, "the short form");
+        // Order is what decides — the flags reply is sent first by a terminal that has them.
+        assert_eq!(kitty_verdict(b"\x1b[?1u\x1b[?62;1;6c"), Supported, "flags came first");
+    }
+
+    /// Nothing conclusive means keep reading. Answering early on a half-arrived sequence would
+    /// read the verdict off whatever byte happened to land first.
+    #[test]
+    fn an_incomplete_or_unrelated_reply_decides_nothing() {
+        use KittyVerdict::*;
+        assert_eq!(kitty_verdict(b""), Waiting, "no answer yet");
+        assert_eq!(kitty_verdict(b"abc"), Waiting, "plain text");
+        assert_eq!(kitty_verdict(b"\x1b[?1"), Waiting, "the final byte has not arrived");
+        assert_eq!(kitty_verdict(b"\x1b[?62;1;"), Waiting, "mid-parameters");
+        // A `CSI ?` sequence that is neither reply is stepped over, not trusted.
+        assert_eq!(kitty_verdict(b"\x1b[?25h"), Waiting, "cursor visibility, not an answer");
+        assert_eq!(kitty_verdict(b"\x1b[?25h\x1b[?1u"), Supported, "and the real reply after it");
     }
 
     /// A paste keeps its newlines — splitting on Enter would fire off the first line of a
