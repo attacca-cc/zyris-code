@@ -385,7 +385,7 @@ impl Picker {
             // somebody else's prompt should say whose.
             note: Some(match c.description.is_empty() {
                 true => c.plugin.clone(),
-                false => format!("{} · {}", c.description, c.plugin),
+                false => format!("{} ∙ {}", c.description, c.plugin),
             }),
             enabled: true,
             status: None,
@@ -564,7 +564,7 @@ impl Picker {
             // typing with no sign of what was typed reads as a list narrowing on its own.
             Level::History { query } => match query.is_empty() {
                 true => lang.history().into(),
-                false => format!("{} · {query}", lang.history()),
+                false => format!("{} ∙ {query}", lang.history()),
             },
             Level::PluginTarget { .. } => lang.plugin_where_title().into(),
         }

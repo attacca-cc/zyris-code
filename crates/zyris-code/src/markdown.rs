@@ -97,7 +97,7 @@ pub fn render_rich(src: &str, width: u16) -> Rendered {
             Event::Start(Tag::Item) => {
                 buf.push(Piece {
                     span: Span::styled(
-                        format!("{}· ", "  ".repeat(list_depth.saturating_sub(1))),
+                        format!("{}∙ ", "  ".repeat(list_depth.saturating_sub(1))),
                         Style::default().fg(theme::accent()),
                     ),
                     url: None,
@@ -834,6 +834,6 @@ mod tests {
         let out = plain(&render("- 첫째\n- 둘째", 40));
         assert_eq!(out.len(), 2);
         assert!(out[0].contains("첫째"));
-        assert!(out[0].trim_start().starts_with('·') || out[0].trim_start().starts_with('-'));
+        assert!(out[0].trim_start().starts_with('∙') || out[0].trim_start().starts_with('-'));
     }
 }

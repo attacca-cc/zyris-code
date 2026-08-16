@@ -255,7 +255,7 @@ impl Panel {
 pub fn mode(lang: Lang, now: Mode) -> Panel {
     let mut lines = vec![
         Line::from(Span::styled(
-            format!("{} · {}", lang.current_mode(), now.label(lang)),
+            format!("{} ∙ {}", lang.current_mode(), now.label(lang)),
             Style::default().fg(now.color()).add_modifier(Modifier::BOLD),
         )),
         blank(),
@@ -272,7 +272,7 @@ pub fn mode(lang: Lang, now: Mode) -> Panel {
                     Style::default().fg(theme::text())
                 },
             ),
-            Span::styled(" — ", Style::default().fg(theme::border_light())),
+            Span::styled(" ‒ ", Style::default().fg(theme::border_light())),
             Span::styled(
                 lang.mode_desc(m),
                 Style::default().fg(if on { theme::text() } else { theme::text_muted() }),
@@ -311,7 +311,7 @@ pub fn mcp(
                 name.clone(),
                 Style::default().fg(theme::text_heading()).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(" — ", Style::default().fg(theme::border_light())),
+            Span::styled(" ‒ ", Style::default().fg(theme::border_light())),
             Span::styled(text, Style::default().fg(color)),
         ]));
     }
@@ -331,7 +331,7 @@ pub fn mcp(
                     slug.clone(),
                     Style::default().fg(theme::text_heading()).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(" — ", Style::default().fg(theme::border_light())),
+                Span::styled(" ‒ ", Style::default().fg(theme::border_light())),
                 Span::styled(
                     lang.mcp_found_from(source, *on),
                     Style::default().fg(theme::text_muted()),
@@ -358,12 +358,12 @@ pub fn skills(lang: Lang, skills: &[SkillInfo]) -> Panel {
         .iter()
         .map(|s| {
             Line::from(vec![
-                Span::styled("· ", Style::default().fg(theme::accent())),
+                Span::styled("∙ ", Style::default().fg(theme::accent())),
                 Span::styled(
                     s.name.clone(),
                     Style::default().fg(theme::text_heading()).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(" — ", Style::default().fg(theme::border_light())),
+                Span::styled(" ‒ ", Style::default().fg(theme::border_light())),
                 Span::styled(s.description.clone(), Style::default().fg(theme::text_muted())),
             ])
         })
@@ -382,7 +382,7 @@ pub fn plugins(lang: Lang, found: &[Plugin]) -> Panel {
     let mut lines = Vec::new();
     for p in found {
         let mut spans = vec![
-            Span::styled("· ", Style::default().fg(theme::accent())),
+            Span::styled("∙ ", Style::default().fg(theme::accent())),
             Span::styled(
                 p.name.clone(),
                 Style::default().fg(theme::text_heading()).add_modifier(Modifier::BOLD),
@@ -395,7 +395,7 @@ pub fn plugins(lang: Lang, found: &[Plugin]) -> Panel {
             ));
         }
         if !p.description.is_empty() {
-            spans.push(Span::styled(" — ", Style::default().fg(theme::border_light())));
+            spans.push(Span::styled(" ‒ ", Style::default().fg(theme::border_light())));
             spans.push(Span::styled(p.description.clone(), Style::default().fg(theme::text())));
         }
         lines.push(Line::from(spans));

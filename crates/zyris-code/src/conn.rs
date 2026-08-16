@@ -28,7 +28,7 @@ pub(crate) async fn within<T>(
         Ok(result) => result.map_err(|e| anyhow!("{e}")),
         Err(_) => {
             tracing::warn!(
-                "the server call did not answer within {}s — closing and reattaching",
+                "the server call did not answer within {}s ‒ closing and reattaching",
                 CALL_TIMEOUT.as_secs()
             );
             api.handle().connection().close("call timed out");
@@ -390,7 +390,7 @@ pub fn default_node_name() -> String {
 fn compose_name(host: &str, dir: Option<&str>) -> String {
     let suffix = dir.filter(|d| !d.is_empty() && *d != SUFFIX);
     let natural = match suffix {
-        Some(dir) => format!("{host} {SUFFIX} · {dir}"),
+        Some(dir) => format!("{host} {SUFFIX} ∙ {dir}"),
         None => format!("{host} {SUFFIX}"),
     };
     if slug_of(&natural).contains(SUFFIX) {
@@ -561,7 +561,7 @@ fn slug_of(name: &str) -> String {
 #[derive(Debug, Default)]
 pub struct Session {
     id: Option<String>,
-    /// The project currently in view. **Everything opened from here goes to this project** —
+    /// The project currently in view. **Everything opened from here goes to this project** ‒
     /// sessions, jobs, and works alike.
     ///
     /// **Must not be consumed on first use.** It used to be single-use: `＋ New thread` filled it
@@ -575,7 +575,7 @@ pub struct Session {
     preamble: Option<String>,
     /// What the next message will **open anew**. `None` appends to the current session.
     ///
-    /// **Can't be replaced by clearing `id`.** It's common to visit work·job mode and come back without
+    /// **Can't be replaced by clearing `id`.** It's common to visit work∙job mode and come back without
     /// saying anything; if `id` was already dropped then, the conversation in progress is lost. A staged
     /// open and "no session" are different states.
     pending_open: Option<Route>,
@@ -584,7 +584,7 @@ pub struct Session {
     stream_gen: u64,
     /// The task reading the live turn stream. **Aborted before another opens.**
     ///
-    /// `turn_events` is a live subscription that never ends by itself — attacca chains the
+    /// `turn_events` is a live subscription that never ends by itself ‒ attacca chains the
     /// backfill onto a broadcast receiver (`zyris_gateway.rs::turn_events`). This app used to
     /// open one on **every message** and every switch and close none, so a session that had been
     /// talked to five times had five subscriptions delivering the same frames. `push_delta`
@@ -597,23 +597,23 @@ pub struct Session {
 
 /// What you need to know after opening a session.
 ///
-/// **`sent` is the point.** With `create_job`·`create_work` the open request **consumes the first message**
-/// (`ZNewJob::message`·`ZNewWork::message`), so calling `send_message` afterwards would send the same
+/// **`sent` is the point.** With `create_job`∙`create_work` the open request **consumes the first message**
+/// (`ZNewJob::message`∙`ZNewWork::message`), so calling `send_message` afterwards would send the same
 /// words twice. On the path that merely creates a session, nothing has been sent yet.
 #[derive(Debug, Clone)]
 pub struct Opened {
     pub id: String,
     /// Whether the first message already rode along on the open request.
     pub sent: bool,
-    /// What was just opened. `None` when nothing new was opened — the screen only announces then.
+    /// What was just opened. `None` when nothing new was opened ‒ the screen only announces then.
     pub announced: Option<(Route, String)>,
 }
 
 impl Session {
-    /// `preamble` is this session's system directive — currently it carries the skill list.
+    /// `preamble` is this session's system directive ‒ currently it carries the skill list.
     ///
     /// **Fixed once when the session is created and can't be changed later** (attacca's `ZNewSession`).
-    /// That's why MCP tools attached later aren't carried here — they go into the tool list.
+    /// That's why MCP tools attached later aren't carried here ‒ they go into the tool list.
     pub fn new(preamble: Option<String>) -> Self {
         Session { preamble, ..Default::default() }
     }
@@ -625,7 +625,7 @@ impl Session {
 
     /// Abandons whatever turn stream is open and hands out the number of the next one.
     ///
-    /// **Exactly one live subscription at a time** — see `stream_task`. Aborting kills the task
+    /// **Exactly one live subscription at a time** ‒ see `stream_task`. Aborting kills the task
     /// mid-`next()`, so the "the stream ended, the turn must be over" line at the bottom of
     /// `spawn_stream` never runs for an abandoned one: an old stream cannot report the new one's
     /// turn finished.
@@ -642,7 +642,7 @@ impl Session {
         self.stream_task = Some(task);
     }
 
-    /// Which opening the live stream is. Frames tagged with any other number are stale — abort
+    /// Which opening the live stream is. Frames tagged with any other number are stale ‒ abort
     /// stops a task from sending more, but whatever it already put in the channel is still there.
     pub fn stream_gen(&self) -> u64 {
         self.stream_gen
@@ -657,7 +657,7 @@ impl Session {
     /// job opened after this into the default project.
     ///
     /// Some paths don't know the project (the way into a session awaiting an answer at startup).
-    /// Then pass `None` and **keep what we knew** — clearing it out of ignorance is exactly the path
+    /// Then pass `None` and **keep what we knew** ‒ clearing it out of ignorance is exactly the path
     /// that drops into the default project.
     pub fn switch_to(&mut self, id: String, project_id: Option<String>) {
         self.id = Some(id);
@@ -670,7 +670,7 @@ impl Session {
         self.next_stream();
     }
 
-    /// Opened one from the project list. **Remembered even before picking a session** — opening the list,
+    /// Opened one from the project list. **Remembered even before picking a session** ‒ opening the list,
     /// closing it with Esc, and launching a job must still go to that project.
     pub fn enter_project(&mut self, project_id: String) {
         self.project = Some(project_id);
@@ -692,10 +692,10 @@ impl Session {
     /// Points the next message where the mode decided.
     ///
     /// **`Route::Session` leaves the current conversation alone.** That's what it means for normal↔plan not
-    /// to touch the session, and coming back to normal from work·job means "answer that", not
+    /// to touch the session, and coming back to normal from work∙job means "answer that", not
     /// opening a new conversation.
     ///
-    /// Conversely, **entering work·job always opens anew**. Even with a job already open it launches another —
+    /// Conversely, **entering work∙job always opens anew**. Even with a job already open it launches another ‒
     /// choosing the mode again means wanting that.
     pub fn set_route(&mut self, route: Route) {
         self.pending_open = match route {
@@ -713,11 +713,11 @@ impl Session {
     ///
     /// **A session's agent is fixed at creation and there's no API to change it** (`ZNewSession.agent_id`;
     /// `send_message` takes no agent argument). So changing the agent means opening a new
-    /// session. Here too nothing is created on the server — actual creation happens at the first
+    /// session. Here too nothing is created on the server ‒ actual creation happens at the first
     /// message. **The previous session is not cleared**: you can return via the ← list.
     pub fn stage_new_default(&mut self) {
         self.id = None;
-        // **The project stays as is.** `/agent` changes the agent, not leaves the project —
+        // **The project stays as is.** `/agent` changes the agent, not leaves the project ‒
         // clearing it here would create the next session in the default project.
         self.pending_open = None;
         self.next_stream();
@@ -726,7 +726,7 @@ impl Session {
     /// Finds the dedicated agent.
     ///
     /// **If not found, doesn't fall back to another agent.** A quiet fallback would show the name in the
-    /// status bar while the send fails with `Agent not found` — a state that's hard to diagnose.
+    /// status bar while the send fails with `Agent not found` ‒ a state that's hard to diagnose.
     pub async fn agent_id(api: &AttaccaApiClient) -> Result<String> {
         Session::agent_id_named(api, &agent_name()).await
     }
@@ -745,7 +745,7 @@ impl Session {
 
     /// Returns the session id, creating it now if absent.
     ///
-    /// `title` must be `None` — giving a title here makes it permanent and blocks attacca's behavior
+    /// `title` must be `None` ‒ giving a title here makes it permanent and blocks attacca's behavior
     /// of titling from the first message.
     pub async fn ensure(&mut self, api: &AttaccaApiClient, agent_id: &str) -> Result<String> {
         if let Some(id) = &self.id {
@@ -782,7 +782,7 @@ impl Session {
         // spawns another job, and no place ever appears to answer the follow-up question.
         //
         // **Even without a staged open, the mode decides when there's no conversation yet.** A stage only
-        // happens at the moment the mode *changes*, so there are several spots without one — the first word
+        // happens at the moment the mode *changes*, so there are several spots without one ‒ the first word
         // right after startup, after staging a new thread with `/agent`, after `＋ New thread`.
         // There, creating only a session means **the bottom bar says job but the plain session
         // opens**. That actually happened.
@@ -821,7 +821,7 @@ impl Session {
                 // answers diverge from other jobs in the same account.
                 timezone: None,
                 // **Leave both off.** `planning` hands the job over to work, and `plan_mode` receives a plan
-                // inside the job and stops; here the mode already is that branch —
+                // inside the job and stops; here the mode already is that branch ‒
                 // job mode means "set it going", and when planning is needed that's plan mode or work mode.
                 planning: false,
                 plan_mode: false,
@@ -868,7 +868,7 @@ impl Session {
 /// Picks up the work's planning conversation. **If absent, waits briefly.**
 ///
 /// `create_work` kicks off a planning turn and returns, but there's no guarantee `planner_session_id`
-/// is already in that response — the server creating the session and returning the work row are not the
+/// is already in that response ‒ the server creating the session and returning the work row are not the
 /// same transaction. Giving up here looks to the person like **the words simply vanished**.
 ///
 /// But it can't hold on too long either. While waiting, the screen can't say anything.
@@ -895,7 +895,7 @@ async fn planner_session(api: &AttaccaApiClient, work: &zyris_attacca::ZWork) ->
     ))
 }
 
-/// How long to wait for the planning conversation — generously 3 seconds. Past that it's not waiting, it's stuck.
+/// How long to wait for the planning conversation ‒ generously 3 seconds. Past that it's not waiting, it's stuck.
 const PLANNER_TRIES: u32 = 6;
 const PLANNER_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
 
@@ -914,7 +914,7 @@ pub fn frame_from(f: ZTurnFrame) -> Frame {
 
 /// Creates a project. Returns the `(id, name)` of what was created.
 ///
-/// **Not called with an empty name** — the server wouldn't know what to create, and once a nameless row
+/// **Not called with an empty name** ‒ the server wouldn't know what to create, and once a nameless row
 /// appears in the list there's no way to delete it in this app. The description may stay empty.
 pub async fn create_project(
     api: &AttaccaApiClient,
@@ -973,7 +973,7 @@ pub async fn sessions(
 
 /// How a session's last turn ended, read back from its history.
 ///
-/// `None` when the session has no terminal event yet — a fresh thread that has not taken a turn.
+/// `None` when the session has no terminal event yet ‒ a fresh thread that has not taken a turn.
 pub fn status_from_events(
     events: &[zyris_attacca::ZSessionEvent],
 ) -> Option<crate::picker::ThreadStatus> {
@@ -984,7 +984,7 @@ pub fn status_from_events(
             // A terminal error marks the turn failed.
             "error" => out = Some(ThreadStatus::Failed),
             // An answer (or a completed work run) marks it a success. A tool error
-            // mid-turn is not terminal — the agent may still finish.
+            // mid-turn is not terminal ‒ the agent may still finish.
             "chat_agent" | "work_summary" => out = Some(ThreadStatus::Success),
             _ => {}
         }
@@ -1003,7 +1003,7 @@ pub async fn session_status(
 
 /// The session's past history. Used to fill the screen when switching sessions.
 ///
-/// An empty `after` means everything — the opposite of `turn_events`, so don't confuse them.
+/// An empty `after` means everything ‒ the opposite of `turn_events`, so don't confuse them.
 pub async fn history(
     api: &AttaccaApiClient,
     session_id: &str,
@@ -1016,7 +1016,7 @@ pub async fn history(
 /// Finds a session that's awaiting an answer.
 ///
 /// If the app is quit without answering a question, the server keeps waiting. If the person had to
-/// find that session by hand after restarting, it would be effectively impossible to answer — it's
+/// find that session by hand after restarting, it would be effectively impossible to answer ‒ it's
 /// picked up right at startup.
 ///
 /// A blocked session has `running` set, so the list alone narrows it down. History is read only for those few.
@@ -1041,7 +1041,7 @@ pub async fn session_awaiting_answer(api: &AttaccaApiClient) -> Option<String> {
     None
 }
 
-/// Session usage. If the deployment doesn't meter, `capability_not_announced` comes back —
+/// Session usage. If the deployment doesn't meter, `capability_not_announced` comes back ‒
 /// that's not an error but "this deployment lacks the feature", so it's quietly emptied.
 pub async fn usage(api: &AttaccaApiClient, session_id: &str) -> Option<crate::usage::Usage> {
     let u = within(api, api.session_usage(session_id.to_string())).await.ok()?;
@@ -1053,7 +1053,7 @@ pub async fn usage(api: &AttaccaApiClient, session_id: &str) -> Option<crate::us
     })
 }
 
-/// This session's title. `None` when not yet present — it attaches after the first message.
+/// This session's title. `None` when not yet present ‒ it attaches after the first message.
 pub async fn session_title(api: &AttaccaApiClient, session_id: &str) -> Option<String> {
     let sessions =
         within(api, api.list_sessions(ZSessionFilter { project_id: None, limit: Some(100) }))
@@ -1279,8 +1279,8 @@ mod tests {
     /// The slug truncates at 16 characters, so it only survives in the display name.
     #[test]
     fn the_node_name_carries_the_working_directory() {
-        assert_eq!(compose_name("arch", Some("zyris-daemon")), "arch zyris-code · zyris-daemon");
-        assert_eq!(slug_of("arch zyris-code · zyris-daemon"), "arch-zyris-code");
+        assert_eq!(compose_name("arch", Some("zyris-daemon")), "arch zyris-code ∙ zyris-daemon");
+        assert_eq!(slug_of("arch zyris-code ∙ zyris-daemon"), "arch-zyris-code");
         // A directory equal to the app name isn't appended — it's a duplicate.
         assert_eq!(compose_name("arch", Some("zyris-code")), "arch zyris-code");
         // Without a directory (e.g. root) it's the usual name.

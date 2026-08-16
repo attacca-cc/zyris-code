@@ -626,7 +626,7 @@ fn make(item: &Item, width: u16, folds: &Folds, turn: Turn, lang: crate::lang::L
             ];
             if total > 0 {
                 card.push(Span::styled(
-                    format!("  ·  {}", lang.tool_count(total)),
+                    format!("  ∙  {}", lang.tool_count(total)),
                     Style::default().fg(theme::text_muted()),
                 ));
             }
@@ -1091,7 +1091,7 @@ fn question_rows(
     ));
     if steps.len() > 1 {
         head.push(Span::styled(
-            format!("  ·  {}", lang.step_count(steps.len())),
+            format!("  ∙  {}", lang.step_count(steps.len())),
             Style::default().fg(theme::text_muted()),
         ));
     }

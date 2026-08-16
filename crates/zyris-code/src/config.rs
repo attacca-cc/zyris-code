@@ -111,7 +111,7 @@ impl Config {
         let Some(at) = store() else { return Config::default() };
         let Ok(text) = std::fs::read_to_string(&at) else { return Config::default() };
         serde_json::from_str(&text).unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "couldn't read the settings — using the defaults");
+            tracing::warn!(error = %e, "couldn't read the settings ‒ using the defaults");
             Config::default()
         })
     }

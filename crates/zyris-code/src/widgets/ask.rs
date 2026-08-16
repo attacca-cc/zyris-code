@@ -57,7 +57,7 @@ pub fn draw(frame: &mut Frame, area: Rect, a: &Answering, lang: crate::lang::Lan
     ));
     if a.steps.len() > 1 {
         head.push(Span::styled(
-            format!("  ·  {}/{}", a.step + 1, a.steps.len()),
+            format!("  ∙  {}/{}", a.step + 1, a.steps.len()),
             Style::default().fg(theme::text_muted()),
         ));
     }
@@ -95,7 +95,7 @@ pub fn draw(frame: &mut Frame, area: Rect, a: &Answering, lang: crate::lang::Lan
                 ];
                 if let Some(d) = &opt.description {
                     spans.push(Span::styled(
-                        format!("  — {d}"),
+                        format!("  ‒ {d}"),
                         Style::default().fg(theme::text_muted()),
                     ));
                 }
@@ -116,7 +116,7 @@ pub fn draw(frame: &mut Frame, area: Rect, a: &Answering, lang: crate::lang::Lan
                             a.input.text.clone(),
                             Style::default().fg(theme::text()),
                         ));
-                        spans.push(Span::styled("▎", Style::default().fg(theme::accent())));
+                        spans.push(Span::styled("▮", Style::default().fg(theme::accent())));
                     }
                 } else if a.free_text().is_empty() {
                     spans.push(Span::styled(

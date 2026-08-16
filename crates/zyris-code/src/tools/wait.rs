@@ -301,7 +301,7 @@ impl Wait for Waits {
     ) -> zyris::Result<Outcome> {
         let chosen = [job.is_some(), command.is_some(), work.is_some()];
         if chosen.iter().filter(|c| **c).count() != 1 {
-            return Err(WireError::invalid_params("job·command·work 중 정확히 하나를 주세요."));
+            return Err(WireError::invalid_params("job∙command∙work 중 정확히 하나를 주세요."));
         }
         let budget = budget(crate::tools::guard::wire_deadline(), timeout_ms);
         let at = std::time::Instant::now();
@@ -361,7 +361,7 @@ impl Waits {
                 snap.label,
                 snap.elapsed_ms / 1000
             ),
-            next: format!("같은 인자로 `wait.until`을 다시 부르세요 — `job: \"{id}\"`."),
+            next: format!("같은 인자로 `wait.until`을 다시 부르세요 ‒ `job: \"{id}\"`."),
             elapsed_ms: at.elapsed().as_millis() as u64,
             tail: self.jobs.tail(id, TAIL_BYTES),
             exit_code: None,
@@ -468,7 +468,7 @@ impl Waits {
         Ok(Outcome {
             done: false,
             why: format!("work `{work_id}`이 아직 `{name}`입니다."),
-            next: format!("같은 인자로 `wait.until`을 다시 부르세요 — `work: \"{work_id}\"`."),
+            next: format!("같은 인자로 `wait.until`을 다시 부르세요 ‒ `work: \"{work_id}\"`."),
             elapsed_ms: at.elapsed().as_millis() as u64,
             tail: String::new(),
             exit_code: None,

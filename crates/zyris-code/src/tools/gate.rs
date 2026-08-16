@@ -127,7 +127,7 @@ pub fn decide(mode: Mode, config: &Config, call: &Call) -> Decision {
     if let Some(path) = &call.outside {
         if config.dir_access == DirAccess::Deny {
             return Decision::Refuse(format!(
-                "`{}`은(는) 작업 디렉터리 밖이라 만질 수 없습니다 — 설정의 \
+                "`{}`은(는) 작업 디렉터리 밖이라 만질 수 없습니다 ‒ 설정의 \
                  '다른 디렉토리 접근'이 거부로 되어 있습니다. `/config dir allow`로 \
                  허용하거나, 작업 디렉터리 안에서 할 수 있는 길을 찾아 주세요.",
                 path.display()
@@ -224,12 +224,12 @@ fn candidates(root: &Path, capability: &str, tool: &str, args: &Value) -> Vec<Pa
     out
 }
 
-/// Whether a shell token is shaped like a path at all — the scan's first filter.
+/// Whether a shell token is shaped like a path at all ‒ the scan's first filter.
 ///
 /// **Windows shapes count too.** An absolute path there is `C:\…`, a network path is
 /// `\\server\share`, and climbing out is `..\`. Testing only the POSIX shapes left this loop
 /// skipping every Windows token, so the fence did nothing at all on that platform while
-/// `/config dir` went on reporting `deny` — the worst kind of failure, one that reports safety
+/// `/config dir` went on reporting `deny` ‒ the worst kind of failure, one that reports safety
 /// it is not providing.
 fn looks_like_a_path(token: &str) -> bool {
     token.starts_with('/')
@@ -283,14 +283,14 @@ fn escapes(root: &Path, full: &Path) -> bool {
     let flat = |p: &Path| p.to_string_lossy().to_ascii_lowercase().replace('/', "\\");
     let (root, full) = (flat(root), flat(full));
     let root = root.trim_end_matches('\\');
-    // A prefix only counts on a component boundary — `C:\proj2` must not read as inside `C:\proj`.
+    // A prefix only counts on a component boundary ‒ `C:\proj2` must not read as inside `C:\proj`.
     !(full == root || (full.starts_with(root) && full.as_bytes().get(root.len()) == Some(&b'\\')))
 }
 
 fn home() -> PathBuf {
     // **`HOME` is a POSIX variable.** On Windows it is normally unset and the home directory is
     // named by `USERPROFILE`; falling back to `/` made `~/notes` resolve to a drive-relative
-    // `\notes`, which never starts with the root — so every `~/…` token was called an escape
+    // `\notes`, which never starts with the root ‒ so every `~/…` token was called an escape
     // regardless of where it actually pointed.
     crate::conn::user_home().unwrap_or_else(|| PathBuf::from("/"))
 }
@@ -313,7 +313,7 @@ pub fn target_of(capability: &str, tool: &str, args: &Value) -> String {
         }
         // Things that continue an already-open PTY target that PTY.
         ("terminal", _) => args.get("pty").and_then(Value::as_str).unwrap_or_default().to_string(),
-        // Backgrounding it also goes by the command's first word — `cargo` reads better on screen.
+        // Backgrounding it also goes by the command's first word ‒ `cargo` reads better on screen.
         ("wait", "start") => {
             let first = s("command").split_whitespace().next().unwrap_or_default().to_string();
             if first.is_empty() {

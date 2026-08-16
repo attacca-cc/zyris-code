@@ -33,7 +33,7 @@ pub fn left_spans(state: &State) -> Vec<Span<'static>> {
     // makes them look like two separate pieces of info — close together, the eye takes them in at once.
     let mut left = vec![
         Span::styled(state.mode.label(state.lang), Style::default().fg(state.mode.color())),
-        Span::styled("·", Style::default().fg(theme::border_light())),
+        Span::styled("∙", Style::default().fg(theme::border_light())),
         Span::styled(
             if state.agent.is_empty() { "-" } else { state.agent.as_str() }.to_string(),
             Style::default().fg(theme::text_muted()),
@@ -44,7 +44,7 @@ pub fn left_spans(state: &State) -> Vec<Span<'static>> {
     // screen said, so a work opened after wandering through the list went somewhere the person
     // could not check. Spaced apart from mode·agent, which are one set on their own.
     if let Some(name) = &state.project_name {
-        left.push(Span::styled(" · ", Style::default().fg(theme::border_light())));
+        left.push(Span::styled(" ∙ ", Style::default().fg(theme::border_light())));
         left.push(Span::styled(
             crate::markdown::truncate_to(name, PROJECT_WIDTH),
             Style::default().fg(theme::text_muted()),
@@ -53,7 +53,7 @@ pub fn left_spans(state: &State) -> Vec<Span<'static>> {
 
     // **If there's unsent text, it must be said.** If it isn't announced, the user believes it was sent.
     if !state.queued.is_empty() {
-        left.push(Span::styled(" · ", Style::default().fg(theme::border_light())));
+        left.push(Span::styled(" ∙ ", Style::default().fg(theme::border_light())));
         left.push(Span::styled(
             state.lang.queued(state.queued.len()),
             Style::default().fg(theme::warning()),
@@ -110,7 +110,7 @@ fn usage_spans(state: &State) -> Vec<Span<'static>> {
     let mut out = Vec::new();
     for (i, seg) in segs.iter().enumerate() {
         if i > 0 {
-            out.push(Span::styled(" · ", Style::default().fg(theme::border_light())));
+            out.push(Span::styled(" ∙ ", Style::default().fg(theme::border_light())));
         }
         out.extend(seg.iter().cloned());
     }

@@ -88,7 +88,7 @@ fn field_line(
         spans.push(Span::styled(shown, Style::default().fg(theme::text())));
     }
     if on {
-        spans.push(Span::styled("▎", Style::default().fg(theme::accent())));
+        spans.push(Span::styled("▮", Style::default().fg(theme::accent())));
     }
     Line::from(spans)
 }

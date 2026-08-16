@@ -262,10 +262,10 @@ fn plugin_action(arg: &str) -> Plugin {
     };
     match (verb, rest) {
         ("", _) | ("list", _) => Plugin::List,
-        ("add" | "install", "") => Plugin::Unknown("add — 받아 올 곳을 같이 적어 주세요".into()),
+        ("add" | "install", "") => Plugin::Unknown("add ‒ 받아 올 곳을 같이 적어 주세요".into()),
         ("add" | "install", what) => Plugin::Add(what.to_string()),
         ("remove" | "rm" | "uninstall", "") => {
-            Plugin::Unknown("remove — 지울 이름을 같이 적어 주세요".into())
+            Plugin::Unknown("remove ‒ 지울 이름을 같이 적어 주세요".into())
         }
         ("remove" | "rm" | "uninstall", what) => Plugin::Remove(what.to_string()),
         ("update" | "upgrade", "") => Plugin::Update(None),
@@ -326,14 +326,14 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "/mode",
         aliases: &[],
-        note_ko: "모드를 보거나 바꿉니다 (일반·계획·일·작업)",
+        note_ko: "모드를 보거나 바꿉니다 (일반∙계획∙일∙작업)",
         note_en: "Show or change the mode (normal / plan / work / job)",
     },
     CommandSpec {
         name: "/config",
         aliases: &[],
-        note_ko: "설정 — 다른 디렉토리 접근(allow·deny)·언어·기본 모드",
-        note_en: "Settings — directory access (allow / deny), language, default mode",
+        note_ko: "설정 ‒ 다른 디렉토리 접근(allow∙deny)∙언어∙기본 모드",
+        note_en: "Settings ‒ directory access (allow / deny), language, default mode",
     },
     CommandSpec {
         name: "/agent",
@@ -356,13 +356,13 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "/plugin",
         aliases: &["plugins"],
-        note_ko: "플러그인을 받고 지웁니다 (add·remove·update)",
+        note_ko: "플러그인을 받고 지웁니다 (add∙remove∙update)",
         note_en: "Install and remove plugins (add / remove / update)",
     },
     CommandSpec {
         name: "/rules",
         aliases: &["claude", "agents"],
-        note_ko: "이 쓰레드에 실린 CLAUDE.md·AGENTS.md",
+        note_ko: "이 쓰레드에 실린 CLAUDE.md∙AGENTS.md",
         note_en: "The CLAUDE.md and AGENTS.md loaded into this thread",
     },
     CommandSpec {
@@ -375,13 +375,13 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "/reconnect",
         aliases: &[],
         note_ko: "다시 붙습니다. 도구 호출이 응답 없이 멈춰 있을 때",
-        note_en: "Attach again — when tool calls sit there with no answer",
+        note_en: "Attach again ‒ when tool calls sit there with no answer",
     },
     CommandSpec {
         name: "/github",
         aliases: &["gh"],
-        note_ko: "GitHub 계정을 잇고 끊습니다 (login · login reviewer · logout)",
-        note_en: "Connect or disconnect GitHub (login · login reviewer · logout)",
+        note_ko: "GitHub 계정을 잇고 끊습니다 (login ∙ login reviewer ∙ logout)",
+        note_en: "Connect or disconnect GitHub (login ∙ login reviewer ∙ logout)",
     },
     CommandSpec {
         name: "/account",
@@ -392,7 +392,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "/status",
         aliases: &["info"],
-        note_ko: "지금 세션·에이전트·모드·사용량을 한눈에",
+        note_ko: "지금 세션∙에이전트∙모드∙사용량을 한눈에",
         note_en: "Session, agent, mode and usage at a glance",
     },
     CommandSpec {
@@ -463,44 +463,44 @@ pub fn keys(lang: crate::lang::Lang) -> Vec<(&'static str, &'static str)> {
         Lang::Ko => vec![
             ("Shift+Tab", "모드 바꾸기 (일반 → 계획 → 일 → 작업)"),
             (
-                "Shift+Enter · Alt+Enter",
+                "Shift+Enter ∙ Alt+Enter",
                 "줄바꿈 (Shift+Enter는 키티 키보드 프로토콜 지원 터미널에서만)",
             ),
-            ("←", "프로젝트·쓰레드 목록 (입력란이 비었을 때)"),
-            ("@", "파일 목록 — 골라서 경로를 넣습니다"),
+            ("←", "프로젝트∙쓰레드 목록 (입력란이 비었을 때)"),
+            ("@", "파일 목록 ‒ 골라서 경로를 넣습니다"),
             ("↑ ↓", "보낸 말 되살리기"),
-            ("Ctrl+R", "보낸 말 검색 — 치는 대로 좁혀집니다"),
-            ("Ctrl+O", "작업 카드 접기·펴기"),
-            ("Ctrl+T", "할 일 목록 펴기·접기 (활동 줄을 눌러도 됩니다)"),
-            ("Ctrl+U · Ctrl+K", "커서 앞쪽·뒤쪽 지우기 (Ctrl+U가 친 것 다 지우기입니다)"),
-            ("Ctrl+W · Alt+Backspace", "낱말 지우기 (앞은 띄어쓰기까지, 뒤는 한 조각씩)"),
+            ("Ctrl+R", "보낸 말 검색 ‒ 치는 대로 좁혀집니다"),
+            ("Ctrl+O", "작업 카드 접기∙펴기"),
+            ("Ctrl+T", "할 일 목록 펴기∙접기 (활동 줄을 눌러도 됩니다)"),
+            ("Ctrl+U ∙ Ctrl+K", "커서 앞쪽∙뒤쪽 지우기 (Ctrl+U가 친 것 다 지우기입니다)"),
+            ("Ctrl+W ∙ Alt+Backspace", "낱말 지우기 (앞은 띄어쓰기까지, 뒤는 한 조각씩)"),
             ("Ctrl+Y", "방금 지운 것 되붙이기"),
-            ("Ctrl+A · Ctrl+E", "줄 맨 앞·맨 뒤로"),
-            ("Alt+← Alt+→", "낱말 단위로 이동 (Alt+B · Alt+F도 됩니다)"),
+            ("Ctrl+A ∙ Ctrl+E", "줄 맨 앞∙맨 뒤로"),
+            ("Alt+← Alt+→", "낱말 단위로 이동 (Alt+B ∙ Alt+F도 됩니다)"),
             ("Esc", "도는 턴 멈추기"),
             ("Ctrl+C", "멈추기 → 한 번 더 누르면 끝내기"),
-            ("드래그", "화면 아무 데나 — 놓는 순간 고른 글이 클립보드로"),
+            ("드래그", "화면 아무 데나 ‒ 놓는 순간 고른 글이 클립보드로"),
         ],
         Lang::En => vec![
             ("Shift+Tab", "Switch mode (normal → plan → work → job)"),
             (
-                "Shift+Enter · Alt+Enter",
+                "Shift+Enter ∙ Alt+Enter",
                 "Newline (Shift+Enter needs a kitty-keyboard-protocol terminal)",
             ),
             ("←", "Project and thread list (when the input box is empty)"),
-            ("@", "File list — pick one and its path goes in"),
+            ("@", "File list ‒ pick one and its path goes in"),
             ("↑ ↓", "Bring back something you sent"),
-            ("Ctrl+R", "Search what you sent — narrows as you type"),
+            ("Ctrl+R", "Search what you sent ‒ narrows as you type"),
             ("Ctrl+O", "Fold or unfold a work card"),
             ("Ctrl+T", "Unfold or fold the todo list (clicking the activity line does it too)"),
-            ("Ctrl+U · Ctrl+K", "Cut back to the start or on to the end (Ctrl+U clears a draft)"),
-            ("Ctrl+W · Alt+Backspace", "Delete a word (whole, or one segment at a time)"),
+            ("Ctrl+U ∙ Ctrl+K", "Cut back to the start or on to the end (Ctrl+U clears a draft)"),
+            ("Ctrl+W ∙ Alt+Backspace", "Delete a word (whole, or one segment at a time)"),
             ("Ctrl+Y", "Put back what you just cut"),
-            ("Ctrl+A · Ctrl+E", "Start and end of the line"),
+            ("Ctrl+A ∙ Ctrl+E", "Start and end of the line"),
             ("Ctrl+← Ctrl+→", "Move by word (Alt+B and Alt+F work too)"),
             ("Esc", "Stop the running turn"),
             ("Ctrl+C", "Stop, then press again to quit"),
-            ("drag", "Drag anywhere — the selected text goes to the clipboard when you let go"),
+            ("drag", "Drag anywhere ‒ the selected text goes to the clipboard when you let go"),
         ],
     }
 }
@@ -514,11 +514,11 @@ pub fn help_text(lang: crate::lang::Lang) -> String {
     };
     let mut s = String::from(head);
     for (name, note) in catalogue(lang) {
-        s.push_str(&format!("\n- `{name}` — {note}"));
+        s.push_str(&format!("\n- `{name}` ‒ {note}"));
     }
     s.push_str(keys_head);
     for (key, note) in keys(lang) {
-        s.push_str(&format!("\n- `{key}` — {note}"));
+        s.push_str(&format!("\n- `{key}` ‒ {note}"));
     }
     s
 }

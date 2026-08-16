@@ -36,7 +36,7 @@ impl GithubTools {
         let accounts = auth::Accounts::load();
         let Some(account) = accounts.for_role(role) else {
             return Err(zyris::WireError::invalid_params(
-                "not signed in to GitHub — the person running this node needs to run `/github login`",
+                "not signed in to GitHub ‒ the person running this node needs to run `/github login`",
             ));
         };
         Github::new(account.token.clone()).map_err(|e| zyris::WireError::internal(e.to_string()))
@@ -287,7 +287,7 @@ impl GithubCap for GithubTools {
     ) -> zyris::Result<Value> {
         let event = review_event(&event).ok_or_else(|| {
             zyris::WireError::invalid_params(format!(
-                "`{event}` is not a review verdict — use comment, approve or request_changes"
+                "`{event}` is not a review verdict ‒ use comment, approve or request_changes"
             ))
         })?;
         // **A verdict with nothing to say is fine; a comment with nothing at all is not.** GitHub

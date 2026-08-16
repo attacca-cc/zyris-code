@@ -2706,7 +2706,7 @@ impl crossterm::Command for MouseCapture {
 
 fn terminal_feature(label: &'static str, command: impl crossterm::Command) {
     if let Err(e) = execute!(io::stdout(), command) {
-        tracing::warn!(label, error = %e, "terminal feature change failed — continuing without that feature");
+        tracing::warn!(label, error = %e, "terminal feature change failed ‒ continuing without that feature");
     }
 }
 
@@ -3207,7 +3207,7 @@ async fn run_inner(
             tokio::time::sleep(LOOP_WATCHDOG_STALL).await;
             if watchdog_progress.load(Ordering::Relaxed) == seen {
                 tracing::error!(
-                    "the app loop stalled for {}s — restoring the screen and ending",
+                    "the app loop stalled for {}s ‒ restoring the screen and ending",
                     LOOP_WATCHDOG_STALL.as_secs()
                 );
                 ratatui::restore();

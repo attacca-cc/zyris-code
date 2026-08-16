@@ -41,7 +41,7 @@ impl RulesCap for Rules {
     async fn load(&self) -> zyris::Result<String> {
         Ok(match Rules::load(self) {
             Some(p) => p,
-            None => "(이 작업 디렉터리에는 CLAUDE.md·AGENTS.md 지침이 없습니다)".to_string(),
+            None => "(이 작업 디렉터리에는 CLAUDE.md∙AGENTS.md 지침이 없습니다)".to_string(),
         })
     }
 }

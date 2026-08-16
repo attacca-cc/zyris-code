@@ -124,7 +124,7 @@ pub fn preamble(skills: &Skills) -> Option<String> {
          도구로 본문을 읽고 그 절차를 따르세요.\n\n",
     );
     for s in list {
-        out.push_str(&format!("- {} — {}\n", s.name, s.description));
+        out.push_str(&format!("- {} ‒ {}\n", s.name, s.description));
     }
     Some(out)
 }

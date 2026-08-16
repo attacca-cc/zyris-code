@@ -217,7 +217,7 @@ fn note_the_cut(out: Outgoing, deadline: Duration) -> Outgoing {
     stderr.push_str(&format!(
         "\n\n이 배포는 노드 호출을 {}초에 끊습니다. **명령은 실패한 것이 아니라 시간에 \
          잘린 것입니다.** 오래 걸리는 것은 wait.start로 배경에 걸고 wait.until로 \
-         기다리세요 — 그쪽은 끝날 때까지 나눠서 기다릴 수 있습니다.",
+         기다리세요 ‒ 그쪽은 끝날 때까지 나눠서 기다릴 수 있습니다.",
         deadline.as_secs()
     ));
     obj.insert("stderr".into(), Value::from(stderr));

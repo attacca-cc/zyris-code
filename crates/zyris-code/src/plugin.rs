@@ -150,17 +150,17 @@ struct Manifest {
 
 /// Pulls the place to clone and the directory name it lands in out of what the person typed.
 ///
-/// **It's fetched with `git`.** No new dependency — a place using coding tools can't lack git, and
+/// **It's fetched with `git`.** No new dependency ‒ a place using coding tools can't lack git, and
 /// `/plugin update` comes down to one `git pull` line. It's the archive path that needs scaffolding:
 /// unpacking and writing the update logic yourself.
 ///
 /// Accepted shapes:
 ///
-/// - `owner/repo` — treated as GitHub. The shape people type most
+/// - `owner/repo` ‒ treated as GitHub. The shape people type most
 /// - `https://github.com/owner/repo` (`.git` or trailing `/` allowed)
 /// - `git@github.com:owner/repo.git`
-/// - any other `scheme://…` — accepted if it can be cloned even when it isn't GitHub
-/// - `/…`·`~/…`·`./…` — a local repo. **This path is needed when testing while building a plugin**
+/// - any other `scheme://…` ‒ accepted if it can be cloned even when it isn't GitHub
+/// - `/…`∙`~/…`∙`./…` ‒ a local repo. **This path is needed when testing while building a plugin**
 pub fn source(text: &str) -> Option<(String, String)> {
     let text = text.trim().trim_end_matches('/');
     if text.is_empty() || text.contains(char::is_whitespace) {

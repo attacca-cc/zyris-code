@@ -239,7 +239,7 @@ fn inject_links(frame: &mut Frame, state: &State) {
                 let sym = cell.symbol().to_string();
                 let w = crate::markdown::display_width(&sym).max(1) as u16;
                 // **The terminal owns the decoration once it owns the link.** Emulators that read
-                // OSC 8 draw their own hyperlink styling, and most of them underline it on hover —
+                // OSC 8 draw their own hyperlink styling, and most of them underline it on hover ‒
                 // so the underline the renderer put on (`markdown.rs`) sat under the terminal's,
                 // permanently, and read as a doubled one that never went away. Taking ours off
                 // here is what leaves the hover behaviour showing.
@@ -250,7 +250,7 @@ fn inject_links(frame: &mut Frame, state: &State) {
                 cell.modifier.remove(ratatui::style::Modifier::UNDERLINED);
                 // Wide glyphs occupy two buffer cells (the second is an empty placeholder).
                 // Advancing by the glyph's own width skips that placeholder, so it is never
-                // written over — the wide char's trailing column stays intact.
+                // written over ‒ the wide char's trailing column stays intact.
                 cell.set_symbol(&format!("{open}{sym}\x1b]8;;\x1b\\"));
                 cell.set_diff_option(CellDiffOption::ForcedWidth(
                     NonZeroU16::new(w).expect("a glyph is at least one column wide"),
