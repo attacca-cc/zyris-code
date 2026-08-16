@@ -5184,6 +5184,8 @@ mod tests {
 
     /// Deciding on the answer to `CSI ? u`. The format is `CSI ? <flags> u` — only a terminal
     /// that knows the protocol can answer, so the format alone is enough.
+    // Unix only, with the probe it reads for: off unix the answer is settled without asking.
+    #[cfg(unix)]
     #[test]
     fn a_flags_reply_settles_it_as_supported() {
         use KittyVerdict::*;
@@ -5200,6 +5202,8 @@ mod tests {
     /// Without this the only signal was silence, which cannot tell "no protocol here" from "this
     /// answer is late": a supporting terminal on a slow link was written off, and every terminal
     /// without the protocol paid the full timeout at startup.
+    // Unix only, with the probe it reads for: off unix the answer is settled without asking.
+    #[cfg(unix)]
     #[test]
     fn a_device_attributes_reply_arriving_first_settles_it_as_unsupported() {
         use KittyVerdict::*;
@@ -5211,6 +5215,8 @@ mod tests {
 
     /// Nothing conclusive means keep reading. Answering early on a half-arrived sequence would
     /// read the verdict off whatever byte happened to land first.
+    // Unix only, with the probe it reads for: off unix the answer is settled without asking.
+    #[cfg(unix)]
     #[test]
     fn an_incomplete_or_unrelated_reply_decides_nothing() {
         use KittyVerdict::*;
