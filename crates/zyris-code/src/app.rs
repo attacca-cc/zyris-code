@@ -2815,44 +2815,52 @@ impl crossterm::Command for MouseCapture {
     }
 }
 
-/// Takes the mouse, or gives it back — in **both** of the places Windows listens.
+/// Takes the mouse, or gives it back.
 ///
-/// **The console mode is one.** `ENABLE_MOUSE_INPUT`, and with it `ENABLE_QUICK_EDIT_MODE` off.
-/// Quick edit is the console's own drag-to-select, and while it is on the console keeps every drag
-/// for itself and draws the shape it has always drawn — **a rectangle**. Nothing but this call
-/// turns that off, and no escape sequence can.
+/// **The console mode is what does it on Windows.** `ENABLE_MOUSE_INPUT`, and with it
+/// `ENABLE_QUICK_EDIT_MODE` off — quick edit is the console's own drag-to-select, and while it is
+/// on the console keeps every drag for itself. Nothing but this call turns that off.
 ///
-/// **The escape sequence is the other, and this is what was missing** (reported 2026-08-17: on
-/// Windows a drag still selected a rectangle, while the same build behaved on Linux). A console
-/// program on Windows now usually reaches its terminal through ConPTY, and ConPTY spent years not
-/// passing the console-mode request on — so a program that only set the mode was never sent a
-/// single mouse event, and the terminal went on selecting text by itself. What the terminal on the
-/// far side reads is the sequence. crossterm sends one or the other, never both:
-/// `EnableMouseCapture` answers `is_ansi_code_supported` with `false` on Windows, which routes it
-/// to the WinAPI and stops there.
+/// **The escape sequence is only a fallback there, and finding that out cost a release.** 0.2.3
+/// sent it alongside the console-mode call, reasoning that ConPTY had spent years not passing that
+/// call on to the terminal. It came straight back: on Windows the drag stopped working **at all**,
+/// on a machine where the release before it had worked. The reasoning was not measured, and it was
+/// wrong.
 ///
-/// **Sending both costs nothing.** They meet again as console input records, and asking twice for
-/// something already on is not an error anywhere.
+/// The likely mechanism is that asking the outer terminal for VT mouse reporting gets the events
+/// delivered as escape sequences, while crossterm on Windows reads console input records and parses
+/// no such thing — so they arrive in a shape nothing here understands. Whatever the exact path, the
+/// measurement is plain: the console mode alone works, the two together do not.
+///
+/// So on Windows the escape goes out **only when there is no console mode to set** — `mintty` and
+/// its like, where the program talks over pipes and the call fails. There it is the only thing left
+/// to try, and it can take nothing away from somebody whose console already took the mouse.
+///
+/// **On unix the escape is all there is**, and that path is unchanged.
+///
+/// The rectangle that started this is still unexplained. It will not be guessed at a second time.
 fn take_the_mouse(on: bool) {
-    #[cfg(windows)]
-    {
-        use crossterm::Command;
-        let done = if on {
-            crossterm::event::EnableMouseCapture.execute_winapi()
-        } else {
-            crossterm::event::DisableMouseCapture.execute_winapi()
-        };
-        if let Err(e) = done {
-            // Worth a line of its own: this is the call that decides whether the console keeps
-            // drag-select for itself, and its failure is invisible until somebody drags.
-            tracing::warn!(error = %e, on, "could not change the console's mouse mode");
-        }
-    }
     let (label, command) = if on {
         ("mouse capture", MouseCapture::On)
     } else {
         ("mouse capture off", MouseCapture::Off)
     };
+    #[cfg(windows)]
+    {
+        use crossterm::Command;
+        let native = if on {
+            crossterm::event::EnableMouseCapture.execute_winapi()
+        } else {
+            crossterm::event::DisableMouseCapture.execute_winapi()
+        };
+        match native {
+            // The console took it. Nothing else is sent — see above.
+            Ok(()) => return,
+            Err(e) => {
+                tracing::warn!(error = %e, on, "no console mouse mode ‒ falling back to the escape")
+            }
+        }
+    }
     terminal_feature(label, command);
 }
 
