@@ -404,6 +404,11 @@ cargo clippy --workspace --all-targets
 
 `rustfmt.toml` is checked in and `cargo fmt` is expected to be clean.
 
+`tests/pty.rs` runs the app on a real pseudo-terminal — a unix pty on Linux and macOS, a ConPTY on
+Windows 10 1809 and later — so drawing, keystrokes and shutdown are covered on every platform by
+`cargo test`. It talks to no network. On Windows, `scripts\windows_check.bat` fetches this branch,
+runs all of the above, and writes a report with a checklist for the parts that need a person.
+
 ## Contributing
 
 **Write English.** Code comments, doc comments, test names, commit messages, pull request

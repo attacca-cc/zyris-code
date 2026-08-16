@@ -55,6 +55,11 @@ reqwest = { version = "0.13.4", default-features = false, features = ["rustls", 
 [dev-dependencies]
 # Tool tests write real files. A mock filesystem can't catch path-resolution mistakes.
 tempfile = "3"
+# **A pseudo-terminal on every platform.** A unix pty here, a ConPTY there
+# (`CreatePseudoConsole`, Windows 10 1809+), behind one API. The smoke scripts under `scripts/`
+# are built on Python's unix-only `pty` module, which left Windows — the console that differs
+# most from the rest — the one platform none of them could reach.
+portable-pty = "0.9"
 # Installs the commit hook into `.git/hooks` the first time `cargo test` runs
 # (Rust counterpart of simple-git-hooks). Hook scripts live in `.cargo-husky/hooks/`;
 # the `commit-msg` one enforces Conventional Commits. Set

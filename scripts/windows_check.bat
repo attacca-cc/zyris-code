@@ -9,10 +9,12 @@ rem
 rem  Usage:   windows_check.bat [work-dir]
 rem           work-dir defaults to %TEMP%\zyris-code-check
 rem
-rem  What it cannot do: the pty smoke scripts under scripts\ are all built on the
-rem  unix `pty` module and do not run here. The parts of this app that only break
-rem  on a real terminal are therefore left to the checklist at the end of the
-rem  report, which a person fills in.
+rem  The pseudo-terminal tests DO run here: tests\pty.rs drives the app through a
+rem  ConPTY, so `cargo test` below covers drawing, keystrokes and shutdown on a
+rem  real console. The older scripts\*.py smokes remain unix-only.
+rem
+rem  What is left over needs eyes — colours, glyph widths, whether a drag looks
+rem  right — and that is the checklist at the end of the report.
 rem ============================================================================
 
 rem UTF-8, or the width section below prints mojibake and proves nothing.
@@ -81,7 +83,9 @@ call :section "Build"
 call :run "cargo build --workspace" cargo build --workspace
 
 call :section "Tests"
+rem Includes tests\pty.rs, which runs the app under a ConPTY.
 call :run "cargo test --workspace" cargo test --workspace
+call :run "cargo test (pseudo-terminal, verbose)" cargo test -p zyris-code --test pty -- --nocapture
 
 call :section "Clippy"
 call :run "cargo clippy --workspace --all-targets" cargo clippy --workspace --all-targets
