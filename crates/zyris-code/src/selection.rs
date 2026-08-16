@@ -34,6 +34,11 @@ impl Drag {
 }
 
 /// Extracts the selected text. Lines are joined with `\n`.
+///
+/// **The cell the drag ends on is part of the selection.** Ranges here are half-open, so the end
+/// column has one added to it: without that, letting go on a character left that character out and
+/// a line ending in `)` came back without its `)` (reported 2026-08-17). Nobody drags one past what
+/// they mean to take, because there is nothing there to aim at.
 pub fn extract(rows: &[String], drag: &Drag) -> String {
     if rows.is_empty() {
         return String::new();
@@ -43,14 +48,14 @@ pub fn extract(rows: &[String], drag: &Drag) -> String {
     let (r0, r1) = (r0.min(last), r1.min(last));
 
     if r0 == r1 {
-        return slice_cols(&rows[r0], c0.min(c1), c0.max(c1));
+        return slice_cols(&rows[r0], c0.min(c1), c0.max(c1) + 1);
     }
 
     let mut out = vec![slice_cols(&rows[r0], c0, usize::MAX)];
     for row in &rows[r0 + 1..r1] {
         out.push(row.trim_end().to_string());
     }
-    out.push(slice_cols(&rows[r1], 0, c1));
+    out.push(slice_cols(&rows[r1], 0, c1 + 1));
     out.join("\n")
 }
 
@@ -99,7 +104,10 @@ pub fn row_spans(
     // to the edge rather than up to where the drag stopped.
     let cut = r1 >= limit;
     let r1 = if cut { limit - 1 } else { r1 };
-    let (c0, c1) = (c0.min(w.saturating_sub(1)), c1.min(w.saturating_sub(1)));
+    // The end column has one added to it for the same reason `extract` does — the cell the drag
+    // ends on is inside the selection — and both are clamped to the width so the last column of a
+    // line can be reached at all.
+    let (c0, c1) = (c0.min(w.saturating_sub(1)), (c1 + 1).min(w));
 
     let (r0, r1) = (r0 as u16, r1 as u16);
     if r0 == r1 {
@@ -151,11 +159,12 @@ mod tests {
         assert!(!d.is_click());
     }
 
-    /// Selecting within one line yields just that span. Full-width is 2 cells, so column 4 is the third character.
+    /// Selecting within one line yields just that span. Full-width is 2 cells, so column 4 is where
+    /// the third character starts — and letting go on a character takes it.
     #[test]
     fn selecting_within_one_line_takes_that_span() {
         let d = Drag { from: (0, 0), to: (0, 4) };
-        assert_eq!(extract(&rows(), &d), "안녕");
+        assert_eq!(extract(&rows(), &d), "안녕하");
     }
 
     #[test]
@@ -191,14 +200,14 @@ mod tests {
     #[test]
     fn row_spans_follow_the_text_not_a_rectangle() {
         let d = Drag { from: (1, 3), to: (3, 7) };
-        assert_eq!(row_spans(&d, 80, 0..24, 0), vec![(1, 3, 80), (2, 0, 80), (3, 0, 7)]);
+        assert_eq!(row_spans(&d, 80, 0..24, 0), vec![(1, 3, 80), (2, 0, 80), (3, 0, 8)]);
     }
 
     /// A single-line drag spans just its two ends.
     #[test]
     fn row_spans_on_one_line_span_the_two_ends() {
         let d = Drag { from: (0, 2), to: (0, 6) };
-        assert_eq!(row_spans(&d, 80, 0..24, 0), vec![(0, 2, 6)]);
+        assert_eq!(row_spans(&d, 80, 0..24, 0), vec![(0, 2, 7)]);
     }
 
     /// Dragging backwards gives the same spans as forwards.
@@ -234,8 +243,8 @@ mod tests {
         let d = Drag { from: (5, 3), to: (7, 7) };
         let still = row_spans(&d, 80, 0..24, 0);
         let moved = row_spans(&d, 80, 0..24, -4);
-        assert_eq!(still, vec![(5, 3, 80), (6, 0, 80), (7, 0, 7)]);
-        assert_eq!(moved, vec![(1, 3, 80), (2, 0, 80), (3, 0, 7)], "it did not follow the text");
+        assert_eq!(still, vec![(5, 3, 80), (6, 0, 80), (7, 0, 8)]);
+        assert_eq!(moved, vec![(1, 3, 80), (2, 0, 80), (3, 0, 8)], "it did not follow the text");
     }
 
     /// Scrolled off the top, what is left starts at the beginning of the first line still on
@@ -244,7 +253,7 @@ mod tests {
     #[test]
     fn a_highlight_scrolled_past_the_top_keeps_only_what_is_left() {
         let d = Drag { from: (5, 3), to: (9, 7) };
-        assert_eq!(row_spans(&d, 80, 0..24, -7), vec![(0, 0, 80), (1, 0, 80), (2, 0, 7)]);
+        assert_eq!(row_spans(&d, 80, 0..24, -7), vec![(0, 0, 80), (1, 0, 80), (2, 0, 8)]);
     }
 
     /// Scrolled away entirely, it draws nothing. Folding it onto the edge instead would leave a
@@ -264,6 +273,47 @@ mod tests {
         let d = Drag { from: (5, 3), to: (7, 7) };
         let spans = row_spans(&d, 80, 0..9, 2);
         assert_eq!(spans, vec![(7, 3, 80), (8, 0, 80)], "it was drawn past the conversation");
+    }
+
+    /// **The character the drag ends on is taken.** Ranges here are half-open, so without the one
+    /// added to the end column, letting go on a character left it out — a line ending in `)` came
+    /// back without its `)` (reported 2026-08-17). Nobody drags one past what they mean to take,
+    /// because past the last character there is nothing to aim at.
+    #[test]
+    fn the_character_the_drag_ends_on_is_copied() {
+        let rows = vec!["do_it(x)".to_string()];
+        // Column 7 is the `)`.
+        let d = Drag { from: (0, 0), to: (0, 7) };
+        assert_eq!(extract(&rows, &d), "do_it(x)");
+        // And backwards over the same cells.
+        let back = Drag { from: (0, 7), to: (0, 0) };
+        assert_eq!(extract(&rows, &back), "do_it(x)");
+    }
+
+    /// The same on the last line of a selection that runs over several.
+    #[test]
+    fn the_last_line_keeps_the_character_the_drag_stopped_on() {
+        let rows = vec!["first".to_string(), "do_it(x)".to_string()];
+        let d = Drag { from: (0, 0), to: (1, 7) };
+        assert_eq!(extract(&rows, &d), "first\ndo_it(x)");
+    }
+
+    /// **What is highlighted is what is copied.** The two are read off different functions, so
+    /// nothing but a test keeps them saying the same thing — and a highlight that stops one cell
+    /// short of the clipboard is how the missing `)` looked on screen.
+    #[test]
+    fn the_highlight_covers_exactly_what_is_copied() {
+        let rows = vec!["do_it(x)".to_string()];
+        let d = Drag { from: (0, 2), to: (0, 7) };
+        let spans = row_spans(&d, 80, 0..24, 0);
+        assert_eq!(spans.len(), 1);
+        let (_, from, to) = spans[0];
+        assert_eq!(extract(&rows, &d), "_it(x)");
+        assert_eq!(
+            (to - from) as usize,
+            extract(&rows, &d).chars().count(),
+            "colour and text differ"
+        );
     }
 
     #[test]
