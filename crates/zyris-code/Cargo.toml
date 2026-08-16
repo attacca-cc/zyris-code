@@ -1,6 +1,6 @@
 [package]
 name = "zyris-code"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 description = "A terminal client for talking with the Attacca agent (ratatui)"
 license = "MIT OR Apache-2.0"
