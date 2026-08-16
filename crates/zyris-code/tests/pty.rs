@@ -144,7 +144,11 @@ impl Session {
     }
 
     fn wait_until(&mut self, done: impl Fn(&Session) -> bool) -> bool {
-        let deadline = Instant::now() + PATIENCE;
+        self.wait_until_by(PATIENCE, done)
+    }
+
+    fn wait_until_by(&mut self, patience: Duration, done: impl Fn(&Session) -> bool) -> bool {
+        let deadline = Instant::now() + patience;
         loop {
             if done(self) {
                 return true;
@@ -281,7 +285,23 @@ fn the_app_draws_on_a_pseudo_terminal_and_takes_a_keystroke() {
     app.wait_until_ready();
 
     app.send(b"hello");
-    assert!(app.wait_for_text("hello"), "a keystroke never reached the input box:\n{}", app.text());
+
+    // **Ask for the whole screen before reading it.** ratatui writes only the cells that changed,
+    // so five letters typed at once can land across several frames — `h` in one, `ello` in the
+    // next, with a screenful of unrelated cells between them. Every letter is there, in order,
+    // and never adjacent, which is what Windows showed the first time this ran there. Ctrl+L
+    // redraws the lot in one go; it is the same trick the smoke scripts under `scripts/` use.
+    //
+    // Repeated, because the first repaint can be served before the last letter is consumed, and
+    // then it faithfully redraws a half-typed line.
+    let arrived = (0..10).any(|_| {
+        if app.wait_until_by(Duration::from_millis(500), |s| s.plain().contains("hello")) {
+            return true;
+        }
+        app.send(b"\x0c");
+        false
+    });
+    assert!(arrived, "a keystroke never reached the input box:\n{}", app.text());
 }
 
 /// **The app ends when it is told to.** Ctrl+C arms the quit and the second one takes it; an app
