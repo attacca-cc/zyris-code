@@ -184,8 +184,23 @@ pub fn draw(frame: &mut Frame, state: &mut State) {
         let bg = crate::theme::selection_bg();
         let area = frame.area();
         let width = area.width as usize;
+        // **The highlight rides the conversation.** A drag inside the conversation is drawn
+        // wherever its text has got to since — scrolling moves both the same distance, so the
+        // colour stays on the words it was drawn around instead of being dropped at the first
+        // notch of the wheel. Such a highlight is also clipped to the conversation: what is below
+        // it does not scroll, and colour sliding down over the input line would sit on text that
+        // never moved.
+        //
+        // A drag that reaches outside the conversation never gets here after a scroll — `apply`
+        // lets go of it — so this arm is the fresh, unscrolled one, and it is drawn as made.
+        let top = state.view_origin.1;
+        let (band, moved) = if state.drag_can_scroll() {
+            (top..top + state.view_height as u16, state.drag_top as isize - state.view_top as isize)
+        } else {
+            (0..area.height, 0)
+        };
         let cells = frame.buffer_mut().content.as_mut_slice();
-        for (y, from, to) in selection::row_spans(&drag, area.width, area.height) {
+        for (y, from, to) in selection::row_spans(&drag, area.width, band, moved) {
             for x in from..to {
                 let idx = y as usize * width + x as usize;
                 if let Some(cell) = cells.get_mut(idx) {

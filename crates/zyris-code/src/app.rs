@@ -400,10 +400,18 @@ pub struct State {
     /// know where anything landed.
     pub screen_links: Vec<ScreenLink>,
     /// The selected range, in **screen** coordinates. **It survives releasing the mouse** — if
-    /// it vanished on release there would be no moment to press Ctrl+C. Scrolling drops it
-    /// (`Action::Wheel`): it is anchored to the screen, so the text under it would no longer
-    /// be the text that was copied.
+    /// it vanished on release there would be no moment to press Ctrl+C.
+    ///
+    /// **It survives scrolling too**, by riding along with the conversation: the drawing side
+    /// moves it by however far the text under it has travelled since `drag_top`. It used to be
+    /// dropped instead, and one notch of the wheel looked like the selection had been lost, copied
+    /// text and all (reported 2026-08-17). A highlight that reaches past the conversation — onto
+    /// the input line or the bars, which do not scroll — is still dropped, because half of it
+    /// sliding out from under the other half is worse than none.
     pub drag: Option<crate::selection::Drag>,
+    /// Which line of the conversation was at the top when the highlight was made, so the drawing
+    /// side can work out how far its text has moved since.
+    pub drag_top: usize,
     /// Is the button held down right now? The range only grows while it is.
     pub dragging: bool,
     /// The visible text of the last drawn frame, one `String` per screen row. Mouse selection
@@ -588,6 +596,7 @@ impl Default for State {
             view_links: Vec::new(),
             screen_links: Vec::new(),
             drag: None,
+            drag_top: 0,
             dragging: false,
             screen: Vec::new(),
             asking: None,
@@ -749,6 +758,26 @@ impl State {
             return None;
         }
         Some((self.view_top + row, (x - ox) as usize))
+    }
+
+    /// Whether the highlight lies entirely inside the conversation.
+    ///
+    /// **Only the conversation scrolls.** Below it sit the activity line, the input and the bars,
+    /// and those stay where they are — so a highlight that reaches them cannot be moved as one
+    /// piece, and half of it sliding out from under the other half reads as a rendering fault.
+    pub fn drag_can_scroll(&self) -> bool {
+        let top = self.view_origin.1 as usize;
+        self.drag.is_some_and(|drag| {
+            let ((r0, _), (r1, _)) = drag.ordered();
+            r0 >= top && r1 < top + self.view_height
+        })
+    }
+
+    /// Lets go of a highlight the conversation cannot carry. Called wherever it scrolls.
+    pub fn drop_drag_that_cannot_scroll(&mut self) {
+        if !self.drag_can_scroll() {
+            self.drag = None;
+        }
     }
 
     /// The URL of the link under the given screen coordinate, if any. `None` outside the
@@ -1433,18 +1462,14 @@ pub fn apply(state: &mut State, action: &Action) {
             }
             let (total, height) = (state.view_total, state.view_height);
             state.scroll.wheel(*notches, total, height);
-            // The selection is anchored to the screen; scrolling moves the text out from under
-            // it, so the highlight would point at text different from what was copied.
-            state.drag = None;
+            state.drop_drag_that_cannot_scroll();
         }
         Action::Page(dir) => {
             // PageUp/PageDown with a panel open never reach here — `on_key` routes them
             // to the panel's own scroll first. So this is always the transcript.
             let (total, height) = (state.view_total, state.view_height);
             state.scroll.page(*dir, total, height);
-            // Same reason as the wheel: the selection is anchored to the screen, and
-            // scrolling moves the text out from under it.
-            state.drag = None;
+            state.drop_drag_that_cannot_scroll();
         }
         Action::ToggleFold => {
             // **The key only ever reaches the last work card's head** — the whole stretch of
@@ -1487,6 +1512,9 @@ pub fn apply(state: &mut State, action: &Action) {
             // **The whole screen is selectable — blank space included.** A drag that starts
             // on empty cells still works; it just selects nothing until it covers text.
             state.drag = Some(crate::selection::Drag::new((*y as usize, *x as usize)));
+            // Where the conversation stood when this began. Everything after it is measured
+            // against this, so the highlight can be drawn wherever its text has got to.
+            state.drag_top = state.view_top;
             state.dragging = true;
         }
         Action::DragTo(x, y) => {
@@ -4958,6 +4986,18 @@ mod tests {
         KeyEvent::new(code, mods)
     }
 
+    /// A screen with a conversation long enough to scroll, and the viewport measurements the
+    /// drawing side would have written down. Rows 0-9 are the conversation; anything below is the
+    /// activity line, the input and the bars.
+    fn scrollable() -> State {
+        let mut s = state();
+        s.view_total = 100;
+        s.view_height = 10;
+        s.view_origin = (0, 0);
+        s.scroll.on_content(100, 10);
+        s
+    }
+
     /// **A mode picked before the connection has to reach the gate.** Shift+Tab works the whole
     /// time "connecting…" is on screen — first enrollment sits there for as long as it takes to
     /// walk to a browser — but `last_mode` is only seeded once that loop ends, so the main loop's
@@ -6104,14 +6144,41 @@ mod tests {
         assert_eq!(s.folds.get(&5).map(|f| f.open), Some(true));
     }
 
-    /// The selection is anchored to the screen; scrolling moves the text out from under it.
-    /// Keeping the highlight would point at text different from what was copied.
+    /// **A highlight in the conversation rides along with it.** Scrolling moves the text and the
+    /// colour the same distance, so the selection stays on the words it was drawn around. It used
+    /// to be dropped outright, and one notch of the wheel looked like the selection had been
+    /// lost — copied text and all, though the copy had already been made.
     #[test]
-    fn scrolling_drops_the_drag() {
-        let mut s = state();
-        s.drag = Some(crate::selection::Drag::new((0, 0)));
+    fn scrolling_carries_the_highlight_with_the_text() {
+        let mut s = scrollable();
+        apply(&mut s, &Action::Press(0, 1));
+        apply(&mut s, &Action::DragTo(5, 3));
         apply(&mut s, &Action::Wheel(-1));
-        assert!(s.drag.is_none());
+        assert!(s.drag.is_some(), "one notch of the wheel threw the selection away");
+    }
+
+    /// **What the conversation cannot carry, it lets go of.** Below it are the activity line, the
+    /// input and the bars, and those do not scroll — half a highlight sliding out from under the
+    /// other half reads as the screen being broken, which is worse than losing the colour.
+    #[test]
+    fn a_highlight_that_reaches_past_the_conversation_goes_when_it_scrolls() {
+        let mut s = scrollable();
+        apply(&mut s, &Action::Press(0, 1));
+        // Past `view_height`: onto the input line.
+        apply(&mut s, &Action::DragTo(5, 12));
+        apply(&mut s, &Action::Wheel(-1));
+        assert!(s.drag.is_none(), "it was left to slide over rows that never move");
+    }
+
+    /// Where the conversation stood is written down when the drag begins, because that is what
+    /// the distance is measured from. Without it there is nothing to compare and the highlight
+    /// is drawn where the text used to be.
+    #[test]
+    fn a_drag_remembers_where_the_conversation_stood() {
+        let mut s = scrollable();
+        s.view_top = 42;
+        apply(&mut s, &Action::Press(0, 1));
+        assert_eq!(s.drag_top, 42);
     }
 
     /// PageUp/PageDown scroll the conversation by a page — the keyboard path that still
@@ -6132,14 +6199,20 @@ mod tests {
         assert_eq!(s.scroll.top, 90, "one page down lands at the bottom");
     }
 
-    /// Page-scrolling drops the drag for the same reason the wheel does — the highlight
-    /// would point at different text.
+    /// Page-scrolling follows the same rule as the wheel — it is the same conversation moving.
     #[test]
-    fn page_scrolling_drops_the_drag() {
-        let mut s = state();
-        s.drag = Some(crate::selection::Drag::new((0, 0)));
-        apply(&mut s, &Action::Page(1));
-        assert!(s.drag.is_none());
+    fn page_scrolling_treats_the_highlight_the_same_way() {
+        let mut inside = scrollable();
+        apply(&mut inside, &Action::Press(0, 1));
+        apply(&mut inside, &Action::DragTo(5, 3));
+        apply(&mut inside, &Action::Page(1));
+        assert!(inside.drag.is_some(), "a page threw away what a notch keeps");
+
+        let mut over = scrollable();
+        apply(&mut over, &Action::Press(0, 1));
+        apply(&mut over, &Action::DragTo(5, 12));
+        apply(&mut over, &Action::Page(1));
+        assert!(over.drag.is_none());
     }
 
     /// The title is written by the server — text we did not write. A control character mixed
