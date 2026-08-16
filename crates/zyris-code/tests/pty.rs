@@ -33,7 +33,9 @@ const PATIENCE: Duration = Duration::from_secs(20);
 /// The app, running on a pseudo-terminal, with everything it says collected as it arrives.
 struct Session {
     child: Box<dyn portable_pty::Child + Send + Sync>,
-    writer: Box<dyn Write + Send>,
+    /// **Shared, because `take_writer` gives it up once.** On Windows the reader thread has to
+    /// write back (see `start`), and asking the master for a second writer fails outright.
+    writer: std::sync::Arc<std::sync::Mutex<Box<dyn Write + Send>>>,
     /// Filled by a reader thread. The pty read blocks, so it cannot live on this thread.
     output: mpsc::Receiver<Vec<u8>>,
     seen: Vec<u8>,
@@ -68,7 +70,9 @@ impl Session {
         drop(pty.slave);
 
         let mut reader = pty.master.try_clone_reader().expect("could not read the pty");
-        let mut writer = pty.master.take_writer().expect("could not write to the pty");
+        let writer = std::sync::Arc::new(std::sync::Mutex::new(
+            pty.master.take_writer().expect("could not write to the pty"),
+        ));
 
         // **On Windows the cursor-position question has to be answered, and on unix it must not
         // be.** The two are not inconsistent: they are questions from different askers.
@@ -83,7 +87,7 @@ impl Session {
         // all — the first run of this suite on Windows sat for forty seconds with `ESC[6n` as the
         // entire screen. So here we are that terminal, and we answer.
         #[cfg(windows)]
-        let mut answer = pty.master.take_writer().expect("could not write to the pty");
+        let answer = std::sync::Arc::clone(&writer);
 
         let (tx, output) = mpsc::channel();
         std::thread::spawn(move || {
@@ -93,11 +97,13 @@ impl Session {
                     break;
                 }
                 #[cfg(windows)]
-                if buf[..n].windows(4).any(|w| w == b"\x1b[6n") {
+                if buf[..n].windows(4).any(|w| w == b"\x1b[6n".as_slice()) {
                     // Row 1, column 1. Where the cursor actually is does not matter to anything
                     // being tested; that the question gets an answer does.
-                    let _ = answer.write_all(b"\x1b[1;1R");
-                    let _ = answer.flush();
+                    if let Ok(mut w) = answer.lock() {
+                        let _ = w.write_all(b"\x1b[1;1R");
+                        let _ = w.flush();
+                    }
                 }
                 if tx.send(buf[..n].to_vec()).is_err() {
                     break;
@@ -166,8 +172,10 @@ impl Session {
     }
 
     fn send(&mut self, bytes: &[u8]) {
-        let _ = self.writer.write_all(bytes);
-        let _ = self.writer.flush();
+        if let Ok(mut w) = self.writer.lock() {
+            let _ = w.write_all(bytes);
+            let _ = w.flush();
+        }
     }
 
     /// Waits for the app to end. `None` if it outlived our patience.
