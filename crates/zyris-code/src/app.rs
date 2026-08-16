@@ -3477,17 +3477,6 @@ async fn run_inner(
                         }
                     }
 
-                    // **Handing over is leaving.** The helper is already waiting on this
-                    // process to end before it replaces the binary, so the two must not be
-                    // ordered the other way round — on Windows the running `.exe` cannot be
-                    // touched at all until this exits.
-                    if std::mem::take(&mut state.update_wanted) {
-                        match hand_over_to_update(&mut state).await {
-                            Ok(()) => break 'app,
-                            Err(e) => state.set_error(state.lang.update_failed(&e.to_string())),
-                        }
-                    }
-
                     // **The settings form's Enter reaches the disk and the gate here.**
                     // The exact three things `/config …` does in `finish_command` — one
                     // stopping short of any of them is how a setting changes on screen and
@@ -3770,6 +3759,22 @@ async fn run_inner(
                     dirty = false;
                     drew_since_heal = false;
                 }
+            }
+        }
+
+        // **Every turn of the loop, not only after a keystroke.** The answer to "is there a newer
+        // release" arrives on its own, from a task nobody is waiting on, so a hand-over that was
+        // only checked in the key arm needed someone to press something before it could happen.
+        // Measured against a real release: the app sat on 0.2.0 with 0.2.1 published and did not
+        // move until a key was sent, which is not what `auto` promises.
+        //
+        // **Handing over is leaving.** The helper is already waiting on this process to end before
+        // it touches the binary, so these two must not be ordered the other way round — on Windows
+        // a running `.exe` cannot be replaced at all until this exits.
+        if std::mem::take(&mut state.update_wanted) {
+            match hand_over_to_update(&mut state).await {
+                Ok(()) => break 'app,
+                Err(e) => state.set_error(state.lang.update_failed(&e.to_string())),
             }
         }
     }

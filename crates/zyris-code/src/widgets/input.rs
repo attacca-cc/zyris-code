@@ -34,6 +34,13 @@ pub fn rule(frame: &mut Frame, area: Rect) {
 }
 
 pub fn draw(frame: &mut Frame, area: Rect, state: &State) {
+    // **A terminal can report no size at all**, and everything below assumes there is a row to put
+    // the cursor on: `area.height - 1` then goes negative and takes the whole app with it. Measured
+    // on a pseudo-terminal opened without a window size — a debug build panics outright, and a
+    // release build wraps to 65535 and draws the cursor somewhere off the screen.
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
     let inner = area.width.saturating_sub(PROMPT_WIDTH);
     let (wrapped, (crow, ccol)) = state.input.wrapped(inner);
 
