@@ -175,6 +175,16 @@ pub fn draw(frame: &mut Frame, state: &mut State) {
         }
     }
 
+    // **Snapshot the visible text for mouse selection.** A drag extracts from this, so it
+    // must always match the frame that is about to be shown. Cheap: a few thousand string
+    // appends per frame against a full terminal redraw.
+    //
+    // **Taken before the highlight is painted**, because the highlight reads it: where a row's
+    // text starts is a question about the row, and the answer decides which cells get colour.
+    // Backgrounds do not reach this — `screen_rows` reads symbols — so nothing here sees the
+    // colour that is about to be laid over it.
+    state.screen = screen_rows(frame.buffer_mut());
+
     // **Mouse selection follows the text, not a box.** Every cell under the drag's per-line
     // spans is washed in a faint theme colour (`selection_bg`) so the highlight shows exactly
     // the text that will be copied — blank cells before the start stay untouched. This runs
@@ -199,8 +209,14 @@ pub fn draw(frame: &mut Frame, state: &mut State) {
         } else {
             (0..area.height, 0)
         };
+        // **Where each row's text starts, so the margin keeps its own colour.** `row_spans` is
+        // geometry and knows nothing about what is drawn; this is the one place that does, and it
+        // is the same answer `selection::extract` uses, so the colour and the clipboard agree.
+        let body: Vec<u16> =
+            state.screen.iter().map(|row| selection::body_start(row) as u16).collect();
         let cells = frame.buffer_mut().content.as_mut_slice();
         for (y, from, to) in selection::row_spans(&drag, area.width, band, moved) {
+            let from = from.max(body.get(y as usize).copied().unwrap_or(0));
             for x in from..to {
                 let idx = y as usize * width + x as usize;
                 if let Some(cell) = cells.get_mut(idx) {
@@ -209,11 +225,6 @@ pub fn draw(frame: &mut Frame, state: &mut State) {
             }
         }
     }
-
-    // **Snapshot the visible text for mouse selection.** A drag extracts from this, so it
-    // must always match the frame that is about to be shown. Cheap: a few thousand string
-    // appends per frame against a full terminal redraw.
-    state.screen = screen_rows(frame.buffer_mut());
 
     // **Make links Ctrl+clickable.** The terminal opens an OSC 8 hyperlink on Ctrl+click, so
     // the cells under a link get the hyperlink escape sequence. Runs after the `screen`

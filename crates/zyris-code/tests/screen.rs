@@ -1091,7 +1091,11 @@ fn the_highlight_covers_only_the_selected_columns() {
     // would race. The selection wash is never a default background and the untouched cells
     // keep it, so checking Reset vs non-Reset is stable under any theme.
     let bg = |x: u16| buf[(x, y)].style().bg;
-    assert_ne!(bg(ox), Some(Color::Reset), "the first selected cell must be washed");
+    // **The margin keeps its own colour.** The drag began at column 0, on the marker the screen
+    // draws there, and the wash starts at the text instead — the same place the clipboard starts.
+    // Dragging across a code block used to come back with the rule down its left on every line.
+    assert_eq!(bg(ox), Some(Color::Reset), "the margin was washed with the text");
+    assert_ne!(bg(ox + 2), Some(Color::Reset), "the first cell of the text must be washed");
     assert_ne!(bg(ox + 3), Some(Color::Reset), "the last selected cell is washed too");
     assert_eq!(bg(ox + 8), Some(Color::Reset), "an unselected cell must not be washed");
 }

@@ -47,15 +47,20 @@ pub fn extract(rows: &[String], drag: &Drag) -> String {
     let last = rows.len() - 1;
     let (r0, r1) = (r0.min(last), r1.min(last));
 
+    // **A selection starts at the text, never in the margin.** Reaching left past the words — which
+    // is what selecting whole lines looks like — used to take the markers with it.
+    let from = |row: &str, at: usize| at.max(body_start(row));
+
     if r0 == r1 {
-        return slice_cols(&rows[r0], c0.min(c1), c0.max(c1) + 1);
+        let (a, b) = (c0.min(c1), c0.max(c1) + 1);
+        return slice_cols(&rows[r0], from(&rows[r0], a), b);
     }
 
-    let mut out = vec![slice_cols(&rows[r0], c0, usize::MAX)];
+    let mut out = vec![slice_cols(&rows[r0], from(&rows[r0], c0), usize::MAX)];
     for row in &rows[r0 + 1..r1] {
-        out.push(row.trim_end().to_string());
+        out.push(slice_cols(row, body_start(row), usize::MAX));
     }
-    out.push(slice_cols(&rows[r1], 0, c1 + 1));
+    out.push(slice_cols(&rows[r1], body_start(&rows[r1]), c1 + 1));
     out.join("\n")
 }
 
@@ -120,6 +125,46 @@ pub fn row_spans(
     }
     out.push((r1, 0, if cut { w as u16 } else { c1 as u16 }));
     out
+}
+
+/// The glyphs the screen draws in a row's left margin, which are furniture rather than text.
+///
+/// `▌` marks what a person said, `✻` a stretch of working, `▸`/`▾` a fold, `●` a tool row and `◆`
+/// an answer; `│` runs down the left of a code block and `┊` down an opened reasoning body.
+const MARGIN_GLYPHS: [char; 8] = ['▌', '✻', '▸', '▾', '●', '◆', '│', '┊'];
+
+/// The column a row's own text starts at, past whatever the screen drew in its margin.
+///
+/// **The margin is drawn, not written.** Dragging across a code block came back with `  │ ` on the
+/// front of every line, and a tool row with its `●` — decoration nobody selected and nothing can
+/// paste (reported 2026-08-17). `rows::PAD` is the margin the markers stand in, and a code block
+/// adds its rule and one space on top of that.
+///
+/// **What comes after is left exactly as it is**, indentation included: the space the renderer put
+/// after `│` is furniture, and every space after that belongs to the code.
+pub fn body_start(row: &str) -> usize {
+    let mut col = 0usize;
+    let mut chars = row.chars().peekable();
+    // The margin: at most `rows::PAD` columns, and blank ones at that.
+    //
+    // **Counted rather than assumed.** Not every row on screen has a margin — the bottom bar and
+    // the status line start hard against the left edge — so taking `PAD` off every row would eat
+    // two characters of those. A row whose first cell holds text has no margin to skip.
+    while col < crate::rows::PAD as usize && chars.peek() == Some(&' ') {
+        chars.next();
+        col += 1;
+    }
+    // A marker standing in that margin, or a rule at the head of the body — a code block, an
+    // opened reasoning body — together with the single space the renderer puts after it. What
+    // comes after that is the row's own, indentation included.
+    if chars.peek().is_some_and(|c| MARGIN_GLYPHS.contains(c)) {
+        let c = chars.next().expect("just peeked at it");
+        col += display_width(&c.to_string()).max(1);
+        if chars.peek() == Some(&' ') {
+            col += 1;
+        }
+    }
+    col
 }
 
 /// The characters in screen columns `[from, to)`. Full-width glyphs count as 2 cells.
@@ -314,6 +359,45 @@ mod tests {
             extract(&rows, &d).chars().count(),
             "colour and text differ"
         );
+    }
+
+    /// **The margin is furniture, not text.** Dragging a code block came back with `  │ ` on the
+    /// front of every line, and a tool row with its `●` — decoration nobody selected and nothing
+    /// can paste. The code's own indentation is not margin and stays.
+    #[test]
+    fn the_margin_the_screen_draws_is_not_part_of_the_selection() {
+        assert_eq!(body_start("  │     ret = pthread_create();"), 4, "the rule and one space");
+        assert_eq!(body_start("● read  src/rows.rs"), 2, "just the marker's own margin");
+        assert_eq!(body_start("  plain conversation text"), 2, "an unmarked row still has one");
+        // The bottom bar and the status line start hard against the edge and have no margin.
+        assert_eq!(body_start("job·Main Agent"), 0, "it ate the start of an unmargined row");
+        assert_eq!(body_start(""), 0, "a blank row has nothing to skip");
+        assert_eq!(body_start(" "), 1, "and neither has a short one");
+    }
+
+    /// Reaching left past the words — which is what selecting whole lines looks like — must not
+    /// take the markers with it, on any line of the selection.
+    #[test]
+    fn dragging_across_a_code_block_copies_the_code_and_not_the_rule() {
+        let rows = vec![
+            "  │     ret = call();".to_string(),
+            "  │     if (ret != 0) {".to_string(),
+            "  │         return 1;".to_string(),
+        ];
+        let d = Drag { from: (0, 0), to: (2, 30) };
+        let got = extract(&rows, &d);
+        assert_eq!(got, "    ret = call();\n    if (ret != 0) {\n        return 1;");
+        assert!(!got.contains('│'), "the rule came along:\n{got}");
+    }
+
+    /// Starting the drag inside the text keeps it there — the margin rule only ever pushes right.
+    #[test]
+    fn a_drag_that_starts_inside_the_text_starts_where_it_was_put() {
+        let rows = vec!["  │     ret = call();".to_string()];
+        // Two spaces, the rule, five more spaces, then `ret = call();` — so columns 10 to 12 are
+        // the end of `ret` and the `=` after it.
+        let d = Drag { from: (0, 10), to: (0, 12) };
+        assert_eq!(extract(&rows, &d), "t =".to_string());
     }
 
     #[test]
