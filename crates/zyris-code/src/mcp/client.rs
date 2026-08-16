@@ -424,8 +424,17 @@ mod tests {
     const FAKE: &str = r#"
 import json, sys
 
+# **A real MCP server speaks UTF-8, so this one has to as well.** Python leaves stdout on the
+# locale codepage on Windows, which turned the Korean in the echo test into something else and
+# failed a client that was reading it correctly. Unix defaults to UTF-8, so this only ever showed
+# up once CI reached Windows.
+sys.stdout.reconfigure(encoding="utf-8")
+sys.stdin.reconfigure(encoding="utf-8")
+
 def send(o):
-    sys.stdout.write(json.dumps(o) + "\n")
+    # `ensure_ascii=False` keeps the bytes on the wire as UTF-8 rather than \u escapes, which is
+    # what a server that has never heard of this test would send.
+    sys.stdout.write(json.dumps(o, ensure_ascii=False) + "\n")
     sys.stdout.flush()
 
 for line in sys.stdin:

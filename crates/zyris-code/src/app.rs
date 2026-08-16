@@ -241,6 +241,11 @@ pub enum Action {
     PickDown,
     /// Choose the current row. What that becomes is the I/O side's job.
     PickConfirm,
+    /// Put the current row up for deletion. **Asks first** — nothing reaches the server until the
+    /// question in the footer is answered.
+    PickDelete,
+    /// Take the question back down, having deleted nothing.
+    PickDeleteCancel,
     /// Back. From the session level to the project list; at the project level, close.
     PickBack,
     /// The new-project form. Next field / previous field / create / close.
@@ -925,6 +930,16 @@ pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
     }
 
     if state.picker.is_some() && !(ctrl && matches!(key.code, KeyCode::Char('c'))) {
+        // **A pending deletion takes every key, and only Enter says yes.** Anything else backs
+        // out. Leaving the other keys to do their usual work would mean the question stays up
+        // while the cursor walks away from the row it names, and then Enter deletes something
+        // nobody was looking at.
+        if state.picker.as_ref().is_some_and(|p| p.confirm.is_some()) {
+            return match key.code {
+                KeyCode::Enter => vec![Action::PickConfirm],
+                _ => vec![Action::PickDeleteCancel],
+            };
+        }
         // **The command list is chosen by typing.** If characters were taken as movement
         // keys (k/j), `/skills` could not be typed — here a character is plain input and the
         // list narrows.
@@ -958,6 +973,9 @@ pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
             KeyCode::Down => vec![Action::PickDown],
             KeyCode::Char('k') if !typing => vec![Action::PickUp],
             KeyCode::Char('j') if !typing => vec![Action::PickDown],
+            // **Del asks; it does not delete.** In the lists that are typed into it stays a plain
+            // editing key, so the draft keeps it.
+            KeyCode::Delete if !typing => vec![Action::PickDelete],
             // **A fully typed command must run on the first Enter.** If Enter only ever
             // meant "pick" because the list is up, typing `/rules` to the end and pressing
             // it would just rewrite the same text into the input and do nothing — this
@@ -1676,6 +1694,21 @@ pub fn apply(state: &mut State, action: &Action) {
         // Acting on the choice (moving in the list, switching sessions, creating) is the
         // I/O side's job.
         Action::PickConfirm => {}
+        // **Pure, and it only arms.** The removal itself is a request, so it belongs to the I/O
+        // side; what happens here is the question going up — or the reason it cannot.
+        Action::PickDelete => {
+            let lang = state.lang;
+            if let Some(picker) = state.picker.as_mut() {
+                if let Err(why) = picker.arm_delete(lang) {
+                    state.set_status(why.to_string());
+                }
+            }
+        }
+        Action::PickDeleteCancel => {
+            if let Some(picker) = state.picker.as_mut() {
+                picker.confirm = None;
+            }
+        }
         // **Do not touch the picker here.** `apply` runs after the I/O handling, so looking
         // again at what I/O just moved back from sessions to projects turns this into "we
         // are at the project level, close it" — and back becomes plain close. This actually
@@ -4059,6 +4092,22 @@ async fn pick(
         }
         // **Do not create it right away.** A name and a description have to be taken — the
         // form owns that job.
+        // **The list is fetched again rather than patched.** Removing the row here would show a
+        // list this account does not have if the request failed, and the failure is exactly the
+        // case where believing the screen matters.
+        Pick::DeleteProject { id, name } => {
+            if let Some(picker) = state.picker.as_mut() {
+                picker.confirm = None;
+            }
+            match crate::conn::within(api, api.delete_project(id)).await {
+                Ok(()) => {
+                    state.set_status(state.lang.picker_deleted(&name));
+                    state.picker = Some(Picker::loading_projects());
+                    spawn_projects(api, state.lang, tx);
+                }
+                Err(e) => state.set_error(e.to_string()),
+            }
+        }
         Pick::NewProject => {
             // **Leave the list as it is.** The form goes on top of it, and closing with Esc
             // returns right to that spot — no need to reopen and refetch the list.

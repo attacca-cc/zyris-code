@@ -100,10 +100,19 @@ pub fn draw(
         | crate::picker::Level::History { .. }
         | crate::picker::Level::PluginTarget { .. } => lang.picker_esc_close(),
     };
-    lines.push(Line::from(Span::styled(
-        lang.picker_keys(back),
-        Style::default().fg(theme::text_muted()),
-    )));
+    // **A pending deletion replaces the hints rather than sitting beside them.** It is the only
+    // thing the keys can do while it is up, so leaving "Enter choose" underneath would say Enter
+    // still opens the row — the one reading that would be answering a different question.
+    match &picker.confirm {
+        Some(armed) => lines.push(Line::from(Span::styled(
+            lang.picker_delete_ask(&armed.name),
+            Style::default().fg(theme::danger()),
+        ))),
+        None => lines.push(Line::from(Span::styled(
+            lang.picker_keys(back),
+            Style::default().fg(theme::text_muted()),
+        ))),
+    }
 
     frame.render_widget(Paragraph::new(lines), inner);
 }

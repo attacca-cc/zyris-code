@@ -113,6 +113,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.tag || github.ref }}
+          # **The notes are written from the history**, so the default shallow clone is not
+          # enough: with depth 1 there is no previous tag to compare against and the release
+          # would go out saying nothing changed.
+          fetch-depth: 0
 
       - uses: actions/download-artifact@v4
         with:
@@ -148,35 +152,31 @@ jobs:
           TAG: ${{ steps.collect.outputs.tag }}
         run: |
           set -eu
-          # The notes carry the install commands themselves. Someone landing on the release page
-          # should not have to go and find the README to learn what to paste.
+          # **The notes say what changed; the README says how to install.** Install instructions
+          # copied into every release go stale one release at a time and nobody notices, because
+          # each page looks right on its own. One place holds them, and this links to it.
+          #
+          # The list is the commits since the previous tag. Merges are left out: on this repo they
+          # carry a pull request number and no description of the change.
+          prev="$(git describe --tags --abbrev=0 "$TAG^" 2>/dev/null || true)"
           {
+            printf '## What changed\n\n'
+            if [ -n "$prev" ]; then
+              git log --no-merges --reverse --pretty='- %s' "$prev..$TAG"
+              printf '\n[Full diff](https://github.com/%s/compare/%s...%s)\n\n' \
+                "$GITHUB_REPOSITORY" "$prev" "$TAG"
+            else
+              git log --no-merges --reverse --pretty='- %s' "$TAG"
+              printf '\n'
+            fi
             printf '## Install\n\n'
-            printf '**macOS / Linux**\n\n'
             printf '```sh\n'
-            printf 'curl -fsSL https://github.com/%s/releases/latest/download/install.sh | sh\n' "$GITHUB_REPOSITORY"
+            printf 'curl -fsSL https://github.com/%s/releases/latest/download/install.sh | sh   # macOS, Linux\n' "$GITHUB_REPOSITORY"
+            printf 'irm https://github.com/%s/releases/latest/download/install.ps1 | iex        # Windows\n' "$GITHUB_REPOSITORY"
             printf '```\n\n'
-            printf '**Windows (PowerShell)**\n\n'
-            printf '```powershell\n'
-            printf 'irm https://github.com/%s/releases/latest/download/install.ps1 | iex\n' "$GITHUB_REPOSITORY"
-            printf '```\n\n'
-            printf 'Both install under your own account and need no administrator rights:\n'
-            printf '`~/.local/bin` on macOS and Linux, `%%LOCALAPPDATA%%\\Programs\\zyris-code` on\n'
-            printf 'Windows. **Your PATH is set up for you** — bash, zsh, fish and PowerShell — so\n'
-            printf 'after opening a new terminal the command is simply:\n\n'
-            printf '```sh\n'
-            printf 'zyris\n'
-            printf '```\n\n'
-            printf '`zyris-code` works too; they are the same program.\n\n'
-            printf 'Set `ZYRIS_CODE_INSTALL_DIR` to install elsewhere, or `--no-modify-path`\n'
-            printf '(`-NoModifyPath` on Windows) to leave your shell alone. To pin a version:\n'
-            printf '`... | sh -s -- --version %s`.\n\n' "$TAG"
-            printf 'Run it in the directory you want to work in. It prints an enrollment code the\n'
-            printf 'first time; approve it in the browser and it attaches.\n\n'
-            printf '### Building instead\n\n'
-            printf '```sh\n'
-            printf 'cargo install --git https://github.com/%s --tag %s zyris-code\n' "$GITHUB_REPOSITORY" "$TAG"
-            printf '```\n\n'
+            printf 'To pin this version: `... | sh -s -- --version %s`.\n\n' "$TAG"
+            printf 'Everything else — what it does, how to run it, every environment variable —\n'
+            printf 'is in the [README](https://github.com/%s#readme).\n\n' "$GITHUB_REPOSITORY"
             printf '### Verifying a download\n\n'
             printf 'Every archive is listed in `SHA256SUMS`, which the install scripts check before\n'
             printf 'unpacking anything. By hand:\n\n'

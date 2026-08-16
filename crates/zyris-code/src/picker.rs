@@ -97,6 +97,11 @@ pub enum Pick {
     TypeCommand { text: String },
     /// Fetches a plugin into the machine's directory or this project's.
     InstallPlugin { source: String, project: bool },
+    /// Removes this project on the server, once the question in the footer has been answered.
+    ///
+    /// **Projects only.** There is no `delete_session` on the Attacca API and no archived flag on
+    /// `ZSession`, so a thread cannot be removed from here however the key is pressed.
+    DeleteProject { id: String, name: String },
     /// Puts a message that was sent back into the draft, replacing whatever is there.
     ///
     /// **Replaces rather than inserts.** It was picked out of a search of whole messages, so what
@@ -248,6 +253,17 @@ pub struct Picker {
     pub top: usize,
     /// Whether the list is still loading.
     pub loading: bool,
+    /// A deletion waiting to be confirmed. **Held here rather than acted on at once**: a list is
+    /// exactly where the wrong row gets hit, and Del sits next to keys nobody aims carefully.
+    pub confirm: Option<Armed>,
+}
+
+/// What a pending deletion is about. The name is carried so the question can say it — by the time
+/// it is answered the cursor is the only other record of which row was meant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Armed {
+    pub id: String,
+    pub name: String,
 }
 
 impl Picker {
@@ -257,7 +273,14 @@ impl Picker {
     /// big account not a fast one — with nothing on screen until it returns, pressing ← looks
     /// like the app stopped responding.
     pub fn loading_projects() -> Self {
-        Self { level: Level::Projects, rows: Vec::new(), cursor: 0, top: 0, loading: true }
+        Self {
+            level: Level::Projects,
+            rows: Vec::new(),
+            cursor: 0,
+            top: 0,
+            loading: true,
+            confirm: None,
+        }
     }
 
     /// An empty thread list waiting for the list. Carries the project it belongs to, so `Esc`
@@ -269,6 +292,7 @@ impl Picker {
             cursor: 0,
             top: 0,
             loading: true,
+            confirm: None,
         }
     }
 
@@ -291,7 +315,7 @@ impl Picker {
         }));
         // The first row is the unselectable 'new project', so start on the second (first real project).
         let cursor = if rows.len() > 1 { 1 } else { 0 };
-        Self { level: Level::Projects, rows, cursor, top: 0, loading: false }
+        Self { level: Level::Projects, rows, cursor, top: 0, loading: false, confirm: None }
     }
 
     /// One project's session list. The top row is new-session.
@@ -323,17 +347,25 @@ impl Picker {
             cursor: 0,
             top: 0,
             loading: false,
+            confirm: None,
         }
     }
 
     /// An empty agents screen waiting for the list.
     pub fn loading_agents() -> Self {
-        Self { level: Level::Agents, rows: Vec::new(), cursor: 0, top: 0, loading: true }
+        Self {
+            level: Level::Agents,
+            rows: Vec::new(),
+            cursor: 0,
+            top: 0,
+            loading: true,
+            confirm: None,
+        }
     }
 
     /// The agents list. Opened by `/agent`.
     pub fn agents(rows: Vec<Row>) -> Self {
-        Self { level: Level::Agents, rows, cursor: 0, top: 0, loading: false }
+        Self { level: Level::Agents, rows, cursor: 0, top: 0, loading: false, confirm: None }
     }
 
     /// Where to put a plugin about to be fetched.
@@ -357,7 +389,14 @@ impl Picker {
                 status: None,
             },
         ];
-        Self { level: Level::PluginTarget { source }, rows, cursor: 0, top: 0, loading: false }
+        Self {
+            level: Level::PluginTarget { source },
+            rows,
+            cursor: 0,
+            top: 0,
+            loading: false,
+            confirm: None,
+        }
     }
 
     /// The slash-command list. Opens when `/` is typed.
@@ -390,7 +429,7 @@ impl Picker {
             enabled: true,
             status: None,
         }));
-        Self { level: Level::Commands, rows, cursor: 0, top: 0, loading: false }
+        Self { level: Level::Commands, rows, cursor: 0, top: 0, loading: false, confirm: None }
     }
 
     /// What has been sent, most recent first, narrowed by `query`.
@@ -423,6 +462,7 @@ impl Picker {
             cursor: 0,
             top: 0,
             loading: false,
+            confirm: None,
         }
     }
 
@@ -432,7 +472,14 @@ impl Picker {
     /// not instant on a big checkout, and with nothing on screen the `@` looks like it did
     /// nothing at all.
     pub fn loading_files(at: usize) -> Self {
-        Self { level: Level::Files { at }, rows: Vec::new(), cursor: 0, top: 0, loading: true }
+        Self {
+            level: Level::Files { at },
+            rows: Vec::new(),
+            cursor: 0,
+            top: 0,
+            loading: true,
+            confirm: None,
+        }
     }
 
     /// The file list, narrowed by what has been typed after the `@`.
@@ -478,7 +525,7 @@ impl Picker {
                 status: None,
             })
             .collect();
-        Self { level: Level::Files { at }, rows, cursor: 0, top: 0, loading: false }
+        Self { level: Level::Files { at }, rows, cursor: 0, top: 0, loading: false, confirm: None }
     }
 
     /// How many file rows are built per keystroke. The list scrolls, so more than this is not
@@ -520,7 +567,35 @@ impl Picker {
     }
 
     /// Picks the current row.
+    /// Puts the row under the cursor up for deletion, and says what to tell the person if it
+    /// cannot be. Pure: nothing goes to the server until the question is answered.
+    ///
+    /// **Only projects.** The API has `delete_project` and nothing for a session, so a thread row
+    /// is refused here rather than silently ignored — a key that does nothing reads as broken.
+    pub fn arm_delete(&mut self, lang: crate::lang::Lang) -> Result<(), &'static str> {
+        if !matches!(self.level, Level::Projects) {
+            return Err(if matches!(self.level, Level::Sessions { .. }) {
+                lang.threads_stay()
+            } else {
+                lang.nothing_to_delete()
+            });
+        }
+        // The "new" row has no id, and there is nothing on the server to remove for it.
+        let Some(row) = self.rows.get(self.cursor).filter(|r| r.id.is_some()) else {
+            return Err(lang.nothing_to_delete());
+        };
+        let id = row.id.clone().expect("filtered on `is_some`");
+        self.confirm = Some(Armed { id, name: row.label.clone() });
+        Ok(())
+    }
+
     pub fn pick(&self) -> Option<Pick> {
+        // **A pending deletion owns Enter.** While the question is up, the row under the cursor
+        // is what the question is about, so confirming must not also open it — that would delete
+        // a project and walk into it in the same keystroke.
+        if let Some(armed) = &self.confirm {
+            return Some(Pick::DeleteProject { id: armed.id.clone(), name: armed.name.clone() });
+        }
         let row = self.rows.get(self.cursor)?;
         if !row.enabled {
             return Some(Pick::Unavailable(
@@ -586,6 +661,61 @@ mod tests {
             vec![("p1".into(), "기본 프로젝트".into(), true), ("p2".into(), "zyris".into(), false)],
             crate::lang::Lang::Ko,
         )
+    }
+
+    /// **Arming is not deleting.** Del sits next to keys nobody aims carefully, and a list is
+    /// where the wrong row gets hit, so what it produces is a question — and until that question
+    /// is answered `pick` must not have turned into anything the I/O side would send.
+    #[test]
+    fn del_asks_before_anything_leaves_for_the_server() {
+        let mut p = projects();
+        assert_eq!(p.arm_delete(crate::lang::Lang::Ko), Ok(()));
+        let armed = p.confirm.clone().expect("nothing was put up for deletion");
+        assert_eq!(armed.id, "p1", "it armed a row other than the one under the cursor");
+        assert_eq!(armed.name, "기본 프로젝트", "the question cannot name what would go");
+    }
+
+    /// **While the question is up, Enter answers it and opens nothing.** Falling through to the
+    /// row would delete a project and walk into it on one keystroke.
+    #[test]
+    fn confirming_deletes_the_row_instead_of_opening_it() {
+        let mut p = projects();
+        assert!(
+            matches!(p.pick(), Some(Pick::OpenProject { .. })),
+            "the cursor is not on a project"
+        );
+        p.arm_delete(crate::lang::Lang::Ko).expect("a project row can be deleted");
+        match p.pick() {
+            Some(Pick::DeleteProject { id, name }) => {
+                assert_eq!(id, "p1");
+                assert_eq!(name, "기본 프로젝트");
+            }
+            other => panic!("Enter did something else while a deletion was waiting: {other:?}"),
+        }
+    }
+
+    /// **There is no `delete_session` on the API**, and no archived flag on `ZSession`. Saying so
+    /// beats a key that quietly does nothing, which reads as the app being broken.
+    #[test]
+    fn a_thread_cannot_be_deleted_and_says_so() {
+        let mut p = Picker::sessions(
+            "p1".into(),
+            "zyris".into(),
+            vec![("s1".into(), "어떤 쓰레드".into(), ThreadStatus::Success)],
+            crate::lang::Lang::Ko,
+        );
+        p.cursor = 1;
+        assert_eq!(p.arm_delete(crate::lang::Lang::Ko), Err(crate::lang::Lang::Ko.threads_stay()));
+        assert!(p.confirm.is_none(), "a thread was put up for deletion anyway");
+    }
+
+    /// The "new" row stands for something that does not exist yet, so there is nothing to remove.
+    #[test]
+    fn the_create_row_has_nothing_to_delete() {
+        let mut p = projects();
+        p.cursor = 0;
+        assert!(p.arm_delete(crate::lang::Lang::Ko).is_err());
+        assert!(p.confirm.is_none());
     }
 
     fn many(n: usize) -> Vec<Row> {

@@ -1,0 +1,57 @@
+name: check
+
+# **This repo takes pull requests from outside.** Until now nothing ran on them, so whether a
+# contribution built at all was something a person had to find out by hand — and the badge in the
+# README had nothing to report.
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: never
+  RUST_BACKTRACE: 1
+
+# A second push to the same branch makes the first run pointless. Cancel it rather than queue it:
+# this repo's builds are minutes long and the runners are shared.
+concurrency:
+  group: check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # **One platform failing must not hide the other's result.** Windows is where the console
+      # differs most, and it is the one worth seeing even when Linux is already red.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Formatting first: it needs no build, so a misformatted branch fails in seconds instead of
+      # after the compile.
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Test
+        run: cargo test --workspace
+
+      # `tests/pty.rs` drives the app through a real pseudo-terminal — a unix pty here, a ConPTY on
+      # Windows. It needs no network: a static token skips enrollment and the server URL points at
+      # a port that refuses at once. It is part of `cargo test` above; named here only so that a
+      # failure in it is readable in the log.
+      - name: Pseudo-terminal
+        run: cargo test -p zyris-code --test pty -- --nocapture
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets

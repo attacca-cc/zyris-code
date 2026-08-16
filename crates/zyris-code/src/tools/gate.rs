@@ -399,19 +399,28 @@ mod tests {
     #[test]
     fn reading_a_credential_through_the_shell_is_refused_as_well() {
         let allow = Config { dir_access: DirAccess::Allow, ..Config::default() };
-        // The `~` and `/tmp` forms resolve through the **real** home, which on Windows is not
-        // the fake `/home/ruma` the constants above use — so only the `APP`-relative absolute
-        // form is portable. The `~` shape is checked on Unix, where it expands to the same place.
+        // **A `~` expands through the real home, so the directory it is weighed against has to be
+        // the real one too.** Weighing it against the fake `/home/ruma` above made this pass on
+        // one machine and only that one — it went red the first time CI ran it, on a runner whose
+        // home is `/home/runner`. Every contributor would have seen the same.
         #[cfg_attr(not(unix), allow(unused_mut))]
-        let mut commands: Vec<String> = vec![format!("cat {APP}/github.json")];
+        let mut cases: Vec<(String, std::path::PathBuf)> =
+            vec![(format!("cat {APP}/github.json"), app().to_path_buf())];
         #[cfg(unix)]
-        commands.extend([
-            "cat ~/.config/zyris-code/github.json".into(),
-            "cp ~/.config/zyris-code/wss-attacca-cc-api-zyris-v1-ws-zyris-code.json /tmp/x"
-                .to_string(),
-        ]);
-        for command in commands {
-            let asked = reaching("terminal", "exec", json!({ "command": command }));
+        if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
+            let real = home.join(".config/zyris-code");
+            cases.push(("cat ~/.config/zyris-code/github.json".into(), real.clone()));
+            cases.push((
+                "cp ~/.config/zyris-code/wss-attacca-cc-api-zyris-v1-ws-zyris-code.json /tmp/x"
+                    .into(),
+                real,
+            ));
+        }
+        for (command, app_dir) in cases {
+            let args = json!({ "command": command });
+            let asked = call("terminal", "exec", "")
+                .leaving(escaping_path(root(), "terminal", "exec", &args))
+                .reaching_for(secret_path(&app_dir, root(), "terminal", "exec", &args));
             assert!(
                 matches!(decide(Mode::Normal, &allow, &asked), Decision::Refuse(_)),
                 "`{command}` went through"

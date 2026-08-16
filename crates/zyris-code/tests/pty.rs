@@ -21,10 +21,25 @@
 //! lost twenty minutes to exactly that. `read_until` gives up and hands back what it saw.
 
 use std::io::{Read, Write};
-use std::sync::mpsc;
+use std::sync::{mpsc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use portable_pty::{CommandBuilder, PtySize};
+
+/// **One pseudo-terminal at a time.**
+///
+/// Each of these starts a real app on a real console and drives it by hand. Two at once on a
+/// two-core runner starve each other: keystrokes written to one arrive late enough that the app
+/// has drawn past them, and which test loses is decided by the scheduler. On Windows they took
+/// turns failing run after run, one passing while the other did not and then the other way round
+/// — which is what contention looks like and what a real fault does not.
+static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+
+/// Held for the length of a test. **A panic elsewhere must not close this door** — a poisoned lock
+/// still hands over the turn, and the test that poisoned it has already reported its own failure.
+fn one_at_a_time() -> MutexGuard<'static, ()> {
+    ONE_AT_A_TIME.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// How long any one wait may take. Generous enough for a debug build starting on a loaded
 /// machine, short enough that a stuck test is still a test result.
@@ -33,7 +48,9 @@ const PATIENCE: Duration = Duration::from_secs(20);
 /// The app, running on a pseudo-terminal, with everything it says collected as it arrives.
 struct Session {
     child: Box<dyn portable_pty::Child + Send + Sync>,
-    writer: Box<dyn Write + Send>,
+    /// **Shared, because `take_writer` gives it up once.** On Windows the reader thread has to
+    /// write back (see `start`), and asking the master for a second writer fails outright.
+    writer: std::sync::Arc<std::sync::Mutex<Box<dyn Write + Send>>>,
     /// Filled by a reader thread. The pty read blocks, so it cannot live on this thread.
     output: mpsc::Receiver<Vec<u8>>,
     seen: Vec<u8>,
@@ -68,17 +85,47 @@ impl Session {
         drop(pty.slave);
 
         let mut reader = pty.master.try_clone_reader().expect("could not read the pty");
+        let writer = std::sync::Arc::new(std::sync::Mutex::new(
+            pty.master.take_writer().expect("could not write to the pty"),
+        ));
+
+        // **On Windows the cursor-position question has to be answered, and on unix it must not
+        // be.** The two are not inconsistent: they are questions from different askers.
+        //
+        // On unix nothing here answers `ESC[6n`, on purpose — this pty stands in for a remote
+        // terminal that never replies, which is how `Terminal::clear()` blocking the whole app
+        // was caught, and answering would retire that guard.
+        //
+        // On Windows the asker is not the app. Console work there goes through the Win32 API, and
+        // crossterm only ever writes `ESC[6n` from its unix path; what emits it is ConPTY, which
+        // is translating for a terminal it assumes exists. Left unanswered it draws nothing at
+        // all — the first run of this suite on Windows sat for forty seconds with `ESC[6n` as the
+        // entire screen. So here we are that terminal, and we answer.
+        #[cfg(windows)]
+        let answer = std::sync::Arc::clone(&writer);
+
         let (tx, output) = mpsc::channel();
         std::thread::spawn(move || {
             let mut buf = [0u8; 8192];
             while let Ok(n) = reader.read(&mut buf) {
-                if n == 0 || tx.send(buf[..n].to_vec()).is_err() {
+                if n == 0 {
+                    break;
+                }
+                #[cfg(windows)]
+                if buf[..n].windows(4).any(|w| w == b"\x1b[6n".as_slice()) {
+                    // Row 1, column 1. Where the cursor actually is does not matter to anything
+                    // being tested; that the question gets an answer does.
+                    if let Ok(mut w) = answer.lock() {
+                        let _ = w.write_all(b"\x1b[1;1R");
+                        let _ = w.flush();
+                    }
+                }
+                if tx.send(buf[..n].to_vec()).is_err() {
                     break;
                 }
             }
         });
 
-        let writer = pty.master.take_writer().expect("could not write to the pty");
         Session { child, writer, output, seen: Vec::new(), _master: pty.master }
     }
 
@@ -112,7 +159,11 @@ impl Session {
     }
 
     fn wait_until(&mut self, done: impl Fn(&Session) -> bool) -> bool {
-        let deadline = Instant::now() + PATIENCE;
+        self.wait_until_by(PATIENCE, done)
+    }
+
+    fn wait_until_by(&mut self, patience: Duration, done: impl Fn(&Session) -> bool) -> bool {
+        let deadline = Instant::now() + patience;
         loop {
             if done(self) {
                 return true;
@@ -139,9 +190,37 @@ impl Session {
         assert!(bar, "the bottom bar never appeared — the app drew nothing:\n{}", self.text());
     }
 
+    /// Types `text` and waits for it to come back on the screen, asking for a full repaint
+    /// between tries.
+    ///
+    /// **Only the cells that changed go out.** Several letters typed at once can therefore be
+    /// split over frames — `h` in one, `ello` in the next, with a screenful of unrelated cells
+    /// between them: every letter present, in order, and never adjacent. Windows showed this the
+    /// first time the suite ran there. Ctrl+L redraws everything at once, which is how the smoke
+    /// scripts under `scripts/` read the screen too.
+    ///
+    /// Repainting is repeated because the first one can be served before the last letter has been
+    /// consumed, and would then faithfully redraw a half-typed line.
+    fn type_and_see(&mut self, text: &str) -> bool {
+        self.send(text.as_bytes());
+        // Twenty tries at a second each, so the whole loop is bounded by `PATIENCE` even on a
+        // runner that is being slow rather than broken.
+        for _ in 0..20 {
+            let looking_for = text.to_string();
+            if self.wait_until_by(Duration::from_secs(1), move |s| s.plain().contains(&looking_for))
+            {
+                return true;
+            }
+            self.send(b"\x0c");
+        }
+        false
+    }
+
     fn send(&mut self, bytes: &[u8]) {
-        let _ = self.writer.write_all(bytes);
-        let _ = self.writer.flush();
+        if let Ok(mut w) = self.writer.lock() {
+            let _ = w.write_all(bytes);
+            let _ = w.flush();
+        }
     }
 
     /// Waits for the app to end. `None` if it outlived our patience.
@@ -176,6 +255,7 @@ impl Drop for Session {
 #[cfg(unix)]
 #[test]
 fn only_the_mouse_modes_this_app_reads_are_switched_on() {
+    let _turn = one_at_a_time();
     let mut app = Session::start();
     app.wait_until_ready();
     let out = app.text();
@@ -243,17 +323,18 @@ fn strip_escapes(raw: &str) -> String {
 /// shape most terminal differences take.
 #[test]
 fn the_app_draws_on_a_pseudo_terminal_and_takes_a_keystroke() {
+    let _turn = one_at_a_time();
     let mut app = Session::start();
     app.wait_until_ready();
 
-    app.send(b"hello");
-    assert!(app.wait_for_text("hello"), "a keystroke never reached the input box:\n{}", app.text());
+    assert!(app.type_and_see("hello"), "a keystroke never reached the input box:\n{}", app.text());
 }
 
 /// **The app ends when it is told to.** Ctrl+C arms the quit and the second one takes it; an app
 /// that cannot be closed from the keyboard is one a person has to kill from another window.
 #[test]
 fn ctrl_c_twice_ends_the_app() {
+    let _turn = one_at_a_time();
     let mut app = Session::start();
     app.wait_until_ready();
     app.send(b"\x03");
@@ -272,6 +353,7 @@ fn ctrl_c_twice_ends_the_app() {
 #[cfg(unix)]
 #[test]
 fn quitting_gives_the_terminal_back() {
+    let _turn = one_at_a_time();
     let mut app = Session::start();
     app.wait_until_ready();
 
@@ -300,16 +382,21 @@ fn quitting_gives_the_terminal_back() {
 /// query used to do, and on a terminal that does not answer it took the whole app with it. This
 /// pty answers nothing, which is exactly that terminal — so a screen that draws and then keeps
 /// taking keys is the proof it does not happen any more.
+///
+/// **On Windows this measures less**, and says so rather than pretending otherwise: the harness
+/// answers ConPTY's own cursor query there (see `start`), so the terminal is not silent. It is
+/// still not silence the app depends on — console work on Windows goes through Win32 and crossterm
+/// writes that query only from its unix path — so what this guards is the unix build.
 #[test]
 fn a_terminal_that_answers_nothing_does_not_stall_the_app() {
+    let _turn = one_at_a_time();
     let mut app = Session::start();
     app.wait_until_ready();
 
     // Ctrl+L asks for a full repaint — the path that used to go through the cursor query.
     app.send(b"\x0c");
-    app.send(b"still awake");
     assert!(
-        app.wait_for_text("still awake"),
+        app.type_and_see("still awake"),
         "the app stopped answering after a repaint:\n{}",
         app.text()
     );
