@@ -2730,9 +2730,7 @@ fn mouse_actions(state: &State, m: crossterm::event::MouseEvent) -> Vec<Action> 
 /// the terminal which one it answers in, and crossterm parses either, so the older one buys
 /// nothing but ambiguity.
 ///
-/// **Windows keeps crossterm's version.** There the console is driven through the WinAPI rather
-/// than escape sequences, so a hand-written ANSI string would reach nothing at all — this is one
-/// of the places where writing it ourselves is strictly worse.
+/// **Windows is told twice, and it has to be** — see `take_the_mouse`.
 #[derive(Debug, Clone, Copy)]
 enum MouseCapture {
     On,
@@ -2749,6 +2747,9 @@ impl crossterm::Command for MouseCapture {
         }
     }
 
+    /// The fallback for a Windows with no VT output at all, where the sequence above reaches
+    /// nothing. `take_the_mouse` has already made this same call by then; making it twice changes
+    /// nothing, and leaving it out would drop the mouse entirely on those consoles.
     #[cfg(windows)]
     fn execute_winapi(&self) -> std::io::Result<()> {
         match self {
@@ -2756,11 +2757,47 @@ impl crossterm::Command for MouseCapture {
             MouseCapture::Off => crossterm::event::DisableMouseCapture.execute_winapi(),
         }
     }
+}
 
+/// Takes the mouse, or gives it back — in **both** of the places Windows listens.
+///
+/// **The console mode is one.** `ENABLE_MOUSE_INPUT`, and with it `ENABLE_QUICK_EDIT_MODE` off.
+/// Quick edit is the console's own drag-to-select, and while it is on the console keeps every drag
+/// for itself and draws the shape it has always drawn — **a rectangle**. Nothing but this call
+/// turns that off, and no escape sequence can.
+///
+/// **The escape sequence is the other, and this is what was missing** (reported 2026-08-17: on
+/// Windows a drag still selected a rectangle, while the same build behaved on Linux). A console
+/// program on Windows now usually reaches its terminal through ConPTY, and ConPTY spent years not
+/// passing the console-mode request on — so a program that only set the mode was never sent a
+/// single mouse event, and the terminal went on selecting text by itself. What the terminal on the
+/// far side reads is the sequence. crossterm sends one or the other, never both:
+/// `EnableMouseCapture` answers `is_ansi_code_supported` with `false` on Windows, which routes it
+/// to the WinAPI and stops there.
+///
+/// **Sending both costs nothing.** They meet again as console input records, and asking twice for
+/// something already on is not an error anywhere.
+fn take_the_mouse(on: bool) {
     #[cfg(windows)]
-    fn is_ansi_code_supported(&self) -> bool {
-        crossterm::event::EnableMouseCapture.is_ansi_code_supported()
+    {
+        use crossterm::Command;
+        let done = if on {
+            crossterm::event::EnableMouseCapture.execute_winapi()
+        } else {
+            crossterm::event::DisableMouseCapture.execute_winapi()
+        };
+        if let Err(e) = done {
+            // Worth a line of its own: this is the call that decides whether the console keeps
+            // drag-select for itself, and its failure is invisible until somebody drags.
+            tracing::warn!(error = %e, on, "could not change the console's mouse mode");
+        }
     }
+    let (label, command) = if on {
+        ("mouse capture", MouseCapture::On)
+    } else {
+        ("mouse capture off", MouseCapture::Off)
+    };
+    terminal_feature(label, command);
 }
 
 fn terminal_feature(label: &'static str, command: impl crossterm::Command) {
@@ -2787,7 +2824,7 @@ pub async fn run(
     // and `$ZYRIS_CODE_MOUSE=0` is how somebody declines to pay it.
     let caps = crate::term::Caps::detect();
     if caps.mouse {
-        terminal_feature("mouse capture", MouseCapture::On);
+        take_the_mouse(true);
     }
     // Coming back from another window, the terminal sometimes does not restore the
     // screen for us. We have to know focus came back to redraw the whole thing.
@@ -2836,7 +2873,7 @@ pub async fn run(
     // out, or line wrap stays off in the shell and long lines look cut.
     // Turned off whether or not we turned it on — a previous run that died without restoring
     // leaves the terminal tracking, and one more `l` costs nothing.
-    terminal_feature("mouse capture off", MouseCapture::Off);
+    take_the_mouse(false);
     terminal_feature("focus change off", crossterm::event::DisableFocusChange);
     terminal_feature("bracketed paste off", crossterm::event::DisableBracketedPaste);
     terminal_feature("kitty keyboard protocol off", crossterm::event::PopKeyboardEnhancementFlags);
