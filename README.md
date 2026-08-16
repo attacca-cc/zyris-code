@@ -394,6 +394,24 @@ Messages typed while a turn is running are queued and sent in order when it ends
 | `RUST_LOG` | `zyris_code=info,zyris=warn` | Log filter |
 | `NO_COLOR` | — | Suppress colour in the messages printed before the UI starts |
 
+## Print mode
+
+```bash
+zyris -p "what does this repo do?"     # one turn, the answer on stdout, exit
+cat notes.md | zyris -p                # the prompt from stdin
+zyris -p "..." > answer.md             # only the answer is printed, so it pipes
+```
+
+`cargo install` puts the binary down as `zyris-code`; `install.sh` adds a `zyris` symlink beside
+it. They are the same file, so either name takes `-p`.
+
+**Print mode still hands this computer over.** The node announces the same capabilities as the
+screen does, so the agent reads and changes files here and runs commands — `/config`'s `dir`
+setting governs it exactly as it does interactively. It is not a hosted question-and-answer.
+
+Only the agent's answer reaches stdout. Tool calls, reasoning and status are not printed, and logs
+go to a file as always.
+
 ## Building
 
 ```bash

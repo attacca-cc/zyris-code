@@ -22,6 +22,37 @@ const CONSUME_WAIT: Duration = Duration::from_secs(5);
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // **Answered before anything else is built.** Help and version must work with no account, no
+    // credential and no terminal, and a misread flag must not reach the point of spending credit.
+    let program = std::env::args()
+        .next()
+        .and_then(|p| {
+            std::path::Path::new(&p).file_stem().map(|s| s.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| "zyris".into());
+    let printing = match zyris_code::cli::parse(std::env::args().skip(1)) {
+        zyris_code::cli::Run::Screen => None,
+        zyris_code::cli::Run::Help => {
+            print!("{}", zyris_code::cli::help(&program));
+            return ExitCode::SUCCESS;
+        }
+        zyris_code::cli::Run::Version => {
+            println!("{program} {}", env!("CARGO_PKG_VERSION"));
+            return ExitCode::SUCCESS;
+        }
+        zyris_code::cli::Run::Bad(what) => {
+            eprintln!("{program}: cannot read {what:?}. Try `{program} --help`.");
+            return ExitCode::from(2);
+        }
+        zyris_code::cli::Run::Print(Some(text)) => Some(text),
+        zyris_code::cli::Run::Print(None) => match zyris_code::print::prompt_from_stdin() {
+            Ok(text) => Some(text),
+            Err(e) => {
+                eprintln!("{program}: {e}");
+                return ExitCode::from(2);
+            }
+        },
+    };
     // Where we talk to the shell while connecting. **Before the screen appears this is the only window.**
     let notice = zyris_code::notice::Notice::new();
 
@@ -155,15 +186,33 @@ async fn main() -> ExitCode {
 
     // **The screen is raised first.** Here, not in `on_connect` — the enrollment code window must
     // reach it before the first connection too (`enroll::ScreenEnroll`).
-    let mut app_task = tokio::spawn(app::run(api_rx.clone(), bridge.clone(), die_rx));
+    // **Print mode raises no screen.** Everything above it is the same — the same credential, the
+    // same node name, the same capabilities announced — so the agent can work on this computer
+    // either way. Only the last step differs: one draws, the other writes a line and leaves.
+    let mut app_task = match printing.clone() {
+        Some(prompt) => {
+            let api_rx = api_rx.clone();
+            let bridge = bridge.clone();
+            tokio::spawn(async move {
+                let api = wait_for_api(api_rx).await?;
+                zyris_code::print::run(api, bridge, &prompt).await
+            })
+        }
+        None => tokio::spawn(app::run(api_rx.clone(), bridge.clone(), die_rx)),
+    };
     // Wait for the screen to attach before the runner runs — so the first enrollment code can
     // reach the screen. **Never wait forever.** If the app task dies before the screen attaches
     // (a terminal that cannot run the TUI, a panic inside `app::run`), the old code sat on the
     // shell's waiting line ("approve in the browser…") with a frozen cursor — exactly what the
     // 2026-08-07 Windows report saw. Say why and exit instead of hanging.
-    let died_before_screen = tokio::select! {
-        () = bridge.wait_screen() => None,
-        ended = &mut app_task => Some(ended),
+    let died_before_screen = if printing.is_some() {
+        // Nothing to attach: print mode has no screen to wait for.
+        None
+    } else {
+        tokio::select! {
+            () = bridge.wait_screen() => None,
+            ended = &mut app_task => Some(ended),
+        }
     };
     if let Some(ended) = died_before_screen {
         // The app may have died mid-raw-mode; restore the terminal so the reason is readable.
@@ -337,9 +386,23 @@ async fn main() -> ExitCode {
         }
         // If the screen closed, the process must end too. `Runner::run()` keeps running, holding the
         // connection even after hooks finish — the app ending is itself the exit signal.
+        // **Print mode has no screen to restore, so its reason has to be said here.** Failing
+        // silently with a bare exit code is worse in a script than anywhere else: the caller sees
+        // a non-zero and nothing to act on.
         RunnerEnded::App(app_result) => match app_result {
             Ok(Ok(())) => ExitCode::SUCCESS,
-            _ => ExitCode::FAILURE,
+            Ok(Err(e)) => {
+                if printing.is_some() {
+                    eprintln!("{program}: {e}");
+                }
+                ExitCode::FAILURE
+            }
+            Err(e) => {
+                if printing.is_some() {
+                    eprintln!("{program}: {e}");
+                }
+                ExitCode::FAILURE
+            }
         },
     }
 }
@@ -348,4 +411,22 @@ async fn main() -> ExitCode {
 enum RunnerEnded {
     Runner(Result<(), zyris::runtime::RunError>),
     App(Result<Result<(), anyhow::Error>, tokio::task::JoinError>),
+}
+
+/// Waits for the first live connection, for the paths that have no screen to draw while waiting.
+///
+/// **The runner is what fills this**, on its own schedule — a first enrolment can sit here for as
+/// long as it takes somebody to reach a browser. The sender being dropped means the runner ended,
+/// and there will never be a handle.
+async fn wait_for_api(
+    mut api_rx: watch::Receiver<Option<Arc<AttaccaApiClient>>>,
+) -> anyhow::Result<Arc<AttaccaApiClient>> {
+    loop {
+        if let Some(api) = api_rx.borrow_and_update().clone() {
+            return Ok(api);
+        }
+        if api_rx.changed().await.is_err() {
+            anyhow::bail!("could not connect");
+        }
+    }
 }

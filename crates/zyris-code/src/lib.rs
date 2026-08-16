@@ -7,6 +7,7 @@
 //! Integration tests (`tests/`) can't see the binary, so the modules are made public here.
 
 pub mod app;
+pub mod cli;
 pub mod clipboard;
 pub mod command;
 pub mod config;
@@ -26,6 +27,7 @@ pub mod newproject;
 pub mod notice;
 pub mod panel;
 pub mod picker;
+pub mod print;
 pub mod plugin;
 pub mod question;
 pub mod repo;
