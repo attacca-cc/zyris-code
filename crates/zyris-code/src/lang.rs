@@ -1944,6 +1944,34 @@ impl Lang {
     pub fn cannot_choose(self) -> &'static str {
         self.pick("지금은 고를 수 없습니다", "Can't choose right now")
     }
+    /// The footer while a deletion waits for a yes. **It names what would go**, because the
+    /// cursor is the only other thing saying which row this is about, and a list is exactly
+    /// where the wrong row gets deleted.
+    pub fn picker_delete_ask(self, name: &str) -> String {
+        match self {
+            Lang::Ko => format!("{name} 지울까요?  Enter 지우기 ∙ Esc 그만두기"),
+            Lang::En => format!("Delete {name}?  Enter delete ∙ Esc keep"),
+        }
+    }
+    pub fn picker_deleted(self, name: &str) -> String {
+        match self {
+            Lang::Ko => format!("{name} 지웠습니다"),
+            Lang::En => format!("Deleted {name}"),
+        }
+    }
+    /// Del on a thread row. **The server has no way to delete a session** — there is no
+    /// `delete_session` on the API and no archived flag on `ZSession`. Saying nothing would read
+    /// as the key being broken, which is worse than saying it cannot be done.
+    pub fn threads_stay(self) -> &'static str {
+        self.pick(
+            "쓰레드는 아직 지울 수 없습니다. 서버에 지우는 길이 없습니다",
+            "Threads can't be deleted yet: the server offers no way to",
+        )
+    }
+    /// Del on the "new" row, or on a list where nothing can go.
+    pub fn nothing_to_delete(self) -> &'static str {
+        self.pick("여기서는 지울 것이 없습니다", "Nothing to delete here")
+    }
 
     // ── Conn (errors that surface in the status bar · timeline)
     pub fn server_timeout(self, secs: u64) -> String {
