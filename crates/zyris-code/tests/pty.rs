@@ -68,17 +68,43 @@ impl Session {
         drop(pty.slave);
 
         let mut reader = pty.master.try_clone_reader().expect("could not read the pty");
+        let mut writer = pty.master.take_writer().expect("could not write to the pty");
+
+        // **On Windows the cursor-position question has to be answered, and on unix it must not
+        // be.** The two are not inconsistent: they are questions from different askers.
+        //
+        // On unix nothing here answers `ESC[6n`, on purpose — this pty stands in for a remote
+        // terminal that never replies, which is how `Terminal::clear()` blocking the whole app
+        // was caught, and answering would retire that guard.
+        //
+        // On Windows the asker is not the app. Console work there goes through the Win32 API, and
+        // crossterm only ever writes `ESC[6n` from its unix path; what emits it is ConPTY, which
+        // is translating for a terminal it assumes exists. Left unanswered it draws nothing at
+        // all — the first run of this suite on Windows sat for forty seconds with `ESC[6n` as the
+        // entire screen. So here we are that terminal, and we answer.
+        #[cfg(windows)]
+        let mut answer = pty.master.take_writer().expect("could not write to the pty");
+
         let (tx, output) = mpsc::channel();
         std::thread::spawn(move || {
             let mut buf = [0u8; 8192];
             while let Ok(n) = reader.read(&mut buf) {
-                if n == 0 || tx.send(buf[..n].to_vec()).is_err() {
+                if n == 0 {
+                    break;
+                }
+                #[cfg(windows)]
+                if buf[..n].windows(4).any(|w| w == b"\x1b[6n") {
+                    // Row 1, column 1. Where the cursor actually is does not matter to anything
+                    // being tested; that the question gets an answer does.
+                    let _ = answer.write_all(b"\x1b[1;1R");
+                    let _ = answer.flush();
+                }
+                if tx.send(buf[..n].to_vec()).is_err() {
                     break;
                 }
             }
         });
 
-        let writer = pty.master.take_writer().expect("could not write to the pty");
         Session { child, writer, output, seen: Vec::new(), _master: pty.master }
     }
 
