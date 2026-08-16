@@ -88,9 +88,9 @@ pub struct Found {
 ///
 /// Home-level files come first and project-level after, matching how those clients read them
 /// themselves. **A file that is not there is not an error** — almost nobody has all of these.
-fn sources(cwd: &Path) -> Vec<(String, PathBuf)> {
+fn sources(home: Option<PathBuf>, cwd: &Path) -> Vec<(String, PathBuf)> {
     let mut out: Vec<(String, PathBuf)> = Vec::new();
-    if let Some(home) = crate::conn::user_home() {
+    if let Some(home) = home {
         out.push(("Claude Code".into(), home.join(".claude.json")));
         out.push(("Claude Code".into(), home.join(".claude/settings.json")));
         out.push(("Cursor".into(), home.join(".cursor/mcp.json")));
@@ -109,10 +109,21 @@ fn sources(cwd: &Path) -> Vec<(String, PathBuf)> {
 /// **Ours win and are not listed twice.** A name that appears in both is already going to start;
 /// offering to turn it on again would read as two different servers.
 pub fn found(cwd: &Path) -> Vec<Found> {
+    found_in(crate::conn::user_home(), cwd)
+}
+
+/// The same, over a home directory that is given rather than looked up.
+///
+/// **Because a test that reads the real one is not a test.** Every assertion below counts what was
+/// found, and each of them passed here while failing on any machine whose owner has an MCP server
+/// of their own: a Windows check came back with six of them red, all reporting one extra server
+/// that belonged to the person running them (2026-08-17). Whether a test passes must not depend on
+/// whose machine it is.
+pub fn found_in(home: Option<PathBuf>, cwd: &Path) -> Vec<Found> {
     let ours: Vec<String> =
         crate::mcp::bridge::load_config(cwd).into_iter().map(|s| s.slug).collect();
     let mut out: Vec<Found> = Vec::new();
-    for (source, path) in sources(cwd) {
+    for (source, path) in sources(home, cwd) {
         for spec in read(&path) {
             if ours.contains(&spec.slug) {
                 continue;
@@ -151,6 +162,15 @@ mod tests {
     use super::*;
     use crate::mcp::bridge::Transport;
 
+    /// Discovery over an empty home and whatever the test wrote into its project directory.
+    ///
+    /// **Never the real home.** See `found_in`: run against the home of somebody who uses Claude
+    /// Code or Cursor, these counts include that person's servers.
+    fn found_here(cwd: &Path) -> Vec<Found> {
+        let home = tempfile::tempdir().expect("somewhere empty to use as a home");
+        found_in(Some(home.path().to_path_buf()), cwd)
+    }
+
     fn write(at: &Path, body: &str) {
         std::fs::create_dir_all(at.parent().unwrap()).unwrap();
         std::fs::write(at, body).unwrap();
@@ -163,7 +183,7 @@ mod tests {
             &dir.path().join(".cursor/mcp.json"),
             r#"{"mcpServers":{"playwright":{"command":"npx","args":["-y","@playwright/mcp"]}}}"#,
         );
-        let got = found(dir.path());
+        let got = found_here(dir.path());
         assert_eq!(got.len(), 1, "{got:?}");
         assert_eq!(got[0].spec.slug, "playwright");
         assert_eq!(got[0].source, "Cursor");
@@ -177,7 +197,7 @@ mod tests {
             &dir.path().join(".vscode/mcp.json"),
             r#"{"servers":{"docs":{"url":"https://example.test/mcp","headers":{"x":"1"}}}}"#,
         );
-        let got = found(dir.path());
+        let got = found_here(dir.path());
         assert_eq!(got.len(), 1, "{got:?}");
         match &got[0].spec.transport {
             Transport::Http { url, headers } => {
@@ -195,7 +215,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write(&dir.path().join(".mcp.json"), r#"{"mcpServers":{"mine":{"command":"a"}}}"#);
         write(&dir.path().join(".cursor/mcp.json"), r#"{"mcpServers":{"mine":{"command":"b"}}}"#);
-        assert!(found(dir.path()).is_empty(), "{:?}", found(dir.path()));
+        assert!(found_here(dir.path()).is_empty(), "{:?}", found_here(dir.path()));
     }
 
     /// The same server set up in two clients is one server, named by the first sighting.
@@ -204,7 +224,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write(&dir.path().join(".cursor/mcp.json"), r#"{"mcpServers":{"a":{"command":"x"}}}"#);
         write(&dir.path().join(".vscode/mcp.json"), r#"{"servers":{"a":{"command":"x"}}}"#);
-        let got = found(dir.path());
+        let got = found_here(dir.path());
         assert_eq!(got.len(), 1, "{got:?}");
         assert_eq!(got[0].source, "Cursor");
     }
@@ -214,9 +234,24 @@ mod tests {
     #[test]
     fn a_missing_or_broken_file_says_nothing() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(found(dir.path()).is_empty());
+        assert!(found_here(dir.path()).is_empty());
         write(&dir.path().join(".vscode/mcp.json"), "not json at all");
-        assert!(found(dir.path()).is_empty());
+        assert!(found_here(dir.path()).is_empty());
+    }
+
+    /// **The home it is given is the home it reads.** Isolation that always looked at nothing
+    /// would leave the home half of `sources` untested and passing.
+    #[test]
+    fn a_server_written_in_the_home_is_found_there() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        write(
+            &home.path().join(".cursor/mcp.json"),
+            r#"{"mcpServers":{"athome":{"command":"x"}}}"#,
+        );
+        let got = found_in(Some(home.path().to_path_buf()), cwd.path());
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].spec.slug, "athome");
     }
 
     /// Claude Code files a project's servers under `projects.<path>`, so that block is read too.
@@ -227,7 +262,7 @@ mod tests {
             &dir.path().join(".claude/settings.json"),
             r#"{"projects":{"/somewhere":{"mcpServers":{"deep":{"command":"d"}}}}}"#,
         );
-        let got = found(dir.path());
+        let got = found_here(dir.path());
         assert_eq!(got.len(), 1, "{got:?}");
         assert_eq!(got[0].spec.slug, "deep");
     }
