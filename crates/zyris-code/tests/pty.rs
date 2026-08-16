@@ -175,6 +175,31 @@ impl Session {
         assert!(bar, "the bottom bar never appeared — the app drew nothing:\n{}", self.text());
     }
 
+    /// Types `text` and waits for it to come back on the screen, asking for a full repaint
+    /// between tries.
+    ///
+    /// **Only the cells that changed go out.** Several letters typed at once can therefore be
+    /// split over frames — `h` in one, `ello` in the next, with a screenful of unrelated cells
+    /// between them: every letter present, in order, and never adjacent. Windows showed this the
+    /// first time the suite ran there. Ctrl+L redraws everything at once, which is how the smoke
+    /// scripts under `scripts/` read the screen too.
+    ///
+    /// Repainting is repeated because the first one can be served before the last letter has been
+    /// consumed, and would then faithfully redraw a half-typed line.
+    fn type_and_see(&mut self, text: &str) -> bool {
+        self.send(text.as_bytes());
+        for _ in 0..10 {
+            let looking_for = text.to_string();
+            if self.wait_until_by(Duration::from_millis(500), move |s| {
+                s.plain().contains(&looking_for)
+            }) {
+                return true;
+            }
+            self.send(b"\x0c");
+        }
+        false
+    }
+
     fn send(&mut self, bytes: &[u8]) {
         if let Ok(mut w) = self.writer.lock() {
             let _ = w.write_all(bytes);
@@ -284,24 +309,7 @@ fn the_app_draws_on_a_pseudo_terminal_and_takes_a_keystroke() {
     let mut app = Session::start();
     app.wait_until_ready();
 
-    app.send(b"hello");
-
-    // **Ask for the whole screen before reading it.** ratatui writes only the cells that changed,
-    // so five letters typed at once can land across several frames — `h` in one, `ello` in the
-    // next, with a screenful of unrelated cells between them. Every letter is there, in order,
-    // and never adjacent, which is what Windows showed the first time this ran there. Ctrl+L
-    // redraws the lot in one go; it is the same trick the smoke scripts under `scripts/` use.
-    //
-    // Repeated, because the first repaint can be served before the last letter is consumed, and
-    // then it faithfully redraws a half-typed line.
-    let arrived = (0..10).any(|_| {
-        if app.wait_until_by(Duration::from_millis(500), |s| s.plain().contains("hello")) {
-            return true;
-        }
-        app.send(b"\x0c");
-        false
-    });
-    assert!(arrived, "a keystroke never reached the input box:\n{}", app.text());
+    assert!(app.type_and_see("hello"), "a keystroke never reached the input box:\n{}", app.text());
 }
 
 /// **The app ends when it is told to.** Ctrl+C arms the quit and the second one takes it; an app
@@ -354,6 +362,11 @@ fn quitting_gives_the_terminal_back() {
 /// query used to do, and on a terminal that does not answer it took the whole app with it. This
 /// pty answers nothing, which is exactly that terminal — so a screen that draws and then keeps
 /// taking keys is the proof it does not happen any more.
+///
+/// **On Windows this measures less**, and says so rather than pretending otherwise: the harness
+/// answers ConPTY's own cursor query there (see `start`), so the terminal is not silent. It is
+/// still not silence the app depends on — console work on Windows goes through Win32 and crossterm
+/// writes that query only from its unix path — so what this guards is the unix build.
 #[test]
 fn a_terminal_that_answers_nothing_does_not_stall_the_app() {
     let mut app = Session::start();
@@ -361,9 +374,8 @@ fn a_terminal_that_answers_nothing_does_not_stall_the_app() {
 
     // Ctrl+L asks for a full repaint — the path that used to go through the cursor query.
     app.send(b"\x0c");
-    app.send(b"still awake");
     assert!(
-        app.wait_for_text("still awake"),
+        app.type_and_see("still awake"),
         "the app stopped answering after a repaint:\n{}",
         app.text()
     );
