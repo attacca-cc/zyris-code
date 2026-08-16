@@ -59,11 +59,20 @@ struct Session {
 
 impl Session {
     fn start() -> Session {
+        Session::start_with(&[])
+    }
+
+    /// The same, with more of the environment set — for the paths that only exist when something
+    /// outside the app is true.
+    fn start_with(extra: &[(&str, String)]) -> Session {
         let pty = portable_pty::native_pty_system()
             .openpty(PtySize { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 })
             .expect("could not open a pseudo-terminal");
 
         let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_zyris-code"));
+        for (name, value) in extra {
+            cmd.env(name, value);
+        }
         // A credential given outright: no enrolment window, nothing written to disk, no browser.
         cmd.env("ZYRIS_NODE_TOKEN", "znt_pty_test_not_a_real_token");
         // Refused at once rather than left hanging, so the screen settles quickly.
@@ -400,4 +409,76 @@ fn a_terminal_that_answers_nothing_does_not_stall_the_app() {
         "the app stopped answering after a repaint:\n{}",
         app.text()
     );
+}
+
+/// **An update keeps the terminal it was started in.**
+///
+/// This is the whole of the Windows report (2026-08-17): in `cmd`, updating made the app vanish.
+/// The old shape asked for the update from inside the screen, wrote a script out, started it
+/// detached and exited; the script waited for that exit, installed, and started the new binary with
+/// `Start-Process` — which gives a console program **a console of its own**. From the window
+/// somebody was watching, the app had quit, and it had.
+///
+/// So what has to be checked is not that an installer runs. It is that after one runs, the app is
+/// drawing **into the same pseudo-terminal it started in** — which is what the harness is holding.
+///
+/// **The installer is a stand-in, and nothing is replaced.** `$ZYRIS_CODE_UPDATE_TAG` says a newer
+/// release exists without one existing and `$ZYRIS_CODE_UPDATE_SCRIPT` puts a script of ours where
+/// the release's would be. Everything after that point — running it, and handing this console to
+/// the new version — is the real path, and the version it hands over to is this same binary.
+#[test]
+fn an_update_keeps_the_terminal_it_was_started_in() {
+    let _turn = one_at_a_time();
+
+    let dir = std::env::temp_dir().join(format!("zyris-update-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let marker = dir.join("ran");
+    let _ = std::fs::remove_file(&marker);
+    let script = dir.join(if cfg!(windows) { "stand-in.ps1" } else { "stand-in.sh" });
+
+    // It is handed the same arguments as the real installer, so it has to accept them — a script
+    // that refused them would fail before writing anything and the test would read as the app's
+    // fault. On Windows that means declaring the parameters; on unix it means ignoring them.
+    let text = if cfg!(windows) {
+        format!(
+            "param([string] $Version, [string] $Dir, [switch] $NoModifyPath)\r\n\
+             Set-Content -Path '{}' -Value $Version\r\n",
+            marker.display()
+        )
+    } else {
+        format!("#!/bin/sh\nprintf '%s' \"$2\" > '{}'\n", marker.display())
+    };
+    std::fs::write(&script, text).expect("could not write the stand-in installer");
+
+    let mut app = Session::start_with(&[
+        ("ZYRIS_CODE_UPDATE_TAG", "v99.0.0".into()),
+        ("ZYRIS_CODE_UPDATE_SCRIPT", script.display().to_string()),
+        // So what it says can be read for what it is, whatever the machine's language.
+        ("ZYRIS_CODE_LANG", "en".into()),
+    ]);
+
+    // **Said on the terminal, before the screen exists.** Somebody who typed a command and got
+    // seconds of nothing reaches for Ctrl+C; this is the line that stops that.
+    assert!(app.wait_for("v99.0.0"), "the update was never mentioned:\n{}", app.text());
+
+    // **Judged by what happened on disk, not by what was printed.** A line saying it is installing
+    // costs nothing to print and proves nothing.
+    let ran = app.wait_until(|_| marker.exists());
+    assert!(ran, "the installer never ran:\n{}", app.text());
+    assert_eq!(
+        std::fs::read_to_string(&marker).unwrap_or_default().trim(),
+        "v99.0.0",
+        "the installer was not told which release to install"
+    );
+
+    // **And here is the report.** The screen is up again, on this same pseudo-terminal, after the
+    // handover — no new console, nothing detached, nothing left for a shell prompt to come back to.
+    app.wait_until_ready();
+    assert!(
+        app.type_and_see("still here"),
+        "the app came back somewhere else — this terminal is not taking keys:\n{}",
+        app.text()
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

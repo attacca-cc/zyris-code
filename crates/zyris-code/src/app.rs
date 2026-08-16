@@ -205,6 +205,10 @@ pub enum Action {
     Yank,
     Left,
     Right,
+    /// One line up or down inside a draft that has lines in it. **Not history** — that is
+    /// `RecallOlder`, which these fall through to at the top and bottom of the draft.
+    CursorUp,
+    CursorDown,
     WordLeft,
     WordRight,
     Home,
@@ -400,10 +404,18 @@ pub struct State {
     /// know where anything landed.
     pub screen_links: Vec<ScreenLink>,
     /// The selected range, in **screen** coordinates. **It survives releasing the mouse** — if
-    /// it vanished on release there would be no moment to press Ctrl+C. Scrolling drops it
-    /// (`Action::Wheel`): it is anchored to the screen, so the text under it would no longer
-    /// be the text that was copied.
+    /// it vanished on release there would be no moment to press Ctrl+C.
+    ///
+    /// **It survives scrolling too**, by riding along with the conversation: the drawing side
+    /// moves it by however far the text under it has travelled since `drag_top`. It used to be
+    /// dropped instead, and one notch of the wheel looked like the selection had been lost, copied
+    /// text and all (reported 2026-08-17). A highlight that reaches past the conversation — onto
+    /// the input line or the bars, which do not scroll — is still dropped, because half of it
+    /// sliding out from under the other half is worse than none.
     pub drag: Option<crate::selection::Drag>,
+    /// Which line of the conversation was at the top when the highlight was made, so the drawing
+    /// side can work out how far its text has moved since.
+    pub drag_top: usize,
     /// Is the button held down right now? The range only grows while it is.
     pub dragging: bool,
     /// The visible text of the last drawn frame, one `String` per screen row. Mouse selection
@@ -588,6 +600,7 @@ impl Default for State {
             view_links: Vec::new(),
             screen_links: Vec::new(),
             drag: None,
+            drag_top: 0,
             dragging: false,
             screen: Vec::new(),
             asking: None,
@@ -647,6 +660,10 @@ pub const STATUS_WINDOW: Duration = Duration::from_secs(6);
 pub const STOP_WAIT: Duration = Duration::from_secs(3);
 /// If the app has not ended this long after a shutdown signal, restore the screen and force
 /// the exit. A safety net for the case where the loop is stuck and never sees the signal.
+///
+/// **Unix only, because the signals are.** Off unix nothing arms it, and a Windows build was
+/// reporting it as dead code — six warnings on a contributor's first build of a public repo.
+#[cfg(unix)]
 const SHUTDOWN_FORCE: Duration = Duration::from_secs(5);
 
 impl State {
@@ -749,6 +766,26 @@ impl State {
             return None;
         }
         Some((self.view_top + row, (x - ox) as usize))
+    }
+
+    /// Whether the highlight lies entirely inside the conversation.
+    ///
+    /// **Only the conversation scrolls.** Below it sit the activity line, the input and the bars,
+    /// and those stay where they are — so a highlight that reaches them cannot be moved as one
+    /// piece, and half of it sliding out from under the other half reads as a rendering fault.
+    pub fn drag_can_scroll(&self) -> bool {
+        let top = self.view_origin.1 as usize;
+        self.drag.is_some_and(|drag| {
+            let ((r0, _), (r1, _)) = drag.ordered();
+            r0 >= top && r1 < top + self.view_height
+        })
+    }
+
+    /// Lets go of a highlight the conversation cannot carry. Called wherever it scrolls.
+    pub fn drop_drag_that_cannot_scroll(&mut self) {
+        if !self.drag_can_scroll() {
+            self.drag = None;
+        }
     }
 
     /// The URL of the link under the given screen coordinate, if any. `None` outside the
@@ -1086,6 +1123,15 @@ pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
         }
         KeyCode::Backspace => vec![Action::Backspace],
         KeyCode::Delete => vec![Action::Delete],
+        // **A draft with lines in it is walked line by line first.** Until now Up and Down were
+        // history whatever the draft held, so a message written with Shift+Enter could only be
+        // moved through one character at a time (asked for on a Windows check, 2026-08-17).
+        //
+        // **History is reached from the edge**, which is what every shell with a multi-line buffer
+        // does: at the top line ↑ goes back into what was sent, at the bottom ↓ comes forward out
+        // of it. Putting these arms above the recall ones is what makes that order true.
+        KeyCode::Up if state.input.above().is_some() => vec![Action::CursorUp],
+        KeyCode::Down if state.input.below().is_some() => vec![Action::CursorDown],
         // **↑ brings back what was sent.** It starts when the input is empty, and once
         // inside it keeps walking further back — stopping at the second ↑ makes recall
         // useless.
@@ -1381,6 +1427,16 @@ pub fn apply(state: &mut State, action: &Action) {
                 state.picker = Some(crate::picker::Picker::history(&state.sent, &query));
             }
         }
+        Action::CursorUp => {
+            if let Some(at) = state.input.above() {
+                state.input.cursor = at;
+            }
+        }
+        Action::CursorDown => {
+            if let Some(at) = state.input.below() {
+                state.input.cursor = at;
+            }
+        }
         Action::Left => state.editor().left(),
         Action::Right => state.editor().right(),
         Action::WordLeft => state.editor().word_left(),
@@ -1433,18 +1489,14 @@ pub fn apply(state: &mut State, action: &Action) {
             }
             let (total, height) = (state.view_total, state.view_height);
             state.scroll.wheel(*notches, total, height);
-            // The selection is anchored to the screen; scrolling moves the text out from under
-            // it, so the highlight would point at text different from what was copied.
-            state.drag = None;
+            state.drop_drag_that_cannot_scroll();
         }
         Action::Page(dir) => {
             // PageUp/PageDown with a panel open never reach here — `on_key` routes them
             // to the panel's own scroll first. So this is always the transcript.
             let (total, height) = (state.view_total, state.view_height);
             state.scroll.page(*dir, total, height);
-            // Same reason as the wheel: the selection is anchored to the screen, and
-            // scrolling moves the text out from under it.
-            state.drag = None;
+            state.drop_drag_that_cannot_scroll();
         }
         Action::ToggleFold => {
             // **The key only ever reaches the last work card's head** — the whole stretch of
@@ -1487,6 +1539,9 @@ pub fn apply(state: &mut State, action: &Action) {
             // **The whole screen is selectable — blank space included.** A drag that starts
             // on empty cells still works; it just selects nothing until it covers text.
             state.drag = Some(crate::selection::Drag::new((*y as usize, *x as usize)));
+            // Where the conversation stood when this began. Everything after it is measured
+            // against this, so the highlight can be drawn wherever its text has got to.
+            state.drag_top = state.view_top;
             state.dragging = true;
         }
         Action::DragTo(x, y) => {
@@ -2016,15 +2071,12 @@ fn apply_frame(state: &mut State, frame: &Frame) {
         // **The screen says when it dropped.** The activity line turns to "connecting…" and
         // the reason goes by once as a notice. Reconnecting is the Runner's job, and
         // `api_rx` tells us once it is back.
-        // **Only said, never done, here.** `apply` is pure; installing is the I/O side's, and it
-        // reads `update_wanted` the same way `/update` sets it.
+        // **Only mentioned here, never installed.** Installing happens on the plain terminal
+        // before this screen exists (`update::at_launch`), so what reaches this frame is the
+        // `notify` case: a release that exists and is waiting to be asked for. Under `auto` this
+        // process is already the new version and there is nothing to report.
         Frame::UpdateFound(tag) => {
-            if state.config.update == crate::update::Policy::Auto {
-                state.update_wanted = true;
-                state.set_status(state.lang.update_installing(tag));
-            } else {
-                state.set_status(state.lang.update_available(tag));
-            }
+            state.set_status(state.lang.update_available(tag));
             state.update_tag = Some(tag.clone());
         }
         Frame::Disconnected(why) => {
@@ -2552,10 +2604,13 @@ fn open_url(url: &str) {
 /// not answer DA1 either — a pty in a test harness, or a pipe. If a real answer arrives after
 /// this, crossterm quietly skips the leftover bytes (its public `Event` has no keyboard-flags
 /// variant), so nothing breaks.
+/// Unix only, with the probe it belongs to.
+#[cfg(unix)]
 const KITTY_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
 
 /// What the terminal has said so far about the kitty keyboard protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(unix)]
 enum KittyVerdict {
     /// `CSI ? <flags> u` came back — only a terminal that knows the protocol answers that.
     Supported,
@@ -2582,6 +2637,7 @@ enum KittyVerdict {
 /// A reply is found even with typed characters mixed in front; typing right at startup is not
 /// rare. Parameter bytes are digits, `;` and `:` — anything else means this is not a reply to
 /// either question, so it is skipped rather than trusted.
+#[cfg(unix)]
 fn kitty_verdict(resp: &[u8]) -> KittyVerdict {
     let mut rest = resp;
     while let Some(i) = rest.windows(3).position(|w| w == b"\x1b[?") {
@@ -2730,9 +2786,7 @@ fn mouse_actions(state: &State, m: crossterm::event::MouseEvent) -> Vec<Action> 
 /// the terminal which one it answers in, and crossterm parses either, so the older one buys
 /// nothing but ambiguity.
 ///
-/// **Windows keeps crossterm's version.** There the console is driven through the WinAPI rather
-/// than escape sequences, so a hand-written ANSI string would reach nothing at all — this is one
-/// of the places where writing it ourselves is strictly worse.
+/// **Windows is told twice, and it has to be** — see `take_the_mouse`.
 #[derive(Debug, Clone, Copy)]
 enum MouseCapture {
     On,
@@ -2749,6 +2803,9 @@ impl crossterm::Command for MouseCapture {
         }
     }
 
+    /// The fallback for a Windows with no VT output at all, where the sequence above reaches
+    /// nothing. `take_the_mouse` has already made this same call by then; making it twice changes
+    /// nothing, and leaving it out would drop the mouse entirely on those consoles.
     #[cfg(windows)]
     fn execute_winapi(&self) -> std::io::Result<()> {
         match self {
@@ -2756,11 +2813,47 @@ impl crossterm::Command for MouseCapture {
             MouseCapture::Off => crossterm::event::DisableMouseCapture.execute_winapi(),
         }
     }
+}
 
+/// Takes the mouse, or gives it back — in **both** of the places Windows listens.
+///
+/// **The console mode is one.** `ENABLE_MOUSE_INPUT`, and with it `ENABLE_QUICK_EDIT_MODE` off.
+/// Quick edit is the console's own drag-to-select, and while it is on the console keeps every drag
+/// for itself and draws the shape it has always drawn — **a rectangle**. Nothing but this call
+/// turns that off, and no escape sequence can.
+///
+/// **The escape sequence is the other, and this is what was missing** (reported 2026-08-17: on
+/// Windows a drag still selected a rectangle, while the same build behaved on Linux). A console
+/// program on Windows now usually reaches its terminal through ConPTY, and ConPTY spent years not
+/// passing the console-mode request on — so a program that only set the mode was never sent a
+/// single mouse event, and the terminal went on selecting text by itself. What the terminal on the
+/// far side reads is the sequence. crossterm sends one or the other, never both:
+/// `EnableMouseCapture` answers `is_ansi_code_supported` with `false` on Windows, which routes it
+/// to the WinAPI and stops there.
+///
+/// **Sending both costs nothing.** They meet again as console input records, and asking twice for
+/// something already on is not an error anywhere.
+fn take_the_mouse(on: bool) {
     #[cfg(windows)]
-    fn is_ansi_code_supported(&self) -> bool {
-        crossterm::event::EnableMouseCapture.is_ansi_code_supported()
+    {
+        use crossterm::Command;
+        let done = if on {
+            crossterm::event::EnableMouseCapture.execute_winapi()
+        } else {
+            crossterm::event::DisableMouseCapture.execute_winapi()
+        };
+        if let Err(e) = done {
+            // Worth a line of its own: this is the call that decides whether the console keeps
+            // drag-select for itself, and its failure is invisible until somebody drags.
+            tracing::warn!(error = %e, on, "could not change the console's mouse mode");
+        }
     }
+    let (label, command) = if on {
+        ("mouse capture", MouseCapture::On)
+    } else {
+        ("mouse capture off", MouseCapture::Off)
+    };
+    terminal_feature(label, command);
 }
 
 fn terminal_feature(label: &'static str, command: impl crossterm::Command) {
@@ -2787,7 +2880,7 @@ pub async fn run(
     // and `$ZYRIS_CODE_MOUSE=0` is how somebody declines to pay it.
     let caps = crate::term::Caps::detect();
     if caps.mouse {
-        terminal_feature("mouse capture", MouseCapture::On);
+        take_the_mouse(true);
     }
     // Coming back from another window, the terminal sometimes does not restore the
     // screen for us. We have to know focus came back to redraw the whole thing.
@@ -2836,7 +2929,7 @@ pub async fn run(
     // out, or line wrap stays off in the shell and long lines look cut.
     // Turned off whether or not we turned it on — a previous run that died without restoring
     // leaves the terminal tracking, and one more `l` costs nothing.
-    terminal_feature("mouse capture off", MouseCapture::Off);
+    take_the_mouse(false);
     terminal_feature("focus change off", crossterm::event::DisableFocusChange);
     terminal_feature("bracketed paste off", crossterm::event::DisableBracketedPaste);
     terminal_feature("kitty keyboard protocol off", crossterm::event::PopKeyboardEnhancementFlags);
@@ -3025,10 +3118,9 @@ async fn run_inner(
     if git_on {
         spawn_git(&state.cwd, &tx, &git_busy);
     }
-    // **Asked once per run, before anything is waited on.** A release that appeared while this was
-    // open is not worth a second request, and the answer is only acted on when the screen is there
-    // to say so.
-    spawn_update_check(state.config.update, tx.clone());
+    // **Nothing here looks for a release.** That happened before this screen existed, on the
+    // terminal `main` still had (`update::at_launch`) — under `auto` this process is already the
+    // new version, and under `notify` the tag arrives as a frame through the bridge.
 
     let mut keys = EventStream::new();
     let mut ticker = tokio::time::interval(frame_interval());
@@ -3762,20 +3854,15 @@ async fn run_inner(
             }
         }
 
-        // **Every turn of the loop, not only after a keystroke.** The answer to "is there a newer
-        // release" arrives on its own, from a task nobody is waiting on, so a hand-over that was
-        // only checked in the key arm needed someone to press something before it could happen.
-        // Measured against a real release: the app sat on 0.2.0 with 0.2.1 published and did not
-        // move until a key was sent, which is not what `auto` promises.
-        //
-        // **Handing over is leaving.** The helper is already waiting on this process to end before
-        // it touches the binary, so these two must not be ordered the other way round — on Windows
-        // a running `.exe` cannot be replaced at all until this exits.
+        // **Asking for an update is leaving.** Nothing about installing belongs on this side: the
+        // installer prints as it works and the new version needs this terminal, and neither is
+        // possible while ratatui holds the screen. So the screen closes, and `main` — back on the
+        // plain terminal — does it. On Windows this is the whole bug: the old shape started the
+        // new binary from a process that was ending, which gave it a console of its own and left
+        // the window somebody was watching with nothing in it.
         if std::mem::take(&mut state.update_wanted) {
-            match hand_over_to_update(&mut state).await {
-                Ok(()) => break 'app,
-                Err(e) => state.set_error(state.lang.update_failed(&e.to_string())),
-            }
+            crate::update::request();
+            break 'app;
         }
     }
 
@@ -3832,6 +3919,11 @@ fn turn_to_stop(state: &State, session: &Session) -> Option<String> {
 /// that arm — quieter than removing the arm with cfg.
 fn shutdown_signals() -> mpsc::Receiver<()> {
     let (tx, rx) = mpsc::channel(1);
+    // **Off unix, letting go of the only sender is what makes the promise above true**: the
+    // channel closes, `recv()` answers `None` at once, and `select!` disables that arm. Said out
+    // loud rather than left to the end of the function, where it also reads as an unused binding.
+    #[cfg(not(unix))]
+    drop(tx);
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
@@ -4869,40 +4961,6 @@ async fn send(
 ///
 /// **Abandoning does not stop the turn**; it keeps running on the server and is read back as
 /// history on return.
-/// Starts the helper that installs the newest release and comes back on it.
-///
-/// **The tag is whatever the check already found.** Asking again would open a window in which
-/// `latest` moves, and then what installs is not what was reported.
-async fn hand_over_to_update(state: &mut State) -> anyhow::Result<()> {
-    let tag = match state.update_tag.clone() {
-        Some(tag) => tag,
-        None => crate::update::latest_tag()
-            .await
-            .ok_or_else(|| anyhow::anyhow!("could not reach GitHub"))?,
-    };
-    if !crate::update::is_newer(&tag, env!("CARGO_PKG_VERSION")) {
-        state.timeline.say(state.lang.update_current().to_string());
-        anyhow::bail!("already current");
-    }
-    crate::update::spawn_helper(&tag)
-}
-
-/// Asks GitHub once, off the loop, whether there is a newer release.
-///
-/// **Off the loop and never blocking.** The answer is worth having and worth nothing if getting it
-/// costs a frozen screen — a laptop with no network would otherwise pay ten seconds at every start.
-fn spawn_update_check(policy: crate::update::Policy, tx: mpsc::UnboundedSender<AppMsg>) {
-    if policy == crate::update::Policy::Off {
-        return;
-    }
-    tokio::spawn(async move {
-        let Some(tag) = crate::update::latest_tag().await else { return };
-        if crate::update::is_newer(&tag, env!("CARGO_PKG_VERSION")) {
-            let _ = tx.send((None, Action::Frame(Frame::UpdateFound(tag))));
-        }
-    });
-}
-
 fn spawn_stream(
     api: Arc<AttaccaApiClient>,
     session: &mut Session,
@@ -4962,6 +5020,18 @@ mod tests {
 
     fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, mods)
+    }
+
+    /// A screen with a conversation long enough to scroll, and the viewport measurements the
+    /// drawing side would have written down. Rows 0-9 are the conversation; anything below is the
+    /// activity line, the input and the bars.
+    fn scrollable() -> State {
+        let mut s = state();
+        s.view_total = 100;
+        s.view_height = 10;
+        s.view_origin = (0, 0);
+        s.scroll.on_content(100, 10);
+        s
     }
 
     /// **A mode picked before the connection has to reach the gate.** Shift+Tab works the whole
@@ -5034,27 +5104,68 @@ mod tests {
         assert_eq!(mouse_actions(&s, ctrl), vec![Action::Press(12, 9)]);
     }
 
-    /// **The policy decides whether a machine replaces its own binary.** `auto` hands over on its
-    /// own; anything else says so and waits to be asked. Getting this backwards would either
-    /// install without consent or never install at all, and neither is visible until it happens.
+    /// **The screen never installs anything on its own, whatever the policy says.** Installing is
+    /// done on the plain terminal before this screen exists (`update::at_launch`), so a release
+    /// reported to it is news and nothing more. The old shape acted on `auto` from here, closed
+    /// itself, and left a detached script to start the new version — which on Windows opened a
+    /// console of its own and looked, from the window somebody was watching, like quitting.
     #[test]
-    fn only_auto_hands_over_on_its_own() {
-        use crate::update::Policy;
-        let found = |policy| {
+    fn a_release_found_while_the_screen_is_up_is_only_mentioned() {
+        for policy in crate::update::Policy::ALL {
             let mut s = state();
             s.config.update = policy;
             apply(&mut s, &Action::Frame(Frame::UpdateFound("v9.9.9".into())));
-            s
-        };
+            assert!(!s.update_wanted, "{policy:?} installed from the screen");
+            assert_eq!(s.update_tag.as_deref(), Some("v9.9.9"), "{policy:?} lost the tag");
+            assert!(s.status().is_some(), "{policy:?} said nothing about it");
+        }
+    }
 
-        let auto = found(Policy::Auto);
-        assert!(auto.update_wanted, "auto did not ask for the handover");
-        assert_eq!(auto.update_tag.as_deref(), Some("v9.9.9"));
+    /// **A draft with lines in it is walked line by line.** Until now Up and Down went straight to
+    /// the history whatever the draft held, so a message written with Shift+Enter could only be
+    /// moved through one character at a time.
+    ///
+    /// **At the top there is still no recall**, because the draft is not empty — that rule is
+    /// older than this one and it is what stops a half-written message being thrown away by a
+    /// keypress. Walking the lines does not weaken it; it only fills in what those keys did with
+    /// a draft they could not move through.
+    #[test]
+    fn arrows_walk_a_multi_line_draft_without_giving_it_away() {
+        let mut s = state();
+        s.sent.push("an earlier message".into());
+        s.input.insert_str("first\nsecond");
+        s.input.cursor = s.input.text.chars().count();
 
-        let notify = found(Policy::Notify);
-        assert!(!notify.update_wanted, "notify installed without being asked");
-        assert_eq!(notify.update_tag.as_deref(), Some("v9.9.9"), "but it still knows the tag");
-        assert!(notify.status().is_some(), "and it said so");
+        // Bottom line, so Up moves inside the draft.
+        assert_eq!(on_key(&s, key(KeyCode::Up, KeyModifiers::NONE)), vec![Action::CursorUp]);
+        for a in on_key(&s, key(KeyCode::Up, KeyModifiers::NONE)) {
+            apply(&mut s, &a);
+        }
+        assert_eq!(s.input.text, "first\nsecond", "moving the cursor changed the draft");
+        assert_eq!(s.input.cursor, 5, "it did not land on the line above");
+
+        // Top line now: nothing above, and the draft is not handed to the history.
+        assert!(
+            on_key(&s, key(KeyCode::Up, KeyModifiers::NONE)).is_empty(),
+            "it walked off the top and recalled over the draft"
+        );
+
+        // And back down again.
+        for a in on_key(&s, key(KeyCode::Down, KeyModifiers::NONE)) {
+            apply(&mut s, &a);
+        }
+        assert_eq!(s.input.cursor, 11, "down did not come back to where up started");
+    }
+
+    /// A draft of one line is untouched by this: both arrows are history, exactly as before.
+    #[test]
+    fn a_single_line_draft_still_hands_both_arrows_to_the_history() {
+        let mut s = state();
+        s.sent.push("an earlier message".into());
+        assert_eq!(on_key(&s, key(KeyCode::Up, KeyModifiers::NONE)), vec![Action::RecallOlder]);
+        s.input.insert_str("halfway through a thought");
+        // With text and nowhere to go, Up is neither — the draft is not lost to a recall.
+        assert!(on_key(&s, key(KeyCode::Up, KeyModifiers::NONE)).is_empty());
     }
 
     /// `/update` asks for the handover whatever the policy is — that is what it is for, and
@@ -5073,6 +5184,8 @@ mod tests {
 
     /// Deciding on the answer to `CSI ? u`. The format is `CSI ? <flags> u` — only a terminal
     /// that knows the protocol can answer, so the format alone is enough.
+    // Unix only, with the probe it reads for: off unix the answer is settled without asking.
+    #[cfg(unix)]
     #[test]
     fn a_flags_reply_settles_it_as_supported() {
         use KittyVerdict::*;
@@ -5089,6 +5202,8 @@ mod tests {
     /// Without this the only signal was silence, which cannot tell "no protocol here" from "this
     /// answer is late": a supporting terminal on a slow link was written off, and every terminal
     /// without the protocol paid the full timeout at startup.
+    // Unix only, with the probe it reads for: off unix the answer is settled without asking.
+    #[cfg(unix)]
     #[test]
     fn a_device_attributes_reply_arriving_first_settles_it_as_unsupported() {
         use KittyVerdict::*;
@@ -5100,6 +5215,8 @@ mod tests {
 
     /// Nothing conclusive means keep reading. Answering early on a half-arrived sequence would
     /// read the verdict off whatever byte happened to land first.
+    // Unix only, with the probe it reads for: off unix the answer is settled without asking.
+    #[cfg(unix)]
     #[test]
     fn an_incomplete_or_unrelated_reply_decides_nothing() {
         use KittyVerdict::*;
@@ -6116,14 +6233,41 @@ mod tests {
         assert_eq!(s.folds.get(&5).map(|f| f.open), Some(true));
     }
 
-    /// The selection is anchored to the screen; scrolling moves the text out from under it.
-    /// Keeping the highlight would point at text different from what was copied.
+    /// **A highlight in the conversation rides along with it.** Scrolling moves the text and the
+    /// colour the same distance, so the selection stays on the words it was drawn around. It used
+    /// to be dropped outright, and one notch of the wheel looked like the selection had been
+    /// lost — copied text and all, though the copy had already been made.
     #[test]
-    fn scrolling_drops_the_drag() {
-        let mut s = state();
-        s.drag = Some(crate::selection::Drag::new((0, 0)));
+    fn scrolling_carries_the_highlight_with_the_text() {
+        let mut s = scrollable();
+        apply(&mut s, &Action::Press(0, 1));
+        apply(&mut s, &Action::DragTo(5, 3));
         apply(&mut s, &Action::Wheel(-1));
-        assert!(s.drag.is_none());
+        assert!(s.drag.is_some(), "one notch of the wheel threw the selection away");
+    }
+
+    /// **What the conversation cannot carry, it lets go of.** Below it are the activity line, the
+    /// input and the bars, and those do not scroll — half a highlight sliding out from under the
+    /// other half reads as the screen being broken, which is worse than losing the colour.
+    #[test]
+    fn a_highlight_that_reaches_past_the_conversation_goes_when_it_scrolls() {
+        let mut s = scrollable();
+        apply(&mut s, &Action::Press(0, 1));
+        // Past `view_height`: onto the input line.
+        apply(&mut s, &Action::DragTo(5, 12));
+        apply(&mut s, &Action::Wheel(-1));
+        assert!(s.drag.is_none(), "it was left to slide over rows that never move");
+    }
+
+    /// Where the conversation stood is written down when the drag begins, because that is what
+    /// the distance is measured from. Without it there is nothing to compare and the highlight
+    /// is drawn where the text used to be.
+    #[test]
+    fn a_drag_remembers_where_the_conversation_stood() {
+        let mut s = scrollable();
+        s.view_top = 42;
+        apply(&mut s, &Action::Press(0, 1));
+        assert_eq!(s.drag_top, 42);
     }
 
     /// PageUp/PageDown scroll the conversation by a page — the keyboard path that still
@@ -6144,14 +6288,20 @@ mod tests {
         assert_eq!(s.scroll.top, 90, "one page down lands at the bottom");
     }
 
-    /// Page-scrolling drops the drag for the same reason the wheel does — the highlight
-    /// would point at different text.
+    /// Page-scrolling follows the same rule as the wheel — it is the same conversation moving.
     #[test]
-    fn page_scrolling_drops_the_drag() {
-        let mut s = state();
-        s.drag = Some(crate::selection::Drag::new((0, 0)));
-        apply(&mut s, &Action::Page(1));
-        assert!(s.drag.is_none());
+    fn page_scrolling_treats_the_highlight_the_same_way() {
+        let mut inside = scrollable();
+        apply(&mut inside, &Action::Press(0, 1));
+        apply(&mut inside, &Action::DragTo(5, 3));
+        apply(&mut inside, &Action::Page(1));
+        assert!(inside.drag.is_some(), "a page threw away what a notch keeps");
+
+        let mut over = scrollable();
+        apply(&mut over, &Action::Press(0, 1));
+        apply(&mut over, &Action::DragTo(5, 12));
+        apply(&mut over, &Action::Page(1));
+        assert!(over.drag.is_none());
     }
 
     /// The title is written by the server — text we did not write. A control character mixed

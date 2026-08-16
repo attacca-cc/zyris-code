@@ -60,8 +60,12 @@ pub struct FileVersion {
 
 #[zyris::capability(name = "code_edit", version = 2)]
 pub trait CodeEdit {
-    /// Replace old_string with new_string in a file. old_string must appear exactly once;
-    /// set replace_all to change every occurrence. Read the file with file_io.read first.
+    /// Change a file by replacing exact strings. Give one edit or several; they apply in order,
+    /// and if any of them fails nothing is written at all. Read the file with `file_io.read`
+    /// first — each `old_string` must appear exactly once unless its `replace_all` is set.
+    ///
+    /// **One edit is a list of one.** There was a second tool for that case, and all it ever did
+    /// was ask every caller to choose between two ways of saying the same thing.
     ///
     /// `base_version`: the file's version token **as it was when you last read it** —
     /// either "`<stat.modified_unix_ms>:<stat.size>`" from the read response, or the
@@ -71,17 +75,6 @@ pub trait CodeEdit {
     ///
     /// `path` is relative to the working directory, or absolute when it starts with `/`.
     async fn edit(
-        &self,
-        path: String,
-        old_string: String,
-        new_string: String,
-        replace_all: Option<bool>,
-        base_version: Option<String>,
-    ) -> zyris::Result<EditResult>;
-
-    /// Several edits to one file in a single call. They apply in order, and if any of them
-    /// fails nothing is written at all. `base_version` works as in `edit`.
-    async fn multi_edit(
         &self,
         path: String,
         edits: Vec<EditSpec>,
@@ -276,23 +269,11 @@ impl CodeEdit for LocalEdit {
     async fn edit(
         &self,
         path: String,
-        old_string: String,
-        new_string: String,
-        replace_all: Option<bool>,
-        base_version: Option<String>,
-    ) -> zyris::Result<EditResult> {
-        let spec = EditSpec { old_string, new_string, replace_all: replace_all.unwrap_or(false) };
-        self.apply(&path, base_version.as_deref(), false, |body| substitute(body, &spec)).await
-    }
-
-    async fn multi_edit(
-        &self,
-        path: String,
         edits: Vec<EditSpec>,
         base_version: Option<String>,
     ) -> zyris::Result<EditResult> {
-        // Apply everything in memory, then write once. If it wrote halfway and failed, nobody would know
-        // what state the file is in — neither the agent nor the human.
+        // Apply everything in memory, then write once. If it wrote halfway and failed, nobody would
+        // know what state the file is in — neither the agent nor the human.
         self.apply(&path, base_version.as_deref(), false, move |body| {
             let mut out = body.to_string();
             for spec in &edits {
@@ -363,7 +344,17 @@ mod tests {
         let undo = edit.undo();
         assert!(undo.is_empty(), "nothing has been changed yet");
 
-        edit.edit(path, "before".into(), "after".into(), None, None).await.unwrap();
+        edit.edit(
+            path,
+            vec![EditSpec {
+                old_string: "before".into(),
+                new_string: "after".into(),
+                replace_all: false,
+            }],
+            None,
+        )
+        .await
+        .unwrap();
         assert!(!undo.is_empty(), "it was changed but there is nothing to undo");
 
         undo.revert_last().unwrap();
@@ -385,7 +376,18 @@ mod tests {
     #[tokio::test]
     async fn editing_replaces_the_one_match() {
         let (_d, edit, p) = scratch("하나\n둘\n셋\n");
-        let r = edit.edit(p, "둘".into(), "TWO".into(), None, None).await.unwrap();
+        let r = edit
+            .edit(
+                p,
+                vec![EditSpec {
+                    old_string: "둘".into(),
+                    new_string: "TWO".into(),
+                    replace_all: false,
+                }],
+                None,
+            )
+            .await
+            .unwrap();
         assert_eq!((r.added, r.removed), (1, 1));
         assert!(r.diff.contains("+TWO"), "{}", r.diff);
     }
@@ -394,7 +396,18 @@ mod tests {
     #[tokio::test]
     async fn two_matches_fail_and_say_how_many() {
         let (_d, edit, p) = scratch("x\nx\n");
-        let e = edit.edit(p, "x".into(), "y".into(), None, None).await.unwrap_err();
+        let e = edit
+            .edit(
+                p,
+                vec![EditSpec {
+                    old_string: "x".into(),
+                    new_string: "y".into(),
+                    replace_all: false,
+                }],
+                None,
+            )
+            .await
+            .unwrap_err();
         assert!(e.message.contains('2'), "it must say how many times it appeared: {}", e.message);
     }
 
@@ -402,37 +415,59 @@ mod tests {
     #[tokio::test]
     async fn no_match_fails_and_says_what_to_do() {
         let (_d, edit, p) = scratch("x\n");
-        let e = edit.edit(p, "없다".into(), "y".into(), None, None).await.unwrap_err();
+        let e = edit
+            .edit(
+                p,
+                vec![EditSpec {
+                    old_string: "없다".into(),
+                    new_string: "y".into(),
+                    replace_all: false,
+                }],
+                None,
+            )
+            .await
+            .unwrap_err();
         assert!(e.message.contains("read"), "it must say to read again: {}", e.message);
     }
 
     #[tokio::test]
     async fn replace_all_takes_every_match() {
         let (_d, edit, p) = scratch("x\nx\n");
-        let r = edit.edit(p, "x".into(), "y".into(), Some(true), None).await.unwrap();
+        let r = edit
+            .edit(
+                p,
+                vec![EditSpec {
+                    old_string: "x".into(),
+                    new_string: "y".into(),
+                    replace_all: true,
+                }],
+                None,
+            )
+            .await
+            .unwrap();
         assert_eq!(r.added, 2);
     }
 
     /// If it wrote halfway and failed, nobody would know what state the file is in.
     #[tokio::test]
-    async fn a_failing_multi_edit_leaves_the_file_alone() {
+    async fn a_failing_edit_leaves_the_file_alone() {
         let (dir, edit, p) = scratch("하나\n둘\n");
         let edits = vec![
             EditSpec { old_string: "하나".into(), new_string: "ONE".into(), replace_all: false },
             EditSpec { old_string: "없다".into(), new_string: "X".into(), replace_all: false },
         ];
-        assert!(edit.multi_edit(p, edits, None).await.is_err());
+        assert!(edit.edit(p, edits, None).await.is_err());
         assert_eq!(std::fs::read_to_string(dir.path().join("a.txt")).unwrap(), "하나\n둘\n");
     }
 
     #[tokio::test]
-    async fn a_whole_multi_edit_applies_in_order() {
+    async fn a_whole_edit_applies_in_order() {
         let (dir, edit, p) = scratch("하나\n둘\n");
         let edits = vec![
             EditSpec { old_string: "하나".into(), new_string: "ONE".into(), replace_all: false },
             EditSpec { old_string: "둘".into(), new_string: "TWO".into(), replace_all: false },
         ];
-        edit.multi_edit(p, edits, None).await.unwrap();
+        edit.edit(p, edits, None).await.unwrap();
         assert_eq!(std::fs::read_to_string(dir.path().join("a.txt")).unwrap(), "ONE\nTWO\n");
     }
 
@@ -461,7 +496,15 @@ mod tests {
         // Pretend another session changed it in between
         std::fs::write(dir.path().join("a.txt"), "before\nother-session\n").unwrap();
         let e = edit
-            .edit(p, "before".into(), "after".into(), None, Some(read_at.clone()))
+            .edit(
+                p,
+                vec![EditSpec {
+                    old_string: "before".into(),
+                    new_string: "after".into(),
+                    replace_all: false,
+                }],
+                Some(read_at.clone()),
+            )
             .await
             .unwrap_err();
         // **Asserted against the current language, not a Korean literal.** This used to read
@@ -479,7 +522,17 @@ mod tests {
     async fn editing_with_a_matching_base_version_succeeds() {
         let (dir, edit, p) = scratch("before\n");
         let v = current_version(&dir.path().join("a.txt")).unwrap();
-        edit.edit(p, "before".into(), "after".into(), None, Some(v)).await.unwrap();
+        edit.edit(
+            p,
+            vec![EditSpec {
+                old_string: "before".into(),
+                new_string: "after".into(),
+                replace_all: false,
+            }],
+            Some(v),
+        )
+        .await
+        .unwrap();
         assert_eq!(std::fs::read_to_string(dir.path().join("a.txt")).unwrap(), "after\n");
     }
 
@@ -490,7 +543,15 @@ mod tests {
         let good = format!("sha256:{}", sha256_of(b"before\n"));
         std::fs::write(dir.path().join("a.txt"), "before\nother\n").unwrap();
         let e = edit
-            .edit(p, "before".into(), "after".into(), None, Some(good.clone()))
+            .edit(
+                p,
+                vec![EditSpec {
+                    old_string: "before".into(),
+                    new_string: "after".into(),
+                    replace_all: false,
+                }],
+                Some(good.clone()),
+            )
             .await
             .unwrap_err();
         assert_eq!(e.message, stale_message(&dir, &good));
@@ -531,7 +592,18 @@ mod tests {
     #[tokio::test]
     async fn edit_reports_the_new_version() {
         let (dir, edit, p) = scratch("x\n");
-        let r = edit.edit(p, "x".into(), "y".into(), None, None).await.unwrap();
+        let r = edit
+            .edit(
+                p,
+                vec![EditSpec {
+                    old_string: "x".into(),
+                    new_string: "y".into(),
+                    replace_all: false,
+                }],
+                None,
+            )
+            .await
+            .unwrap();
         assert_eq!(r.version, current_version(&dir.path().join("a.txt")).unwrap());
     }
 }

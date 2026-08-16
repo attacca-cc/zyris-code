@@ -20,6 +20,26 @@ use zyris_code::{app, lang};
 /// The server announces `attacca_api` right after the handshake. A generous margin.
 const CONSUME_WAIT: Duration = Duration::from_secs(5);
 
+/// How long print mode waits for a first connection before saying it could not get one.
+///
+/// **Long enough for a slow link, short enough to be an answer.** Enrolling from scratch takes
+/// longer than this, and that is deliberate: `-p` on a machine that has never been approved should
+/// report that rather than sit through a browser trip nobody is watching for.
+const CONNECT_WAIT: Duration = Duration::from_secs(45);
+
+/// The same, when somebody has a reason to want it different.
+///
+/// **A knob because 45 seconds is a guess.** A slow link or a machine that takes its time waking a
+/// VPN can want longer, and a script that would rather fail fast can want shorter. Anything
+/// unreadable leaves the default alone rather than becoming zero.
+fn connect_wait() -> Duration {
+    std::env::var("ZYRIS_CODE_CONNECT_WAIT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(CONNECT_WAIT)
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     // **Answered before anything else is built.** Help and version must work with no account, no
@@ -38,6 +58,14 @@ async fn main() -> ExitCode {
         }
         zyris_code::cli::Run::Version => {
             println!("{program} {}", env!("CARGO_PKG_VERSION"));
+            return ExitCode::SUCCESS;
+        }
+        // **Nothing else is built for this.** No credential, no node, no screen — just the
+        // installer on the terminal that asked. On success it does not return: the new version
+        // takes this window over.
+        zyris_code::cli::Run::Update => {
+            zyris_code::lang::set(zyris_code::lang::startup());
+            zyris_code::update::install_now().await;
             return ExitCode::SUCCESS;
         }
         zyris_code::cli::Run::Bad(what) => {
@@ -95,6 +123,26 @@ async fn main() -> ExitCode {
     // **Decide the screen language first.** Even the words that go to the shell before connecting (`notice`) use this value.
     // Order: `$ZYRIS_CODE_LANG` → last choice → locale.
     zyris_code::lang::set(zyris_code::lang::startup());
+
+    // **Updating happens here, on the terminal, before anything else is built.**
+    //
+    // It used to happen from inside the screen: the app asked for an update, wrote a script out,
+    // started it detached and left; the script waited for the exit, installed, and started the new
+    // binary. On Windows that last step opens a **new console window** for a console program, so in
+    // `cmd` the app simply disappeared — reported 2026-08-17, and not fixable from that shape,
+    // because a process that is ending cannot hand its console to anything.
+    //
+    // Doing it here costs a moment at launch and gives the installer the terminal it needs to say
+    // what it is doing. `auto` does not come back from this line at all: it becomes the new version
+    // in this same window. What is left is a tag to mention, which only `notify` produces.
+    //
+    // **Print mode does not look.** `-p` is what a script runs; an install writing to its stdout
+    // would land in whatever it was piped into.
+    let newer = if printing.is_some() {
+        None
+    } else {
+        zyris_code::update::at_launch(zyris_code::config::Config::load().update).await
+    };
 
     // Credentials live in **an app-specific directory** — `~/.config/zyris-code/`.
     //
@@ -194,7 +242,7 @@ async fn main() -> ExitCode {
             let api_rx = api_rx.clone();
             let bridge = bridge.clone();
             tokio::spawn(async move {
-                let api = wait_for_api(api_rx).await?;
+                let api = wait_for_api(api_rx, connect_wait()).await?;
                 zyris_code::print::run(api, bridge, &prompt).await
             })
         }
@@ -263,6 +311,13 @@ async fn main() -> ExitCode {
         ));
     }
     let _instance_lock = window;
+
+    // **`notify` says it here, through the same door as every other notice.** The check happened
+    // before the screen existed, so this is the one way the tag reaches it — and the bridge holds
+    // frames until the screen attaches, so saying it early loses nothing.
+    if let Some(tag) = newer {
+        bridge.frame(zyris_code::app::Frame::UpdateFound(tag));
+    }
     //
     // **The enrollment code is sent to the screen by upstream's `EnrollmentUi` hook** (`enroll.rs`, upstream PR #6).
     // Only when there's no screen (the extreme where the app couldn't start) does it fall to a stdout box. The old
@@ -390,16 +445,27 @@ async fn main() -> ExitCode {
         // silently with a bare exit code is worse in a script than anywhere else: the caller sees
         // a non-zero and nothing to act on.
         RunnerEnded::App(app_result) => match app_result {
-            Ok(Ok(())) => ExitCode::SUCCESS,
+            Ok(Ok(())) => {
+                // **`/update` is finished here, not on the screen.** The screen closed for it, so
+                // the terminal is back and the installer can be watched; on success this does not
+                // return at all, because the new version takes over this same window.
+                if zyris_code::update::requested() {
+                    zyris_code::update::install_now().await;
+                }
+                ExitCode::SUCCESS
+            }
+            // **Print mode has to say why here.** There is no screen to have shown it, and a
+            // non-zero exit with nothing on stderr is the worst thing to hand a script. The log
+            // is named because the reason a connection failed is in it and nowhere else.
             Ok(Err(e)) => {
                 if printing.is_some() {
-                    eprintln!("{program}: {e}");
+                    eprintln!("{program}: {e}. Details in {}", log.display());
                 }
                 ExitCode::FAILURE
             }
             Err(e) => {
                 if printing.is_some() {
-                    eprintln!("{program}: {e}");
+                    eprintln!("{program}: {e}. Details in {}", log.display());
                 }
                 ExitCode::FAILURE
             }
@@ -415,18 +481,32 @@ enum RunnerEnded {
 
 /// Waits for the first live connection, for the paths that have no screen to draw while waiting.
 ///
-/// **The runner is what fills this**, on its own schedule — a first enrolment can sit here for as
-/// long as it takes somebody to reach a browser. The sender being dropped means the runner ended,
-/// and there will never be a handle.
+/// **The runner is what fills this**, on its own schedule. The sender being dropped means the
+/// runner ended, and there will never be a handle.
+///
+/// **It gives up.** With the screen there is something to look at while this takes its time — a
+/// first enrolment sits here for as long as it takes somebody to reach a browser, and the screen
+/// says so. Print mode has no such thing: a `-p` that cannot reach the server used to wait for
+/// ever on a blank line, which in a script is a hang and to a person is indistinguishable from the
+/// program being broken (reported on Windows, 2026-08-17). Better to say what happened and leave.
 async fn wait_for_api(
     mut api_rx: watch::Receiver<Option<Arc<AttaccaApiClient>>>,
+    within: Duration,
 ) -> anyhow::Result<Arc<AttaccaApiClient>> {
+    let deadline = tokio::time::Instant::now() + within;
     loop {
         if let Some(api) = api_rx.borrow_and_update().clone() {
             return Ok(api);
         }
-        if api_rx.changed().await.is_err() {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
             anyhow::bail!("could not connect");
+        }
+        match tokio::time::timeout(left, api_rx.changed()).await {
+            Ok(Ok(())) => {}
+            // The runner ended: there will never be a handle.
+            Ok(Err(_)) => anyhow::bail!("could not connect"),
+            Err(_) => anyhow::bail!("could not connect"),
         }
     }
 }

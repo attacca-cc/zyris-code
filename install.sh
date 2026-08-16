@@ -62,10 +62,32 @@ else
 fi
 
 # ── Fetch ────────────────────────────────────────────────────────────────────
+#
+# Two ways of fetching, on purpose. `fetch` is silent and `show` draws a progress bar, and only the
+# archive gets the bar: it is the one download here big enough for the wait to need explaining, and
+# a bar for a one-line checksum file is noise.
+#
+# **The bar is only drawn for somebody watching.** Written to something that is not a terminal,
+# curl prints a line per update — thousands of them in a build log. `[ -t 2 ]` asks whether stderr
+# is a terminal, which is also where the bar goes, and that is why it survives `curl … | sh`: the
+# script has the pipe on stdin, not on stderr.
 if command -v curl >/dev/null 2>&1; then
   fetch() { curl -fsSL "$1" -o "$2"; }
+  if [ -t 2 ]; then
+    show() { curl -#fSL "$1" -o "$2"; }
+  else
+    show() { fetch "$1" "$2"; }
+  fi
 elif command -v wget >/dev/null 2>&1; then
   fetch() { wget -qO "$2" "$1"; }
+  # **Asked, not assumed.** `--show-progress` arrived in wget 1.16 and busybox's wget has never had
+  # it; passing it blind would turn a download into "unrecognized option" on the machines least
+  # likely to have a second way to get the file.
+  if [ -t 2 ] && wget --help 2>&1 | grep -q -- --show-progress; then
+    show() { wget -q --show-progress -O "$2" "$1"; }
+  else
+    show() { fetch "$1" "$2"; }
+  fi
 else
   die "neither curl nor wget is available"
 fi
@@ -75,7 +97,7 @@ tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT INT TERM
 
 say "downloading $archive"
-fetch "$base/$archive" "$tmp/$archive" \
+show "$base/$archive" "$tmp/$archive" \
   || die "no build for $target in that release. See https://github.com/$REPO/releases"
 
 # **Check the download before unpacking it.** This is a binary about to go on your PATH.

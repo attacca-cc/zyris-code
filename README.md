@@ -175,7 +175,7 @@ what you open here is what you look up there.
 |---|---|
 | `search` | `glob`, `grep` — respects `.gitignore`, skips binaries |
 | `file_io` | `stat`, `list`, `read`, `read_stream` — **read only** |
-| `code_edit` | `edit`, `multi_edit`, `write` |
+| `code_edit` | `edit`, `write` |
 | `terminal` | `exec`, plus a full PTY: `open`, `read`, `write`, `screen`, `resize`, `close` |
 | `skill` | `list`, `load` |
 | `work` | `start`, `status`, `list`, `say`, `stop`, `resume` — hands a goal to attacca |
@@ -376,14 +376,18 @@ Messages typed while a turn is running are queued and sent in order when it ends
 
 ## Updating itself
 
-zyris-code asks GitHub once per launch whether there is a newer release. What happens then is
-`/config`'s `update` setting:
+zyris-code asks GitHub once per launch — **before the screen opens** — whether there is a newer
+release. What happens then is `/config`'s `update` setting:
 
 | | |
 |---|---|
-| `auto` (default) | Installs it and reopens on the new version. |
+| `auto` (default) | Installs it there and then, on the terminal you started it from, and comes back on the new version in that same window. |
 | `notify` | Says a newer release exists; `/update` installs it. |
 | `off` | Never looks. |
+
+`zyris --update` does the same thing without opening anything, whatever the setting says. Either
+way the download draws a progress bar, and the installer's own account of what it is doing goes to
+your terminal rather than being swallowed.
 
 **Nothing you have is touched by an update.** The installers only write to the directory the
 binary lives in. Credentials, settings, language, the GitHub token, plugins, skills and the undo
@@ -396,9 +400,10 @@ given that tag. It is the script tested against that build, and pinning the tag 
 moving between the check and the install cannot change what lands. Checksums are verified before
 anything is unpacked, as with a first install.
 
-The running process does not replace itself: a helper waits for it to exit, installs, and starts
-the new one. On Windows a running `.exe` cannot be overwritten at all, so the installer renames the
-old one aside — which is also why an update there needs no manual step.
+**The update keeps the terminal it was started in.** On unix the process replaces itself with the
+new version; on Windows, which has no way to do that, it starts the new one and waits for it. A
+running `.exe` cannot be overwritten there at all, so the installer renames the old one aside
+first — which is why an update needs no manual step on Windows either.
 
 ## Print mode
 

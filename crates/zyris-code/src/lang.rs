@@ -1397,12 +1397,49 @@ impl Lang {
             Lang::En => format!("{tag} is out. `/update` installs it."),
         }
     }
-    /// Said just before the app steps aside for its replacement.
-    pub fn update_installing(self, tag: &str) -> String {
+    /// The first line of an update, printed on the terminal before the screen exists.
+    ///
+    /// **It names both versions.** This appears in front of somebody who typed a command and
+    /// expected an app, so what is happening and why has to be readable in one line.
+    pub fn update_installing_from(self, current: &str, tag: &str) -> String {
         match self {
-            Lang::Ko => format!("{tag} 설치를 시작합니다 ‒ 잠시 뒤 새 버전으로 다시 열립니다."),
-            Lang::En => format!("Installing {tag} ‒ this reopens on the new version in a moment."),
+            Lang::Ko => format!("새 버전을 설치합니다: {current} → {tag}"),
+            Lang::En => format!("Updating: {current} → {tag}"),
         }
+    }
+    /// The last line of an update, just before the new version takes this terminal.
+    pub fn update_restarting(self, tag: &str) -> String {
+        match self {
+            Lang::Ko => format!("{tag}으로 다시 시작합니다."),
+            Lang::En => format!("Restarting on {tag}."),
+        }
+    }
+    /// Installed, but this process could not become the new one.
+    ///
+    /// **Worth saying loudly.** Silence here reads as an update that did not happen, and the
+    /// version number stays where it was until somebody runs the command again.
+    pub fn update_installed_not_started(self, why: &str) -> String {
+        match self {
+            Lang::Ko => {
+                format!("설치는 됐지만 다시 시작하지 못했습니다 ({why}). 다시 실행해 주세요.")
+            }
+            Lang::En => format!("Installed, but could not restart ({why}). Run it again."),
+        }
+    }
+    /// Said by the process an update started, when it was asked to update again.
+    ///
+    /// **The version, not "already the newest".** If the install landed somewhere PATH does not
+    /// reach, this is still the old one, and saying it is current would be a lie told by the very
+    /// thing that failed.
+    pub fn update_now_on(self, version: &str) -> String {
+        match self {
+            Lang::Ko => format!("지금 버전: {version}"),
+            Lang::En => format!("Now on {version}."),
+        }
+    }
+    /// Why an update asked for by name could not even begin.
+    pub fn update_no_answer(self) -> &'static str {
+        self.pick("GitHub에 닿지 못했습니다", "could not reach GitHub")
     }
     /// Said when `/update` was asked for and there is nothing to do.
     pub fn update_current(self) -> &'static str {
