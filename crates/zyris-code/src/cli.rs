@@ -69,6 +69,10 @@ OPTIONS
     -h, --help            This.
     -V, --version         Version.
 
+The prompt needs no quotes — everything after the flag is taken as one. In zsh, a prompt
+containing ? or * is the exception: the shell tries to match it against filenames and gives
+up before this program ever starts. The installer leaves an alias behind that turns that off.
+
 Print mode still hands this computer over: the agent can read and change files here and
 run commands, exactly as it can with the screen open.
 
@@ -108,6 +112,16 @@ mod tests {
         assert_eq!(parse_of("-p"), Run::Print(None));
         assert_eq!(parse_of("--print   "), Run::Print(None));
         assert_eq!(parse_of("--print="), Run::Print(None));
+    }
+
+    /// **The parser was never what needed quotes.** A prompt keeps its punctuation whole, `?`
+    /// included — what eats that one is zsh, which tries to match it against filenames and refuses
+    /// to run the command at all, so nothing here is ever reached. The installer's `noglob` alias
+    /// is where that is dealt with; this only records that there is nothing to fix on this side.
+    #[test]
+    fn a_prompt_keeps_its_punctuation() {
+        assert_eq!(parse_of("-p 이거 뭐야?"), Run::Print(Some("이거 뭐야?".into())));
+        assert_eq!(parse_of("-p what * means"), Run::Print(Some("what * means".into())));
     }
 
     /// **A flag that starts with `-` inside the prompt still belongs to the prompt.** Otherwise
