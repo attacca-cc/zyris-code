@@ -205,6 +205,10 @@ pub enum Action {
     Yank,
     Left,
     Right,
+    /// One line up or down inside a draft that has lines in it. **Not history** — that is
+    /// `RecallOlder`, which these fall through to at the top and bottom of the draft.
+    CursorUp,
+    CursorDown,
     WordLeft,
     WordRight,
     Home,
@@ -656,6 +660,10 @@ pub const STATUS_WINDOW: Duration = Duration::from_secs(6);
 pub const STOP_WAIT: Duration = Duration::from_secs(3);
 /// If the app has not ended this long after a shutdown signal, restore the screen and force
 /// the exit. A safety net for the case where the loop is stuck and never sees the signal.
+///
+/// **Unix only, because the signals are.** Off unix nothing arms it, and a Windows build was
+/// reporting it as dead code — six warnings on a contributor's first build of a public repo.
+#[cfg(unix)]
 const SHUTDOWN_FORCE: Duration = Duration::from_secs(5);
 
 impl State {
@@ -1115,6 +1123,15 @@ pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
         }
         KeyCode::Backspace => vec![Action::Backspace],
         KeyCode::Delete => vec![Action::Delete],
+        // **A draft with lines in it is walked line by line first.** Until now Up and Down were
+        // history whatever the draft held, so a message written with Shift+Enter could only be
+        // moved through one character at a time (asked for on a Windows check, 2026-08-17).
+        //
+        // **History is reached from the edge**, which is what every shell with a multi-line buffer
+        // does: at the top line ↑ goes back into what was sent, at the bottom ↓ comes forward out
+        // of it. Putting these arms above the recall ones is what makes that order true.
+        KeyCode::Up if state.input.above().is_some() => vec![Action::CursorUp],
+        KeyCode::Down if state.input.below().is_some() => vec![Action::CursorDown],
         // **↑ brings back what was sent.** It starts when the input is empty, and once
         // inside it keeps walking further back — stopping at the second ↑ makes recall
         // useless.
@@ -1408,6 +1425,16 @@ pub fn apply(state: &mut State, action: &Action) {
                 let mut query = query.clone();
                 query.pop();
                 state.picker = Some(crate::picker::Picker::history(&state.sent, &query));
+            }
+        }
+        Action::CursorUp => {
+            if let Some(at) = state.input.above() {
+                state.input.cursor = at;
+            }
+        }
+        Action::CursorDown => {
+            if let Some(at) = state.input.below() {
+                state.input.cursor = at;
             }
         }
         Action::Left => state.editor().left(),
@@ -2577,10 +2604,13 @@ fn open_url(url: &str) {
 /// not answer DA1 either — a pty in a test harness, or a pipe. If a real answer arrives after
 /// this, crossterm quietly skips the leftover bytes (its public `Event` has no keyboard-flags
 /// variant), so nothing breaks.
+/// Unix only, with the probe it belongs to.
+#[cfg(unix)]
 const KITTY_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
 
 /// What the terminal has said so far about the kitty keyboard protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(unix)]
 enum KittyVerdict {
     /// `CSI ? <flags> u` came back — only a terminal that knows the protocol answers that.
     Supported,
@@ -2607,6 +2637,7 @@ enum KittyVerdict {
 /// A reply is found even with typed characters mixed in front; typing right at startup is not
 /// rare. Parameter bytes are digits, `;` and `:` — anything else means this is not a reply to
 /// either question, so it is skipped rather than trusted.
+#[cfg(unix)]
 fn kitty_verdict(resp: &[u8]) -> KittyVerdict {
     let mut rest = resp;
     while let Some(i) = rest.windows(3).position(|w| w == b"\x1b[?") {
@@ -3888,6 +3919,11 @@ fn turn_to_stop(state: &State, session: &Session) -> Option<String> {
 /// that arm — quieter than removing the arm with cfg.
 fn shutdown_signals() -> mpsc::Receiver<()> {
     let (tx, rx) = mpsc::channel(1);
+    // **Off unix, letting go of the only sender is what makes the promise above true**: the
+    // channel closes, `recv()` answers `None` at once, and `select!` disables that arm. Said out
+    // loud rather than left to the end of the function, where it also reads as an unused binding.
+    #[cfg(not(unix))]
+    drop(tx);
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
@@ -5083,6 +5119,53 @@ mod tests {
             assert_eq!(s.update_tag.as_deref(), Some("v9.9.9"), "{policy:?} lost the tag");
             assert!(s.status().is_some(), "{policy:?} said nothing about it");
         }
+    }
+
+    /// **A draft with lines in it is walked line by line.** Until now Up and Down went straight to
+    /// the history whatever the draft held, so a message written with Shift+Enter could only be
+    /// moved through one character at a time.
+    ///
+    /// **At the top there is still no recall**, because the draft is not empty — that rule is
+    /// older than this one and it is what stops a half-written message being thrown away by a
+    /// keypress. Walking the lines does not weaken it; it only fills in what those keys did with
+    /// a draft they could not move through.
+    #[test]
+    fn arrows_walk_a_multi_line_draft_without_giving_it_away() {
+        let mut s = state();
+        s.sent.push("an earlier message".into());
+        s.input.insert_str("first\nsecond");
+        s.input.cursor = s.input.text.chars().count();
+
+        // Bottom line, so Up moves inside the draft.
+        assert_eq!(on_key(&s, key(KeyCode::Up, KeyModifiers::NONE)), vec![Action::CursorUp]);
+        for a in on_key(&s, key(KeyCode::Up, KeyModifiers::NONE)) {
+            apply(&mut s, &a);
+        }
+        assert_eq!(s.input.text, "first\nsecond", "moving the cursor changed the draft");
+        assert_eq!(s.input.cursor, 5, "it did not land on the line above");
+
+        // Top line now: nothing above, and the draft is not handed to the history.
+        assert!(
+            on_key(&s, key(KeyCode::Up, KeyModifiers::NONE)).is_empty(),
+            "it walked off the top and recalled over the draft"
+        );
+
+        // And back down again.
+        for a in on_key(&s, key(KeyCode::Down, KeyModifiers::NONE)) {
+            apply(&mut s, &a);
+        }
+        assert_eq!(s.input.cursor, 11, "down did not come back to where up started");
+    }
+
+    /// A draft of one line is untouched by this: both arrows are history, exactly as before.
+    #[test]
+    fn a_single_line_draft_still_hands_both_arrows_to_the_history() {
+        let mut s = state();
+        s.sent.push("an earlier message".into());
+        assert_eq!(on_key(&s, key(KeyCode::Up, KeyModifiers::NONE)), vec![Action::RecallOlder]);
+        s.input.insert_str("halfway through a thought");
+        // With text and nowhere to go, Up is neither — the draft is not lost to a recall.
+        assert!(on_key(&s, key(KeyCode::Up, KeyModifiers::NONE)).is_empty());
     }
 
     /// `/update` asks for the handover whatever the policy is — that is what it is for, and

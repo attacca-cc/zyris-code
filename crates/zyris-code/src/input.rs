@@ -62,6 +62,57 @@ impl Input {
         self.cursor = 0;
     }
 
+    /// Where the cursor would land one line up, or `None` if there is no line above it.
+    ///
+    /// **A draft here can hold newlines** (Shift+Enter, or a paste), and until now the only way
+    /// through one was a character at a time: Up and Down were history whatever the draft held.
+    /// Every editor and every shell that takes a multi-line buffer walks the lines first and
+    /// reaches for history only from the edge, which is the rule here too — `None` is what lets
+    /// the caller fall through to the history.
+    ///
+    /// **Lines are the draft's own, split on `\n`, not the ones the screen wrapped.** Wrapping
+    /// depends on the width, `on_key` is pure and does not know it, and a rule that changed with
+    /// the size of the window would be a rule nobody could learn.
+    ///
+    /// The column is kept where it can be, and clipped to the end of a shorter line.
+    pub fn above(&self) -> Option<usize> {
+        let (start, col) = self.line_start_and_column();
+        if start == 0 {
+            return None;
+        }
+        // One before the newline that starts this line is the last character of the one above.
+        let previous = self.line_start_of(start - 1);
+        Some((previous + col).min(start - 1))
+    }
+
+    /// The same, one line down.
+    pub fn below(&self) -> Option<usize> {
+        let (start, col) = self.line_start_and_column();
+        let chars: Vec<char> = self.text.chars().collect();
+        let end = chars.iter().skip(start).position(|c| *c == '\n').map(|i| start + i)?;
+        let next = end + 1;
+        let next_end =
+            chars.iter().skip(next).position(|c| *c == '\n').map_or(chars.len(), |i| next + i);
+        Some((next + col).min(next_end))
+    }
+
+    /// The first character of the line the cursor is on, and how far along it the cursor is.
+    fn line_start_and_column(&self) -> (usize, usize) {
+        let start = self.line_start_of(self.cursor);
+        (start, self.cursor - start)
+    }
+
+    /// The first character of the line `at` falls on.
+    fn line_start_of(&self, at: usize) -> usize {
+        self.text
+            .chars()
+            .take(at)
+            .collect::<Vec<_>>()
+            .iter()
+            .rposition(|c| *c == '\n')
+            .map_or(0, |i| i + 1)
+    }
+
     pub fn end(&mut self) {
         self.cursor = self.len_chars();
     }
@@ -376,6 +427,60 @@ mod tests {
         i.backspace();
         assert_eq!(i.text, "안녕세요");
         assert_eq!(i.cursor, 2);
+    }
+
+    /// **A draft with lines in it is walked line by line.** Written with Shift+Enter, the only
+    /// way through one used to be a character at a time.
+    #[test]
+    fn the_cursor_walks_the_lines_of_a_draft() {
+        let mut i = Input::default();
+        i.insert_str("one\ntwo\nthree");
+        i.cursor = 4 + 3; // end of "two"
+        assert_eq!(i.above(), Some(3), "up lands at the same column of the line above");
+        assert_eq!(i.below(), Some(8 + 3), "and down at the same column below");
+    }
+
+    /// **At the top and the bottom there is nowhere to go**, and that is what hands the key on to
+    /// the history. A draft of one line never moves at all.
+    #[test]
+    fn there_is_no_line_above_the_first_or_below_the_last() {
+        let mut i = Input::default();
+        i.insert_str("one\ntwo");
+        i.cursor = 1;
+        assert_eq!(i.above(), None, "the first line has nothing above it");
+        i.cursor = 5;
+        assert_eq!(i.below(), None, "the last line has nothing below it");
+
+        let mut flat = Input::default();
+        flat.insert_str("just the one");
+        flat.cursor = 4;
+        assert_eq!((flat.above(), flat.below()), (None, None));
+
+        let empty = Input::default();
+        assert_eq!((empty.above(), empty.below()), (None, None));
+    }
+
+    /// A column past the end of the line it lands on is clipped to that line's end, the way every
+    /// editor does it — not carried past the newline into the line after.
+    #[test]
+    fn a_column_past_the_end_of_the_next_line_stops_at_its_end() {
+        let mut i = Input::default();
+        i.insert_str("a longer line\nshort\nanother longer one");
+        i.cursor = 13 + 1 + 5 + 1 + 12; // well along the third line
+        let up = i.above().expect("there is a line above");
+        assert_eq!(up, 13 + 1 + 5, "it stopped at the end of the short line");
+        i.cursor = 12;
+        let down = i.below().expect("there is a line below");
+        assert_eq!(down, 13 + 1 + 5, "and again coming down onto it");
+    }
+
+    /// Columns are characters, so a line of Hangul is walked the same as any other.
+    #[test]
+    fn lines_of_wide_characters_are_walked_by_character() {
+        let mut i = Input::default();
+        i.insert_str("안녕하세요\n반갑습니다");
+        i.cursor = 6 + 2; // third character of the second line
+        assert_eq!(i.above(), Some(2), "it kept the character column, not the display column");
     }
 
     #[test]
