@@ -159,7 +159,17 @@ jobs:
           # The list is the commits since the previous tag. Merges are left out: on this repo they
           # carry a pull request number and no description of the change.
           prev="$(git describe --tags --abbrev=0 "$TAG^" 2>/dev/null || true)"
+          # **A release that needs something said goes and says it, at the top.**
+          # `docs/release-notes/<tag>.md` is read if it is there and ignored if it is not, so a
+          # one-off — an upgrade that behaves oddly once, a setting whose meaning changed — is
+          # written for the release it belongs to and cannot follow the next one out. A paragraph
+          # kept in this file instead would, and nobody would notice for a version or two.
+          note="docs/release-notes/$TAG.md"
           {
+            if [ -f "$note" ]; then
+              cat "$note"
+              printf '\n'
+            fi
             printf '## What changed\n\n'
             if [ -n "$prev" ]; then
               git log --no-merges --reverse --pretty='- %s' "$prev..$TAG"
