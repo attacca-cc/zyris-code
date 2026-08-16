@@ -52,6 +52,9 @@ pub enum Command {
     /// advertises, has no ping/pong, and `conn.closed()` never fires for a merely unrouted socket.
     /// Redialling re-announces, which puts this connection back in the registry.
     Reconnect,
+    /// Install the newest release and come back on it. What `update: notify` leaves to be asked
+    /// for, and what `auto` does on its own.
+    Update,
     /// Something unknown. **Not sent to the server; tells what's available instead.**
     Unknown(String),
 }
@@ -147,6 +150,7 @@ pub fn parse(text: &str) -> Option<Command> {
         "/undo" => Command::Undo,
         "/clear" => Command::Clear,
         "/reconnect" => Command::Reconnect,
+        "/update" => Command::Update,
         "/config" => match arg {
             "" => Command::Config(None),
             given => match given.split_once(char::is_whitespace) {
@@ -370,6 +374,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         aliases: &["pwd"],
         note_ko: "도구가 상대경로를 푸는 자리",
         note_en: "Where tools resolve relative paths",
+    },
+    CommandSpec {
+        name: "/update",
+        aliases: &[],
+        note_ko: "새 버전을 설치하고 그 버전으로 다시 엽니다",
+        note_en: "Install the newest release and reopen on it",
     },
     CommandSpec {
         name: "/reconnect",

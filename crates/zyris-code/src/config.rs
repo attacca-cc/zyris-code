@@ -99,6 +99,10 @@ pub struct Config {
     /// terminal the dark palette's text sits at 1.19:1 against the paper — unreadable.
     #[serde(default)]
     pub theme: ThemeChoice,
+    /// What to do when a newer release exists. **Default `auto`**: a client that hands a machine
+    /// to an agent is one where being a version behind is a thing to fix, not a preference.
+    #[serde(default)]
+    pub update: crate::update::Policy,
 }
 
 /// The file where the settings live. Same directory as the credentials and the language.

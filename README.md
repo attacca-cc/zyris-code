@@ -394,6 +394,32 @@ Messages typed while a turn is running are queued and sent in order when it ends
 | `RUST_LOG` | `zyris_code=info,zyris=warn` | Log filter |
 | `NO_COLOR` | — | Suppress colour in the messages printed before the UI starts |
 
+## Updating itself
+
+zyris-code asks GitHub once per launch whether there is a newer release. What happens then is
+`/config`'s `update` setting:
+
+| | |
+|---|---|
+| `auto` (default) | Installs it and reopens on the new version. |
+| `notify` | Says a newer release exists; `/update` installs it. |
+| `off` | Never looks. |
+
+**Nothing you have is touched by an update.** The installers only write to the directory the
+binary lives in. Credentials, settings, language, the GitHub token, plugins, skills and the undo
+log all live under `~/.config/zyris-code/` and `~/.cache/zyris-code/`
+(`%LOCALAPPDATA%` on Windows), which no installer reads or removes — a reinstall picks up exactly
+where you left off, still enrolled.
+
+**The release's own installer does the replacing**, fetched from the release being installed and
+given that tag. It is the script tested against that build, and pinning the tag means `latest`
+moving between the check and the install cannot change what lands. Checksums are verified before
+anything is unpacked, as with a first install.
+
+The running process does not replace itself: a helper waits for it to exit, installs, and starts
+the new one. On Windows a running `.exe` cannot be overwritten at all, so the installer renames the
+old one aside — which is also why an update there needs no manual step.
+
 ## Print mode
 
 ```bash

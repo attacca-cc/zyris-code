@@ -33,6 +33,9 @@ pub enum Frame {
     Status {
         running: bool,
     },
+    /// A newer release was found. Carried as a frame rather than acted on where it was found,
+    /// because the check runs off the loop and `apply` is the one place that changes state.
+    UpdateFound(String),
     /// The agent opened a shell. **Not saying so leaves a ghost shell running.**
     ShellOpened {
         id: String,
@@ -323,6 +326,12 @@ pub struct State {
     ///
     /// `apply` is pure, so it cannot quit here — same trick as `submit_now`/`flush_queue`.
     pub quitting: bool,
+    /// The newest release, once the check has answered. `/update` uses it rather than asking
+    /// again — the answer does not change between one keystroke and the next.
+    pub update_tag: Option<String>,
+    /// Set when an update should be installed. The I/O side picks it up, hands over to the
+    /// helper and ends this process; `apply` cannot do any of that.
+    pub update_wanted: bool,
     /// Have we already asked for this turn to stop?
     ///
     /// **Without this there is no way to close the window when the server hangs.** Ctrl+C
@@ -555,6 +564,8 @@ impl Default for State {
             agent: String::new(),
             quit_armed_at: None,
             quitting: false,
+            update_tag: None,
+            update_wanted: false,
             stopping: false,
             selection: None,
             sent: Vec::new(),
@@ -1970,6 +1981,17 @@ fn apply_frame(state: &mut State, frame: &Frame) {
         // **The screen says when it dropped.** The activity line turns to "connecting…" and
         // the reason goes by once as a notice. Reconnecting is the Runner's job, and
         // `api_rx` tells us once it is back.
+        // **Only said, never done, here.** `apply` is pure; installing is the I/O side's, and it
+        // reads `update_wanted` the same way `/update` sets it.
+        Frame::UpdateFound(tag) => {
+            if state.config.update == crate::update::Policy::Auto {
+                state.update_wanted = true;
+                state.set_status(state.lang.update_installing(tag));
+            } else {
+                state.set_status(state.lang.update_available(tag));
+            }
+            state.update_tag = Some(tag.clone());
+        }
         Frame::Disconnected(why) => {
             state.connected = false;
             // **Losing the connection is a failure, not news** — silent failure is the worst
@@ -2232,6 +2254,8 @@ pub fn run_command(state: &mut State, text: &str) -> Option<crate::command::Comm
         }
         // **Purely I/O** — dropping the socket happens in `finish_command`.
         Command::Reconnect => {}
+        // The work is the I/O side's; this only asks for it.
+        Command::Update => state.update_wanted = true,
         Command::Config(Some(action)) => match action {
             crate::command::ConfigAction::Dir(access) => {
                 state.config.dir_access = *access;
@@ -2966,6 +2990,10 @@ async fn run_inner(
     if git_on {
         spawn_git(&state.cwd, &tx, &git_busy);
     }
+    // **Asked once per run, before anything is waited on.** A release that appeared while this was
+    // open is not worth a second request, and the answer is only acted on when the screen is there
+    // to say so.
+    spawn_update_check(state.config.update, tx.clone());
 
     let mut keys = EventStream::new();
     let mut ticker = tokio::time::interval(frame_interval());
@@ -3411,6 +3439,17 @@ async fn run_inner(
                         // stopped below.
                         if state.quitting {
                             break 'app;
+                        }
+                    }
+
+                    // **Handing over is leaving.** The helper is already waiting on this
+                    // process to end before it replaces the binary, so the two must not be
+                    // ordered the other way round — on Windows the running `.exe` cannot be
+                    // touched at all until this exits.
+                    if std::mem::take(&mut state.update_wanted) {
+                        match hand_over_to_update(&mut state).await {
+                            Ok(()) => break 'app,
+                            Err(e) => state.set_error(state.lang.update_failed(&e.to_string())),
                         }
                     }
 
@@ -4774,6 +4813,40 @@ async fn send(
 ///
 /// **Abandoning does not stop the turn**; it keeps running on the server and is read back as
 /// history on return.
+/// Starts the helper that installs the newest release and comes back on it.
+///
+/// **The tag is whatever the check already found.** Asking again would open a window in which
+/// `latest` moves, and then what installs is not what was reported.
+async fn hand_over_to_update(state: &mut State) -> anyhow::Result<()> {
+    let tag = match state.update_tag.clone() {
+        Some(tag) => tag,
+        None => crate::update::latest_tag()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("could not reach GitHub"))?,
+    };
+    if !crate::update::is_newer(&tag, env!("CARGO_PKG_VERSION")) {
+        state.timeline.say(state.lang.update_current().to_string());
+        anyhow::bail!("already current");
+    }
+    crate::update::spawn_helper(&tag)
+}
+
+/// Asks GitHub once, off the loop, whether there is a newer release.
+///
+/// **Off the loop and never blocking.** The answer is worth having and worth nothing if getting it
+/// costs a frozen screen — a laptop with no network would otherwise pay ten seconds at every start.
+fn spawn_update_check(policy: crate::update::Policy, tx: mpsc::UnboundedSender<AppMsg>) {
+    if policy == crate::update::Policy::Off {
+        return;
+    }
+    tokio::spawn(async move {
+        let Some(tag) = crate::update::latest_tag().await else { return };
+        if crate::update::is_newer(&tag, env!("CARGO_PKG_VERSION")) {
+            let _ = tx.send((None, Action::Frame(Frame::UpdateFound(tag))));
+        }
+    });
+}
+
 fn spawn_stream(
     api: Arc<AttaccaApiClient>,
     session: &mut Session,
@@ -4903,6 +4976,43 @@ mod tests {
         // parts of the screen unselectable for no reason the person can see.
         let ctrl = at(MouseEventKind::Down(MouseButton::Left), 12, 9, KeyModifiers::CONTROL);
         assert_eq!(mouse_actions(&s, ctrl), vec![Action::Press(12, 9)]);
+    }
+
+    /// **The policy decides whether a machine replaces its own binary.** `auto` hands over on its
+    /// own; anything else says so and waits to be asked. Getting this backwards would either
+    /// install without consent or never install at all, and neither is visible until it happens.
+    #[test]
+    fn only_auto_hands_over_on_its_own() {
+        use crate::update::Policy;
+        let found = |policy| {
+            let mut s = state();
+            s.config.update = policy;
+            apply(&mut s, &Action::Frame(Frame::UpdateFound("v9.9.9".into())));
+            s
+        };
+
+        let auto = found(Policy::Auto);
+        assert!(auto.update_wanted, "auto did not ask for the handover");
+        assert_eq!(auto.update_tag.as_deref(), Some("v9.9.9"));
+
+        let notify = found(Policy::Notify);
+        assert!(!notify.update_wanted, "notify installed without being asked");
+        assert_eq!(notify.update_tag.as_deref(), Some("v9.9.9"), "but it still knows the tag");
+        assert!(notify.status().is_some(), "and it said so");
+    }
+
+    /// `/update` asks for the handover whatever the policy is — that is what it is for, and
+    /// `notify` would otherwise have no way to act on what it reported.
+    #[test]
+    fn the_update_command_asks_for_it_under_any_policy() {
+        for policy in crate::update::Policy::ALL {
+            let mut s = state();
+            s.config.update = policy;
+            apply(&mut s, &Action::Frame(Frame::UpdateFound("v9.9.9".into())));
+            s.update_wanted = false;
+            run_command(&mut s, "/update");
+            assert!(s.update_wanted, "/update did nothing under {policy:?}");
+        }
     }
 
     /// Deciding on the answer to `CSI ? u`. The format is `CSI ? <flags> u` — only a terminal

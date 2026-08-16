@@ -55,6 +55,8 @@ pub enum Setting {
     DefaultMode,
     /// Which palette the screen is drawn in.
     Theme,
+    /// Whether a newer release installs itself.
+    Update,
 }
 
 impl Setting {
@@ -65,6 +67,7 @@ impl Setting {
             Setting::Language => lang.cfg_language(),
             Setting::DefaultMode => lang.cfg_default_mode(),
             Setting::Theme => lang.cfg_theme(),
+            Setting::Update => lang.cfg_update(),
         }
     }
 
@@ -75,6 +78,7 @@ impl Setting {
             // The unset state plus every mode.
             Setting::DefaultMode => 1 + Mode::ALL.len(),
             Setting::Theme => THEMES.len(),
+            Setting::Update => crate::update::Policy::ALL.len(),
         }
     }
 
@@ -97,6 +101,7 @@ impl Setting {
                 Some(n) => Mode::ALL[n.min(Mode::ALL.len() - 1)].label(lang),
             },
             Setting::Theme => lang.cfg_theme_name(THEMES[i.min(THEMES.len() - 1)]),
+            Setting::Update => lang.cfg_update_name(pick(i)),
         }
     }
 
@@ -113,11 +118,18 @@ impl Setting {
                 lang.cfg_mode_desc(i.checked_sub(1).map(|n| Mode::ALL[n.min(Mode::ALL.len() - 1)]))
             }
             Setting::Theme => lang.cfg_theme_desc(THEMES[i.min(THEMES.len() - 1)]).to_string(),
+            Setting::Update => lang.cfg_update_desc(pick(i)).to_string(),
         }
     }
 }
 
 /// The palette choices, in the order the row walks them.
+/// The update policy at that index, clamped — the form walks indices and must never be handed one
+/// past the end.
+fn pick(i: usize) -> crate::update::Policy {
+    crate::update::Policy::ALL[i.min(crate::update::Policy::ALL.len() - 1)]
+}
+
 const THEMES: [crate::config::ThemeChoice; 3] = [
     crate::config::ThemeChoice::Auto,
     crate::config::ThemeChoice::Dark,
@@ -145,8 +157,13 @@ pub struct Form {
 
 impl Form {
     /// The rows, in the order they are drawn.
-    pub const ROWS: [Setting; 4] =
-        [Setting::DirAccess, Setting::Language, Setting::DefaultMode, Setting::Theme];
+    pub const ROWS: [Setting; 5] = [
+        Setting::DirAccess,
+        Setting::Language,
+        Setting::DefaultMode,
+        Setting::Theme,
+        Setting::Update,
+    ];
 
     fn new(lang: Lang, draft: crate::config::Config) -> Form {
         Form { draft, lang, cursor: 0 }
@@ -181,6 +198,10 @@ impl Form {
                 Some(m) => 1 + Mode::ALL.iter().position(|it| *it == m).unwrap_or(0),
             },
             Setting::Theme => THEMES.iter().position(|t| *t == self.draft.theme).unwrap_or(0),
+            Setting::Update => crate::update::Policy::ALL
+                .iter()
+                .position(|p| *p == self.draft.update)
+                .unwrap_or(0),
         }
     }
 
@@ -195,6 +216,7 @@ impl Form {
                     i.checked_sub(1).map(|n| Mode::ALL[n.min(Mode::ALL.len() - 1)])
             }
             Setting::Theme => self.draft.theme = THEMES[i.min(THEMES.len() - 1)],
+            Setting::Update => self.draft.update = pick(i),
         }
     }
 }

@@ -1364,6 +1364,57 @@ impl Lang {
         self.pick("언어", "Language")
     }
     /// The row label for the palette.
+    pub fn cfg_update(self) -> &'static str {
+        self.pick("업데이트", "Updates")
+    }
+    /// The name of an update policy.
+    pub fn cfg_update_name(self, p: crate::update::Policy) -> &'static str {
+        use crate::update::Policy::{Auto, Notify, Off};
+        match (self, p) {
+            (Lang::Ko, Auto) => "자동",
+            (Lang::Ko, Notify) => "알림",
+            (Lang::Ko, Off) => "끔",
+            (Lang::En, Auto) => "auto",
+            (Lang::En, Notify) => "notify",
+            (Lang::En, Off) => "off",
+        }
+    }
+    pub fn cfg_update_desc(self, p: crate::update::Policy) -> &'static str {
+        use crate::update::Policy::{Auto, Notify, Off};
+        match (self, p) {
+            (Lang::Ko, Auto) => "새 버전이 나오면 받아서 설치하고 그 버전으로 다시 시작합니다.",
+            (Lang::Ko, Notify) => "새 버전이 나오면 알리기만 합니다 ‒ `/update`로 설치합니다.",
+            (Lang::Ko, Off) => "새 버전이 있는지 확인하지 않습니다.",
+            (Lang::En, Auto) => "Install a newer release and come back on it.",
+            (Lang::En, Notify) => "Say a newer release exists ‒ `/update` installs it.",
+            (Lang::En, Off) => "Never look for one.",
+        }
+    }
+    /// Said when a newer release is found and the policy is `notify`.
+    pub fn update_available(self, tag: &str) -> String {
+        match self {
+            Lang::Ko => format!("새 버전 {tag}이(가) 나왔습니다. `/update`로 설치합니다."),
+            Lang::En => format!("{tag} is out. `/update` installs it."),
+        }
+    }
+    /// Said just before the app steps aside for its replacement.
+    pub fn update_installing(self, tag: &str) -> String {
+        match self {
+            Lang::Ko => format!("{tag} 설치를 시작합니다 ‒ 잠시 뒤 새 버전으로 다시 열립니다."),
+            Lang::En => format!("Installing {tag} ‒ this reopens on the new version in a moment."),
+        }
+    }
+    /// Said when `/update` was asked for and there is nothing to do.
+    pub fn update_current(self) -> &'static str {
+        self.pick("이미 최신입니다.", "Already the newest release.")
+    }
+    /// Said when the release could not be looked up, or the handover could not be started.
+    pub fn update_failed(self, why: &str) -> String {
+        match self {
+            Lang::Ko => format!("업데이트하지 못했습니다: {why}"),
+            Lang::En => format!("Could not update: {why}"),
+        }
+    }
     pub fn cfg_theme(self) -> &'static str {
         self.pick("화면 색", "Colours")
     }
