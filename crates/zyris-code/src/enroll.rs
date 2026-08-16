@@ -55,11 +55,101 @@ pub fn source(
     )
     .map_err(|e| e.to_string())?
     .with_ui(Arc::new(ScreenEnroll { bridge: bridge.clone() }));
-    let creds: Arc<dyn Credentials> =
-        Arc::new(zyris::runtime::credentials::DeviceGrant::new(enroller));
+    // **Not upstream's `DeviceGrant`** — see `Held`. The behaviour is the same; the difference is
+    // that logging out can reach the copy it keeps in memory.
+    let held = Arc::new(Held::new(enroller));
+    let creds: Arc<dyn Credentials> = held.clone();
 
-    let reauth = Reauth { store, spent: Arc::new(AtomicBool::new(false)) };
+    let reauth = Reauth { store, held, spent: Arc::new(AtomicBool::new(false)) };
     Ok((creds, Some(reauth)))
+}
+
+/// The credential this node presents, **with a way to let go of it.**
+///
+/// Upstream's `DeviceGrant` does exactly this and nothing here differs from it — the token is
+/// fetched once and reused until it expires, because `bearer` is called before *every* dial and
+/// going back to the store each time would be pointless work.
+///
+/// The copy it keeps is private, though, and that made `/account logout` a lie: it cleared the
+/// credential file, dropped the socket so the runner would redial, and the redial presented the
+/// token this process was **still holding** and attached. Logged out on disk, connected on the
+/// wire, and no enrollment code — which is exactly what was reported (2026-08-14). Clearing the
+/// file cannot be the whole of logging out while a live process holds a working token.
+///
+/// So this type exists for one method: [`forget`](Self::forget).
+pub struct Held {
+    enroller: zyris::enroll::Enroller,
+    held: tokio::sync::Mutex<Option<zyris::enroll::StoredCredential>>,
+}
+
+impl Held {
+    /// Clock-skew allowance when deciding whether a stored access token is still worth presenting.
+    /// The same figure upstream uses — a token this close to expiry will be refused mid-handshake.
+    const SKEW_SECS: i64 = 30;
+
+    fn new(enroller: zyris::enroll::Enroller) -> Held {
+        Held { enroller, held: tokio::sync::Mutex::new(None) }
+    }
+
+    /// Lets go of the token held in memory. The next dial goes back through `obtain`, which finds
+    /// whatever the store now holds — nothing, once logging out has cleared it — and enrolls.
+    pub async fn forget(&self) {
+        *self.held.lock().await = None;
+    }
+
+    /// Whether a token is being held right now. For the test that logging out lets go of it —
+    /// there is no other way to see the thing that made logging out a lie.
+    #[cfg(test)]
+    pub(crate) async fn is_holding(&self) -> bool {
+        self.held.lock().await.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn hold(&self, credential: zyris::enroll::StoredCredential) {
+        *self.held.lock().await = Some(credential);
+    }
+
+    fn now_unix() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
+    }
+}
+
+#[async_trait::async_trait]
+impl Credentials for Held {
+    async fn bearer(&self) -> Result<String, zyris::runtime::credentials::CredentialsError> {
+        let mut held = self.held.lock().await;
+        // `obtain` is the whole startup decision tree: reuse, refresh, or enroll. Going there
+        // whenever the access token is spent means there is no timer task and no second code path.
+        if held.as_ref().and_then(|c| c.bearer(Self::now_unix(), Self::SKEW_SECS)).is_none() {
+            *held = Some(self.enroller.obtain().await?);
+        }
+        held.as_ref()
+            .and_then(|c| c.bearer(Self::now_unix(), Self::SKEW_SECS))
+            .map(str::to_string)
+            .ok_or_else(|| {
+                zyris::runtime::credentials::CredentialsError::NeedsOperator(
+                    "the credential just issued is already expired; check this machine's clock"
+                        .to_string(),
+                )
+            })
+    }
+
+    async fn refresh(&self) -> Result<bool, zyris::runtime::credentials::CredentialsError> {
+        let mut held = self.held.lock().await;
+        let Some(current) = held.as_ref() else { return Ok(false) };
+        // `None` means the server disowned this credential and the store has already been cleared.
+        // Dropping what is held sends the next `bearer` back through `obtain`, which finds nothing
+        // stored and enrolls — so a revoked node shows a fresh code instead of dying.
+        *held = self.enroller.force_refresh(current).await?;
+        Ok(true)
+    }
+
+    fn describe(&self) -> String {
+        format!("device enrollment ({})", self.enroller.store_description())
+    }
 }
 
 /// The hook that moves the enrollment code to the screen. The upstream polling loop calls this method.
@@ -107,33 +197,131 @@ impl EnrollmentUi for ScreenEnroll {
 #[derive(Clone)]
 pub struct Reauth {
     store: Arc<dyn CredentialStore>,
+    /// The token this process is holding. **Clearing the file is only half of it** — see `Held`.
+    held: Arc<Held>,
     /// Whether this process has already discarded once. **A person can approve narrowly again** —
     /// discarding every time would demand the browser on every attach, not every launch.
     spent: Arc<AtomicBool>,
 }
 
 impl Reauth {
+    /// A `Reauth` over whatever store the test hands it. The enroller is never called — nothing in
+    /// these tests reaches the network — but `Held` needs one to exist.
+    #[cfg(test)]
+    pub(crate) fn for_test(store: Arc<dyn CredentialStore>) -> Reauth {
+        let enroller = zyris::enroll::Enroller::new(
+            "wss://example.invalid",
+            "arch zyris-code".into(),
+            "linux".into(),
+            Vec::new(),
+            store.clone(),
+        )
+        .expect("the enroller is only built, never called");
+        Reauth {
+            store,
+            held: Arc::new(Held::new(enroller)),
+            spent: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
     /// Whether it has already been done. The value fed into the decision (`conn::needs_reenrollment`).
     pub fn spent(&self) -> bool {
         self.spent.load(Ordering::SeqCst)
     }
 
-    /// Discards the credentials. True if something was actually discarded.
+    /// Discards the credentials **at most once per process.** True if something was discarded.
     ///
-    /// **The connection currently running is left alone.** Cutting it here would make upstream pop
-    /// enrollment onto the screen, and the person sees the code **on the screen** — it doesn't leak
-    /// to the terminal as before. The credentials are still emptied, so the next launch (or when the connection drops and reattaches) asks cleanly.
+    /// The limit is for the automatic path: when the granted scopes come back short
+    /// (`conn::needs_reenrollment`), asking again every time would demand a browser on every
+    /// reconnect, because the person may approve narrowly again.
+    ///
+    /// **A person asking to log out is not that path** — see `discard`.
     pub async fn discard_once(&self) -> bool {
         if self.spent.swap(true, Ordering::SeqCst) {
             return false;
         }
-        match self.store.clear().await {
+        self.discard().await
+    }
+
+    /// Discards the credentials, however many times it is asked.
+    ///
+    /// **`/account logout` must not be silently refused.** It used to go through `discard_once`,
+    /// so once the automatic scope check had spent the one allowance, pressing logout cleared
+    /// nothing and reported failure — with the credentials still on disk and still working. A
+    /// person asking to log out means it every time.
+    ///
+    /// **The file and the copy in memory both go, in that order.** Clearing the file alone left
+    /// this process holding a working access token, so the redial that logging out triggers
+    /// presented it and attached — no enrollment code, still connected, credential gone from disk.
+    /// The order matters because forgetting first would let a dial in between reload the file and
+    /// cache it again.
+    pub async fn discard(&self) -> bool {
+        // Anything automatic afterwards would be pointless: there is nothing left to discard.
+        self.spent.store(true, Ordering::SeqCst);
+        let cleared = match self.store.clear().await {
             Ok(()) => true,
             Err(e) => {
                 tracing::warn!(error = %e, "could not discard the credentials");
                 false
             }
-        }
+        };
+        self.held.forget().await;
+        cleared
+    }
+}
+
+#[cfg(test)]
+mod tests_discard {
+    use super::*;
+    use zyris::enroll::{CredentialStore, MemoryCredentialStore};
+
+    fn stored() -> zyris::enroll::StoredCredential {
+        zyris::enroll::StoredCredential::new(
+            "a".into(),
+            "r".into(),
+            "n".into(),
+            "arch zyris-code".into(),
+            "e@example.com".into(),
+            i64::MAX,
+        )
+    }
+
+    /// **Clearing the file is only half of logging out.**
+    ///
+    /// The token this process is already holding is what the next dial presents, so wiping the
+    /// credential file and dropping the socket left the redial attaching on the held token: no
+    /// enrollment code, still connected, nothing on disk. Reported 2026-08-14.
+    #[tokio::test]
+    async fn logging_out_lets_go_of_the_token_this_process_is_holding() {
+        let store = std::sync::Arc::new(MemoryCredentialStore::default());
+        store.save(&stored()).await.unwrap();
+        let reauth = Reauth::for_test(store.clone());
+        reauth.held.hold(stored()).await;
+
+        assert!(reauth.discard().await);
+        assert!(store.load().await.unwrap().is_none(), "the file was not cleared");
+        assert!(!reauth.held.is_holding().await, "the token in memory would still attach");
+    }
+
+    /// **A person asking to log out means it every time.**
+    ///
+    /// Logging out went through `discard_once`, which allows one discard per process for the
+    /// automatic scope check. Once that allowance was spent, pressing logout cleared nothing and
+    /// reported failure — with the credentials still on disk and still working.
+    #[tokio::test]
+    async fn asking_to_log_out_twice_still_logs_out() {
+        let store = std::sync::Arc::new(MemoryCredentialStore::default());
+        store.save(&stored()).await.unwrap();
+        let reauth = Reauth::for_test(store.clone());
+
+        // The automatic path spends its one allowance.
+        assert!(reauth.discard_once().await);
+        assert!(!reauth.discard_once().await, "the automatic path is once per process");
+
+        // A person can still log out afterwards.
+        store.save(&stored()).await.unwrap();
+        assert!(reauth.discard().await, "logging out was refused");
+        assert!(store.load().await.unwrap().is_none(), "the credential is still there");
     }
 }
 
@@ -234,7 +422,7 @@ mod tests {
     async fn a_credential_is_discarded_at_most_once_per_process() {
         let store = Arc::new(MemoryCredentialStore::new());
         store.save(&stored()).await.unwrap();
-        let reauth = Reauth { store: store.clone(), spent: Arc::new(AtomicBool::new(false)) };
+        let reauth = Reauth::for_test(store.clone());
 
         assert!(!reauth.spent());
         assert!(reauth.discard_once().await, "the first one is discarded");

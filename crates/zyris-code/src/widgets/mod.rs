@@ -2,7 +2,8 @@
 //!
 //! ```text
 //! │   (conversation)                    │
-//! │ ● working…                 Esc stop │ what's happening now
+//! │ ● working… (2/5)           Esc stop │ what's happening now
+//! │   ● 1. read the failing test        │ the plan — only while unfolded (Ctrl+T, or a click above)
 //! ├─ ~/zyris-code · * main +2 ~1 ───────┤ where tools run, and what git says (`repo::spans`)
 //! │ > input                             │ input box (grows with content)
 //! ├─────────────────────────────────────┤
@@ -27,6 +28,7 @@
 pub mod activity;
 mod ask;
 mod enroll;
+mod githubform;
 mod input;
 mod newproject;
 mod panel;
@@ -34,6 +36,9 @@ mod picker;
 /// Public for the same reason as `activity` — `left_spans` is the pure seam tests read the
 /// bottom bar through.
 pub mod status;
+/// Public because `lines` is the pure seam the todo list is read through — the same reason
+/// `activity` and `status` are.
+pub mod todos;
 mod transcript;
 
 use ratatui::layout::{Constraint, Direction, Layout};
@@ -57,32 +62,44 @@ pub fn draw(frame: &mut Frame, state: &mut State) {
             state.input.height(area.width.saturating_sub(2)).min((area.height / 2).max(1)).max(1)
         }
     };
+    // **The unfolded plan takes from the conversation, never from the input.** It sits directly
+    // under the line whose count it explains, and is capped at a third of the screen — a plan of
+    // twenty tasks must not push what is being read off the top.
+    let todo_h = todos::height(state, (area.height / 3).max(1));
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(1),              // conversation
             Constraint::Length(1),           // what's happening now
+            Constraint::Length(todo_h),      // the plan, when it is unfolded
             Constraint::Length(input_h + 1), // divider + input box
             Constraint::Length(1),           // divider
             Constraint::Length(1),           // bottom bar
         ])
         .split(area);
 
+    // **Rebuilt every frame.** An overlay that closed must not leave a clickable cell behind, and
+    // one that moved must not be clickable where it used to be.
+    state.screen_links.clear();
     transcript::draw(frame, chunks[0], state);
+    // A click on this row opens the plan, and `apply` is pure — so where it landed is written
+    // down here.
+    state.activity_row = Some(chunks[1].y);
     activity::draw(frame, chunks[1], state);
+    todos::draw(frame, chunks[2], state);
     match &state.asking {
         Some((_, a)) => {
             // Moving a click to a row requires knowing this area.
-            state.ask_area = Some(chunks[2]);
-            ask::draw(frame, chunks[2], a, state.lang);
+            state.ask_area = Some(chunks[3]);
+            ask::draw(frame, chunks[3], a, state.lang);
         }
         None => {
             state.ask_area = None;
-            input::draw(frame, chunks[2], state);
+            input::draw(frame, chunks[3], state);
         }
     }
-    input::rule(frame, chunks[3]);
-    status::draw(frame, chunks[4], state);
+    input::rule(frame, chunks[4]);
+    status::draw(frame, chunks[5], state);
 
     // The picker overlaps at the very top — while it is open, that is the current task.
     if let Some(p) = &mut state.picker {
@@ -95,10 +112,24 @@ pub fn draw(frame: &mut Frame, state: &mut State) {
         newproject::draw(frame, full, form, state.lang);
     }
 
+    // **The GitHub screen sits at the same level as the new-project form** — both are opened from
+    // one place, and neither can be open while the other is.
+    if let Some(form) = &state.github_form {
+        let link = githubform::draw(frame, full, form, state.lang);
+        if let Some(link) = link {
+            state.screen_links.push(link);
+        }
+    }
+
     // **The enrollment code window overlaps on top of that.** Nothing else may be done while viewing
     // the code — key handling also gives it top priority (`on_key`).
     if let Some(view) = &state.enroll {
-        enroll::draw(frame, full, view, state.lang);
+        // **The window is drawn from a borrow of `state`**, so the link it hands back is stored
+        // after that borrow ends.
+        let link = enroll::draw(frame, full, view, state.lang);
+        if let Some(link) = link {
+            state.screen_links.push(link);
+        }
     }
 
     // **The popup panel is drawn on top of everything.** It only opens from a slash
@@ -188,7 +219,12 @@ fn inject_links(frame: &mut Frame, state: &State) {
     use ratatui::buffer::CellDiffOption;
     use std::num::NonZeroU16;
 
-    if state.view_links.is_empty() {
+    // **A terminal that never learned OSC 8 prints the bytes.** Then a link is not merely
+    // un-clickable — the escape sequence lands across the transcript as rubbish, and the diff
+    // believes those cells are right, so it stays until a full repaint. Ctrl+click still opens
+    // the URL without this, because the app opens it itself (`open_url`) rather than leaving it
+    // to the emulator, so the cost of guessing "no" is the underline and nothing else.
+    if !state.caps.hyperlinks || state.view_links.is_empty() {
         return;
     }
     let (ox, oy) = state.view_origin;
@@ -202,9 +238,19 @@ fn inject_links(frame: &mut Frame, state: &State) {
                 let Some(cell) = frame.buffer_mut().cell_mut((x, y)) else { break };
                 let sym = cell.symbol().to_string();
                 let w = crate::markdown::display_width(&sym).max(1) as u16;
+                // **The terminal owns the decoration once it owns the link.** Emulators that read
+                // OSC 8 draw their own hyperlink styling, and most of them underline it on hover ‒
+                // so the underline the renderer put on (`markdown.rs`) sat under the terminal's,
+                // permanently, and read as a doubled one that never went away. Taking ours off
+                // here is what leaves the hover behaviour showing.
+                //
+                // It comes off **only** where the sequence goes on. A terminal we did not send
+                // OSC 8 to has nothing to style the link with, so there the underline stays and is
+                // the only sign that the text is a link at all.
+                cell.modifier.remove(ratatui::style::Modifier::UNDERLINED);
                 // Wide glyphs occupy two buffer cells (the second is an empty placeholder).
                 // Advancing by the glyph's own width skips that placeholder, so it is never
-                // written over — the wide char's trailing column stays intact.
+                // written over ‒ the wide char's trailing column stays intact.
                 cell.set_symbol(&format!("{open}{sym}\x1b]8;;\x1b\\"));
                 cell.set_diff_option(CellDiffOption::ForcedWidth(
                     NonZeroU16::new(w).expect("a glyph is at least one column wide"),

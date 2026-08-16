@@ -40,9 +40,14 @@ def read_until(fd, needle, buf, deadline, label):
     않는데, 읽은 뒤에만 검사하면 이미 화면에 있는 것도 영영 못 찾는다 — 앞선 검사가
     받아 둔 출력에 답이 들어 있는 경우가 그렇다. 실제로 이것 때문에 멀쩡한 앱이
     5개 항목에서 한꺼번에 실패했다.
+
+    `needle` is a string or a tuple of them. A tuple passes when **any one** of them shows up —
+    used for things the person's settings can change, such as the mode label.
     """
+    wanted = (needle,) if isinstance(needle, str) else tuple(needle)
     while True:
-        if needle in ANSI.sub("", "".join(buf)):
+        seen = ANSI.sub("", "".join(buf))
+        if any(w in seen for w in wanted):
             return True
         if time.time() >= deadline:
             break
@@ -56,7 +61,7 @@ def read_until(fd, needle, buf, deadline, label):
         if not chunk:
             break
         buf.append(chunk.decode("utf-8", "replace"))
-    print(f"  ✗ {label}: '{needle}'를 못 봤다")
+    print(f"  ✗ {label}: '{' 또는 '.join(wanted)}'를 못 봤다")
     return False
 
 
@@ -69,8 +74,13 @@ def main():
     #
     # Also cut the wire deadline to an extreme. This value is only used where approval is awaited,
     # but if the small value bites somewhere in the startup path, the checks below collapse entirely — that is what we watch for.
+    #
+    # **The screen language is pinned.** The checks below look for Korean words, and the app
+    # carries over whatever `/config lang` last saved — so on a machine set to English a
+    # perfectly healthy app failed four checks at once. That actually happened.
     env = dict(
         os.environ,
+        ZYRIS_CODE_LANG="ko",
         ZYRIS_PROFILE="zyris-code",
         ZYRIS_CODE_LOG="/tmp/zyris-code-smoke.log",
         ZYRIS_CODE_HEAL_MS="500",
@@ -101,7 +111,10 @@ def main():
         # **It is the mode label, so it moves when the wording does.** This looked for "기본"
         # long after `lang::mode_normal` had become "일반", and the check had been failing on a
         # perfectly healthy app ever since.
-        if read_until(primary, "일반", buf, deadline, "첫 프레임"):
+        #
+        # **And which mode it starts in is the person's setting** (`/config default mode`), so any
+        # of the four counts. Looking only for "일반" failed on a machine whose default was `job`.
+        if read_until(primary, ("일반", "계획", "작업", "일"), buf, deadline, "첫 프레임"):
             print("  ✓ 첫 프레임이 그려진다")
             checks += 1
         else:

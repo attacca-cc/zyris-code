@@ -564,28 +564,38 @@ mod jobs_tests {
     #[tokio::test]
     async fn a_finished_job_keeps_its_output_readable() {
         let j = jobs();
-        let id = j.start(shell("echo 안녕; exit 3")).unwrap();
+        // `cmd /C` does not speak bash: `;` is not a separator and `exit 3` needs `/b`.
+        // ASCII only — `cmd /C echo` writes non-ASCII in the console codepage, not UTF-8.
+        let cmd = if cfg!(windows) { "echo hi & exit /b 3" } else { "echo hi; exit 3" };
+        let id = j.start(shell(cmd)).unwrap();
         wait_for(&j, &id).await;
         let snap = j.snapshot(&id).unwrap();
         assert!(!snap.running);
         assert_eq!(snap.exit_code, Some(3));
         // Still readable after it ends — the agent calls logs after `until` says done.
-        assert!(j.read(&id, 0).unwrap().text.contains("안녕"));
+        assert!(j.read(&id, 0).unwrap().text.contains("hi"));
     }
 
     /// stdout and stderr arrive in one buffer.
     #[tokio::test]
     async fn both_streams_land_in_one_buffer() {
         let j = jobs();
-        let id = j.start(shell("echo 나감; echo 오류 1>&2")).unwrap();
+        // `cmd /C` on Windows uses `&` to separate commands, not `;`. ASCII only — a Korean
+        // word would come back in the console codepage rather than UTF-8 and never match.
+        let cmd = if cfg!(windows) { "echo hi & echo err 1>&2" } else { "echo hi; echo err 1>&2" };
+        let id = j.start(shell(cmd)).unwrap();
         wait_for(&j, &id).await;
         let text = j.read(&id, 0).unwrap().text;
-        assert!(text.contains("나감"), "{text}");
-        assert!(text.contains("오류"), "{text}");
+        assert!(text.contains("hi"), "{text}");
+        assert!(text.contains("err"), "{text}");
     }
 
     /// **Kill only the shell and the grandchild is left an orphan.** On this machine that
     /// means a freeze.
+    ///
+    /// Unix-only: the `( … ) & wait` subshell is bash, and on Windows the tree-kill goes
+    /// through `taskkill /T`, which this bash shape cannot exercise.
+    #[cfg(unix)]
     #[tokio::test]
     async fn stopping_a_job_kills_the_whole_process_tree() {
         let j = jobs();
@@ -652,7 +662,10 @@ mod jobs_tests {
         let j = jobs();
         let id = j
             .start(Spec {
-                command: Some("echo $NO_COLOR-$TERM".into()),
+                command: Some(
+                    if cfg!(windows) { "echo %NO_COLOR%-%TERM%" } else { "echo $NO_COLOR-$TERM" }
+                        .into(),
+                ),
                 env: vec![("TERM".into(), "xterm".into())],
                 ..Default::default()
             })

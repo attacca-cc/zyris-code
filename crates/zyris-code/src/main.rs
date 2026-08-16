@@ -22,6 +22,37 @@ const CONSUME_WAIT: Duration = Duration::from_secs(5);
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // **Answered before anything else is built.** Help and version must work with no account, no
+    // credential and no terminal, and a misread flag must not reach the point of spending credit.
+    let program = std::env::args()
+        .next()
+        .and_then(|p| {
+            std::path::Path::new(&p).file_stem().map(|s| s.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| "zyris".into());
+    let printing = match zyris_code::cli::parse(std::env::args().skip(1)) {
+        zyris_code::cli::Run::Screen => None,
+        zyris_code::cli::Run::Help => {
+            print!("{}", zyris_code::cli::help(&program));
+            return ExitCode::SUCCESS;
+        }
+        zyris_code::cli::Run::Version => {
+            println!("{program} {}", env!("CARGO_PKG_VERSION"));
+            return ExitCode::SUCCESS;
+        }
+        zyris_code::cli::Run::Bad(what) => {
+            eprintln!("{program}: cannot read {what:?}. Try `{program} --help`.");
+            return ExitCode::from(2);
+        }
+        zyris_code::cli::Run::Print(Some(text)) => Some(text),
+        zyris_code::cli::Run::Print(None) => match zyris_code::print::prompt_from_stdin() {
+            Ok(text) => Some(text),
+            Err(e) => {
+                eprintln!("{program}: {e}");
+                return ExitCode::from(2);
+            }
+        },
+    };
     // Where we talk to the shell while connecting. **Before the screen appears this is the only window.**
     let notice = zyris_code::notice::Notice::new();
 
@@ -35,9 +66,9 @@ async fn main() -> ExitCode {
     // current drive, so `File::create` failed there and the `Err` arm below silently dropped the
     // file layer — leaving no logs at all on the one platform where nothing can be reproduced
     // locally. `std::env::temp_dir` reads `%TEMP%` there and `/tmp` here.
-    let log = std::env::var("ZYRIS_CODE_LOG").map(std::path::PathBuf::from).unwrap_or_else(|_| {
-        std::env::temp_dir().join("zyris-code.log")
-    });
+    let log = std::env::var("ZYRIS_CODE_LOG")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir().join("zyris-code.log"));
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         // **It's `zyris=info`.** If only disconnects (`warn`) were kept, the reconnecting would vanish
         // from the log and "keeps disconnecting" couldn't be traced later.
@@ -78,24 +109,44 @@ async fn main() -> ExitCode {
     if std::env::var_os("ZYRIS_CONFIG_DIR").is_none_or(|v| v.is_empty()) {
         if let Some(dir) = zyris_code::conn::credential_dir() {
             std::env::set_var("ZYRIS_CONFIG_DIR", &dir);
-            // What's left in the old place is **moved over** (not copied). If two live refresh tokens
-            // sit on disk, both will be presented eventually, and attacca reads that reuse as a leaked
-            // chain and revokes the whole node — both die.
-            if let Some(legacy) = zyris_code::conn::legacy_credential_dir() {
-                let profile = std::env::var("ZYRIS_PROFILE")
-                    .unwrap_or_else(|_| zyris_code::conn::APP.to_string());
-                let moved = zyris_code::conn::migrate_credentials(&legacy, &dir, &profile);
-                if moved > 0 {
-                    tracing::info!(moved, "moved credentials from the old credential directory");
-                }
-            }
         }
     }
+
+    // **One credential, one node.** Splitting it per window was tried (2026-08-12) and taken out:
+    // it made a window's identity depend on what else happened to be running when it started, so
+    // ordinary use produced an approval screen again and again. What remains is the lock, which
+    // says whether another window is already up.
+    //
+    // **The handle lives as long as `main`** — dropping it removes the lock file, and a window
+    // that let go early would look absent to the next one to start.
+    let window = zyris_code::conn::credential_dir().map(|dir| {
+        let base =
+            std::env::var("ZYRIS_PROFILE").unwrap_or_else(|_| zyris_code::conn::APP.to_string());
+        zyris_code::conn::claim_window(&dir, &base)
+    });
 
     // The profile splits again inside that directory. Unset just leaves it `default`, and now
     // that `default` is ours.
     if std::env::var_os("ZYRIS_PROFILE").is_none() {
-        std::env::set_var("ZYRIS_PROFILE", "zyris-code");
+        std::env::set_var("ZYRIS_PROFILE", zyris_code::conn::APP);
+    }
+
+    // What's left in the old place is **moved over** (not copied). If two live refresh tokens
+    // sit on disk, both will be presented eventually, and attacca reads that reuse as a leaked
+    // chain and revokes the whole node — both die.
+    //
+    // **Only this window's own profile is moved.** A later window's profile never existed back
+    // then, so there is nothing of its to find, and reaching for another profile's file would log
+    // that program out.
+    if let (Some(dir), Some(legacy)) =
+        (zyris_code::conn::credential_dir(), zyris_code::conn::legacy_credential_dir())
+    {
+        let profile =
+            std::env::var("ZYRIS_PROFILE").unwrap_or_else(|_| zyris_code::conn::APP.to_string());
+        let moved = zyris_code::conn::migrate_credentials(&legacy, &dir, &profile);
+        if moved > 0 {
+            tracing::info!(moved, "moved credentials from the old credential directory");
+        }
     }
 
     // **The scopes to request must be decided before credentials are made.** Since `Enroller` copies
@@ -112,7 +163,7 @@ async fn main() -> ExitCode {
     // separates them by appending `-2` to one, but which one keeps `arch` depends on attach order.
     // Then the tool names the agent reads (`zyris__arch__…`) change from run to run.
     if std::env::var_os("ZYRIS_NODE_NAME").is_none() {
-        std::env::set_var("ZYRIS_NODE_NAME", zyris_code::conn::node_name());
+        std::env::set_var("ZYRIS_NODE_NAME", zyris_code::conn::default_node_name());
     }
 
     // **The app is raised before the runner.** That way the enrollment code window is on screen from
@@ -135,15 +186,33 @@ async fn main() -> ExitCode {
 
     // **The screen is raised first.** Here, not in `on_connect` — the enrollment code window must
     // reach it before the first connection too (`enroll::ScreenEnroll`).
-    let mut app_task = tokio::spawn(app::run(api_rx.clone(), bridge.clone(), die_rx));
+    // **Print mode raises no screen.** Everything above it is the same — the same credential, the
+    // same node name, the same capabilities announced — so the agent can work on this computer
+    // either way. Only the last step differs: one draws, the other writes a line and leaves.
+    let mut app_task = match printing.clone() {
+        Some(prompt) => {
+            let api_rx = api_rx.clone();
+            let bridge = bridge.clone();
+            tokio::spawn(async move {
+                let api = wait_for_api(api_rx).await?;
+                zyris_code::print::run(api, bridge, &prompt).await
+            })
+        }
+        None => tokio::spawn(app::run(api_rx.clone(), bridge.clone(), die_rx)),
+    };
     // Wait for the screen to attach before the runner runs — so the first enrollment code can
     // reach the screen. **Never wait forever.** If the app task dies before the screen attaches
     // (a terminal that cannot run the TUI, a panic inside `app::run`), the old code sat on the
     // shell's waiting line ("approve in the browser…") with a frozen cursor — exactly what the
     // 2026-08-07 Windows report saw. Say why and exit instead of hanging.
-    let died_before_screen = tokio::select! {
-        () = bridge.wait_screen() => None,
-        ended = &mut app_task => Some(ended),
+    let died_before_screen = if printing.is_some() {
+        // Nothing to attach: print mode has no screen to wait for.
+        None
+    } else {
+        tokio::select! {
+            () = bridge.wait_screen() => None,
+            ended = &mut app_task => Some(ended),
+        }
     };
     if let Some(ended) = died_before_screen {
         // The app may have died mid-raw-mode; restore the terminal so the reason is readable.
@@ -163,38 +232,37 @@ async fn main() -> ExitCode {
     // another window can touch this computer too. The only thing blocking is `tools::guard::Gate`.
     let cwd = zyris_code::tools::working_dir();
 
-    // **Multiple windows are not blocked. They are announced.**
+    // **Every window is its own node** (`conn::claim_window`, taken at the top of `main`).
     //
-    // With two windows using the same credentials, the server registry **overwrites with the later
-    // connection** — the first window's socket stays alive but stops receiving tool calls. Blocking
-    // wouldn't change that (with the same directory, whichever window receives, the files changed are
-    // the same), so the second window isn't refused; but if it tangles quietly, the person has no way
-    // to know which window is receiving. So when an earlier window is alive, that fact is said once
-    // in the activity line (`conn::another_instance_alive`; lock file `.instance-<profile>.lock`).
+    // It used to be one node for all of them, because identity is the credential and they shared
+    // one. The server registry is keyed by node id (`insert(node_id, connection)`), so the second
+    // window replaced the first's connection and the first was handed no tool calls at all while
+    // its socket stayed up. This app could only say so and carry on. Now each window takes a slot,
+    // files its credentials under a profile of its own, and registers under a name of its own —
+    // so a tool call lands in the window whose session made it.
     //
-    // You only need to know one thing: judgment (plan mode · open directory) and the approval window
-    // belong to **the window that received the call**; if the two windows are in different modes, the server decides which rules apply.
+    // **The judgment still belongs to the window that received the call** (plan mode, `/config`
+    // dir access). That is now the same window that asked, which is what it always should have been.
     //
-    // **The handle has to live as long as the window does.** Bound inside the `else` block it
-    // was dropped at that block's closing brace, and `Drop` deletes the very file it had just
-    // written — so no window ever left a lock behind, no second window ever found one, and the
-    // notice could not fire. That is the one warning that explains "my tool calls just sit
-    // there": whichever window the server picked is the only one being asked.
-    let _instance_lock = zyris_code::conn::credential_dir().and_then(|dir| {
-        let profile =
-            std::env::var("ZYRIS_PROFILE").unwrap_or_else(|_| zyris_code::conn::APP.to_string());
-        if zyris_code::conn::another_instance_alive(&dir, &profile) {
-            tracing::warn!(
-                "another zyris-code window is attached with the same credentials. tool calls go \
-                 to whichever window the server picked."
-            );
-            bridge.frame(zyris_code::app::Frame::Notice(
-                zyris_code::lang::current().another_window_notice().to_string(),
-            ));
-            return None;
-        }
-        zyris_code::conn::claim_instance_lock(&dir, &profile)
-    });
+    // **The handle has to live as long as the window does.** Bound inside a block it was dropped at
+    // the closing brace, and `Drop` deletes the very file it had just written — so no window ever
+    // left a lock behind and no later window ever found one.
+    //
+    // Here is where the screen exists to say what the slot means. **A window past the first enrols
+    // once** — an approval window with no explanation reads as the app having logged itself out.
+    // **The second window is told, and told once.** With one credential the server keeps the
+    // connection that arrived last, so this window has just taken the tool calls from the other
+    // one — see `### 창 여럿` in CLAUDE.md.
+    if window.as_ref().is_some_and(|w| w.lock.is_none()) {
+        tracing::warn!(
+            "another zyris-code window is attached with the same credentials. tool calls go to \
+             whichever window the server picked."
+        );
+        bridge.frame(zyris_code::app::Frame::Notice(
+            zyris_code::lang::current().another_window_notice().to_string(),
+        ));
+    }
+    let _instance_lock = window;
     //
     // **The enrollment code is sent to the screen by upstream's `EnrollmentUi` hook** (`enroll.rs`, upstream PR #6).
     // Only when there's no screen (the extreme where the app couldn't start) does it fall to a stdout box. The old
@@ -318,9 +386,23 @@ async fn main() -> ExitCode {
         }
         // If the screen closed, the process must end too. `Runner::run()` keeps running, holding the
         // connection even after hooks finish — the app ending is itself the exit signal.
+        // **Print mode has no screen to restore, so its reason has to be said here.** Failing
+        // silently with a bare exit code is worse in a script than anywhere else: the caller sees
+        // a non-zero and nothing to act on.
         RunnerEnded::App(app_result) => match app_result {
             Ok(Ok(())) => ExitCode::SUCCESS,
-            _ => ExitCode::FAILURE,
+            Ok(Err(e)) => {
+                if printing.is_some() {
+                    eprintln!("{program}: {e}");
+                }
+                ExitCode::FAILURE
+            }
+            Err(e) => {
+                if printing.is_some() {
+                    eprintln!("{program}: {e}");
+                }
+                ExitCode::FAILURE
+            }
         },
     }
 }
@@ -329,4 +411,22 @@ async fn main() -> ExitCode {
 enum RunnerEnded {
     Runner(Result<(), zyris::runtime::RunError>),
     App(Result<Result<(), anyhow::Error>, tokio::task::JoinError>),
+}
+
+/// Waits for the first live connection, for the paths that have no screen to draw while waiting.
+///
+/// **The runner is what fills this**, on its own schedule — a first enrolment can sit here for as
+/// long as it takes somebody to reach a browser. The sender being dropped means the runner ended,
+/// and there will never be a handle.
+async fn wait_for_api(
+    mut api_rx: watch::Receiver<Option<Arc<AttaccaApiClient>>>,
+) -> anyhow::Result<Arc<AttaccaApiClient>> {
+    loop {
+        if let Some(api) = api_rx.borrow_and_update().clone() {
+            return Ok(api);
+        }
+        if api_rx.changed().await.is_err() {
+            anyhow::bail!("could not connect");
+        }
+    }
 }

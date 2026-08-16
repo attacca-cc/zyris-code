@@ -187,6 +187,20 @@ impl Lang {
     pub fn ctrl_c_quits(self) -> &'static str {
         self.pick("Ctrl+C 종료", "Ctrl+C quits")
     }
+    /// What rides on the end of the activity line while the session has a plan: `(2/5)`.
+    ///
+    /// **The same in both languages.** It is a count, and a word in front of it would take room
+    /// from the line that has to say what is happening.
+    pub fn todo_count(self, done: usize, total: usize) -> String {
+        format!(" ({done}/{total})")
+    }
+    /// The line that stands in for the tasks that did not fit.
+    pub fn todo_more(self, n: usize) -> String {
+        match self {
+            Lang::Ko => format!("↓ {n}개 더"),
+            Lang::En => format!("↓ {n} more"),
+        }
+    }
     pub fn queued(self, n: usize) -> String {
         match self {
             Lang::Ko => format!("대기 {n}개"),
@@ -209,25 +223,25 @@ impl Lang {
     /// works everywhere) is the way to insert a newline.
     pub fn kitty_shift_enter_hint(self) -> &'static str {
         self.pick(
-            "연결됨 — 이 터미널은 Shift+Enter를 구별하지 못합니다. 줄바꿈은 Alt+Enter를 쓰세요.",
-            "Connected — this terminal can't tell Shift+Enter apart from Enter. Use Alt+Enter for a newline.",
+            "연결됨 ‒ 이 터미널은 Shift+Enter를 구별하지 못합니다. 줄바꿈은 Alt+Enter를 쓰세요.",
+            "Connected ‒ this terminal can't tell Shift+Enter apart from Enter. Use Alt+Enter for a newline.",
         )
     }
     /// What to show in the activity line while a command runs.
     pub fn running_command(self, command: &str, secs: u64) -> String {
         match self {
-            Lang::Ko => format!("▶ {command}  ·  {secs}초"),
-            Lang::En => format!("▶ {command}  ·  {secs}s"),
+            Lang::Ko => format!("▶ {command}  ∙  {secs}초"),
+            Lang::En => format!("▶ {command}  ∙  {secs}s"),
         }
     }
     /// Says once, on the status line, that a background job finished. **It says so on success
     /// too** — not knowing it is done leaves a person waiting.
     pub fn job_ended(self, id: &str, ok: bool, secs: u64) -> String {
         match (self, ok) {
-            (Lang::Ko, true) => format!("배경 {id} 끝남 · 성공 · {secs}초"),
-            (Lang::Ko, false) => format!("배경 {id} 끝남 · 실패 · {secs}초"),
-            (Lang::En, true) => format!("background {id} done · ok · {secs}s"),
-            (Lang::En, false) => format!("background {id} done · failed · {secs}s"),
+            (Lang::Ko, true) => format!("배경 {id} 끝남 ∙ 성공 ∙ {secs}초"),
+            (Lang::Ko, false) => format!("배경 {id} 끝남 ∙ 실패 ∙ {secs}초"),
+            (Lang::En, true) => format!("background {id} done ∙ ok ∙ {secs}s"),
+            (Lang::En, false) => format!("background {id} done ∙ failed ∙ {secs}s"),
         }
     }
     /// Background jobs on the activity line. With several, only the count and the oldest one —
@@ -240,8 +254,8 @@ impl Lang {
             (Lang::En, n) => format!("background ×{n}"),
         };
         match self {
-            Lang::Ko => format!("{head}  {id} {label}  ·  {secs}초"),
-            Lang::En => format!("{head}  {id} {label}  ·  {secs}s"),
+            Lang::Ko => format!("{head}  {id} {label}  ∙  {secs}초"),
+            Lang::En => format!("{head}  {id} {label}  ∙  {secs}s"),
         }
     }
     pub fn jobs_none(self) -> &'static str {
@@ -271,24 +285,24 @@ impl Lang {
     /// One row of `/jobs`. The seconds suffix belongs here, not at the call site.
     pub fn jobs_row(self, id: &str, label: &str, secs: u64) -> String {
         match self {
-            Lang::Ko => format!("\n  {id}  {label}  ·  {secs}초"),
-            Lang::En => format!("\n  {id}  {label}  ·  {secs}s"),
+            Lang::Ko => format!("\n  {id}  {label}  ∙  {secs}초"),
+            Lang::En => format!("\n  {id}  {label}  ∙  {secs}s"),
         }
     }
     /// What to show in the activity line while waiting for a question.
     pub fn waiting_answer(self) -> &'static str {
-        self.pick("대기 중 — 답을 고르세요", "Waiting — answer the question")
+        self.pick("대기 중 ‒ 답을 고르세요", "Waiting ‒ answer the question")
     }
     /// The hint attached to the right of the activity line while waiting for a question.
     pub fn waiting_answer_hint(self) -> &'static str {
-        self.pick("↑↓ 이동 · Enter 고르기", "↑↓ move · Enter choose")
+        self.pick("↑↓ 이동 ∙ Enter 고르기", "↑↓ move ∙ Enter choose")
     }
 
     pub fn mode_now(self, mode: &str) -> String {
         match self {
             Lang::Ko => format!(
                 "지금은 **{mode}** 모드입니다. Shift+Tab으로 돌리거나 \
-                 `/mode 일반`·`/mode 계획`·`/mode 일`·`/mode 작업`으로 바꿉니다."
+                 `/mode 일반`∙`/mode 계획`∙`/mode 일`∙`/mode 작업`으로 바꿉니다."
             ),
             Lang::En => format!(
                 "Mode is **{mode}**. Cycle it with Shift+Tab, or set it with \
@@ -336,8 +350,8 @@ impl Lang {
     }
     pub fn threads_in(self, project: &str) -> String {
         match self {
-            Lang::Ko => format!("쓰레드  ·  {project}"),
-            Lang::En => format!("Threads  ·  {project}"),
+            Lang::Ko => format!("쓰레드  ∙  {project}"),
+            Lang::En => format!("Threads  ∙  {project}"),
         }
     }
     pub fn agents(self) -> &'static str {
@@ -345,6 +359,14 @@ impl Lang {
     }
     pub fn commands(self) -> &'static str {
         self.pick("명령", "Commands")
+    }
+    /// Title of the list `@` opens.
+    pub fn files(self) -> &'static str {
+        self.pick("파일", "Files")
+    }
+    /// Title of the list `Ctrl+R` opens.
+    pub fn history(self) -> &'static str {
+        self.pick("보낸 말", "History")
     }
     pub fn new_project(self) -> &'static str {
         self.pick("＋ 새 프로젝트", "+ New project")
@@ -371,8 +393,8 @@ impl Lang {
     }
     pub fn project_form_keys(self) -> &'static str {
         self.pick(
-            "Tab 다음 칸 · Enter 만들기 · Esc 닫기",
-            "Tab next field · Enter create · Esc close",
+            "Tab 다음 칸 ∙ Enter 만들기 ∙ Esc 닫기",
+            "Tab next field ∙ Enter create ∙ Esc close",
         )
     }
     /// **An empty name isn't created** — it's unclear what's being made, and a nameless row in the
@@ -384,7 +406,7 @@ impl Lang {
         match self {
             Lang::Ko => format!(
                 "프로젝트 **{name}**을 만들고 그 안으로 들어왔습니다. \
-                 여기서 여는 thread·job·work는 이 프로젝트의 것이 됩니다."
+                 여기서 여는 thread∙job∙work는 이 프로젝트의 것이 됩니다."
             ),
             Lang::En => format!(
                 "Created project **{name}** and moved into it. \
@@ -425,16 +447,16 @@ impl Lang {
         self.pick("여기에 직접 적으세요 (Enter로 확정)", "Type here (Enter to confirm)")
     }
     pub fn typing_keys(self) -> &'static str {
-        self.pick("Enter 입력 끝 · Esc 취소", "Enter to finish · Esc to cancel")
+        self.pick("Enter 입력 끝 ∙ Esc 취소", "Enter to finish ∙ Esc to cancel")
     }
     pub fn choosing_keys(self) -> &'static str {
         self.pick(
-            "↑↓ 이동 · Enter 고르기/실행 · 클릭도 됨 · Esc 접기",
-            "↑↓ move · Enter choose/run · click works too · Esc folds",
+            "↑↓ 이동 ∙ Enter 고르기/실행 ∙ 클릭도 됨 ∙ Esc 접기",
+            "↑↓ move ∙ Enter choose/run ∙ click works too ∙ Esc folds",
         )
     }
     pub fn review_keys(self) -> &'static str {
-        self.pick("↑↓ 이동 · Enter 실행 · 클릭도 됨", "↑↓ move · Enter runs · click works too")
+        self.pick("↑↓ 이동 ∙ Enter 실행 ∙ 클릭도 됨", "↑↓ move ∙ Enter runs ∙ click works too")
     }
     pub fn answered(self) -> &'static str {
         self.pick("답한 내용", "Your answer")
@@ -449,8 +471,18 @@ impl Lang {
     }
     pub fn enroll_steps(self) -> &'static str {
         self.pick(
-            "브라우저에서 이 주소를 열고, 아래 코드를 입력해 승인해 주세요:",
-            "Open this address in your browser and enter the code below:",
+            "아래 코드를 복사해 이 주소에서 승인해 주세요 (Ctrl+클릭으로 열립니다):",
+            "Copy the code below and approve it at this address (Ctrl+click opens it):",
+        )
+    }
+    /// **Said where the code is, because that is where it is decided.** Approving hands this
+    /// computer's files and shell to whichever account approved — so whose account it is matters
+    /// more here than anywhere else in the app, and afterwards there is nothing to warn about.
+    pub fn enroll_warning(self) -> &'static str {
+        self.pick(
+            "다른 사람의 계정과 연결하지 마세요. 승인한 계정이 이 컴퓨터의 파일과 셸을 쓰게 됩니다.",
+            "Do not connect this to someone else's account. Whoever approves it gets to read and \
+             change this computer's files and run commands on it.",
         )
     }
     pub fn enroll_expires(self, secs: u64) -> String {
@@ -535,6 +567,21 @@ impl Lang {
             "Another zyris-code window is already using the same credential. The enrollment-code window may be there.",
         )
     }
+    /// A window that took a slot of its own. **Said because the first launch of a slot asks for
+    /// approval again** — an enrollment window appearing for no visible reason reads as the app
+    /// having logged itself out.
+    pub fn window_slot_notice(self, slot: usize) -> String {
+        match self {
+            Lang::Ko => format!(
+                "다른 창이 이미 붙어 있어 이 창은 {slot}번 노드로 따로 등록합니다. \
+                 처음 한 번만 승인이 필요하고, 그 뒤로는 이 창이 자기 도구 호출만 받습니다."
+            ),
+            Lang::En => format!(
+                "Another window is already attached, so this one registers as node {slot} of its \
+                 own. It asks for approval once; after that this window only gets its own tool calls."
+            ),
+        }
+    }
 
     // ── Commands (`/clear` · `/cwd` · `/config` · `/agent` · `/undo` · `/changes`)
     pub fn clear_done(self) -> &'static str {
@@ -547,14 +594,14 @@ impl Lang {
         match self {
             Lang::Ko => format!(
                 "도구는 `{}`에서 돕니다.\n\n\
-                 이 노드는 **{node}**로 등록돼 있습니다 — 도구 이름은 `zyris__{slug}__…`입니다. \
+                 이 노드는 **{node}**로 등록돼 있습니다 ‒ 도구 이름은 `zyris__{slug}__…`입니다. \
                  `ZYRIS_NODE_NAME`으로 바꿉니다.\n\n\
                  자격은 `{cred}`에 있습니다.",
                 cwd.display(),
             ),
             Lang::En => format!(
                 "Tools run in `{}`.\n\n\
-                 This node is registered as **{node}** — tool names are `zyris__{slug}__…`. \
+                 This node is registered as **{node}** ‒ tool names are `zyris__{slug}__…`. \
                  Change it with `ZYRIS_NODE_NAME`.\n\n\
                  Credentials live in `{cred}`.",
                 cwd.display(),
@@ -588,7 +635,7 @@ impl Lang {
                  {plan_line}\
                  {credits_line}\
                  부여된 권한: {scopes}\n\n\
-                 `/account logout` — 이 기기에서 로그아웃합니다. \
+                 `/account logout` ‒ 이 기기에서 로그아웃합니다. \
                  다음 실행 때 다시 승인을 받습니다.",
                 plan_line = plan.map(|p| format!("플랜: {p}\n")).unwrap_or_default(),
                 credits_line = credits.map(|c| format!("크레딧: {c}\n")).unwrap_or_default(),
@@ -599,7 +646,7 @@ impl Lang {
                  {plan_line}\
                  {credits_line}\
                  Granted scopes: {scopes}\n\n\
-                 `/account logout` — log out on this device. The next launch asks for approval again.",
+                 `/account logout` ‒ log out on this device. The next launch asks for approval again.",
                 plan_line = plan.map(|p| format!("Plan: {p}\n")).unwrap_or_default(),
                 credits_line = credits.map(|c| format!("Credits: {c}\n")).unwrap_or_default(),
             ),
@@ -618,26 +665,25 @@ impl Lang {
     /// the credentials are empty, so the next launch asks cleanly.
     pub fn account_logged_out(self) -> &'static str {
         self.pick(
-            "로그아웃했습니다. 저장된 자격을 지웠습니다 — 다음 실행 때 다시 승인 화면이 나옵니다. \
-             지금 연결은 그대로입니다.",
-            "Logged out. The stored credentials are cleared — the next launch shows the approval \
-             screen again. The current connection stays as is.",
+            "로그아웃했습니다. 자격을 지우고 연결을 끊었습니다 ‒ 잠시 뒤 등록 코드 창이 뜹니다.",
+            "Logged out. The credentials are cleared and the connection dropped ‒ the enrolment \
+             code appears in a moment.",
         )
     }
     /// What `/account logout` says when there is nothing to discard — a token given directly
     /// (env/file) is not ours to drop, and there is no one to ask again.
     pub fn account_logout_nothing(self) -> &'static str {
         self.pick(
-            "로그아웃할 자격이 없습니다 — 토큰을 직접 줘서 로그인했습니다.",
-            "Nothing to log out — the token was given directly, not enrolled.",
+            "로그아웃할 자격이 없습니다 ‒ 토큰을 직접 줘서 로그인했습니다.",
+            "Nothing to log out ‒ the token was given directly, not enrolled.",
         )
     }
     /// What `/account logout` says when the credentials could not be cleared — already
     /// discarded this process, or the file refused to be removed.
     pub fn account_logout_failed(self) -> &'static str {
         self.pick(
-            "자격을 지우지 못했습니다 — 이미 처리했거나 파일을 지울 수 없었습니다.",
-            "Could not clear the credentials — already done, or the file could not be removed.",
+            "자격을 지우지 못했습니다 ‒ 이미 처리했거나 파일을 지울 수 없었습니다.",
+            "Could not clear the credentials ‒ already done, or the file could not be removed.",
         )
     }
     /// What `/status` shows — the current session's picture. **Every line earns its place:**
@@ -651,8 +697,8 @@ impl Lang {
         let thread = match session_id {
             Some(id) => format!("**thread** `{id}`"),
             None => match self {
-                Lang::Ko => "**thread** 아직 없음 — 첫 메시지에서 만들어집니다".to_string(),
-                Lang::En => "**thread** none yet — your first message creates it".to_string(),
+                Lang::Ko => "**thread** 아직 없음 ‒ 첫 메시지에서 만들어집니다".to_string(),
+                Lang::En => "**thread** none yet ‒ your first message creates it".to_string(),
             },
         };
         let project = match project {
@@ -665,10 +711,10 @@ impl Lang {
                 Lang::En => "project default (not picked)".to_string(),
             },
         };
-        s.push_str(&format!("{thread} · {project}\n"));
+        s.push_str(&format!("{thread} ∙ {project}\n"));
         s.push_str(&match self {
-            Lang::Ko => format!("에이전트 **{agent}** · 모드 **{mode}**\n"),
-            Lang::En => format!("agent **{agent}** · mode **{mode}**\n"),
+            Lang::Ko => format!("에이전트 **{agent}** ∙ 모드 **{mode}**\n"),
+            Lang::En => format!("agent **{agent}** ∙ mode **{mode}**\n"),
         });
 
         if let Some(model) = &usage.model {
@@ -702,7 +748,7 @@ impl Lang {
             segs.push(format!("{} {}", self.total_tokens(), crate::usage::compact(tokens)));
         }
         if !segs.is_empty() {
-            s.push_str(&format!("\n{}\n", segs.join(" · ")));
+            s.push_str(&format!("\n{}\n", segs.join(" ∙ ")));
         }
 
         s.push_str(&match self {
@@ -727,11 +773,11 @@ impl Lang {
     pub fn agent_staged(self, name: &str) -> String {
         match self {
             Lang::Ko => format!(
-                "에이전트: **{name}** · 다음 메시지에서 새 thread가 열립니다. \
+                "에이전트: **{name}** ∙ 다음 메시지에서 새 thread가 열립니다. \
                  앞 thread는 ←의 목록에 그대로 있습니다."
             ),
             Lang::En => format!(
-                "Agent: **{name}** · a new thread opens with your next message. \
+                "Agent: **{name}** ∙ a new thread opens with your next message. \
                  The previous thread stays in the ← list."
             ),
         }
@@ -743,7 +789,7 @@ impl Lang {
         }
     }
     pub fn agent_cannot_send(self) -> &'static str {
-        self.pick("에이전트를 찾지 못해 보낼 수 없습니다.", "No agent — can't send.")
+        self.pick("에이전트를 찾지 못해 보낼 수 없습니다.", "No agent ‒ can't send.")
     }
     pub fn send_failed(self, e: &str) -> String {
         match self {
@@ -792,11 +838,11 @@ impl Lang {
             // That a file was created comes before +N — undoing it means deleting it,
             // so it carries a different weight.
             let note = if c.created {
-                self.pick(" · 새로 만든 것", " · created").to_string()
+                self.pick(" ∙ 새로 만든 것", " ∙ created").to_string()
             } else if c.edits > 1 {
                 match self {
-                    Lang::Ko => format!(" · {}번 고침", c.edits),
-                    Lang::En => format!(" · edited {} times", c.edits),
+                    Lang::Ko => format!(" ∙ {}번 고침", c.edits),
+                    Lang::En => format!(" ∙ edited {} times", c.edits),
                 }
             } else {
                 String::new()
@@ -826,12 +872,12 @@ impl Lang {
         for (name, outcome) in report {
             s.push_str(&match outcome {
                 Ok(n) => match self {
-                    Lang::Ko => format!("\n- `{name}` — 도구 {n}개"),
-                    Lang::En => format!("\n- `{name}` — {n} tools"),
+                    Lang::Ko => format!("\n- `{name}` ‒ 도구 {n}개"),
+                    Lang::En => format!("\n- `{name}` ‒ {n} tools"),
                 },
                 Err(why) => match self {
-                    Lang::Ko => format!("\n- `{name}` — 못 띄웠습니다: {why}"),
-                    Lang::En => format!("\n- `{name}` — couldn't start it: {why}"),
+                    Lang::Ko => format!("\n- `{name}` ‒ 못 띄웠습니다: {why}"),
+                    Lang::En => format!("\n- `{name}` ‒ couldn't start it: {why}"),
                 },
             });
         }
@@ -853,8 +899,8 @@ impl Lang {
         for f in found {
             let count = f.text.chars().count();
             s.push_str(&match self {
-                Lang::Ko => format!("\n- `{}` — {count}자", f.path.display()),
-                Lang::En => format!("\n- `{}` — {count} chars", f.path.display()),
+                Lang::Ko => format!("\n- `{}` ‒ {count}자", f.path.display()),
+                Lang::En => format!("\n- `{}` ‒ {count} chars", f.path.display()),
             });
         }
         s.push_str(self.pick(
@@ -877,7 +923,7 @@ impl Lang {
         }
         let mut s = String::from(self.pick("쓸 수 있는 스킬입니다.\n", "Skills available:\n"));
         for skill in skills {
-            s.push_str(&format!("\n- **{}** — {}", skill.name, skill.description));
+            s.push_str(&format!("\n- **{}** ‒ {}", skill.name, skill.description));
         }
         s
     }
@@ -887,13 +933,13 @@ impl Lang {
         match self {
             Lang::Ko => format!(
                 "**{}**을 받았습니다.{}\n\n{contents}\n\n\
-                 다음에 zyris-code를 다시 띄우면 붙습니다 — 도구도 스킬도 시작할 때 읽습니다.",
+                 다음에 zyris-code를 다시 띄우면 붙습니다 ‒ 도구도 스킬도 시작할 때 읽습니다.",
                 p.name,
                 if p.description.is_empty() { String::new() } else { format!(" {}", p.description) },
             ),
             Lang::En => format!(
                 "Installed **{}**.{}\n\n{contents}\n\n\
-                 It attaches on the next launch of zyris-code — tools and skills are read at startup.",
+                 It attaches on the next launch of zyris-code ‒ tools and skills are read at startup.",
                 p.name,
                 if p.description.is_empty() { String::new() } else { format!(" {}", p.description) },
             ),
@@ -913,14 +959,14 @@ impl Lang {
         for (name, outcome) in done {
             s.push_str(&match outcome {
                 Ok(out) if out.contains("up to date") || out.contains("최신") => match self {
-                    Lang::Ko => format!("\n- `{name}` — 이미 최신입니다"),
-                    Lang::En => format!("\n- `{name}` — already up to date"),
+                    Lang::Ko => format!("\n- `{name}` ‒ 이미 최신입니다"),
+                    Lang::En => format!("\n- `{name}` ‒ already up to date"),
                 },
                 Ok(_) => match self {
-                    Lang::Ko => format!("\n- `{name}` — 새로 받았습니다"),
-                    Lang::En => format!("\n- `{name}` — fetched the update"),
+                    Lang::Ko => format!("\n- `{name}` ‒ 새로 받았습니다"),
+                    Lang::En => format!("\n- `{name}` ‒ fetched the update"),
                 },
-                Err(why) => format!("\n- `{name}` — {why}"),
+                Err(why) => format!("\n- `{name}` ‒ {why}"),
             });
         }
         s.push_str(
@@ -931,16 +977,16 @@ impl Lang {
     pub fn plugin_unknown(self, why: &str) -> String {
         match self {
             Lang::Ko => format!(
-                "`/plugin {why}`\n\n             - `/plugin` — 받아 둔 것 보기\n\
-                 \x20            - `/plugin add owner/repo` — 받기\n\
-                 \x20            - `/plugin remove 이름` — 지우기\n\
-                 \x20            - `/plugin update [이름]` — 갱신"
+                "`/plugin {why}`\n\n             - `/plugin` ‒ 받아 둔 것 보기\n\
+                 \x20            - `/plugin add owner/repo` ‒ 받기\n\
+                 \x20            - `/plugin remove 이름` ‒ 지우기\n\
+                 \x20            - `/plugin update [이름]` ‒ 갱신"
             ),
             Lang::En => format!(
-                "`/plugin {why}`\n\n             - `/plugin` — list what's fetched\n\
-                 \x20            - `/plugin add owner/repo` — install\n\
-                 \x20            - `/plugin remove name` — remove\n\
-                 \x20            - `/plugin update [name]` — update"
+                "`/plugin {why}`\n\n             - `/plugin` ‒ list what's fetched\n\
+                 \x20            - `/plugin add owner/repo` ‒ install\n\
+                 \x20            - `/plugin remove name` ‒ remove\n\
+                 \x20            - `/plugin update [name]` ‒ update"
             ),
         }
     }
@@ -1011,15 +1057,218 @@ impl Lang {
             Lang::En => format!("`{name}` isn't among the fetched plugins."),
         }
     }
+    /// A plugin command whose file had no prompt in it. **Said rather than sending nothing** — an
+    /// Enter that produces no message reads as the app having missed the key.
+    pub fn plugin_command_empty(self, name: &str) -> String {
+        match self {
+            Lang::Ko => {
+                format!("`/{name}`에는 보낼 내용이 없습니다. 플러그인의 명령 파일이 비어 있습니다.")
+            }
+            Lang::En => {
+                format!("`/{name}` has nothing to send ‒ the plugin's command file is empty.")
+            }
+        }
+    }
+    // ── GitHub screen (`/github`)
+    pub fn github_form_title(self) -> &'static str {
+        self.pick("GitHub", "GitHub")
+    }
+    pub fn github_row_user(self) -> &'static str {
+        self.pick("내 계정", "My account")
+    }
+    /// **The reviewer row is named for what it does, not for what it holds.** "Token" would say
+    /// how it is filled in; this says why it exists.
+    pub fn github_row_reviewer(self) -> &'static str {
+        self.pick("리뷰 계정", "Reviews as")
+    }
+    pub fn github_not_connected(self) -> &'static str {
+        self.pick("이어져 있지 않음", "not connected")
+    }
+    pub fn github_paste_token(self) -> &'static str {
+        self.pick("토큰을 붙여넣으세요", "paste a token")
+    }
+    pub fn github_enter_browser(self) -> &'static str {
+        self.pick("Enter ‒ 브라우저로 잇습니다", "Enter ‒ connect through the browser")
+    }
+    pub fn github_enter_disconnect(self) -> &'static str {
+        self.pick("Enter ‒ 끊습니다", "Enter ‒ disconnect")
+    }
+    /// **Says which kind of token and why.** A fine-grained token can be limited to one repository
+    /// and to pull requests alone; the browser route hands out the same broad access the person has.
+    pub fn github_reviewer_help(self) -> &'static str {
+        self.pick(
+            "fine-grained 토큰을 붙여넣고 Enter. 리포 하나 ∙ Pull requests 쓰기만 주면 됩니다.",
+            "Paste a fine-grained token and press Enter. One repository, Pull requests: write, is enough.",
+        )
+    }
+    /// While a code is waiting. **Says to open it, not just that something is happening** — the
+    /// address right above is the only thing that moves this along.
+    pub fn github_approve_it(self) -> &'static str {
+        self.pick(
+            "위 주소를 열고(Ctrl+클릭) 이 코드를 넣어 승인해 주세요. 승인하면 저절로 이어집니다.",
+            "Open the address above (Ctrl+click), enter this code and approve. It connects by itself.",
+        )
+    }
+    pub fn github_working(self) -> &'static str {
+        self.pick("GitHub에 물어보는 중…", "asking GitHub…")
+    }
+    pub fn github_form_keys(self) -> &'static str {
+        self.pick(
+            "↑↓ 이동 ∙ Enter 실행 ∙ Ctrl+U 지우기 ∙ Esc 닫기",
+            "↑↓ move ∙ Enter ∙ Ctrl+U clear ∙ Esc close",
+        )
+    }
+
+    // ── GitHub (`/github`)
+    /// Both slots. **The reviewer is named even when there isn't one** — which account a review
+    /// goes out under is the whole point of having two, and silence there reads as "the same one".
+    pub fn github_signed_in(self, login: &str, reviewer: Option<&str>) -> String {
+        match (self, reviewer) {
+            (Lang::Ko, Some(r)) => format!(
+                "GitHub에 `{login}`으로 이어져 있습니다.\n리뷰는 `{r}` 이름으로 나갑니다.\n\n\
+                 `/github logout`∙`/github logout reviewer`로 끊습니다."
+            ),
+            (Lang::Ko, None) => format!(
+                "GitHub에 `{login}`으로 이어져 있습니다.\n리뷰어를 따로 잇지 않아 리뷰도 \
+                 `{login}` 이름으로 나갑니다 ‒ 자기 PR은 승인할 수 없습니다.\n\n\
+                 `/github login reviewer`로 리뷰 전용 계정을 잇습니다."
+            ),
+            (Lang::En, Some(r)) => format!(
+                "Connected to GitHub as `{login}`.\nReviews go out as `{r}`.\n\n\
+                 `/github logout` and `/github logout reviewer` disconnect."
+            ),
+            (Lang::En, None) => format!(
+                "Connected to GitHub as `{login}`.\nNo separate reviewer is connected, so reviews \
+                 go out as `{login}` too ‒ and nobody can approve their own pull request.\n\n\
+                 `/github login reviewer` connects an account just for reviews."
+            ),
+        }
+    }
+    pub fn github_signed_out(self) -> &'static str {
+        self.pick(
+            "GitHub에 이어져 있지 않습니다. `/github login`으로 잇습니다.",
+            "Not connected to GitHub. `/github login` connects it.",
+        )
+    }
+    /// **A build with no OAuth app registered.** Saying "not signed in" here would send someone
+    /// looking for a browser page that is never going to appear.
+    pub fn github_no_app(self) -> &'static str {
+        self.pick(
+            "이 빌드에는 GitHub 앱이 등록돼 있지 않아 로그인할 수 없습니다. \
+             GitHub에서 OAuth App을 만들고 `ZYRIS_CODE_GITHUB_CLIENT_ID`에 client id를 주세요.",
+            "This build has no GitHub app registered, so there is nothing to log in to. Create an \
+             OAuth App on GitHub and give its client id as `ZYRIS_CODE_GITHUB_CLIENT_ID`.",
+        )
+    }
+    /// The code to type, and where. **Both, together** — a code with nowhere to put it is no use.
+    pub fn github_code(self, code: &str, url: &str, role: crate::github::auth::Role) -> String {
+        use crate::github::auth::Role;
+        // **The reviewer line says to use a logged-out window.** Approving in the everyday browser
+        // signs in as yourself, which is the one mistake this arrangement exists to prevent — and
+        // it looks exactly like it worked.
+        let head = match (self, role) {
+            (Lang::Ko, Role::User) => "이 창을 GitHub 계정에 잇습니다.",
+            (Lang::Ko, Role::Reviewer) => {
+                "리뷰 전용 계정을 잇습니다. **시크릿 창에서 그 계정으로 로그인한 뒤** 승인해 주세요 \
+                 ‒ 평소 브라우저로 하면 본인 계정으로 이어집니다."
+            }
+            (Lang::En, Role::User) => "Connecting this window to a GitHub account.",
+            (Lang::En, Role::Reviewer) => {
+                "Connecting the account reviews go out under. **Approve from a private window \
+                 signed in as that account** ‒ your everyday browser would connect you instead."
+            }
+        };
+        match self {
+            Lang::Ko => {
+                format!("{head}\n\n[{url}]({url}) 을 열고 이 코드를 넣어 주세요:\n\n**{code}**")
+            }
+            Lang::En => format!("{head}\n\nOpen [{url}]({url}) and enter this code:\n\n**{code}**"),
+        }
+    }
+    pub fn github_logged_in(self, login: &str, role: crate::github::auth::Role) -> String {
+        use crate::github::auth::Role;
+        let who = if login.is_empty() { "GitHub" } else { login };
+        match (self, role) {
+            (Lang::Ko, Role::User) => format!("GitHub에 `{who}`으로 이었습니다."),
+            (Lang::Ko, Role::Reviewer) => format!("리뷰는 이제 `{who}` 이름으로 나갑니다."),
+            (Lang::En, Role::User) => format!("Connected to GitHub as `{who}`."),
+            (Lang::En, Role::Reviewer) => format!("Reviews now go out as `{who}`."),
+        }
+    }
+    /// **Says the token is not revoked at GitHub.** Device flow has no secret to revoke with, and
+    /// leaving that unsaid would let someone think a live token had been destroyed.
+    pub fn github_logged_out(self, role: crate::github::auth::Role) -> String {
+        use crate::github::auth::Role;
+        let revoke = self.pick(
+            "GitHub 쪽 권한은 남아 있으니 [github.com/settings/applications](https://github.com/settings/applications) 에서 직접 해제해 주세요.",
+            "The authorisation still stands on GitHub ‒ revoke it at [github.com/settings/applications](https://github.com/settings/applications).",
+        );
+        let head = match (self, role) {
+            (Lang::Ko, Role::User) => "GitHub 자격을 지웠습니다.",
+            (Lang::Ko, Role::Reviewer) => {
+                "리뷰어 자격을 지웠습니다. 이제 리뷰도 본인 계정으로 나갑니다."
+            }
+            (Lang::En, Role::User) => "The GitHub credential is gone from this machine.",
+            (Lang::En, Role::Reviewer) => {
+                "The reviewer credential is gone; reviews go out as you again."
+            }
+        };
+        format!("{head} {revoke}")
+    }
+    pub fn github_nothing_to_log_out(self) -> &'static str {
+        self.pick("이어져 있는 GitHub 계정이 없습니다.", "No GitHub account is connected.")
+    }
+    /// A pasted token GitHub would not accept. **Checked before it is kept** — a bad token has to
+    /// fail here, where it can be pasted again.
+    pub fn github_token_refused(self, why: &str) -> String {
+        match self {
+            Lang::Ko => format!("이 토큰은 GitHub이 받지 않습니다: {why}"),
+            Lang::En => format!("GitHub would not take that token: {why}"),
+        }
+    }
+    pub fn github_login_failed(self, why: &str) -> String {
+        match self {
+            Lang::Ko => format!("GitHub에 잇지 못했습니다: {why}"),
+            Lang::En => format!("Could not connect to GitHub: {why}"),
+        }
+    }
+    pub fn plugin_where_title(self) -> &'static str {
+        self.pick("어디에 받을까요?", "Where should it go?")
+    }
+    pub fn plugin_where_machine(self) -> &'static str {
+        self.pick("이 컴퓨터", "This machine")
+    }
+    pub fn plugin_where_machine_note(self) -> &'static str {
+        self.pick("모든 프로젝트에서 씁니다", "Used from every project")
+    }
+    pub fn plugin_where_project(self) -> &'static str {
+        self.pick("이 프로젝트", "This project")
+    }
+    /// **Says it lands in the repo.** A fetched plugin inside the working directory shows up in
+    /// `git status`, and finding out at commit time is the wrong time.
+    pub fn plugin_where_project_note(self) -> &'static str {
+        self.pick(
+            "`.zyris-code/plugins/`에 받습니다 ‒ git에 잡힙니다",
+            "Into `.zyris-code/plugins/` ‒ it will show up in git",
+        )
+    }
     pub fn plugin_contents_text(self, p: &Plugin) -> String {
         let mut s = String::new();
         for spec in &p.mcp {
             s.push_str(&match self {
                 Lang::Ko => {
-                    format!("- MCP `{}` — 다음 실행 때 `{}`을 돌립니다\n", spec.slug, spec.command)
+                    format!(
+                        "- MCP `{}` ‒ 다음 실행 때 `{}`을 씁니다\n",
+                        spec.slug,
+                        spec.transport.summary()
+                    )
                 }
                 Lang::En => {
-                    format!("- MCP `{}` — runs `{}` on the next launch\n", spec.slug, spec.command)
+                    format!(
+                        "- MCP `{}` ‒ uses `{}` on the next launch\n",
+                        spec.slug,
+                        spec.transport.summary()
+                    )
                 }
             });
         }
@@ -1049,7 +1298,7 @@ impl Lang {
                 if p.description.is_empty() {
                     String::new()
                 } else {
-                    format!(" — {}", p.description)
+                    format!(" ‒ {}", p.description)
                 },
             ));
         }
@@ -1060,13 +1309,13 @@ impl Lang {
     /// The hint line at the bottom of every panel.
     pub fn panel_keys(self) -> String {
         match self {
-            Lang::Ko => "↑↓ 스크롤 · Esc 닫기".into(),
-            Lang::En => "↑↓ scroll · Esc close".into(),
+            Lang::Ko => "↑↓ 스크롤 ∙ Esc 닫기".into(),
+            Lang::En => "↑↓ scroll ∙ Esc close".into(),
         }
     }
     /// A missing value in a panel — a dash, never an invented number.
     pub fn panel_dash(self) -> &'static str {
-        self.pick("—", "—")
+        self.pick("‒", "‒")
     }
     /// Panel titles.
     pub fn title_mode(self) -> &'static str {
@@ -1115,6 +1364,57 @@ impl Lang {
         self.pick("언어", "Language")
     }
     /// The row label for the palette.
+    pub fn cfg_update(self) -> &'static str {
+        self.pick("업데이트", "Updates")
+    }
+    /// The name of an update policy.
+    pub fn cfg_update_name(self, p: crate::update::Policy) -> &'static str {
+        use crate::update::Policy::{Auto, Notify, Off};
+        match (self, p) {
+            (Lang::Ko, Auto) => "자동",
+            (Lang::Ko, Notify) => "알림",
+            (Lang::Ko, Off) => "끔",
+            (Lang::En, Auto) => "auto",
+            (Lang::En, Notify) => "notify",
+            (Lang::En, Off) => "off",
+        }
+    }
+    pub fn cfg_update_desc(self, p: crate::update::Policy) -> &'static str {
+        use crate::update::Policy::{Auto, Notify, Off};
+        match (self, p) {
+            (Lang::Ko, Auto) => "새 버전이 나오면 받아서 설치하고 그 버전으로 다시 시작합니다.",
+            (Lang::Ko, Notify) => "새 버전이 나오면 알리기만 합니다 ‒ `/update`로 설치합니다.",
+            (Lang::Ko, Off) => "새 버전이 있는지 확인하지 않습니다.",
+            (Lang::En, Auto) => "Install a newer release and come back on it.",
+            (Lang::En, Notify) => "Say a newer release exists ‒ `/update` installs it.",
+            (Lang::En, Off) => "Never look for one.",
+        }
+    }
+    /// Said when a newer release is found and the policy is `notify`.
+    pub fn update_available(self, tag: &str) -> String {
+        match self {
+            Lang::Ko => format!("새 버전 {tag}이(가) 나왔습니다. `/update`로 설치합니다."),
+            Lang::En => format!("{tag} is out. `/update` installs it."),
+        }
+    }
+    /// Said just before the app steps aside for its replacement.
+    pub fn update_installing(self, tag: &str) -> String {
+        match self {
+            Lang::Ko => format!("{tag} 설치를 시작합니다 ‒ 잠시 뒤 새 버전으로 다시 열립니다."),
+            Lang::En => format!("Installing {tag} ‒ this reopens on the new version in a moment."),
+        }
+    }
+    /// Said when `/update` was asked for and there is nothing to do.
+    pub fn update_current(self) -> &'static str {
+        self.pick("이미 최신입니다.", "Already the newest release.")
+    }
+    /// Said when the release could not be looked up, or the handover could not be started.
+    pub fn update_failed(self, why: &str) -> String {
+        match self {
+            Lang::Ko => format!("업데이트하지 못했습니다: {why}"),
+            Lang::En => format!("Could not update: {why}"),
+        }
+    }
     pub fn cfg_theme(self) -> &'static str {
         self.pick("화면 색", "Colours")
     }
@@ -1138,7 +1438,7 @@ impl Lang {
     pub fn cfg_theme_desc(self, choice: crate::config::ThemeChoice) -> &'static str {
         use crate::config::ThemeChoice::{Auto, Dark, Light};
         match (self, choice) {
-            (Lang::Ko, Auto) => "터미널에 맞춰 고릅니다 — 알 수 없으면 어두운 쪽입니다.",
+            (Lang::Ko, Auto) => "터미널에 맞춰 고릅니다 ‒ 알 수 없으면 어두운 쪽입니다.",
             (Lang::Ko, Dark) => "어두운 터미널에 맞춘 색입니다.",
             (Lang::Ko, Light) => "밝은 터미널에 맞춘 색입니다.",
             (Lang::En, Auto) => "Follows the terminal, and falls back to dark when it won't say.",
@@ -1174,8 +1474,8 @@ impl Lang {
     /// panel draws its lines as-is — the asterisks would show up literally.
     pub fn cfg_mode_desc(self, mode: Option<Mode>) -> String {
         match (self, mode) {
-            (Lang::Ko, None) => "따로 정하지 않습니다 — 일반 모드로 시작합니다.".into(),
-            (Lang::En, None) => "No override — starts in normal.".into(),
+            (Lang::Ko, None) => "따로 정하지 않습니다 ‒ 일반 모드로 시작합니다.".into(),
+            (Lang::En, None) => "No override ‒ starts in normal.".into(),
             (Lang::Ko, Some(m)) => format!("켤 때 {} 모드로 시작합니다.", m.label(self)),
             (Lang::En, Some(m)) => format!("Starts in {} mode.", m.label(self)),
         }
@@ -1184,22 +1484,35 @@ impl Lang {
     /// a form whose keys you have to guess is a form nobody finishes.
     pub fn form_keys(self) -> String {
         match self {
-            Lang::Ko => "↑↓ 항목 · ←→ 값 · Enter 저장 · Esc 취소".into(),
-            Lang::En => "↑↓ row · ←→ value · Enter save · Esc cancel".into(),
+            Lang::Ko => "↑↓ 항목 ∙ ←→ 값 ∙ Enter 저장 ∙ Esc 취소".into(),
+            Lang::En => "↑↓ row ∙ ←→ value ∙ Enter save ∙ Esc cancel".into(),
         }
     }
     /// The hint line of the `/config` panel — everything here is settable by command too.
     pub fn config_keys(self) -> String {
         match self {
-            Lang::Ko => "`/config dir allow·deny` · `/config lang ko·en` · \
-                 `/config mode 일반·계획·일·작업·off`"
+            Lang::Ko => "`/config dir allow∙deny` ∙ `/config lang ko∙en` ∙ \
+                 `/config mode 일반∙계획∙일∙작업∙off`"
                 .into(),
-            Lang::En => "`/config dir allow|deny` · `/config lang ko|en` · \
+            Lang::En => "`/config dir allow|deny` ∙ `/config lang ko|en` ∙ \
                  `/config mode normal|plan|work|job|off`"
                 .into(),
         }
     }
     /// Said while `/reconnect` is reattaching.
+    /// Said **once** when a selection could not reach the system clipboard, because this terminal
+    /// was not found to read OSC 52. Copying looks like it worked otherwise — the text is held in
+    /// the app and pastes back into it — so without a word the paste into another window is where
+    /// it is discovered, and by then the reason is nowhere in sight.
+    pub fn copy_stayed_here(self) -> &'static str {
+        self.pick(
+            "복사한 글이 이 앱 안에만 있습니다 ‒ 이 터미널이 시스템 클립보드 쓰기를 안 받습니다. \
+             ZYRIS_CODE_OSC52=1로 켜 보거나, ZYRIS_CODE_MOUSE=0으로 터미널이 직접 긁게 하세요.",
+            "The copy stayed inside this app ‒ this terminal was not found to accept clipboard \
+             writes. Try ZYRIS_CODE_OSC52=1, or ZYRIS_CODE_MOUSE=0 to let the terminal select \
+             text itself.",
+        )
+    }
     pub fn reconnecting(self) -> &'static str {
         self.pick("다시 붙는 중…", "attaching again…")
     }
@@ -1225,7 +1538,7 @@ impl Lang {
                     .into()
             }
             (Lang::En, crate::config::DirAccess::Allow) => {
-                "Directory access is now **allow** — tools may touch outside the working \
+                "Directory access is now **allow** ‒ tools may touch outside the working \
                  directory without asking. It stays this way next time."
                     .into()
             }
@@ -1235,7 +1548,7 @@ impl Lang {
                     .into()
             }
             (Lang::En, crate::config::DirAccess::Deny) => {
-                "Directory access is now **deny** — tools may not touch outside the working \
+                "Directory access is now **deny** ‒ tools may not touch outside the working \
                  directory. It stays this way next time."
                     .into()
             }
@@ -1253,11 +1566,11 @@ impl Lang {
             Lang::En => match mode {
                 Some(m) => {
                     format!(
-                        "Default mode is now **{}** — the app opens in it next time.",
+                        "Default mode is now **{}** ‒ the app opens in it next time.",
                         m.label(self)
                     )
                 }
-                None => "Default mode is off — the app opens in **normal** next time.".into(),
+                None => "Default mode is off ‒ the app opens in **normal** next time.".into(),
             },
         }
     }
@@ -1268,7 +1581,7 @@ impl Lang {
     }
     pub fn mode_cycle_hint(self) -> &'static str {
         self.pick(
-            "Shift+Tab으로 돌리거나 `/mode 일반`·`/mode 계획`·`/mode 일`·`/mode 작업`으로 바꿉니다.",
+            "Shift+Tab으로 돌리거나 `/mode 일반`∙`/mode 계획`∙`/mode 일`∙`/mode 작업`으로 바꿉니다.",
             "Cycle with Shift+Tab, or set it with `/mode normal`, `/mode plan`, `/mode work`, `/mode job`.",
         )
     }
@@ -1277,12 +1590,12 @@ impl Lang {
     pub fn mode_desc(self, mode: Mode) -> &'static str {
         match mode {
             Mode::Normal => self.pick(
-                "물어보지 않고 도구를 돌립니다. 기본값 — 평범한 대화에 이어붙습니다.",
-                "Runs tools without asking. The default — carries on one plain conversation.",
+                "물어보지 않고 도구를 돌립니다. 기본값 ‒ 평범한 대화에 이어붙습니다.",
+                "Runs tools without asking. The default ‒ carries on one plain conversation.",
             ),
             Mode::Plan => self.pick(
                 "도구를 돌리지 않고, 먼저 할 일을 세웁니다.",
-                "Does not run tools — lays out what to do first.",
+                "Does not run tools ‒ lays out what to do first.",
             ),
             Mode::Work => self.pick(
                 "다음 말이 attacca의 **일**(work) 목표가 됩니다. 계획을 태스크로 쪼갭니다.",
@@ -1316,9 +1629,59 @@ impl Lang {
     }
     pub fn mcp_config_hint(self) -> &'static str {
         self.pick(
-            "`.mcp.json` · `~/.config/zyris-code/mcp.json`에 적습니다.",
+            "`.mcp.json` ∙ `~/.config/zyris-code/mcp.json`에 적습니다.",
             "Write in `.mcp.json` or `~/.config/zyris-code/mcp.json`.",
         )
+    }
+    /// Heading over the servers other clients already have set up.
+    pub fn mcp_found_heading(self) -> &'static str {
+        self.pick("다른 프로그램의 설정에서 찾은 것", "Found in another program's settings")
+    }
+    /// Where one was found, and whether this machine said yes to it.
+    pub fn mcp_found_from(self, source: &str, on: bool) -> String {
+        match (self, on) {
+            (Lang::Ko, true) => format!("{source} ∙ 다음 실행에 켭니다"),
+            (Lang::Ko, false) => format!("{source} ∙ 꺼져 있습니다"),
+            (Lang::En, true) => format!("{source} ∙ on from the next launch"),
+            (Lang::En, false) => format!("{source} ∙ off"),
+        }
+    }
+    pub fn mcp_switch_hint(self) -> &'static str {
+        self.pick(
+            "`/mcp on <이름>`으로 켜고 `/mcp off <이름>`으로 끕니다. 찾은 것은 켜기 전에는 돌지 않습니다.",
+            "`/mcp on <name>` turns one on, `/mcp off <name>` turns it off. Nothing found here runs until you do.",
+        )
+    }
+    /// What `/mcp on|off` answers. **It says to restart** — servers are started once, at launch.
+    pub fn mcp_switched(self, slug: &str, on: bool) -> String {
+        match (self, on) {
+            (Lang::Ko, true) => format!("`{slug}`을 켰습니다. 다시 띄우면 도구가 붙습니다."),
+            (Lang::Ko, false) => format!("`{slug}`을 껐습니다. 다시 띄우면 빠집니다."),
+            (Lang::En, true) => format!("`{slug}` is on. Restart and its tools attach."),
+            (Lang::En, false) => format!("`{slug}` is off. Restart and it goes."),
+        }
+    }
+    /// Asked to switch something that is not in the found list.
+    pub fn mcp_not_found(self, slug: &str) -> String {
+        match self {
+            Lang::Ko => format!(
+                "`{slug}`은 찾은 목록에 없습니다. `/mcp`로 이름을 확인해 주세요 ‒ \
+                 직접 적어 둔 서버는 언제나 돌기 때문에 켜고 끌 것이 없습니다."
+            ),
+            Lang::En => format!(
+                "`{slug}` is not in the found list. Check the name with `/mcp` ‒ a server you \
+                 wrote down yourself always runs, so there is nothing to switch."
+            ),
+        }
+    }
+    /// Nothing changed, because it already was that way.
+    pub fn mcp_already(self, slug: &str, on: bool) -> String {
+        match (self, on) {
+            (Lang::Ko, true) => format!("`{slug}`은 이미 켜져 있습니다."),
+            (Lang::Ko, false) => format!("`{slug}`은 이미 꺼져 있습니다."),
+            (Lang::En, true) => format!("`{slug}` is already on."),
+            (Lang::En, false) => format!("`{slug}` is already off."),
+        }
     }
 
     // ── Skills panel
@@ -1341,8 +1704,8 @@ impl Lang {
     }
     pub fn plugin_mcp_line(self, slug: &str, command: &str) -> String {
         match self {
-            Lang::Ko => format!("MCP `{slug}` — `{command}`"),
-            Lang::En => format!("MCP `{slug}` — runs `{command}`"),
+            Lang::Ko => format!("MCP `{slug}` ‒ `{command}`"),
+            Lang::En => format!("MCP `{slug}` ‒ runs `{command}`"),
         }
     }
     pub fn plugin_skills_line(self) -> &'static str {
@@ -1365,7 +1728,7 @@ impl Lang {
     pub fn acc_logout_note(self) -> &'static str {
         self.pick(
             "로그아웃하면 저장된 자격이 지워지고, 다음 실행 때 다시 승인을 받습니다.",
-            "Logging out clears the stored credentials — the next launch asks for approval again.",
+            "Logging out clears the stored credentials ‒ the next launch asks for approval again.",
         )
     }
     /// The label of the account panel's logout button.
@@ -1375,15 +1738,15 @@ impl Lang {
     /// The hint line when the panel carries a button — Tab moves focus onto it.
     pub fn panel_keys_button(self) -> String {
         match self {
-            Lang::Ko => "↑↓ 스크롤 · Tab 버튼 · Esc 닫기".into(),
-            Lang::En => "↑↓ scroll · Tab button · Esc close".into(),
+            Lang::Ko => "↑↓ 스크롤 ∙ Tab 버튼 ∙ Esc 닫기".into(),
+            Lang::En => "↑↓ scroll ∙ Tab button ∙ Esc close".into(),
         }
     }
     /// The hint line when the panel's button is focused — Enter activates it.
     pub fn panel_keys_button_focused(self) -> String {
         match self {
-            Lang::Ko => "Enter 실행 · Esc 닫기".into(),
-            Lang::En => "Enter activate · Esc close".into(),
+            Lang::Ko => "Enter 실행 ∙ Esc 닫기".into(),
+            Lang::En => "Enter activate ∙ Esc close".into(),
         }
     }
 
@@ -1409,8 +1772,8 @@ impl Lang {
     }
     pub fn st_thread_none(self) -> &'static str {
         self.pick(
-            "아직 없음 — 첫 메시지에서 만들어집니다",
-            "none yet — your first message creates it",
+            "아직 없음 ‒ 첫 메시지에서 만들어집니다",
+            "none yet ‒ your first message creates it",
         )
     }
     pub fn st_project_default(self) -> &'static str {
@@ -1489,8 +1852,8 @@ impl Lang {
     /// The headline of a `grep` detail: how many matches, across how many files scanned.
     pub fn detail_hits(self, hits: usize, scanned: u32) -> String {
         match self {
-            Lang::Ko => format!("{hits}처 · {scanned}개 파일을 살펴봄"),
-            Lang::En => format!("{hits} matches · {scanned} files scanned"),
+            Lang::Ko => format!("{hits}처 ∙ {scanned}개 파일을 살펴봄"),
+            Lang::En => format!("{hits} matches ∙ {scanned} files scanned"),
         }
     }
     /// The headline of a `glob`/`list` detail.
@@ -1574,8 +1937,8 @@ impl Lang {
     }
     pub fn picker_keys(self, back: &str) -> String {
         match self {
-            Lang::Ko => format!("↑↓ 이동 · Enter 고르기 · {back}"),
-            Lang::En => format!("↑↓ move · Enter choose · {back}"),
+            Lang::Ko => format!("↑↓ 이동 ∙ Enter 고르기 ∙ {back}"),
+            Lang::En => format!("↑↓ move ∙ Enter choose ∙ {back}"),
         }
     }
     pub fn cannot_choose(self) -> &'static str {
@@ -1603,7 +1966,7 @@ impl Lang {
             ),
             Lang::En => format!(
                 "**Not enough permissions: {missing}**. Permissions fixed at approval time \
-                 never widen.\n\nA fresh enrollment-code window appears on reconnect — check \
+                 never widen.\n\nA fresh enrollment-code window appears on reconnect ‒ check \
                  **every** scope there."
             ),
         }
@@ -1612,13 +1975,12 @@ impl Lang {
         match self {
             Lang::Ko => format!(
                 "**권한이 모자랍니다: {missing}**. 다시 승인받을 수 있도록 이 컴퓨터의 자격을 비웠습니다.\n\n\
-                 다시 연결되면 등록 코드 창이 뜨니, 승인 화면에서 권한을 **모두** 체크해 주세요. \
-                 지금 연결은 그대로 쓸 수 있습니다."
+                 잠시 뒤 등록 코드 창이 뜹니다. 승인 화면에서 권한을 **모두** 체크해 주세요."
             ),
             Lang::En => format!(
                 "**Not enough permissions: {missing}**. Dropped this machine's credentials so \
-                 you can be approved again.\n\nA fresh enrollment-code window appears on reconnect \
-                 — check **every** scope there. The current connection keeps working."
+                 you can be approved again.\n\nThe enrolment-code window appears in a moment ‒ \
+                 check **every** scope there."
             ),
         }
     }
@@ -1700,11 +2062,11 @@ impl Lang {
     pub fn edit_changed_after_read(self, path: &str, base: &str, now: &str) -> String {
         match self {
             Lang::Ko => format!(
-                "'{path}'이(가) 읽은 뒤 바뀌었습니다 (base_version {base} ≠ 지금 {now}). \
+                "'{path}'이(가) 읽은 뒤 바뀌었습니다 (base_version {base} != 지금 {now}). \
                  file_io.read로 지금 내용을 다시 읽고, 새 버전 토큰을 base_version으로 다시 시도하세요."
             ),
             Lang::En => format!(
-                "'{path}' changed after it was read (base_version {base} ≠ current {now}). \
+                "'{path}' changed after it was read (base_version {base} != current {now}). \
                  Re-read the current content with file_io.read and retry with the new version \
                  token as base_version."
             ),
@@ -1713,12 +2075,12 @@ impl Lang {
     pub fn edit_exists_no_base(self, path: &str) -> String {
         match self {
             Lang::Ko => format!(
-                "'{path}'은(는) 이미 있는 파일입니다 — 덮어쓰려면 base_version을 주세요. \
+                "'{path}'은(는) 이미 있는 파일입니다 ‒ 덮어쓰려면 base_version을 주세요. \
                  읽은 응답의 stat.modified_unix_ms:stat.size 또는 code_edit.version의 version을 \
                  그대로 넘기세요."
             ),
             Lang::En => format!(
-                "'{path}' already exists — pass base_version to overwrite it. Use the \
+                "'{path}' already exists ‒ pass base_version to overwrite it. Use the \
                  stat.modified_unix_ms:stat.size of the read response or code_edit.version's \
                  version as-is."
             ),
@@ -1847,6 +2209,8 @@ mod tests {
             (ko.esc_stops(), en.esc_stops()),
             (ko.enroll_title(), en.enroll_title()),
             (ko.enroll_steps(), en.enroll_steps()),
+            (ko.enroll_warning(), en.enroll_warning()),
+            (ko.copy_stayed_here(), en.copy_stayed_here()),
             (ko.enroll_lapsed(), en.enroll_lapsed()),
             (ko.enroll_denied(), en.enroll_denied()),
             (ko.enroll_keys(), en.enroll_keys()),
@@ -1906,6 +2270,8 @@ mod tests {
             en.lang_changed(),
             en.enroll_title(),
             en.enroll_steps(),
+            en.enroll_warning(),
+            en.copy_stayed_here(),
             en.enroll_lapsed(),
             en.enroll_denied(),
             en.enroll_keys(),
@@ -2007,11 +2373,16 @@ mod tests {
                 description: String::new(),
                 mcp: vec![crate::mcp::bridge::ServerSpec {
                     slug: "m".into(),
-                    command: "cmd".into(),
-                    args: vec![],
-                    env: Default::default(),
+                    transport: crate::mcp::bridge::Transport::Stdio {
+                        command: "cmd".into(),
+                        args: vec![],
+                        env: Default::default(),
+                    },
                 }],
                 skills: None,
+                agents: None,
+                commands: Vec::new(),
+                hooks: Vec::new(),
                 root: "/tmp".into(),
             }),
             en.plugin_added(
@@ -2020,6 +2391,9 @@ mod tests {
                     description: String::new(),
                     mcp: vec![],
                     skills: None,
+                    agents: None,
+                    commands: Vec::new(),
+                    hooks: Vec::new(),
                     root: "/tmp".into(),
                 },
                 "contents",

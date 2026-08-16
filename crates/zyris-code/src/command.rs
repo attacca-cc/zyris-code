@@ -13,7 +13,10 @@ pub enum Command {
     Help,
     /// Without an argument, reports the current mode; with one, changes it.
     Mode(Option<Mode>),
-    Mcp,
+    /// `/mcp` on its own lists; `/mcp on|off <name>` decides whether a **discovered** server may
+    /// start (`mcp::discovery`). What was written for this app directly is not switchable — it was
+    /// written for this app.
+    Mcp(Option<McpSwitch>),
     Skills,
     /// Which `CLAUDE.md`·`AGENTS.md` are loaded into the session.
     Rules,
@@ -34,6 +37,8 @@ pub enum Command {
     Quit,
     /// Shows who this node is attached as (`/account`), or logs out (`/account logout`).
     Account(Option<AccountAction>),
+    /// GitHub — who this node is signed in as, signing in, and signing out.
+    Github(Option<AccountAction>),
     /// The current session's picture — thread, project, agent, mode, and usage.
     Status,
     /// The settings — with no argument the panel; with `option value`, sets that one.
@@ -47,6 +52,9 @@ pub enum Command {
     /// advertises, has no ping/pong, and `conn.closed()` never fires for a merely unrouted socket.
     /// Redialling re-announces, which puts this connection back in the registry.
     Reconnect,
+    /// Install the newest release and come back on it. What `update: notify` leaves to be asked
+    /// for, and what `auto` does on its own.
+    Update,
     /// Something unknown. **Not sent to the server; tells what's available instead.**
     Unknown(String),
 }
@@ -55,7 +63,13 @@ pub enum Command {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AccountAction {
     /// Forgets the stored credentials. The next launch asks for approval again.
-    Logout,
+    ///
+    /// The role is GitHub's — `/account logout` passes `Role::User` and ignores it, since the
+    /// node has only ever had one identity.
+    Logout(crate::github::auth::Role),
+    /// Signs in. **Only GitHub uses this** — the node's own credentials are made on first launch,
+    /// so there is nothing for `/account login` to do.
+    Login(crate::github::auth::Role),
 }
 
 /// What `/config` can set after the command word.
@@ -127,7 +141,7 @@ pub fn parse(text: &str) -> Option<Command> {
                 None => return Some(Command::Unknown(format!("mode {other}"))),
             },
         }),
-        "/mcp" => Command::Mcp,
+        "/mcp" => Command::Mcp(mcp_switch(arg)),
         "/skills" => Command::Skills,
         "/rules" => Command::Rules,
         "/cwd" => Command::Cwd,
@@ -136,6 +150,7 @@ pub fn parse(text: &str) -> Option<Command> {
         "/undo" => Command::Undo,
         "/clear" => Command::Clear,
         "/reconnect" => Command::Reconnect,
+        "/update" => Command::Update,
         "/config" => match arg {
             "" => Command::Config(None),
             given => match given.split_once(char::is_whitespace) {
@@ -149,9 +164,7 @@ pub fn parse(text: &str) -> Option<Command> {
                     "theme" | "colour" | "color" | "색" | "테마" => {
                         match crate::config::ThemeChoice::parse(value) {
                             Some(theme) => Command::Config(Some(ConfigAction::Theme(theme))),
-                            None => {
-                                return Some(Command::Unknown(format!("config theme {value}")))
-                            }
+                            None => return Some(Command::Unknown(format!("config theme {value}"))),
                         }
                     }
                     "lang" | "language" | "언어" => match crate::lang::Lang::parse(value) {
@@ -181,9 +194,32 @@ pub fn parse(text: &str) -> Option<Command> {
             }
             _ => Command::Unknown(format!("jobs {arg}")),
         },
+        // `/github login [reviewer]` · `/github logout [reviewer]`. **The role rides on the verb**
+        // rather than being a separate command, because it is the same act either way — the only
+        // difference is which slot the token lands in.
+        "/github" => {
+            let (verb, who) = match arg.split_once(char::is_whitespace) {
+                Some((v, r)) => (v, r.trim()),
+                None => (arg, ""),
+            };
+            let role = crate::github::auth::Role::parse(who);
+            match (verb, role) {
+                ("" | "status", _) => Command::Github(None),
+                (_, None) => return Some(Command::Unknown(format!("github {verb} {who}"))),
+                ("login" | "signin" | "로그인", Some(role)) => {
+                    Command::Github(Some(AccountAction::Login(role)))
+                }
+                ("logout" | "로그아웃", Some(role)) => {
+                    Command::Github(Some(AccountAction::Logout(role)))
+                }
+                (other, _) => return Some(Command::Unknown(format!("github {other}"))),
+            }
+        }
         "/account" => match arg {
             "" => Command::Account(None),
-            "logout" | "log out" | "로그아웃" => Command::Account(Some(AccountAction::Logout)),
+            "logout" | "log out" | "로그아웃" => {
+                Command::Account(Some(AccountAction::Logout(crate::github::auth::Role::User)))
+            }
             other => return Some(Command::Unknown(format!("account {other}"))),
         },
         "/status" => Command::Status,
@@ -194,6 +230,35 @@ pub fn parse(text: &str) -> Option<Command> {
 }
 
 /// What comes after `/plugin`. **Arguments can contain spaces** (addresses don't, but names can).
+/// `/mcp on <name>` · `/mcp off <name>`. Anything else lists.
+///
+/// **An unknown word is not silently taken as a list.** `/mcp of playwright` would then look like
+/// it worked and change nothing.
+fn mcp_switch(arg: &str) -> Option<McpSwitch> {
+    let (verb, name) = match arg.split_once(char::is_whitespace) {
+        Some((v, r)) => (v, r.trim()),
+        None => (arg, ""),
+    };
+    match (verb, name) {
+        ("" | "list", _) => None,
+        ("on" | "off", "") => Some(McpSwitch::Unknown(format!("mcp {verb}"))),
+        ("on", name) => Some(McpSwitch::On(name.to_string())),
+        ("off", name) => Some(McpSwitch::Off(name.to_string())),
+        (other, _) => Some(McpSwitch::Unknown(format!("mcp {other}"))),
+    }
+}
+
+/// What `/mcp on|off` was asked to do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpSwitch {
+    /// Let this discovered server start from the next launch.
+    On(String),
+    Off(String),
+    /// Neither, and **said rather than swallowed** — a typo that changes nothing silently reads
+    /// as the setting having been taken.
+    Unknown(String),
+}
+
 fn plugin_action(arg: &str) -> Plugin {
     let (verb, rest) = match arg.split_once(char::is_whitespace) {
         Some((v, r)) => (v, r.trim()),
@@ -201,10 +266,10 @@ fn plugin_action(arg: &str) -> Plugin {
     };
     match (verb, rest) {
         ("", _) | ("list", _) => Plugin::List,
-        ("add" | "install", "") => Plugin::Unknown("add — 받아 올 곳을 같이 적어 주세요".into()),
+        ("add" | "install", "") => Plugin::Unknown("add ‒ 받아 올 곳을 같이 적어 주세요".into()),
         ("add" | "install", what) => Plugin::Add(what.to_string()),
         ("remove" | "rm" | "uninstall", "") => {
-            Plugin::Unknown("remove — 지울 이름을 같이 적어 주세요".into())
+            Plugin::Unknown("remove ‒ 지울 이름을 같이 적어 주세요".into())
         }
         ("remove" | "rm" | "uninstall", what) => Plugin::Remove(what.to_string()),
         ("update" | "upgrade", "") => Plugin::Update(None),
@@ -256,23 +321,120 @@ impl CommandSpec {
 
 /// The one command list. **Order is the order the `/`-list and `/help` are shown in.**
 pub const COMMANDS: &[CommandSpec] = &[
-    CommandSpec { name: "/help", aliases: &["h"], note_ko: "쓸 수 있는 명령", note_en: "What you can type" },
-    CommandSpec { name: "/mode", aliases: &[], note_ko: "모드를 보거나 바꿉니다 (일반·계획·일·작업)", note_en: "Show or change the mode (normal / plan / work / job)" },
-    CommandSpec { name: "/config", aliases: &[], note_ko: "설정 — 다른 디렉토리 접근(allow·deny)·언어·기본 모드", note_en: "Settings — directory access (allow / deny), language, default mode" },
-    CommandSpec { name: "/agent", aliases: &[], note_ko: "에이전트를 고릅니다. 다음 메시지에서 새 쓰레드가 열립니다", note_en: "Pick an agent. A new thread opens with your next message" },
-    CommandSpec { name: "/mcp", aliases: &[], note_ko: "붙은 MCP 서버와 도구 수", note_en: "MCP servers that connected, and how many tools each brought" },
-    CommandSpec { name: "/skills", aliases: &["skill"], note_ko: "쓸 수 있는 스킬", note_en: "Skills available here" },
-    CommandSpec { name: "/plugin", aliases: &["plugins"], note_ko: "플러그인을 받고 지웁니다 (add·remove·update)", note_en: "Install and remove plugins (add / remove / update)" },
-    CommandSpec { name: "/rules", aliases: &["claude", "agents"], note_ko: "이 쓰레드에 실린 CLAUDE.md·AGENTS.md", note_en: "The CLAUDE.md and AGENTS.md loaded into this thread" },
-    CommandSpec { name: "/cwd", aliases: &["pwd"], note_ko: "도구가 상대경로를 푸는 자리", note_en: "Where tools resolve relative paths" },
-    CommandSpec { name: "/reconnect", aliases: &[], note_ko: "다시 붙습니다. 도구 호출이 응답 없이 멈춰 있을 때", note_en: "Attach again — when tool calls sit there with no answer" },
-    CommandSpec { name: "/account", aliases: &[], note_ko: "계정 정보를 보고, 로그아웃합니다 (logout)", note_en: "Show account info, or log out (logout)" },
-    CommandSpec { name: "/status", aliases: &["info"], note_ko: "지금 세션·에이전트·모드·사용량을 한눈에", note_en: "Session, agent, mode and usage at a glance" },
-    CommandSpec { name: "/jobs", aliases: &["job"], note_ko: "배경에서 도는 작업 (stop <id>로 멈춥니다)", note_en: "Background jobs (stop <id> kills one)" },
-    CommandSpec { name: "/changes", aliases: &["changed", "diff"], note_ko: "이 디렉터리에서 바꾼 파일", note_en: "Files changed in this directory" },
-    CommandSpec { name: "/undo", aliases: &[], note_ko: "마지막 편집을 되돌립니다", note_en: "Undo the last edit" },
-    CommandSpec { name: "/clear", aliases: &[], note_ko: "화면의 대화를 지웁니다 (쓰레드는 그대로입니다)", note_en: "Clear the screen (the thread itself is untouched)" },
-    CommandSpec { name: "/quit", aliases: &["exit", "q"], note_ko: "끝냅니다. 도는 턴이 있으면 서버에서도 멈춥니다", note_en: "Quit. A running turn is stopped on the server too" },
+    CommandSpec {
+        name: "/help",
+        aliases: &["h"],
+        note_ko: "쓸 수 있는 명령",
+        note_en: "What you can type",
+    },
+    CommandSpec {
+        name: "/mode",
+        aliases: &[],
+        note_ko: "모드를 보거나 바꿉니다 (일반∙계획∙일∙작업)",
+        note_en: "Show or change the mode (normal / plan / work / job)",
+    },
+    CommandSpec {
+        name: "/config",
+        aliases: &[],
+        note_ko: "설정 ‒ 다른 디렉토리 접근(allow∙deny)∙언어∙기본 모드",
+        note_en: "Settings ‒ directory access (allow / deny), language, default mode",
+    },
+    CommandSpec {
+        name: "/agent",
+        aliases: &[],
+        note_ko: "에이전트를 고릅니다. 다음 메시지에서 새 쓰레드가 열립니다",
+        note_en: "Pick an agent. A new thread opens with your next message",
+    },
+    CommandSpec {
+        name: "/mcp",
+        aliases: &[],
+        note_ko: "붙은 MCP 서버와 도구 수",
+        note_en: "MCP servers that connected, and how many tools each brought",
+    },
+    CommandSpec {
+        name: "/skills",
+        aliases: &["skill"],
+        note_ko: "쓸 수 있는 스킬",
+        note_en: "Skills available here",
+    },
+    CommandSpec {
+        name: "/plugin",
+        aliases: &["plugins"],
+        note_ko: "플러그인을 받고 지웁니다 (add∙remove∙update)",
+        note_en: "Install and remove plugins (add / remove / update)",
+    },
+    CommandSpec {
+        name: "/rules",
+        aliases: &["claude", "agents"],
+        note_ko: "이 쓰레드에 실린 CLAUDE.md∙AGENTS.md",
+        note_en: "The CLAUDE.md and AGENTS.md loaded into this thread",
+    },
+    CommandSpec {
+        name: "/cwd",
+        aliases: &["pwd"],
+        note_ko: "도구가 상대경로를 푸는 자리",
+        note_en: "Where tools resolve relative paths",
+    },
+    CommandSpec {
+        name: "/update",
+        aliases: &[],
+        note_ko: "새 버전을 설치하고 그 버전으로 다시 엽니다",
+        note_en: "Install the newest release and reopen on it",
+    },
+    CommandSpec {
+        name: "/reconnect",
+        aliases: &[],
+        note_ko: "다시 붙습니다. 도구 호출이 응답 없이 멈춰 있을 때",
+        note_en: "Attach again ‒ when tool calls sit there with no answer",
+    },
+    CommandSpec {
+        name: "/github",
+        aliases: &["gh"],
+        note_ko: "GitHub 계정을 잇고 끊습니다 (login ∙ login reviewer ∙ logout)",
+        note_en: "Connect or disconnect GitHub (login ∙ login reviewer ∙ logout)",
+    },
+    CommandSpec {
+        name: "/account",
+        aliases: &[],
+        note_ko: "계정 정보를 보고, 로그아웃합니다 (logout)",
+        note_en: "Show account info, or log out (logout)",
+    },
+    CommandSpec {
+        name: "/status",
+        aliases: &["info"],
+        note_ko: "지금 세션∙에이전트∙모드∙사용량을 한눈에",
+        note_en: "Session, agent, mode and usage at a glance",
+    },
+    CommandSpec {
+        name: "/jobs",
+        aliases: &["job"],
+        note_ko: "배경에서 도는 작업 (stop <id>로 멈춥니다)",
+        note_en: "Background jobs (stop <id> kills one)",
+    },
+    CommandSpec {
+        name: "/changes",
+        aliases: &["changed", "diff"],
+        note_ko: "이 디렉터리에서 바꾼 파일",
+        note_en: "Files changed in this directory",
+    },
+    CommandSpec {
+        name: "/undo",
+        aliases: &[],
+        note_ko: "마지막 편집을 되돌립니다",
+        note_en: "Undo the last edit",
+    },
+    CommandSpec {
+        name: "/clear",
+        aliases: &[],
+        note_ko: "화면의 대화를 지웁니다 (쓰레드는 그대로입니다)",
+        note_en: "Clear the screen (the thread itself is untouched)",
+    },
+    CommandSpec {
+        name: "/quit",
+        aliases: &["exit", "q"],
+        note_ko: "끝냅니다. 도는 턴이 있으면 서버에서도 멈춥니다",
+        note_en: "Quit. A running turn is stopped on the server too",
+    },
 ];
 
 /// The list that appears when `/` is typed. **`/help` prints the same thing.**
@@ -293,6 +455,14 @@ pub fn catalogue(lang: crate::lang::Lang) -> Vec<(&'static str, &'static str)> {
         .collect()
 }
 
+/// The names this app answers to itself, without the slash.
+///
+/// **A plugin may not take one of these.** `/help` has to stay `/help`, whatever a plugin calls a
+/// file of its own — so a colliding plugin command is namespaced instead (`plugin::commands`).
+pub fn builtin_names() -> Vec<&'static str> {
+    COMMANDS.iter().map(|c| c.name.trim_start_matches('/')).collect()
+}
+
 /// Keys worth knowing. **If it isn't on the screen, it doesn't exist** — a README isn't opened when you need it.
 ///
 /// The canonical source is `on_key` in `app.rs`; this is only a transcription of what a human should memorize.
@@ -303,30 +473,44 @@ pub fn keys(lang: crate::lang::Lang) -> Vec<(&'static str, &'static str)> {
         Lang::Ko => vec![
             ("Shift+Tab", "모드 바꾸기 (일반 → 계획 → 일 → 작업)"),
             (
-                "Shift+Enter · Alt+Enter",
+                "Shift+Enter ∙ Alt+Enter",
                 "줄바꿈 (Shift+Enter는 키티 키보드 프로토콜 지원 터미널에서만)",
             ),
-            ("←", "프로젝트·쓰레드 목록 (입력란이 비었을 때)"),
+            ("←", "프로젝트∙쓰레드 목록 (입력란이 비었을 때)"),
+            ("@", "파일 목록 ‒ 골라서 경로를 넣습니다"),
             ("↑ ↓", "보낸 말 되살리기"),
-            ("Ctrl+O", "작업 카드 접기·펴기"),
-            ("Ctrl+U", "친 것 모두 지우기"),
+            ("Ctrl+R", "보낸 말 검색 ‒ 치는 대로 좁혀집니다"),
+            ("Ctrl+O", "작업 카드 접기∙펴기"),
+            ("Ctrl+T", "할 일 목록 펴기∙접기 (활동 줄을 눌러도 됩니다)"),
+            ("Ctrl+U ∙ Ctrl+K", "커서 앞쪽∙뒤쪽 지우기 (Ctrl+U가 친 것 다 지우기입니다)"),
+            ("Ctrl+W ∙ Alt+Backspace", "낱말 지우기 (앞은 띄어쓰기까지, 뒤는 한 조각씩)"),
+            ("Ctrl+Y", "방금 지운 것 되붙이기"),
+            ("Ctrl+A ∙ Ctrl+E", "줄 맨 앞∙맨 뒤로"),
+            ("Alt+← Alt+→", "낱말 단위로 이동 (Alt+B ∙ Alt+F도 됩니다)"),
             ("Esc", "도는 턴 멈추기"),
             ("Ctrl+C", "멈추기 → 한 번 더 누르면 끝내기"),
-            ("드래그", "화면 아무 데나 — 놓는 순간 고른 글이 클립보드로"),
+            ("드래그", "화면 아무 데나 ‒ 놓는 순간 고른 글이 클립보드로"),
         ],
         Lang::En => vec![
             ("Shift+Tab", "Switch mode (normal → plan → work → job)"),
             (
-                "Shift+Enter · Alt+Enter",
+                "Shift+Enter ∙ Alt+Enter",
                 "Newline (Shift+Enter needs a kitty-keyboard-protocol terminal)",
             ),
             ("←", "Project and thread list (when the input box is empty)"),
+            ("@", "File list ‒ pick one and its path goes in"),
             ("↑ ↓", "Bring back something you sent"),
+            ("Ctrl+R", "Search what you sent ‒ narrows as you type"),
             ("Ctrl+O", "Fold or unfold a work card"),
-            ("Ctrl+U", "Clear what you typed"),
+            ("Ctrl+T", "Unfold or fold the todo list (clicking the activity line does it too)"),
+            ("Ctrl+U ∙ Ctrl+K", "Cut back to the start or on to the end (Ctrl+U clears a draft)"),
+            ("Ctrl+W ∙ Alt+Backspace", "Delete a word (whole, or one segment at a time)"),
+            ("Ctrl+Y", "Put back what you just cut"),
+            ("Ctrl+A ∙ Ctrl+E", "Start and end of the line"),
+            ("Ctrl+← Ctrl+→", "Move by word (Alt+B and Alt+F work too)"),
             ("Esc", "Stop the running turn"),
             ("Ctrl+C", "Stop, then press again to quit"),
-            ("drag", "Drag anywhere — the selected text goes to the clipboard when you let go"),
+            ("drag", "Drag anywhere ‒ the selected text goes to the clipboard when you let go"),
         ],
     }
 }
@@ -340,11 +524,11 @@ pub fn help_text(lang: crate::lang::Lang) -> String {
     };
     let mut s = String::from(head);
     for (name, note) in catalogue(lang) {
-        s.push_str(&format!("\n- `{name}` — {note}"));
+        s.push_str(&format!("\n- `{name}` ‒ {note}"));
     }
     s.push_str(keys_head);
     for (key, note) in keys(lang) {
-        s.push_str(&format!("\n- `{key}` — {note}"));
+        s.push_str(&format!("\n- `{key}` ‒ {note}"));
     }
     s
 }
@@ -588,12 +772,48 @@ mod tests {
     }
 
     /// When it's unclear what's being asked, **don't pick just anything.** Falling into the closing side would be the worst.
+    /// **The two GitHub slots are told apart by the word after the verb.** Getting this wrong
+    /// would sign the wrong account in, which looks exactly like it worked.
+    #[test]
+    fn github_login_takes_a_role_and_refuses_a_word_it_does_not_know() {
+        use crate::github::auth::Role;
+        assert_eq!(parse("/github"), Some(Command::Github(None)));
+        assert_eq!(
+            parse("/github login"),
+            Some(Command::Github(Some(AccountAction::Login(Role::User))))
+        );
+        assert_eq!(
+            parse("/github login reviewer"),
+            Some(Command::Github(Some(AccountAction::Login(Role::Reviewer))))
+        );
+        assert_eq!(
+            parse("/github logout reviewer"),
+            Some(Command::Github(Some(AccountAction::Logout(Role::Reviewer))))
+        );
+        assert_eq!(parse("/gh login 리뷰어"), parse("/github login reviewer"));
+        // **A role nobody knows is refused, not taken as the person.** Signing the wrong account
+        // in is the one mistake here that looks like success.
+        assert_eq!(
+            parse("/github login 아무거나"),
+            Some(Command::Unknown("github login 아무거나".into()))
+        );
+    }
+
     #[test]
     fn account_shows_by_default_and_logs_out_only_when_asked() {
         assert_eq!(parse("/account"), Some(Command::Account(None)));
-        assert_eq!(parse("/account logout"), Some(Command::Account(Some(AccountAction::Logout))));
-        assert_eq!(parse("/account log out"), Some(Command::Account(Some(AccountAction::Logout))));
-        assert_eq!(parse("/account 로그아웃"), Some(Command::Account(Some(AccountAction::Logout))));
+        assert_eq!(
+            parse("/account logout"),
+            Some(Command::Account(Some(AccountAction::Logout(crate::github::auth::Role::User))))
+        );
+        assert_eq!(
+            parse("/account log out"),
+            Some(Command::Account(Some(AccountAction::Logout(crate::github::auth::Role::User))))
+        );
+        assert_eq!(
+            parse("/account 로그아웃"),
+            Some(Command::Account(Some(AccountAction::Logout(crate::github::auth::Role::User))))
+        );
         // An unknown argument never falls into the logging-out side.
         assert_eq!(parse("/account stop"), Some(Command::Unknown("account stop".into())));
     }

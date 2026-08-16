@@ -66,9 +66,24 @@ pub fn parts_at(
     if state.running && state.stopping {
         return (theme::warning(), lang.stopping().to_string(), lang.ctrl_c_quits());
     }
+    // **How far along the plan is rides on the end of whichever line describes the moment.**
+    // Not on the transient ones above — a notice or an error owns the line while it is up, and a
+    // count beside "could not send" says nothing about it.
+    let plan = plan_count(state);
+    // **What is running on this machine is not necessarily this conversation's.** A tool call
+    // arrives as `zyris__node__cap__tool` with no session on it, so the node cannot tell which
+    // conversation asked — and another window on the same directory shares this node besides. So
+    // ownership is read off the one thing that is known: whether **this** session has a turn
+    // running. If it does not, the work is somebody else's — shown, because the machine really is
+    // busy, but dimmed and without a hint that would not do what it says.
+    let ours = state.running;
+    let colour = if ours { theme::accent() } else { theme::text_muted() };
+    // **`Esc 정지` stops this session's turn and nothing else.** Beside work that belongs to
+    // another conversation it is a lie, and pressing it would look broken.
+    let stop = if ours { lang.esc_stops() } else { "" };
     if let Some((_, command, since)) = &state.running_exec {
         let secs = now.saturating_duration_since(*since).as_secs();
-        return (theme::accent(), lang.running_command(command, secs), lang.esc_stops());
+        return (colour, lang.running_command(command, secs) + &plan, stop);
     }
     // **What runs in the background is more specific than "working…".** It is shown even while a
     // turn is running — that turn is usually waiting on this job, and what a person wants to know
@@ -76,17 +91,29 @@ pub fn parts_at(
     if let Some(job) = state.jobs.first() {
         let secs = now.saturating_duration_since(job.since).as_secs();
         let text = lang.background_job(state.jobs.len(), &job.id, &job.label, secs);
-        let hint = if state.running { lang.esc_stops() } else { "" };
-        return (theme::accent(), text, hint);
+        return (colour, text + &plan, stop);
     }
     if state.running {
-        return (theme::accent(), lang.working().to_string(), lang.esc_stops());
+        return (theme::accent(), lang.working().to_string() + &plan, lang.esc_stops());
     }
     if state.asking.is_some() {
         return (theme::warning(), lang.waiting_answer().to_string(), lang.waiting_answer_hint());
     }
     // No hint when idle. An always-on hint stops getting read.
-    (theme::text_muted(), lang.idle().to_string(), "")
+    //
+    // **The count stays after the turn ends.** A plan left half-finished is exactly what a person
+    // wants to see when the agent stops, and if it only showed while running there would be no
+    // moment left in which to open the list and read it.
+    (theme::text_muted(), lang.idle().to_string() + &plan, "")
+}
+
+/// `" (2/5)"` while this session has a plan, and nothing at all when it does not.
+fn plan_count(state: &State) -> String {
+    let (done, total) = state.todos.counts();
+    if total == 0 {
+        return String::new();
+    }
+    state.lang.todo_count(done, total)
 }
 
 pub fn draw(frame: &mut Frame, area: Rect, state: &State) {

@@ -10,8 +10,16 @@
 //! This module is pure. Fetching lists and creating sessions is the I/O spot's job.
 
 /// How a thread (session) is doing, shown as a coloured dot in the list.
+///
+/// **There is no "no dot" state for a session row.** Deriving an outcome is a request of its own,
+/// so the dots land well after the rows do — and a dot that appears out of nowhere pushes its
+/// title two columns right. With thirty rows filling in one by one the whole list squirms. So a
+/// row that knows nothing yet still carries `Unknown` and draws a grey dot: what changes when the
+/// answer lands is the colour, never the width.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThreadStatus {
+    /// Nothing known yet — either the outcome has not been derived, or it could not be. Drawn grey.
+    Unknown,
     /// A turn is running right now. Drawn orange and blinking.
     Running,
     /// The last turn finished cleanly.
@@ -30,7 +38,8 @@ pub struct Row {
     pub note: Option<String>,
     /// Whether it can be picked.
     pub enabled: bool,
-    /// A per-thread status dot. Only session rows carry one; the rest stay `None`.
+    /// A per-thread status dot. **Only session rows carry one, and they always do** — `None` here
+    /// means "not a thread", not "not known yet". `ThreadStatus::Unknown` is the latter.
     pub status: Option<ThreadStatus>,
 }
 
@@ -45,6 +54,27 @@ pub enum Level {
     Agents,
     /// The slash-command list shown when typing `/`.
     Commands,
+    /// What has been sent, searched (`Ctrl+R`).
+    ///
+    /// **This one carries its own query**, unlike the `/` and `@` lists which narrow from the
+    /// draft. Those are *being typed into* the draft; a history search is not — the draft is
+    /// often already full, and the search must not touch it. What is typed while this is up goes
+    /// here instead.
+    History {
+        query: String,
+    },
+    /// The file list shown when typing `@`. **`at` is where the `@` sits**, as a character index
+    /// into the draft — picking replaces everything from there to the cursor, and without it the
+    /// insertion would have to guess which of several `@`s in a sentence it belongs to.
+    Files {
+        at: usize,
+    },
+    /// Where to put a plugin that is about to be fetched. **Asked rather than assumed**: on this
+    /// machine it is there for every project, and in the project it travels with the repo — and
+    /// which of those someone wants is not something the address can say.
+    PluginTarget {
+        source: String,
+    },
 }
 
 /// What happens when picked.
@@ -65,6 +95,21 @@ pub enum Pick {
     /// Puts this command in the input field. **Doesn't run it immediately** — commands like
     /// `/mode` take arguments, so you must be able to keep typing after picking.
     TypeCommand { text: String },
+    /// Fetches a plugin into the machine's directory or this project's.
+    InstallPlugin { source: String, project: bool },
+    /// Puts a message that was sent back into the draft, replacing whatever is there.
+    ///
+    /// **Replaces rather than inserts.** It was picked out of a search of whole messages, so what
+    /// is wanted is that message — merging it into a half-written draft would produce a sentence
+    /// nobody wrote.
+    UseHistory { text: String },
+    /// Puts this path into the draft, replacing the `@…` that was being typed.
+    ///
+    /// **The `@` does not survive.** It is a way of asking for the list, not a marker the agent
+    /// reads — nothing downstream resolves one, so leaving it in would send a sigil the other end
+    /// has to guess about. What goes in is the plain relative path, which every tool here already
+    /// takes.
+    InsertPath { at: usize, path: String },
     /// A row that can't be picked. Says why.
     Unavailable(String),
 }
@@ -80,31 +125,48 @@ pub enum Slot {
     More { count: usize, up: bool },
 }
 
-/// Where the window sits after the cursor moved to `cursor`.
+/// Where the window over the scrolling rows sits after the cursor moved to `cursor`.
+///
+/// `first` is the index the scrolling part starts at — the pinned "New" row sits above it and
+/// never scrolls, so the window may never climb over it. `cursor` is `None` while the cursor is
+/// on a pinned row: then the window has no reason to move at all.
 ///
 /// **The window only moves when the cursor would leave it.** It used to be derived from the
 /// cursor alone — `start = cursor - (visible - 1)` — which pins the cursor to the bottom edge,
 /// so every ↑ scrolled the list by one even though there were rows above the cursor still on
 /// screen. Walking back up then never reached the `↑ N more` mark: it kept retreating.
-pub fn window_top(len: usize, cursor: usize, top: usize, visible: usize) -> usize {
-    let last = len.saturating_sub(visible);
+pub fn window_top(
+    len: usize,
+    first: usize,
+    cursor: Option<usize>,
+    top: usize,
+    visible: usize,
+) -> usize {
+    // A short list leaves nowhere to scroll to, so the last window is the first one.
+    let last = len.saturating_sub(visible).max(first);
+    let top = top.clamp(first, last);
+    let Some(cursor) = cursor else { return top };
     if cursor < top {
         // Off the top — follow it up, one row at a time.
-        return cursor;
+        return cursor.max(first);
     }
     if cursor >= top + visible {
         // Off the bottom — the cursor becomes the last visible row.
-        return (cursor + 1 - visible).min(last);
+        return (cursor + 1 - visible).clamp(first, last);
     }
     // Still inside. **Stay put**, except that a shrinking list must not leave the window
     // hanging past the end.
-    top.min(last)
+    top
 }
 
 /// Decides how many rows fit and lays out what goes in them, given where the window was.
 ///
 /// Returns the layout and where the window ended up — the caller stores that back, and it is
 /// what makes scrolling stick instead of snapping to the cursor every keypress.
+///
+/// **The "New" row is pinned above the window and never scrolls away.** It is not one more
+/// entry in the list, it is the one thing on the screen that makes a new one — and it used to
+/// slide out of sight the moment you looked past the first screenful, taking its rule with it.
 ///
 /// **The cursor is always visible.** And the cut side notes how many more there are — without it,
 /// the list looks like it ends there and the user won't look below.
@@ -113,19 +175,31 @@ pub fn slots(rows: &[Row], cursor: usize, top: usize, height: usize) -> (Vec<Slo
         return (Vec::new(), 0);
     }
     let has_create = rows.first().is_some_and(|r| r.id.is_none());
+    // Where the scrolling part starts. The pinned row, when there is one, is `rows[0]`.
+    let first = has_create as usize;
 
-    // The overflow marks and rule take space, so how many rows remain depends on itself.
+    // **In a box too short for both, the cursor wins over the furniture.** The rule goes first,
+    // then the pinned row itself — unless the cursor is standing on it.
+    let mut pin = has_create;
+    let mut rule = has_create && rows.len() > 1;
+    if height < 3 {
+        rule = false;
+    }
+    if height < 2 && cursor != 0 {
+        pin = false;
+    }
+    let head = pin as usize + rule as usize;
+
+    // The overflow marks take space, so how many rows remain depends on itself.
     // A couple of rounds reaches the fixed point.
-    let (mut room, mut start, mut end) = (height, 0usize, rows.len());
+    let (mut room, mut start, mut end) = (height.saturating_sub(head).max(1), first, rows.len());
     for _ in 0..3 {
-        let visible = room.max(1).min(rows.len());
-        start = window_top(rows.len(), cursor, top, visible);
+        let visible = room.min(rows.len() - first).max(1);
+        // On the pinned row there is no cursor down in the list, so the window stays put.
+        start = window_top(rows.len(), first, (cursor >= first).then_some(cursor), top, visible);
         end = (start + visible).min(rows.len());
-        let extra = (start > 0) as usize
-            + (end < rows.len()) as usize
-            // The rule is drawn only when "New" is actually visible and something is below it.
-            + (has_create && start == 0 && end > 1) as usize;
-        let want = height.saturating_sub(extra).max(1);
+        let extra = (start > first) as usize + (end < rows.len()) as usize;
+        let want = height.saturating_sub(head + extra).max(1);
         if want == room {
             break;
         }
@@ -133,14 +207,17 @@ pub fn slots(rows: &[Row], cursor: usize, top: usize, height: usize) -> (Vec<Slo
     }
 
     let mut out = Vec::with_capacity(height);
-    if start > 0 {
-        out.push(Slot::More { count: start, up: true });
+    if pin {
+        out.push(Slot::Row(0));
+        if rule {
+            out.push(Slot::Rule);
+        }
+    }
+    if start > first {
+        out.push(Slot::More { count: start - first, up: true });
     }
     for i in start..end {
         out.push(Slot::Row(i));
-        if has_create && i == 0 && end > 1 {
-            out.push(Slot::Rule);
-        }
     }
     if end < rows.len() {
         out.push(Slot::More { count: rows.len() - end, up: false });
@@ -163,9 +240,11 @@ pub struct Picker {
     pub level: Level,
     pub rows: Vec<Row>,
     pub cursor: usize,
-    /// The first visible row. **Remembered rather than derived from the cursor** — deriving it
-    /// pins the cursor to an edge and makes the list scroll on every keypress. `slots` returns
-    /// where it ended up and the widget stores it back.
+    /// The first visible *scrolling* row, as an index into `rows`. **Remembered rather than
+    /// derived from the cursor** — deriving it pins the cursor to an edge and makes the list
+    /// scroll on every keypress. `slots` returns where it ended up and the widget stores it back.
+    ///
+    /// On a list with a "New" row this never reaches 0: that row is pinned above the window.
     pub top: usize,
     /// Whether the list is still loading.
     pub loading: bool,
@@ -216,20 +295,27 @@ impl Picker {
     }
 
     /// One project's session list. The top row is new-session.
+    ///
+    /// **Every thread arrives with a status**, `Unknown` included — see `ThreadStatus`.
     pub fn sessions(
         project_id: String,
         project_name: String,
-        items: Vec<(String, String, Option<ThreadStatus>)>,
+        items: Vec<(String, String, ThreadStatus)>,
         lang: crate::lang::Lang,
     ) -> Self {
-        let mut rows =
-            vec![Row { id: None, label: lang.new_thread().into(), note: None, enabled: true, status: None }];
+        let mut rows = vec![Row {
+            id: None,
+            label: lang.new_thread().into(),
+            note: None,
+            enabled: true,
+            status: None,
+        }];
         rows.extend(items.into_iter().map(|(id, title, status)| Row {
             id: Some(id),
             label: title,
             note: None,
             enabled: true,
-            status,
+            status: Some(status),
         }));
         Self {
             level: Level::Sessions { project_id, project_name },
@@ -250,12 +336,39 @@ impl Picker {
         Self { level: Level::Agents, rows, cursor: 0, top: 0, loading: false }
     }
 
+    /// Where to put a plugin about to be fetched.
+    ///
+    /// **The machine is first** because it is what people mean nearly always — a plugin in the
+    /// project has to be committed or gitignored, which is a decision of its own.
+    pub fn plugin_target(source: String, lang: crate::lang::Lang) -> Self {
+        let rows = vec![
+            Row {
+                id: Some("machine".into()),
+                label: lang.plugin_where_machine().into(),
+                note: Some(lang.plugin_where_machine_note().into()),
+                enabled: true,
+                status: None,
+            },
+            Row {
+                id: Some("project".into()),
+                label: lang.plugin_where_project().into(),
+                note: Some(lang.plugin_where_project_note().into()),
+                enabled: true,
+                status: None,
+            },
+        ];
+        Self { level: Level::PluginTarget { source }, rows, cursor: 0, top: 0, loading: false }
+    }
+
     /// The slash-command list. Opens when `/` is typed.
     ///
     /// **The list comes from the single `command::catalogue()`** — writing it here too lets one go stale.
     /// The language is decided by the screen (`State.lang`).
-    pub fn commands(lang: crate::lang::Lang) -> Self {
-        let rows = crate::command::catalogue(lang)
+    ///
+    /// `added` is what the plugins bring (`plugin::commands`). **They come after the built-ins** so
+    /// that the commands this app is answerable for are the ones read first.
+    pub fn commands(lang: crate::lang::Lang, added: &[crate::plugin::PluginCommand]) -> Self {
+        let mut rows: Vec<Row> = crate::command::catalogue(lang)
             .into_iter()
             .map(|(name, note)| Row {
                 id: Some(name.to_string()),
@@ -265,15 +378,124 @@ impl Picker {
                 status: None,
             })
             .collect();
+        rows.extend(added.iter().map(|c| Row {
+            id: Some(format!("/{}", c.name)),
+            label: format!("/{}", c.name),
+            // **Which plugin it came from is part of the description.** A command that runs
+            // somebody else's prompt should say whose.
+            note: Some(match c.description.is_empty() {
+                true => c.plugin.clone(),
+                false => format!("{} ∙ {}", c.description, c.plugin),
+            }),
+            enabled: true,
+            status: None,
+        }));
         Self { level: Level::Commands, rows, cursor: 0, top: 0, loading: false }
     }
 
+    /// What has been sent, most recent first, narrowed by `query`.
+    ///
+    /// **Most recent first, because that is what is being looked for.** `↑` already walks back one
+    /// at a time and gives up being useful around the third press; this is for the message from
+    /// twenty turns ago, and the ones nearest the end are still the likeliest.
+    ///
+    /// **A newline becomes a space in the label only.** A multi-line message would otherwise take
+    /// over the list, and the row still carries the real text — what is picked is never the
+    /// flattened version.
+    pub fn history(sent: &[String], query: &str) -> Self {
+        let needle = query.to_lowercase();
+        let rows = sent
+            .iter()
+            .rev()
+            .filter(|text| needle.is_empty() || text.to_lowercase().contains(&needle))
+            .take(Self::FILE_ROWS)
+            .map(|text| Row {
+                id: Some(text.clone()),
+                label: text.replace('\n', " "),
+                note: None,
+                enabled: true,
+                status: None,
+            })
+            .collect();
+        Self {
+            level: Level::History { query: query.to_string() },
+            rows,
+            cursor: 0,
+            top: 0,
+            loading: false,
+        }
+    }
+
+    /// An empty file list waiting for the walk.
+    ///
+    /// **The box goes up before the answer does**, same as the project list. Walking a tree is
+    /// not instant on a big checkout, and with nothing on screen the `@` looks like it did
+    /// nothing at all.
+    pub fn loading_files(at: usize) -> Self {
+        Self { level: Level::Files { at }, rows: Vec::new(), cursor: 0, top: 0, loading: true }
+    }
+
+    /// The file list, narrowed by what has been typed after the `@`.
+    ///
+    /// **Ranked, not merely filtered.** Someone typing `app` means `app.rs`, not the first path
+    /// that happens to contain those letters somewhere — so a hit on the file's own name outranks
+    /// one anywhere else in the path, and a name that *starts* with it outranks both. Sorted by
+    /// path within a rank so the order does not jump around as the query grows.
+    ///
+    /// **At most [`Picker::FILE_ROWS`] rows are built.** This runs on every keystroke, and a
+    /// checkout with thousands of files would otherwise pay for thousands of `String`s per press
+    /// to show twenty.
+    pub fn files(all: &[String], query: &str, at: usize) -> Self {
+        let needle = query.to_lowercase();
+        let mut hits: Vec<(u8, &String)> = all
+            .iter()
+            .filter_map(|path| {
+                let lower = path.to_lowercase();
+                let name = lower.rsplit('/').next().unwrap_or(&lower);
+                let rank = if needle.is_empty() {
+                    2
+                } else if name.starts_with(&needle) {
+                    0
+                } else if name.contains(&needle) {
+                    1
+                } else if lower.contains(&needle) {
+                    2
+                } else {
+                    return None;
+                };
+                Some((rank, path))
+            })
+            .collect();
+        hits.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
+        let rows = hits
+            .into_iter()
+            .take(Self::FILE_ROWS)
+            .map(|(_, path)| Row {
+                id: Some(path.clone()),
+                label: path.clone(),
+                note: None,
+                enabled: true,
+                status: None,
+            })
+            .collect();
+        Self { level: Level::Files { at }, rows, cursor: 0, top: 0, loading: false }
+    }
+
+    /// How many file rows are built per keystroke. The list scrolls, so more than this is not
+    /// reachable in any useful way before narrowing further.
+    pub const FILE_ROWS: usize = 200;
+
     /// Narrows the list by typed text. If nothing remains, leaves it as is — an empty list looks broken.
-    pub fn narrow(&mut self, typed: &str, lang: crate::lang::Lang) {
+    pub fn narrow(
+        &mut self,
+        typed: &str,
+        lang: crate::lang::Lang,
+        added: &[crate::plugin::PluginCommand],
+    ) {
         if !matches!(self.level, Level::Commands) {
             return;
         }
-        *self = Picker::commands(lang);
+        *self = Picker::commands(lang, added);
         self.rows.retain(|r| r.label.starts_with(typed));
         self.cursor = 0;
     }
@@ -321,7 +543,18 @@ impl Picker {
             (Level::Projects, None) => Some(Pick::NewProject),
             (Level::Agents, Some(name)) => Some(Pick::UseAgent { name: name.clone() }),
             (Level::Commands, Some(text)) => Some(Pick::TypeCommand { text: text.clone() }),
-            (Level::Agents, None) | (Level::Commands, None) => None,
+            (Level::History { .. }, Some(text)) => Some(Pick::UseHistory { text: text.clone() }),
+            (Level::Files { at }, Some(path)) => {
+                Some(Pick::InsertPath { at: *at, path: path.clone() })
+            }
+            (Level::PluginTarget { source }, Some(where_to)) => {
+                Some(Pick::InstallPlugin { source: source.clone(), project: where_to == "project" })
+            }
+            (Level::Agents, None)
+            | (Level::Commands, None)
+            | (Level::History { .. }, None)
+            | (Level::Files { .. }, None)
+            | (Level::PluginTarget { .. }, None) => None,
         }
     }
 
@@ -332,6 +565,14 @@ impl Picker {
             Level::Sessions { project_name, .. } => lang.threads_in(project_name),
             Level::Agents => lang.agents().into(),
             Level::Commands => lang.commands().into(),
+            Level::Files { .. } => lang.files().into(),
+            // The query is shown in the title, since it lives here rather than in the draft —
+            // typing with no sign of what was typed reads as a list narrowing on its own.
+            Level::History { query } => match query.is_empty() {
+                true => lang.history().into(),
+                false => format!("{} ∙ {query}", lang.history()),
+            },
+            Level::PluginTarget { .. } => lang.plugin_where_title().into(),
         }
     }
 }
@@ -392,15 +633,58 @@ mod tests {
         assert_eq!(shown + count, rows.len(), "the count is wrong: {got:?}");
     }
 
-    /// Scrolling down adds a count of what's left above.
+    /// Scrolling down adds a count of what's left above. It comes right under the pinned rows.
     #[test]
     fn scrolling_down_marks_what_is_left_above() {
         let rows = many(30);
         let got = lay(&rows, 20, 8);
+        assert_eq!(got[0], Slot::Row(0), "the create row is pinned: {got:?}");
+        assert_eq!(got[1], Slot::Rule, "{got:?}");
         assert!(
-            matches!(got.first(), Some(Slot::More { up: true, .. })),
+            matches!(got[2], Slot::More { up: true, .. }),
             "no count of what is left above: {got:?}"
         );
+    }
+
+    /// **The create row never scrolls away.** It is the only way to make a new one, and it used
+    /// to slide off the top the moment you looked past the first screenful — taking its rule with
+    /// it, so the list below read as if the row had never existed.
+    #[test]
+    fn the_create_row_stays_pinned_however_far_down_the_list_goes() {
+        let rows = many(40);
+        for cursor in [0, 1, 12, 30, 40] {
+            let got = lay(&rows, cursor, 9);
+            assert_eq!(got[0], Slot::Row(0), "at {cursor} the create row left the top: {got:?}");
+            assert_eq!(got[1], Slot::Rule, "at {cursor} the rule went with it: {got:?}");
+            // And it is drawn exactly once — pinned above the window and inside it both would
+            // offer two rows that do the same thing.
+            assert_eq!(
+                got.iter().filter(|s| **s == Slot::Row(0)).count(),
+                1,
+                "drawn twice at {cursor}: {got:?}"
+            );
+        }
+    }
+
+    /// The count above never includes the pinned row — it is not hidden, so counting it lies.
+    #[test]
+    fn the_pinned_row_is_not_counted_as_hidden_above() {
+        let rows = many(40);
+        let got = lay(&rows, 30, 9);
+        let above = got.iter().find_map(|s| match s {
+            Slot::More { count, up: true } => Some(*count),
+            _ => None,
+        });
+        let shown: Vec<usize> = got
+            .iter()
+            .filter_map(|s| match s {
+                Slot::Row(i) if *i > 0 => Some(*i),
+                _ => None,
+            })
+            .collect();
+        let first = *shown.first().expect("no list rows: {got:?}");
+        // Rows 1..first are the hidden ones. Row 0 is pinned and visible.
+        assert_eq!(above, Some(first - 1), "{got:?}");
     }
 
     /// **Going back up does not scroll until the cursor reaches the top of the window.**
@@ -414,7 +698,7 @@ mod tests {
         let rows = many(40);
         // Scrolled to the bottom, then four steps back up.
         let (_, top) = slots(&rows, 39, 0, 9);
-        assert!(top > 0, "it did not scroll down at all");
+        assert!(top > 1, "it did not scroll down at all");
         let mut at = top;
         for cursor in (36..=38).rev() {
             let (_, now) = slots(&rows, cursor, at, 9);
@@ -430,11 +714,19 @@ mod tests {
     #[test]
     fn walking_down_holds_the_window_until_the_cursor_reaches_the_bottom() {
         let rows = many(40);
-        let (first, _) = slots(&rows, 0, 0, 9);
-        let visible = first.iter().filter(|s| matches!(s, Slot::Row(_))).count();
-        for cursor in 1..visible {
-            let (_, now) = slots(&rows, cursor, 0, 9);
-            assert_eq!(now, 0, "the list scrolled while row {cursor} was still on screen");
+        let (laid, start) = slots(&rows, 0, 0, 9);
+        // The pinned row is not in the window, so it does not count towards what scrolls.
+        let last = laid
+            .iter()
+            .filter_map(|s| match s {
+                Slot::Row(i) if *i > 0 => Some(*i),
+                _ => None,
+            })
+            .max()
+            .expect("no list rows");
+        for cursor in 1..=last {
+            let (_, now) = slots(&rows, cursor, start, 9);
+            assert_eq!(now, start, "the list scrolled while row {cursor} was still on screen");
         }
     }
 
@@ -443,8 +735,9 @@ mod tests {
     fn a_window_past_the_end_of_a_shrunken_list_is_pulled_back() {
         let rows = many(6);
         let (got, top) = slots(&rows, 0, 30, 9);
-        assert_eq!(top, 0, "{got:?}");
-        assert!(got.iter().any(|s| matches!(s, Slot::Row(0))), "{got:?}");
+        assert_eq!(top, 1, "the window did not come back to the head of the list: {got:?}");
+        assert!(got.iter().any(|s| matches!(s, Slot::Row(1))), "{got:?}");
+        assert!(!got.iter().any(|s| matches!(s, Slot::More { .. })), "nothing is cut: {got:?}");
     }
 
     /// **The cursor is always visible.** If it weren't, you couldn't tell what you're picking.
@@ -481,17 +774,17 @@ mod tests {
         assert_eq!(got[2], Slot::Row(1));
     }
 
-    /// Once scrolled past where the create row is visible, there's no rule either.
+    /// With nothing under it there is no rule — a line separating one row from nothing is noise.
     #[test]
-    fn there_is_no_rule_once_the_create_row_scrolls_away() {
-        let got = lay(&many(30), 25, 8);
-        assert!(!got.contains(&Slot::Rule), "{got:?}");
+    fn a_create_row_with_an_empty_list_gets_no_rule() {
+        let got = lay(&many(0), 0, 10);
+        assert_eq!(got, vec![Slot::Row(0)], "{got:?}");
     }
 
     /// Lists without a create row (agents·commands) get no rule.
     #[test]
     fn a_list_without_a_create_row_has_no_rule() {
-        let got = lay(&Picker::commands(crate::lang::Lang::Ko).rows, 0, 20);
+        let got = lay(&Picker::commands(crate::lang::Lang::Ko, &[]).rows, 0, 20);
         assert!(!got.contains(&Slot::Rule), "{got:?}");
     }
 
@@ -499,8 +792,12 @@ mod tests {
         Picker::agents(
             ["Main Agent", "Zyris Code"]
                 .into_iter()
-                .map(|n| {
-                    Row { id: Some(n.into()), label: n.into(), note: None, enabled: true, status: None }
+                .map(|n| Row {
+                    id: Some(n.into()),
+                    label: n.into(),
+                    note: None,
+                    enabled: true,
+                    status: None,
                 })
                 .collect(),
         )
@@ -517,7 +814,7 @@ mod tests {
     /// **If the list and parser diverge, the pick doesn't work.** The list comes from `command::catalogue()`.
     #[test]
     fn every_command_row_is_something_the_parser_knows() {
-        for row in Picker::commands(crate::lang::Lang::Ko).rows {
+        for row in Picker::commands(crate::lang::Lang::Ko, &[]).rows {
             assert!(crate::command::parse(&row.label).is_some(), "{}", row.label);
         }
     }
@@ -525,19 +822,19 @@ mod tests {
     /// **Picking only puts it in the input field; it doesn't run.** `/mode` takes arguments.
     #[test]
     fn picking_a_command_only_types_it() {
-        let p = Picker::commands(crate::lang::Lang::Ko);
+        let p = Picker::commands(crate::lang::Lang::Ko, &[]);
         assert_eq!(p.pick(), Some(Pick::TypeCommand { text: "/help".into() }));
     }
 
     /// Narrowed by typed text. Without it, you'd have to find it by eye in the list.
     #[test]
     fn typing_narrows_the_command_rows() {
-        let mut p = Picker::commands(crate::lang::Lang::Ko);
-        p.narrow("/mo", crate::lang::Lang::Ko);
+        let mut p = Picker::commands(crate::lang::Lang::Ko, &[]);
+        p.narrow("/mo", crate::lang::Lang::Ko, &[]);
         assert_eq!(p.rows.len(), 1, "{:?}", p.rows);
         assert_eq!(p.rows[0].label, "/mode");
         // Widening again must bring it back — if deleting one character lost it, it's unusable.
-        p.narrow("/m", crate::lang::Lang::Ko);
+        p.narrow("/m", crate::lang::Lang::Ko, &[]);
         assert!(p.rows.iter().any(|r| r.label == "/mcp"), "{:?}", p.rows);
     }
 
@@ -577,7 +874,7 @@ mod tests {
         let s = Picker::sessions(
             "p1".into(),
             "기본".into(),
-            vec![("s1".into(), "지난 대화".into(), None)],
+            vec![("s1".into(), "지난 대화".into(), ThreadStatus::Unknown)],
             crate::lang::Lang::Ko,
         );
         assert_eq!(s.rows[0].label, "＋ 새 쓰레드");
@@ -591,12 +888,26 @@ mod tests {
         let mut s = Picker::sessions(
             "p1".into(),
             "기본".into(),
-            vec![("s1".into(), "지난 대화".into(), Some(ThreadStatus::Running))],
+            vec![("s1".into(), "지난 대화".into(), ThreadStatus::Running)],
             crate::lang::Lang::Ko,
         );
         s.down();
         assert_eq!(s.pick(), Some(Pick::OpenSession { id: "s1".into(), project_id: "p1".into() }));
         assert_eq!(s.rows[1].status, Some(ThreadStatus::Running));
+    }
+
+    /// **A thread that knows nothing still holds its dot.** `None` on a session row would take the
+    /// two columns back and shove the title left, so every row would jump as the outcomes land.
+    #[test]
+    fn a_thread_whose_outcome_is_not_known_yet_still_carries_a_dot() {
+        let s = Picker::sessions(
+            "p1".into(),
+            "기본".into(),
+            vec![("s1".into(), "지난 대화".into(), ThreadStatus::Unknown)],
+            crate::lang::Lang::Ko,
+        );
+        assert_eq!(s.rows[1].status, Some(ThreadStatus::Unknown), "{:?}", s.rows);
+        assert_eq!(s.rows[0].status, None, "the create row is not a thread");
     }
 
     #[test]

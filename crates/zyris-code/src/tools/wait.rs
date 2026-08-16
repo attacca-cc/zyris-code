@@ -301,7 +301,7 @@ impl Wait for Waits {
     ) -> zyris::Result<Outcome> {
         let chosen = [job.is_some(), command.is_some(), work.is_some()];
         if chosen.iter().filter(|c| **c).count() != 1 {
-            return Err(WireError::invalid_params("job·command·work 중 정확히 하나를 주세요."));
+            return Err(WireError::invalid_params("job∙command∙work 중 정확히 하나를 주세요."));
         }
         let budget = budget(crate::tools::guard::wire_deadline(), timeout_ms);
         let at = std::time::Instant::now();
@@ -361,7 +361,7 @@ impl Waits {
                 snap.label,
                 snap.elapsed_ms / 1000
             ),
-            next: format!("같은 인자로 `wait.until`을 다시 부르세요 — `job: \"{id}\"`."),
+            next: format!("같은 인자로 `wait.until`을 다시 부르세요 ‒ `job: \"{id}\"`."),
             elapsed_ms: at.elapsed().as_millis() as u64,
             tail: self.jobs.tail(id, TAIL_BYTES),
             exit_code: None,
@@ -468,7 +468,7 @@ impl Waits {
         Ok(Outcome {
             done: false,
             why: format!("work `{work_id}`이 아직 `{name}`입니다."),
-            next: format!("같은 인자로 `wait.until`을 다시 부르세요 — `work: \"{work_id}\"`."),
+            next: format!("같은 인자로 `wait.until`을 다시 부르세요 ‒ `work: \"{work_id}\"`."),
             elapsed_ms: at.elapsed().as_millis() as u64,
             tail: String::new(),
             exit_code: None,
@@ -586,7 +586,9 @@ mod tests {
     #[tokio::test]
     async fn a_job_shows_up_in_the_list_and_its_logs_are_readable() {
         let w = waits();
-        let id = w.start(Some("echo 안녕".into()), None, None, None, None).await.unwrap().id;
+        // ASCII only — on Windows `cmd /C echo` writes in the console codepage, not UTF-8,
+        // so a non-ASCII word would come back mangled and never match.
+        let id = w.start(Some("echo hi".into()), None, None, None, None).await.unwrap().id;
         wait_for(&w, &id).await;
 
         let list = w.list().await.unwrap();
@@ -594,7 +596,7 @@ mod tests {
         assert!(!list[0].running);
 
         let logs = w.logs(id.clone(), None).await.unwrap();
-        assert!(logs.text.contains("안녕"), "{}", logs.text);
+        assert!(logs.text.contains("hi"), "{}", logs.text);
         assert_eq!(logs.exit_code, Some(0));
         assert!(!logs.more);
         // Reading on gives back nothing — the same bytes must never come twice.
@@ -602,6 +604,8 @@ mod tests {
     }
 
     /// When it is cut, **it says so** and gives the place to read on from.
+    /// Unix-only: `/dev/zero` and `tr` are not present on Windows.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_long_log_is_cut_but_says_there_is_more() {
         let w = waits();
@@ -657,12 +661,22 @@ mod tests {
         assert_eq!(budget(None, Some(600_000)), std::time::Duration::from_secs(600));
     }
 
+    /// A command that runs for ~30s so an `until` call can time out against it.
+    /// `cmd` has no `sleep`; `ping -n N 127.0.0.1` is the reliable wait there.
+    fn long_running() -> &'static str {
+        if cfg!(windows) {
+            "ping -n 35 127.0.0.1 >nul"
+        } else {
+            "sleep 30"
+        }
+    }
+
     /// **The canonical statement of the bug.** Not finished is not a failure — the agent
     /// reading `exec`'s `timed_out: true, exit_code: -1` as a failure is why this work exists.
     #[tokio::test]
     async fn an_unfinished_wait_answers_success_not_an_error() {
         let w = waits();
-        let id = w.start(Some("sleep 30".into()), None, None, None, None).await.unwrap().id;
+        let id = w.start(Some(long_running().into()), None, None, None, None).await.unwrap().id;
         let out = w
             .until_job(&id, ms(1500), std::time::Instant::now())
             .await
@@ -679,7 +693,7 @@ mod tests {
     #[tokio::test]
     async fn a_wait_answers_before_its_budget_runs_out() {
         let w = waits();
-        let id = w.start(Some("sleep 30".into()), None, None, None, None).await.unwrap().id;
+        let id = w.start(Some(long_running().into()), None, None, None, None).await.unwrap().id;
         let at = std::time::Instant::now();
         let _ = w.until_job(&id, ms(1000), at).await.unwrap();
         assert!(at.elapsed() < std::time::Duration::from_secs(3), "{:?}", at.elapsed());
@@ -690,12 +704,17 @@ mod tests {
     #[tokio::test]
     async fn a_wait_returns_the_moment_the_job_ends() {
         let w = waits();
-        let id = w.start(Some("sleep 1; echo 끝".into()), None, None, None, None).await.unwrap().id;
+        let cmd = if cfg!(windows) {
+            "ping -n 2 127.0.0.1 >nul & echo done"
+        } else {
+            "sleep 1; echo done"
+        };
+        let id = w.start(Some(cmd.into()), None, None, None, None).await.unwrap().id;
         let at = std::time::Instant::now();
         let out = w.until_job(&id, ms(20_000), at).await.unwrap();
         assert!(out.done, "{}", out.why);
         assert_eq!(out.exit_code, Some(0));
-        assert!(out.tail.contains("끝"), "{}", out.tail);
+        assert!(out.tail.contains("done"), "{}", out.tail);
         assert!(at.elapsed() < std::time::Duration::from_secs(5), "{:?}", at.elapsed());
     }
 
@@ -729,7 +748,9 @@ mod tests {
     #[tokio::test]
     async fn a_probe_that_succeeds_ends_the_wait() {
         let w = waits();
-        let out = w.until(None, Some("true".into()), None, None, None, None).await.unwrap();
+        // `cmd /C` has no `true`; `exit /b 0` is the portable no-op success.
+        let true_cmd = if cfg!(windows) { "exit /b 0" } else { "true" };
+        let out = w.until(None, Some(true_cmd.into()), None, None, None, None).await.unwrap();
         assert!(out.done, "{}", out.why);
     }
 
@@ -762,6 +783,8 @@ mod tests {
 
     /// **It really does run again.** Measured with a command that only turns true on the
     /// second round.
+    /// Unix-only: the probe command is bash (`$(wc -c)`).
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_probe_actually_runs_again_until_it_is_true() {
         let w = waits();
@@ -864,18 +887,21 @@ mod tests {
     #[tokio::test]
     async fn env_lines_reach_the_command() {
         let w = waits();
+        // `cmd /C` does not expand `$FOO`; `%FOO%` is its form. ASCII value only — a Korean
+        // one would come back in the console codepage rather than UTF-8.
+        let echo = if cfg!(windows) { "echo %FOO%" } else { "echo $FOO" };
         let id = w
             .start(
-                Some("echo $FOO".into()),
+                Some(echo.into()),
                 None,
                 None,
-                Some(vec!["FOO=바".into()]),
+                Some(vec!["FOO=bar".into()]),
                 Some("환경 시험".into()),
             )
             .await
             .unwrap()
             .id;
         wait_for(&w, &id).await;
-        assert_eq!(w.logs(id, None).await.unwrap().text.trim(), "바");
+        assert_eq!(w.logs(id, None).await.unwrap().text.trim(), "bar");
     }
 }

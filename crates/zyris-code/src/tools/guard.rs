@@ -49,12 +49,30 @@ impl<C: ServeCapability> ServeCapability for Gate<C> {
         // what is running. Then leave it as the empty value and take the decision.
         let args = call.params.to_json().unwrap_or(Value::Null);
         let target = target_of(&self.capability, &call.tool, &args);
-        let outside = escaping_path(&self.bridge.root(), &self.capability, &call.tool, &args);
-        let gated = Call::new(&self.capability, &call.tool, target).leaving(outside);
+        let root = self.bridge.root();
+        let outside = escaping_path(&root, &self.capability, &call.tool, &args);
+        // **Where this app's credentials live.** Read per call rather than held, because it is a
+        // pure function of the environment and holding it would be one more thing to keep in step.
+        let secret = crate::conn::app_dir().and_then(|dir| {
+            crate::tools::gate::secret_path(&dir, &root, &self.capability, &call.tool, &args)
+        });
+        let gated =
+            Call::new(&self.capability, &call.tool, target).leaving(outside).reaching_for(secret);
 
         match self.bridge.decide(&gated) {
             Decision::Run => {}
             Decision::Refuse(why) => return Err(WireError::invalid_params(why)),
+        }
+
+        // **A plugin's hooks run here and nowhere else.** This is the one point every tool call
+        // already passes, so there is no second path to keep in step — and a hook can only refuse,
+        // never rewrite, so nothing downstream has to re-read what it did (`hooks.rs`).
+        let hooks = self.bridge.hooks();
+        let named = format!("{}.{}", gated.capability, gated.tool);
+        if let crate::hooks::Verdict::Refused(why) =
+            crate::hooks::run(&hooks, crate::hooks::When::Before, &named, &args).await
+        {
+            return Err(WireError::invalid_params(why));
         }
 
         let (call, cut) = self.clamp_exec(call, &args, wire_deadline());
@@ -65,10 +83,15 @@ impl<C: ServeCapability> ServeCapability for Gate<C> {
         // looking at the screen alone can't tell whether a window missed it or wasn't asked.
         tracing::info!(capability = %gated.capability, tool = %gated.tool, "took a tool call");
 
-        let running = self.tell_the_screen_it_started(&gated, &args);
+        let running = self.tell_the_screen_it_started(&gated, &args, asking_session(&call));
         let out = self.inner.dispatch(call).await;
         if let Some(id) = running {
             self.bridge.frame(crate::app::Frame::ExecDone { id });
+        }
+        // **After the call, whatever it did.** The verdict is not read — the call already happened,
+        // and reporting a refusal now would describe something that did not occur.
+        if !hooks.is_empty() {
+            crate::hooks::run(&hooks, crate::hooks::When::After, &named, &args).await;
         }
         let out = out?;
         self.note_the_shells(&gated, &args, &out);
@@ -84,13 +107,18 @@ impl<C: ServeCapability> Gate<C> {
     ///
     /// What's returned is the number to clear when done. **Only `exec`** — the other tools finish
     /// quickly, so announcing each one would just make the activity line flicker.
-    fn tell_the_screen_it_started(&self, call: &Call, args: &Value) -> Option<u64> {
+    fn tell_the_screen_it_started(
+        &self,
+        call: &Call,
+        args: &Value,
+        session: Option<String>,
+    ) -> Option<u64> {
         if (call.capability.as_str(), call.tool.as_str()) != ("terminal", "exec") {
             return None;
         }
         let command = args.get("command").and_then(Value::as_str)?.to_string();
         let id = self.bridge.next_id();
-        self.bridge.frame(crate::app::Frame::ExecStart { id, command });
+        self.bridge.frame(crate::app::Frame::ExecStart { id, command, session });
         Some(id)
     }
 
@@ -149,6 +177,21 @@ impl<C: ServeCapability> Gate<C> {
     }
 }
 
+/// **Which conversation asked for this call**, when the server said so.
+///
+/// This node runs one account's tools, and attacca hands them to *every* session on that account —
+/// including ones open in another window on this machine. Nothing in the arguments distinguishes
+/// them, by design: which session asked is the server's business, not the tool's, so it rides
+/// beside the arguments in `meta` (`route::call_meta` on the attacca side).
+///
+/// `None` is the ordinary answer, not a fault. A server built before it says nothing, and so does
+/// anything else that reaches these capabilities directly.
+fn asking_session(call: &IncomingCall) -> Option<String> {
+    let meta = call.meta.to_json().ok()?;
+    let id = meta.get("session_id")?.as_str()?.trim();
+    (!id.is_empty()).then(|| id.to_string())
+}
+
 /// Identifier of the opened PTY. Same spot in a unary response or a stream head.
 fn pty_id_of(out: &Outgoing) -> Option<String> {
     let payload = match out {
@@ -174,7 +217,7 @@ fn note_the_cut(out: Outgoing, deadline: Duration) -> Outgoing {
     stderr.push_str(&format!(
         "\n\n이 배포는 노드 호출을 {}초에 끊습니다. **명령은 실패한 것이 아니라 시간에 \
          잘린 것입니다.** 오래 걸리는 것은 wait.start로 배경에 걸고 wait.until로 \
-         기다리세요 — 그쪽은 끝날 때까지 나눠서 기다릴 수 있습니다.",
+         기다리세요 ‒ 그쪽은 끝날 때까지 나눠서 기다릴 수 있습니다.",
         deadline.as_secs()
     ));
     obj.insert("stderr".into(), Value::from(stderr));
@@ -284,7 +327,28 @@ mod tests {
             tool: tool.into(),
             params: Payload::from_json(args),
             serialization: Serialization::Json,
+            meta: Payload::default(),
         }
+    }
+
+    /// **A call that says which session asked is the only one that can be attributed.** Anything
+    /// else — an older server, or something calling these capabilities directly — says nothing,
+    /// and that is the ordinary answer rather than a fault.
+    #[test]
+    fn who_asked_is_read_only_when_the_caller_actually_said() {
+        let with = |meta: Value| IncomingCall {
+            meta: Payload::from_json(meta),
+            ..incoming("exec", serde_json::json!({}))
+        };
+        assert_eq!(
+            asking_session(&with(serde_json::json!({"session_id": "s-1"}))),
+            Some("s-1".to_string())
+        );
+        assert_eq!(asking_session(&incoming("exec", serde_json::json!({}))), None);
+        assert_eq!(asking_session(&with(serde_json::json!({}))), None);
+        // A blank id is not an id. Kept as one it would be compared against the session on screen
+        // and never match, silently hiding this conversation's own commands.
+        assert_eq!(asking_session(&with(serde_json::json!({"session_id": "  "}))), None);
     }
 
     /// **Inside work just runs with no screen attached** — the policy only looks at paths,

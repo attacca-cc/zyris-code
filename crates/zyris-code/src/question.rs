@@ -243,7 +243,12 @@ impl Answering {
         &self.free[self.step]
     }
 
-    /// Pick or unpick. For single-select, it replaces the previous pick.
+    /// Pick or unpick. For single-select, it replaces the previous pick — and pressing the row
+    /// that is already picked lets go of it.
+    ///
+    /// **Choosing has to be undoable.** A single-select row that re-picked itself left no way back
+    /// to "nothing chosen", so one wrong press was permanent and took the option of skipping the
+    /// step with it.
     pub fn toggle(&mut self) {
         match self.row_at(self.cursor) {
             Some(RowKind::Free) => {
@@ -255,12 +260,12 @@ impl Answering {
             Some(RowKind::Option(i)) => {
                 let multi = self.current().multi;
                 let set = &mut self.chosen[self.step];
-                if multi {
-                    if !set.remove(&i) {
-                        set.insert(i);
-                    }
-                } else {
+                let had = set.remove(&i);
+                if !multi {
+                    // Single-select: whatever else was picked goes, since only one may stand.
                     set.clear();
+                }
+                if !had {
                     set.insert(i);
                 }
             }
@@ -505,6 +510,20 @@ mod tests {
         a.toggle();
         assert!(!a.is_chosen(0), "single select replaces the previous one");
         assert!(a.is_chosen(1));
+    }
+
+    /// **Choosing must be undoable.** A single-select row that re-picks itself leaves no way back
+    /// to "nothing chosen" — the one wrong press is then permanent, and skipping the step is gone
+    /// with it.
+    #[test]
+    fn pressing_the_chosen_single_select_row_again_unpicks_it() {
+        let mut a = Answering::new(parse(&args()).unwrap());
+        a.toggle();
+        assert!(a.is_chosen(0));
+        a.toggle();
+        assert!(!a.is_chosen(0), "pressing the same row again must let go of it");
+        assert!(!a.answered(), "with nothing chosen the step is unanswered again");
+        assert!(a.rows().contains(&RowKind::Action(Act::Skip)), "and so it can be skipped again");
     }
 
     #[test]

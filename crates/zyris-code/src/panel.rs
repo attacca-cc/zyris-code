@@ -55,6 +55,8 @@ pub enum Setting {
     DefaultMode,
     /// Which palette the screen is drawn in.
     Theme,
+    /// Whether a newer release installs itself.
+    Update,
 }
 
 impl Setting {
@@ -65,6 +67,7 @@ impl Setting {
             Setting::Language => lang.cfg_language(),
             Setting::DefaultMode => lang.cfg_default_mode(),
             Setting::Theme => lang.cfg_theme(),
+            Setting::Update => lang.cfg_update(),
         }
     }
 
@@ -75,6 +78,7 @@ impl Setting {
             // The unset state plus every mode.
             Setting::DefaultMode => 1 + Mode::ALL.len(),
             Setting::Theme => THEMES.len(),
+            Setting::Update => crate::update::Policy::ALL.len(),
         }
     }
 
@@ -97,6 +101,7 @@ impl Setting {
                 Some(n) => Mode::ALL[n.min(Mode::ALL.len() - 1)].label(lang),
             },
             Setting::Theme => lang.cfg_theme_name(THEMES[i.min(THEMES.len() - 1)]),
+            Setting::Update => lang.cfg_update_name(pick(i)),
         }
     }
 
@@ -109,14 +114,22 @@ impl Setting {
             Setting::Language => {
                 lang.cfg_lang_desc(if i == 0 { Lang::Ko } else { Lang::En }).to_string()
             }
-            Setting::DefaultMode => lang
-                .cfg_mode_desc(i.checked_sub(1).map(|n| Mode::ALL[n.min(Mode::ALL.len() - 1)])),
+            Setting::DefaultMode => {
+                lang.cfg_mode_desc(i.checked_sub(1).map(|n| Mode::ALL[n.min(Mode::ALL.len() - 1)]))
+            }
             Setting::Theme => lang.cfg_theme_desc(THEMES[i.min(THEMES.len() - 1)]).to_string(),
+            Setting::Update => lang.cfg_update_desc(pick(i)).to_string(),
         }
     }
 }
 
 /// The palette choices, in the order the row walks them.
+/// The update policy at that index, clamped — the form walks indices and must never be handed one
+/// past the end.
+fn pick(i: usize) -> crate::update::Policy {
+    crate::update::Policy::ALL[i.min(crate::update::Policy::ALL.len() - 1)]
+}
+
 const THEMES: [crate::config::ThemeChoice; 3] = [
     crate::config::ThemeChoice::Auto,
     crate::config::ThemeChoice::Dark,
@@ -144,8 +157,13 @@ pub struct Form {
 
 impl Form {
     /// The rows, in the order they are drawn.
-    pub const ROWS: [Setting; 4] =
-        [Setting::DirAccess, Setting::Language, Setting::DefaultMode, Setting::Theme];
+    pub const ROWS: [Setting; 5] = [
+        Setting::DirAccess,
+        Setting::Language,
+        Setting::DefaultMode,
+        Setting::Theme,
+        Setting::Update,
+    ];
 
     fn new(lang: Lang, draft: crate::config::Config) -> Form {
         Form { draft, lang, cursor: 0 }
@@ -180,6 +198,9 @@ impl Form {
                 Some(m) => 1 + Mode::ALL.iter().position(|it| *it == m).unwrap_or(0),
             },
             Setting::Theme => THEMES.iter().position(|t| *t == self.draft.theme).unwrap_or(0),
+            Setting::Update => {
+                crate::update::Policy::ALL.iter().position(|p| *p == self.draft.update).unwrap_or(0)
+            }
         }
     }
 
@@ -194,6 +215,7 @@ impl Form {
                     i.checked_sub(1).map(|n| Mode::ALL[n.min(Mode::ALL.len() - 1)])
             }
             Setting::Theme => self.draft.theme = THEMES[i.min(THEMES.len() - 1)],
+            Setting::Update => self.draft.update = pick(i),
         }
     }
 }
@@ -254,7 +276,7 @@ impl Panel {
 pub fn mode(lang: Lang, now: Mode) -> Panel {
     let mut lines = vec![
         Line::from(Span::styled(
-            format!("{} · {}", lang.current_mode(), now.label(lang)),
+            format!("{} ∙ {}", lang.current_mode(), now.label(lang)),
             Style::default().fg(now.color()).add_modifier(Modifier::BOLD),
         )),
         blank(),
@@ -271,7 +293,7 @@ pub fn mode(lang: Lang, now: Mode) -> Panel {
                     Style::default().fg(theme::text())
                 },
             ),
-            Span::styled(" — ", Style::default().fg(theme::border_light())),
+            Span::styled(" ‒ ", Style::default().fg(theme::border_light())),
             Span::styled(
                 lang.mode_desc(m),
                 Style::default().fg(if on { theme::text() } else { theme::text_muted() }),
@@ -285,8 +307,17 @@ pub fn mode(lang: Lang, now: Mode) -> Panel {
 }
 
 /// The `/mcp` panel — every attached server and how many tools it brought.
-pub fn mcp(lang: Lang, report: &[(String, Result<usize, String>)]) -> Panel {
-    if report.is_empty() {
+/// The `/mcp` panel: what is running, and **what could be**.
+///
+/// `found` is what other clients already have set up (`mcp::discovery`), with whether this machine
+/// has said yes. Showing it is the whole point of discovering it — a list nobody sees may as well
+/// not have been read.
+pub fn mcp(
+    lang: Lang,
+    report: &[(String, Result<usize, String>)],
+    found: &[(String, String, bool)],
+) -> Panel {
+    if report.is_empty() && found.is_empty() {
         return Panel::new(lang.title_mcp().into(), vec![muted(lang.mcp_empty().to_string())]);
     }
     let mut lines = Vec::new();
@@ -301,9 +332,35 @@ pub fn mcp(lang: Lang, report: &[(String, Result<usize, String>)]) -> Panel {
                 name.clone(),
                 Style::default().fg(theme::text_heading()).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(" — ", Style::default().fg(theme::border_light())),
+            Span::styled(" ‒ ", Style::default().fg(theme::border_light())),
             Span::styled(text, Style::default().fg(color)),
         ]));
+    }
+    if !found.is_empty() {
+        if !lines.is_empty() {
+            lines.push(blank());
+        }
+        lines.push(muted(lang.mcp_found_heading().to_string()));
+        for (slug, source, on) in found {
+            // **The dot says whether it will start**, because that is the only thing about a
+            // discovered entry a person has to decide.
+            let (mark, colour) =
+                if *on { ("● ", theme::success()) } else { ("○ ", theme::text_muted()) };
+            lines.push(Line::from(vec![
+                Span::styled(mark, Style::default().fg(colour)),
+                Span::styled(
+                    slug.clone(),
+                    Style::default().fg(theme::text_heading()).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" ‒ ", Style::default().fg(theme::border_light())),
+                Span::styled(
+                    lang.mcp_found_from(source, *on),
+                    Style::default().fg(theme::text_muted()),
+                ),
+            ]));
+        }
+        lines.push(blank());
+        lines.push(muted(lang.mcp_switch_hint().to_string()));
     }
     lines.push(blank());
     lines.push(muted(lang.mcp_config_hint().to_string()));
@@ -322,12 +379,12 @@ pub fn skills(lang: Lang, skills: &[SkillInfo]) -> Panel {
         .iter()
         .map(|s| {
             Line::from(vec![
-                Span::styled("· ", Style::default().fg(theme::accent())),
+                Span::styled("∙ ", Style::default().fg(theme::accent())),
                 Span::styled(
                     s.name.clone(),
                     Style::default().fg(theme::text_heading()).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(" — ", Style::default().fg(theme::border_light())),
+                Span::styled(" ‒ ", Style::default().fg(theme::border_light())),
                 Span::styled(s.description.clone(), Style::default().fg(theme::text_muted())),
             ])
         })
@@ -346,7 +403,7 @@ pub fn plugins(lang: Lang, found: &[Plugin]) -> Panel {
     let mut lines = Vec::new();
     for p in found {
         let mut spans = vec![
-            Span::styled("· ", Style::default().fg(theme::accent())),
+            Span::styled("∙ ", Style::default().fg(theme::accent())),
             Span::styled(
                 p.name.clone(),
                 Style::default().fg(theme::text_heading()).add_modifier(Modifier::BOLD),
@@ -359,12 +416,15 @@ pub fn plugins(lang: Lang, found: &[Plugin]) -> Panel {
             ));
         }
         if !p.description.is_empty() {
-            spans.push(Span::styled(" — ", Style::default().fg(theme::border_light())));
+            spans.push(Span::styled(" ‒ ", Style::default().fg(theme::border_light())));
             spans.push(Span::styled(p.description.clone(), Style::default().fg(theme::text())));
         }
         lines.push(Line::from(spans));
         for spec in &p.mcp {
-            lines.push(muted(format!("    {}", lang.plugin_mcp_line(&spec.slug, &spec.command))));
+            lines.push(muted(format!(
+                "    {}",
+                lang.plugin_mcp_line(&spec.slug, &spec.transport.summary())
+            )));
         }
         if p.skills.is_some() {
             lines.push(muted(format!("    {}", lang.plugin_skills_line())));
@@ -520,10 +580,7 @@ fn form_lines(form: &Form) -> Vec<Line<'static>> {
                 Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD),
             )
         } else {
-            (
-                Style::default().fg(theme::border_light()),
-                Style::default().fg(theme::text()),
-            )
+            (Style::default().fg(theme::border_light()), Style::default().fg(theme::text()))
         };
         lines.push(Line::from(vec![
             Span::styled(if on { "❯ " } else { "  " }, Style::default().fg(theme::accent())),
@@ -606,7 +663,7 @@ mod tests {
 
     #[test]
     fn an_empty_mcp_report_says_there_are_none_and_where_to_write_them() {
-        let p = mcp(Lang::Ko, &[]);
+        let p = mcp(Lang::Ko, &[], &[]);
         assert!(text(&p)[0].contains("없습니다"), "{:?}", text(&p));
         assert!(p.title.contains("MCP"), "{}", p.title);
     }
@@ -614,11 +671,37 @@ mod tests {
     #[test]
     fn a_mcp_report_lists_servers_with_their_outcome() {
         let report = vec![("files".into(), Ok(3)), ("broken".into(), Err("없는 명령".into()))];
-        let p = mcp(Lang::Ko, &report);
+        let p = mcp(Lang::Ko, &report, &[]);
         let joined = text(&p).join("\n");
         assert!(joined.contains("files"), "{joined}");
         assert!(joined.contains("도구 3개"), "{joined}");
         assert!(joined.contains("못 띄웠습니다"), "{joined}");
+    }
+
+    /// **What was found is shown even when nothing is running.** A list nobody sees may as well
+    /// not have been read, and with no servers of our own the panel used to say only "there are
+    /// none" while three sat in another client's config.
+    #[test]
+    fn servers_found_in_another_program_are_offered_with_a_way_to_turn_them_on() {
+        let found = vec![("playwright".to_string(), "Cursor".to_string(), false)];
+        let p = mcp(Lang::Ko, &[], &found);
+        let joined = text(&p).join("\n");
+        assert!(joined.contains("playwright"), "{joined}");
+        assert!(
+            joined.contains("Cursor"),
+            "where it came from is the basis for trusting it: {joined}"
+        );
+        assert!(joined.contains("/mcp on"), "no way to turn it on: {joined}");
+        assert!(!joined.contains("없습니다"), "it said there were none: {joined}");
+    }
+
+    /// On and off must not read the same. The dot carries it, so the words have to as well.
+    #[test]
+    fn a_server_that_is_on_reads_differently_from_one_that_is_off() {
+        let on = text(&mcp(Lang::Ko, &[], &[("a".into(), "Cursor".into(), true)])).join("\n");
+        let off = text(&mcp(Lang::Ko, &[], &[("a".into(), "Cursor".into(), false)])).join("\n");
+        assert_ne!(on, off);
+        assert!(on.contains("켭니다"), "{on}");
     }
 
     #[test]
@@ -681,7 +764,11 @@ mod tests {
     /// brackets — a setting you can't see the value of might as well not exist.
     #[test]
     fn the_config_form_shows_every_setting_with_its_current_value() {
-        let cfg = crate::config::Config { dir_access: DirAccess::Allow, default_mode: Some(Mode::Job), ..Default::default() };
+        let cfg = crate::config::Config {
+            dir_access: DirAccess::Allow,
+            default_mode: Some(Mode::Job),
+            ..Default::default()
+        };
         let p = config(Lang::Ko, cfg);
         let joined = text(&p).join("\n");
         for label in ["다른 디렉토리 접근", "언어", "기본 모드"] {
@@ -803,7 +890,11 @@ mod tests {
     /// not on the defaults.
     #[test]
     fn the_draft_starts_from_the_settings_it_was_given() {
-        let cfg = crate::config::Config { dir_access: DirAccess::Allow, default_mode: Some(Mode::Plan), ..Default::default() };
+        let cfg = crate::config::Config {
+            dir_access: DirAccess::Allow,
+            default_mode: Some(Mode::Plan),
+            ..Default::default()
+        };
         let p = config(Lang::En, cfg);
         let form = p.form.expect("the config panel carries a form");
         assert_eq!(form.draft, cfg);

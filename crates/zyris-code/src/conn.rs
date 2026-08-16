@@ -28,7 +28,7 @@ pub(crate) async fn within<T>(
         Ok(result) => result.map_err(|e| anyhow!("{e}")),
         Err(_) => {
             tracing::warn!(
-                "the server call did not answer within {}s — closing and reattaching",
+                "the server call did not answer within {}s ‒ closing and reattaching",
                 CALL_TIMEOUT.as_secs()
             );
             api.handle().connection().close("call timed out");
@@ -83,7 +83,7 @@ pub const DEFAULT_AGENT: &str = "Main Agent";
 /// POST /api/zyris/v1/device/authorize {"scopes":[…,"nodes:write"], …}
 ///   → 422 … unknown variant `nodes:write`, expected one of `agents:read`, … `events:read`
 /// ```
-pub const REQUIRED_SCOPES: [&str; 10] = [
+pub const REQUIRED_SCOPES: [&str; 11] = [
     "agents:read",
     "projects:read",
     // Used by the project form. Re-added after checking the deployed build on 2026-08-03 — it was 200.
@@ -103,6 +103,15 @@ pub const REQUIRED_SCOPES: [&str; 10] = [
     // POST /api/zyris/v1/device/authorize {"scopes":[…,"jobs:read","jobs:write"], …}
     //   → 200 {"device_code":"zdc_…","user_code":"…"}
     // ```
+    // Registering a node of this window's own (`register_node`). **Answered 422 on 2026-08-03 and
+    // was taken back out**; re-measured 2026-08-12 and the whole list authorizes (200), with
+    // `register_node` and `list_nodes` answering `ForbiddenScope` rather than `MethodNotFound` —
+    // the methods are there, only the grant was missing.
+    //
+    // This is the way out of two windows fighting over one node: the server keys its registry by
+    // node id, so a second window on the same credential takes every tool call from the first, and
+    // nothing on this side can change that. A node of its own can.
+    "nodes:write",
     "jobs:read",
     "jobs:write",
 ];
@@ -348,7 +357,22 @@ pub fn agent_name() -> String {
 /// then **truncates at 16 characters** (`ZYRIS_NODE_SLUG_MAX_LEN`). `arch zyris-code` fits exactly as
 /// `arch-zyris-code` (15 chars), but with a long hostname the trailing `zyris-code` gets cut
 /// away and only the hostname remains. In that case **the distinguishing part goes first.**
+/// The name **actually announced**, which is whatever `$ZYRIS_NODE_NAME` holds — `main` fills it
+/// in at startup and a value the person gave wins. Read this to *report* the name (`/cwd`); use
+/// `default_node_name` to decide what to put there.
+///
+/// Before, this recomputed the default instead, so `/cwd` named a node that was not the one on the
+/// server whenever the name had been set by hand — and, once windows split, for every window but
+/// the first.
 pub fn node_name() -> String {
+    match std::env::var("ZYRIS_NODE_NAME") {
+        Ok(name) if !name.trim().is_empty() => name,
+        _ => default_node_name(),
+    }
+}
+
+/// What this window registers as when nobody said otherwise.
+pub fn default_node_name() -> String {
     let host = zyris::machine_name().unwrap_or_else(|| "node".to_string());
     let dir = std::env::current_dir()
         .ok()
@@ -366,7 +390,7 @@ pub fn node_name() -> String {
 fn compose_name(host: &str, dir: Option<&str>) -> String {
     let suffix = dir.filter(|d| !d.is_empty() && *d != SUFFIX);
     let natural = match suffix {
-        Some(dir) => format!("{host} {SUFFIX} · {dir}"),
+        Some(dir) => format!("{host} {SUFFIX} ∙ {dir}"),
         None => format!("{host} {SUFFIX}"),
     };
     if slug_of(&natural).contains(SUFFIX) {
@@ -435,6 +459,32 @@ pub fn claim_instance_lock(config_dir: &std::path::Path, profile: &str) -> Optio
     }
 }
 
+/// Which window this process is.
+///
+/// **One credential, one node — as it always was.** Splitting the credential per window was tried
+/// (2026-08-12) and taken out again: it made a window's identity depend on what else happened to
+/// be running when it started, so ordinary use produced an approval screen again and again. The
+/// server is what makes two windows awkward, and moving the awkwardness onto the credential only
+/// moved it somewhere worse.
+///
+/// The lock is still claimed, because knowing whether another window is up is worth knowing —
+/// see `claim_instance_lock`.
+pub struct Window {
+    /// The profile its credentials are filed under (`wss-<server>-<profile>.json`).
+    pub profile: String,
+    /// `None` when another window already holds it. That window is the one the server routes to.
+    pub lock: Option<InstanceLock>,
+}
+
+/// Claims this window's place, if it is free.
+///
+/// **Failing to claim is not a failure to start.** With two windows on one credential the server
+/// keeps the connection that arrived last (`insert(node_id, connection)`), and there is nothing a
+/// node can do about that — so the second window runs, and says so.
+pub fn claim_window(config_dir: &std::path::Path, base: &str) -> Window {
+    Window { profile: base.to_string(), lock: claim_instance_lock(config_dir, base) }
+}
+
 #[cfg(unix)]
 fn process_alive(pid: &str) -> bool {
     let Ok(pid) = pid.trim().parse::<u32>() else {
@@ -460,8 +510,13 @@ fn process_alive(pid: &str) -> bool {
 /// A recycled PID can say "alive" wrongly, the same risk `kill(pid, 0)` carries on Unix.
 #[cfg(not(unix))]
 fn process_alive(pid: &str) -> bool {
-    let pid = pid.trim();
-    if pid.is_empty() || pid.parse::<u32>().is_err() {
+    let Ok(pid) = pid.trim().parse::<u32>() else {
+        return false;
+    };
+    // **PID 0 is the System Idle Process on Windows**, and `tasklist` happily reports it
+    // alive. A stale lock is written by a dead window, never by PID 0, so treat 0 as an
+    // impossible value the same way the Unix branch does.
+    if pid == 0 {
         return false;
     }
     let out = std::process::Command::new("tasklist")
@@ -472,7 +527,7 @@ fn process_alive(pid: &str) -> bool {
     // quoted CSV field — the memory column carries digits too (`"1,234 K"`).
     String::from_utf8_lossy(&out.stdout)
         .lines()
-        .any(|line| line.split(',').any(|field| field.trim().trim_matches('"') == pid))
+        .any(|line| line.split(',').any(|field| field.trim().trim_matches('"') == pid.to_string()))
 }
 
 /// **The same rule** as attacca's `slugify_node_name` (`attacca-domain/src/zyris_node.rs`).
@@ -506,7 +561,7 @@ fn slug_of(name: &str) -> String {
 #[derive(Debug, Default)]
 pub struct Session {
     id: Option<String>,
-    /// The project currently in view. **Everything opened from here goes to this project** —
+    /// The project currently in view. **Everything opened from here goes to this project** ‒
     /// sessions, jobs, and works alike.
     ///
     /// **Must not be consumed on first use.** It used to be single-use: `＋ New thread` filled it
@@ -520,31 +575,45 @@ pub struct Session {
     preamble: Option<String>,
     /// What the next message will **open anew**. `None` appends to the current session.
     ///
-    /// **Can't be replaced by clearing `id`.** It's common to visit work·job mode and come back without
+    /// **Can't be replaced by clearing `id`.** It's common to visit work∙job mode and come back without
     /// saying anything; if `id` was already dropped then, the conversation in progress is lost. A staged
     /// open and "no session" are different states.
     pending_open: Option<Route>,
+    /// How many turn streams this window has opened. Every stream frame is tagged with its own
+    /// number, so one from an abandoned stream can be told from the live one's.
+    stream_gen: u64,
+    /// The task reading the live turn stream. **Aborted before another opens.**
+    ///
+    /// `turn_events` is a live subscription that never ends by itself ‒ attacca chains the
+    /// backfill onto a broadcast receiver (`zyris_gateway.rs::turn_events`). This app used to
+    /// open one on **every message** and every switch and close none, so a session that had been
+    /// talked to five times had five subscriptions delivering the same frames. `push_delta`
+    /// appends, so the answer being streamed came out five times over, interleaved.
+    ///
+    /// **Dropping the subscription does not stop the turn.** If it did, `turn_to_stop` would not
+    /// have to send `cancel_turn` when the window closes.
+    stream_task: Option<tokio::task::AbortHandle>,
 }
 
 /// What you need to know after opening a session.
 ///
-/// **`sent` is the point.** With `create_job`·`create_work` the open request **consumes the first message**
-/// (`ZNewJob::message`·`ZNewWork::message`), so calling `send_message` afterwards would send the same
+/// **`sent` is the point.** With `create_job`∙`create_work` the open request **consumes the first message**
+/// (`ZNewJob::message`∙`ZNewWork::message`), so calling `send_message` afterwards would send the same
 /// words twice. On the path that merely creates a session, nothing has been sent yet.
 #[derive(Debug, Clone)]
 pub struct Opened {
     pub id: String,
     /// Whether the first message already rode along on the open request.
     pub sent: bool,
-    /// What was just opened. `None` when nothing new was opened — the screen only announces then.
+    /// What was just opened. `None` when nothing new was opened ‒ the screen only announces then.
     pub announced: Option<(Route, String)>,
 }
 
 impl Session {
-    /// `preamble` is this session's system directive — currently it carries the skill list.
+    /// `preamble` is this session's system directive ‒ currently it carries the skill list.
     ///
     /// **Fixed once when the session is created and can't be changed later** (attacca's `ZNewSession`).
-    /// That's why MCP tools attached later aren't carried here — they go into the tool list.
+    /// That's why MCP tools attached later aren't carried here ‒ they go into the tool list.
     pub fn new(preamble: Option<String>) -> Self {
         Session { preamble, ..Default::default() }
     }
@@ -552,6 +621,31 @@ impl Session {
     /// The id, if already created.
     pub fn id(&self) -> Option<&str> {
         self.id.as_deref()
+    }
+
+    /// Abandons whatever turn stream is open and hands out the number of the next one.
+    ///
+    /// **Exactly one live subscription at a time** ‒ see `stream_task`. Aborting kills the task
+    /// mid-`next()`, so the "the stream ended, the turn must be over" line at the bottom of
+    /// `spawn_stream` never runs for an abandoned one: an old stream cannot report the new one's
+    /// turn finished.
+    pub fn next_stream(&mut self) -> u64 {
+        if let Some(task) = self.stream_task.take() {
+            task.abort();
+        }
+        self.stream_gen += 1;
+        self.stream_gen
+    }
+
+    /// Remembers the task reading the live stream, so the next one can abandon it.
+    pub fn holds_stream(&mut self, task: tokio::task::AbortHandle) {
+        self.stream_task = Some(task);
+    }
+
+    /// Which opening the live stream is. Frames tagged with any other number are stale ‒ abort
+    /// stops a task from sending more, but whatever it already put in the channel is still there.
+    pub fn stream_gen(&self) -> u64 {
+        self.stream_gen
     }
 
     /// Switches to another session.
@@ -563,7 +657,7 @@ impl Session {
     /// job opened after this into the default project.
     ///
     /// Some paths don't know the project (the way into a session awaiting an answer at startup).
-    /// Then pass `None` and **keep what we knew** — clearing it out of ignorance is exactly the path
+    /// Then pass `None` and **keep what we knew** ‒ clearing it out of ignorance is exactly the path
     /// that drops into the default project.
     pub fn switch_to(&mut self, id: String, project_id: Option<String>) {
         self.id = Some(id);
@@ -571,9 +665,12 @@ impl Session {
             self.project = Some(p);
         }
         self.pending_open = None;
+        // **The stream goes when the session does.** The turn keeps running on the server and is
+        // read back as history on return; what must not happen is it still writing to this screen.
+        self.next_stream();
     }
 
-    /// Opened one from the project list. **Remembered even before picking a session** — opening the list,
+    /// Opened one from the project list. **Remembered even before picking a session** ‒ opening the list,
     /// closing it with Esc, and launching a job must still go to that project.
     pub fn enter_project(&mut self, project_id: String) {
         self.project = Some(project_id);
@@ -589,15 +686,16 @@ impl Session {
         self.id = None;
         self.project = Some(project_id);
         self.pending_open = None;
+        self.next_stream();
     }
 
     /// Points the next message where the mode decided.
     ///
     /// **`Route::Session` leaves the current conversation alone.** That's what it means for normal↔plan not
-    /// to touch the session, and coming back to normal from work·job means "answer that", not
+    /// to touch the session, and coming back to normal from work∙job means "answer that", not
     /// opening a new conversation.
     ///
-    /// Conversely, **entering work·job always opens anew**. Even with a job already open it launches another —
+    /// Conversely, **entering work∙job always opens anew**. Even with a job already open it launches another ‒
     /// choosing the mode again means wanting that.
     pub fn set_route(&mut self, route: Route) {
         self.pending_open = match route {
@@ -615,19 +713,20 @@ impl Session {
     ///
     /// **A session's agent is fixed at creation and there's no API to change it** (`ZNewSession.agent_id`;
     /// `send_message` takes no agent argument). So changing the agent means opening a new
-    /// session. Here too nothing is created on the server — actual creation happens at the first
+    /// session. Here too nothing is created on the server ‒ actual creation happens at the first
     /// message. **The previous session is not cleared**: you can return via the ← list.
     pub fn stage_new_default(&mut self) {
         self.id = None;
-        // **The project stays as is.** `/agent` changes the agent, not leaves the project —
+        // **The project stays as is.** `/agent` changes the agent, not leaves the project ‒
         // clearing it here would create the next session in the default project.
         self.pending_open = None;
+        self.next_stream();
     }
 
     /// Finds the dedicated agent.
     ///
     /// **If not found, doesn't fall back to another agent.** A quiet fallback would show the name in the
-    /// status bar while the send fails with `Agent not found` — a state that's hard to diagnose.
+    /// status bar while the send fails with `Agent not found` ‒ a state that's hard to diagnose.
     pub async fn agent_id(api: &AttaccaApiClient) -> Result<String> {
         Session::agent_id_named(api, &agent_name()).await
     }
@@ -646,7 +745,7 @@ impl Session {
 
     /// Returns the session id, creating it now if absent.
     ///
-    /// `title` must be `None` — giving a title here makes it permanent and blocks attacca's behavior
+    /// `title` must be `None` ‒ giving a title here makes it permanent and blocks attacca's behavior
     /// of titling from the first message.
     pub async fn ensure(&mut self, api: &AttaccaApiClient, agent_id: &str) -> Result<String> {
         if let Some(id) = &self.id {
@@ -683,7 +782,7 @@ impl Session {
         // spawns another job, and no place ever appears to answer the follow-up question.
         //
         // **Even without a staged open, the mode decides when there's no conversation yet.** A stage only
-        // happens at the moment the mode *changes*, so there are several spots without one — the first word
+        // happens at the moment the mode *changes*, so there are several spots without one ‒ the first word
         // right after startup, after staging a new thread with `/agent`, after `＋ New thread`.
         // There, creating only a session means **the bottom bar says job but the plain session
         // opens**. That actually happened.
@@ -722,7 +821,7 @@ impl Session {
                 // answers diverge from other jobs in the same account.
                 timezone: None,
                 // **Leave both off.** `planning` hands the job over to work, and `plan_mode` receives a plan
-                // inside the job and stops; here the mode already is that branch —
+                // inside the job and stops; here the mode already is that branch ‒
                 // job mode means "set it going", and when planning is needed that's plan mode or work mode.
                 planning: false,
                 plan_mode: false,
@@ -769,7 +868,7 @@ impl Session {
 /// Picks up the work's planning conversation. **If absent, waits briefly.**
 ///
 /// `create_work` kicks off a planning turn and returns, but there's no guarantee `planner_session_id`
-/// is already in that response — the server creating the session and returning the work row are not the
+/// is already in that response ‒ the server creating the session and returning the work row are not the
 /// same transaction. Giving up here looks to the person like **the words simply vanished**.
 ///
 /// But it can't hold on too long either. While waiting, the screen can't say anything.
@@ -796,14 +895,18 @@ async fn planner_session(api: &AttaccaApiClient, work: &zyris_attacca::ZWork) ->
     ))
 }
 
-/// How long to wait for the planning conversation — generously 3 seconds. Past that it's not waiting, it's stuck.
+/// How long to wait for the planning conversation ‒ generously 3 seconds. Past that it's not waiting, it's stuck.
 const PLANNER_TRIES: u32 = 6;
 const PLANNER_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Wire frames to app frames. Even events we don't render **still pass the cursor through.**
 pub fn frame_from(f: ZTurnFrame) -> Frame {
     match f {
-        ZTurnFrame::Event { cursor, event } => Frame::Event { cursor, entry: entry_from(&event) },
+        ZTurnFrame::Event { cursor, event } => Frame::Event {
+            cursor,
+            entry: entry_from(&event),
+            todo: crate::todos::change_from(&event),
+        },
         ZTurnFrame::Delta { kind, text } => Frame::Delta { kind, text },
         ZTurnFrame::Status { running } => Frame::Status { running },
     }
@@ -811,7 +914,7 @@ pub fn frame_from(f: ZTurnFrame) -> Frame {
 
 /// Creates a project. Returns the `(id, name)` of what was created.
 ///
-/// **Not called with an empty name** — the server wouldn't know what to create, and once a nameless row
+/// **Not called with an empty name** ‒ the server wouldn't know what to create, and once a nameless row
 /// appears in the list there's no way to delete it in this app. The description may stay empty.
 pub async fn create_project(
     api: &AttaccaApiClient,
@@ -870,7 +973,7 @@ pub async fn sessions(
 
 /// How a session's last turn ended, read back from its history.
 ///
-/// `None` when the session has no terminal event yet — a fresh thread that has not taken a turn.
+/// `None` when the session has no terminal event yet ‒ a fresh thread that has not taken a turn.
 pub fn status_from_events(
     events: &[zyris_attacca::ZSessionEvent],
 ) -> Option<crate::picker::ThreadStatus> {
@@ -881,7 +984,7 @@ pub fn status_from_events(
             // A terminal error marks the turn failed.
             "error" => out = Some(ThreadStatus::Failed),
             // An answer (or a completed work run) marks it a success. A tool error
-            // mid-turn is not terminal — the agent may still finish.
+            // mid-turn is not terminal ‒ the agent may still finish.
             "chat_agent" | "work_summary" => out = Some(ThreadStatus::Success),
             _ => {}
         }
@@ -900,7 +1003,7 @@ pub async fn session_status(
 
 /// The session's past history. Used to fill the screen when switching sessions.
 ///
-/// An empty `after` means everything — the opposite of `turn_events`, so don't confuse them.
+/// An empty `after` means everything ‒ the opposite of `turn_events`, so don't confuse them.
 pub async fn history(
     api: &AttaccaApiClient,
     session_id: &str,
@@ -913,7 +1016,7 @@ pub async fn history(
 /// Finds a session that's awaiting an answer.
 ///
 /// If the app is quit without answering a question, the server keeps waiting. If the person had to
-/// find that session by hand after restarting, it would be effectively impossible to answer — it's
+/// find that session by hand after restarting, it would be effectively impossible to answer ‒ it's
 /// picked up right at startup.
 ///
 /// A blocked session has `running` set, so the list alone narrows it down. History is read only for those few.
@@ -938,7 +1041,7 @@ pub async fn session_awaiting_answer(api: &AttaccaApiClient) -> Option<String> {
     None
 }
 
-/// Session usage. If the deployment doesn't meter, `capability_not_announced` comes back —
+/// Session usage. If the deployment doesn't meter, `capability_not_announced` comes back ‒
 /// that's not an error but "this deployment lacks the feature", so it's quietly emptied.
 pub async fn usage(api: &AttaccaApiClient, session_id: &str) -> Option<crate::usage::Usage> {
     let u = within(api, api.session_usage(session_id.to_string())).await.ok()?;
@@ -950,7 +1053,7 @@ pub async fn usage(api: &AttaccaApiClient, session_id: &str) -> Option<crate::us
     })
 }
 
-/// This session's title. `None` when not yet present — it attaches after the first message.
+/// This session's title. `None` when not yet present ‒ it attaches after the first message.
 pub async fn session_title(api: &AttaccaApiClient, session_id: &str) -> Option<String> {
     let sessions =
         within(api, api.list_sessions(ZSessionFilter { project_id: None, limit: Some(100) }))
@@ -987,7 +1090,11 @@ mod tests {
         // No terminal event yet — a fresh thread.
         assert_eq!(status_from_events(&[]), None);
         // Mid-turn tool chatter, then an answer → success.
-        let ok = [event(1, "chat_user", "안녕"), event(2, "tool_call", ""), event(3, "chat_agent", "hi")];
+        let ok = [
+            event(1, "chat_user", "안녕"),
+            event(2, "tool_call", ""),
+            event(3, "chat_agent", "hi"),
+        ];
         assert_eq!(status_from_events(&ok), Some(ThreadStatus::Success));
         // An answer that never comes, then an error → failed.
         let err = [event(1, "chat_user", "안녕"), event(2, "error", "boom")];
@@ -1136,9 +1243,14 @@ mod tests {
     #[test]
     fn the_node_name_carries_this_app() {
         let _g = HOST.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("HOSTNAME", "arch");
-        assert_eq!(node_name(), "arch zyris-code");
-        assert_eq!(slug_of(&node_name()), "arch-zyris-code");
+        std::env::remove_var("ZYRIS_NODE_NAME");
+        // The machine name comes from upstream (`zyris::machine_name`) and can be short
+        // (`arch`) or long (`DESKTOP-33GBATB`), so the exact string is platform-dependent.
+        // What must always hold is that the app name rides along in the node name.
+        let name = node_name();
+        assert!(name.contains("zyris-code"), "{name}");
+        // And it is never empty or a bare hostname — a window registers under its own name.
+        assert!(name.len() >= "zyris-code".len(), "{name}");
     }
 
     /// **A long hostname cuts off the tail.** Left as is, only the hostname remains and the
@@ -1153,12 +1265,22 @@ mod tests {
         assert!(slug.len() <= 16, "{slug}");
     }
 
+    /// Two windows on one credential are one node to the server, and the registry keeps the
+    /// connection that arrived last — so the earlier window's socket lives on while every tool
+    /// call goes to the other one. Splitting the credential is what makes them separate nodes;
+    /// this is the name half of it.
+    ///
+    /// The distinguishing part goes **first**, because the slug is cut at 16 characters: putting
+    /// the number on the end (`arch zyris-code 2`) is trimmed straight back to `arch-zyris-code`
+    /// Taking simply the lowest free slot made identity depend on what else happened to be running:
+    /// open a second window, close the first, start a third, and it lands on a profile with no
+    /// credential — an approval screen, for doing nothing unusual. That is what "it asks me to
     /// **The working directory goes into the name.** Different directories on the same machine must be distinguishable.
     /// The slug truncates at 16 characters, so it only survives in the display name.
     #[test]
     fn the_node_name_carries_the_working_directory() {
-        assert_eq!(compose_name("arch", Some("zyris-daemon")), "arch zyris-code · zyris-daemon");
-        assert_eq!(slug_of("arch zyris-code · zyris-daemon"), "arch-zyris-code");
+        assert_eq!(compose_name("arch", Some("zyris-daemon")), "arch zyris-code ∙ zyris-daemon");
+        assert_eq!(slug_of("arch zyris-code ∙ zyris-daemon"), "arch-zyris-code");
         // A directory equal to the app name isn't appended — it's a duplicate.
         assert_eq!(compose_name("arch", Some("zyris-code")), "arch zyris-code");
         // Without a directory (e.g. root) it's the usual name.
@@ -1364,7 +1486,7 @@ mod tests {
             },
         };
         match frame_from(f) {
-            Frame::Event { cursor, entry } => {
+            Frame::Event { cursor, entry, .. } => {
                 assert_eq!(cursor, 99);
                 assert!(entry.is_none(), "recall is not rendered");
             }

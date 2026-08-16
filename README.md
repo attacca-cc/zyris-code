@@ -388,8 +388,55 @@ Messages typed while a turn is running are queued and sent in order when it ends
 | `ZYRIS_NODE_TOKEN` | — | Dial with a fixed node token instead of enrolling |
 | `ZYRIS_CODE_LOG` | `/tmp/zyris-code.log` | Log file. Logs never go to the terminal — they would land in the middle of the UI |
 | `ZYRIS_CODE_WIRE_DEADLINE_SECS` | `55` | Answer the wire before the server gives up on a call; `0` disables it |
+| `ZYRIS_CODE_MOUSE` | on | `0` hands the mouse back to the terminal, so copy-on-select and the scrollback drag work as they do everywhere else. Click-to-fold, drag-to-copy and Ctrl+click go with it |
+| `ZYRIS_CODE_HYPERLINKS` | detected | Force OSC 8 link markup on or off. Only terminals known to read it are sent any, because one that does not prints the escape bytes across the screen. Links stay Ctrl+clickable either way — the app opens them itself |
+| `ZYRIS_CODE_OSC52` | detected | Force system-clipboard writes on or off. Terminals differ, and several that draw links keep clipboard writes switched off until told otherwise |
 | `RUST_LOG` | `zyris_code=info,zyris=warn` | Log filter |
 | `NO_COLOR` | — | Suppress colour in the messages printed before the UI starts |
+
+## Updating itself
+
+zyris-code asks GitHub once per launch whether there is a newer release. What happens then is
+`/config`'s `update` setting:
+
+| | |
+|---|---|
+| `auto` (default) | Installs it and reopens on the new version. |
+| `notify` | Says a newer release exists; `/update` installs it. |
+| `off` | Never looks. |
+
+**Nothing you have is touched by an update.** The installers only write to the directory the
+binary lives in. Credentials, settings, language, the GitHub token, plugins, skills and the undo
+log all live under `~/.config/zyris-code/` and `~/.cache/zyris-code/`
+(`%LOCALAPPDATA%` on Windows), which no installer reads or removes — a reinstall picks up exactly
+where you left off, still enrolled.
+
+**The release's own installer does the replacing**, fetched from the release being installed and
+given that tag. It is the script tested against that build, and pinning the tag means `latest`
+moving between the check and the install cannot change what lands. Checksums are verified before
+anything is unpacked, as with a first install.
+
+The running process does not replace itself: a helper waits for it to exit, installs, and starts
+the new one. On Windows a running `.exe` cannot be overwritten at all, so the installer renames the
+old one aside — which is also why an update there needs no manual step.
+
+## Print mode
+
+```bash
+zyris -p "what does this repo do?"     # one turn, the answer on stdout, exit
+cat notes.md | zyris -p                # the prompt from stdin
+zyris -p "..." > answer.md             # only the answer is printed, so it pipes
+```
+
+`cargo install` puts the binary down as `zyris-code`; `install.sh` adds a `zyris` symlink beside
+it. They are the same file, so either name takes `-p`.
+
+**Print mode still hands this computer over.** The node announces the same capabilities as the
+screen does, so the agent reads and changes files here and runs commands — `/config`'s `dir`
+setting governs it exactly as it does interactively. It is not a hosted question-and-answer.
+
+Only the agent's answer reaches stdout. Tool calls, reasoning and status are not printed, and logs
+go to a file as always.
 
 ## Building
 
@@ -400,6 +447,11 @@ cargo clippy --workspace --all-targets
 ```
 
 `rustfmt.toml` is checked in and `cargo fmt` is expected to be clean.
+
+`tests/pty.rs` runs the app on a real pseudo-terminal — a unix pty on Linux and macOS, a ConPTY on
+Windows 10 1809 and later — so drawing, keystrokes and shutdown are covered on every platform by
+`cargo test`. It talks to no network. On Windows, `scripts\windows_check.bat` fetches this branch,
+runs all of the above, and writes a report with a checklist for the parts that need a person.
 
 ## Contributing
 

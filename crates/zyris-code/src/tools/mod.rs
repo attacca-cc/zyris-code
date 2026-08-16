@@ -55,6 +55,9 @@ pub fn announce(
     api: tokio::sync::watch::Receiver<Option<std::sync::Arc<zyris_attacca::AttaccaApiClient>>>,
 ) -> Runner {
     let edit = LocalEdit::new(cwd.clone());
+    // The GitHub tools read the repository out of this, so they need their own copy — `search`
+    // takes `cwd` by value further down.
+    let cwd2 = cwd.clone();
     // `/undo` must see the **same history** as the edit tool. Built separately, their locks would drift apart.
     bridge.set_undo(edit.undo());
     // **The reference for what counts as going outside.** Without this, the gate wouldn't see anything as outside.
@@ -74,6 +77,10 @@ pub fn announce(
     }
     skill_dirs.extend(skill::plugin_skill_dirs(&cwd));
     let skills = skill::Skills::new(skill_dirs);
+
+    // What the plugins want run around a tool call. **Read once, here** — the gate wraps every
+    // capability separately, so a list held per wrapper would drift the moment one was rebuilt.
+    bridge.set_hooks(crate::plugin::hooks(&crate::plugin::discover(&cwd)));
 
     // Two things to put in the session: **this repo's conventions** (`CLAUDE.md`·`AGENTS.md`) and the skill list.
     // Conventions come first — they must be followed no matter what, while skills are only used when relevant.
@@ -97,6 +104,13 @@ pub fn announce(
             wait::WaitServer(wait::Waits::new(jobs, api.clone(), bridge.clone())),
             bridge.clone(),
         ))
+        // **GitHub, without needing `gh` on the machine.** Announced whether or not anybody has
+        // signed in — the tools say "not signed in" plainly, which is a far better answer than a
+        // tool that is simply absent and leaves the agent shelling out to a `gh` that is not there.
+        .capability(Gate::new(
+            crate::github::GithubCapServer(crate::github::GithubTools::new(cwd2)),
+            bridge.clone(),
+        ))
         // **Only this one reaches outside this computer.** Big jobs are handed to attacca so a
         // subagent runs them (`work.rs`). The handle arrives after we attach, so we receive it via `watch`.
         .capability(Gate::new(work::WorkServer(work::Works::new(api)), bridge))
@@ -118,6 +132,18 @@ pub fn start_mcp(caps: zyris::Capabilities, cwd: PathBuf, bridge: Bridge) {
             match specs.iter_mut().find(|s| s.slug == spec.slug) {
                 Some(slot) => *slot = spec,
                 None => specs.push(spec),
+            }
+        }
+        // **What another client set up starts only if this machine said yes** (`/mcp on`). Those
+        // entries name a program somebody else's client was told to run, and running it because it
+        // happened to be on disk is not a decision this app gets to make.
+        let allowed = crate::mcp::discovery::Allowed::load();
+        for found in crate::mcp::discovery::found(&cwd) {
+            if !allowed.allows(&found.spec.slug) {
+                continue;
+            }
+            if !specs.iter().any(|s| s.slug == found.spec.slug) {
+                specs.push(found.spec);
             }
         }
         if specs.is_empty() {

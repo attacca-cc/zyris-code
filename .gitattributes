@@ -1,0 +1,13 @@
+# **cmd.exe reads a batch file by byte offset.** With LF endings the position drifts by one per
+# line and it starts running from the middle of them, so every line loses its first few characters
+# and the errors name fragments of words. That is what a handover of this file did the first time.
+#
+# `-text` rather than `text eol=crlf` on purpose. `eol=crlf` normalises to LF *in the repository*
+# and converts on checkout, which is right for a clone and wrong for the way this file actually
+# travels: downloaded straight from the web, where the stored LF bytes are what arrives. `-text`
+# stores the CRLF bytes verbatim, so a download and a checkout give the same working file.
+*.bat -text
+*.ps1 -text
+
+# Everything a shell reads stays LF, whatever the local git config says.
+*.sh text eol=lf

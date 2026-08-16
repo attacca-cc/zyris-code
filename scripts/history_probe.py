@@ -56,7 +56,10 @@ def drain(fd, buf, seconds):
 def wait_for(fd, needle, buf, seconds, label):
     end = time.time() + seconds
     while True:
-        if needle in ANSI.sub("", "".join(buf)):
+        # `needle` may be a tuple; then **any one** of them passes. Used for what the person's
+        # settings can change, such as the mode label in the bottom bar.
+        wanted = (needle,) if isinstance(needle, str) else tuple(needle)
+        if any(w in ANSI.sub("", "".join(buf)) for w in wanted):
             return True
         if time.time() >= end:
             print(f"  ✗ {label}: never saw {needle!r}", file=sys.stderr)
@@ -141,6 +144,7 @@ def main():
 
     env = dict(
         os.environ,
+        ZYRIS_CODE_LANG="ko",
         ZYRIS_PROFILE="zyris-code",
         ZYRIS_CODE_LOG="/tmp/zyris-code-history.log",
     )

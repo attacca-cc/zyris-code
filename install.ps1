@@ -85,16 +85,31 @@ try {
     if (-not (Test-Path $exe)) { throw "the archive did not contain $Bin.exe" }
 
     New-Item -ItemType Directory -Path $Dir -Force | Out-Null
-    # A running copy cannot be overwritten on Windows. Say so plainly rather than failing with
-    # "the process cannot access the file", which reads like a permissions problem.
-    $dest = Join-Path $Dir "$Bin.exe"
-    try {
-        Copy-Item $exe $dest -Force
-    } catch {
-        throw "could not replace $dest. Close any running $Bin and try again."
+
+    # **A running .exe cannot be overwritten on Windows, but it can be renamed.** The handle
+    # follows the file, so moving it aside frees the name at once and the process that is using
+    # it carries on undisturbed. Overwriting in place is what fails with "the process cannot
+    # access the file" - which reads like a permissions problem and is not one.
+    #
+    # This is what lets zyris-code update itself. Without it a self-update could only ever tell
+    # you to close the thing you were using.
+    function Install-Binary($From, $To) {
+        if (Test-Path $To) {
+            $old = "$To.old"
+            # Last update's leftover, now that nothing is holding it.
+            Remove-Item $old -Force -ErrorAction SilentlyContinue
+            try {
+                Move-Item $To $old -Force
+            } catch {
+                # Renaming failed for some other reason; overwriting may still work.
+            }
+        }
+        Copy-Item $From $To -Force
     }
+
+    Install-Binary $exe (Join-Path $Dir "$Bin.exe")
     # The short name. Windows has no usable symlink without elevation, so this is a second copy.
-    Copy-Item $exe (Join-Path $Dir "$Alias.exe") -Force
+    Install-Binary $exe (Join-Path $Dir "$Alias.exe")
 
     Write-Host "installed to $Dir"
 

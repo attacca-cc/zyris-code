@@ -115,6 +115,7 @@ def main():
 
     env = dict(
         os.environ,
+        ZYRIS_CODE_LANG="ko",
         ZYRIS_PROFILE="zyris-code",
         ZYRIS_CODE_LOG="/tmp/zyris-code-sandbox.log",
     )
@@ -137,7 +138,7 @@ def main():
     total = 5
 
     try:
-        if not read_until(primary, "일반", buf, time.time() + 30, "첫 프레임"):
+        if not read_until(primary, ("일반", "계획", "작업", "일"), buf, time.time() + 30, "첫 프레임"):
             return finish(proc, primary, checks, total, False)
         print("  ✓ 떴다")
         checks += 1

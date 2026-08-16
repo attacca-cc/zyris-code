@@ -102,7 +102,7 @@ fn ahead_behind(text: &str) -> (usize, usize) {
 /// The lead-in before the first piece, and the gap before the rule resumes.
 const LEAD: &str = "─ ";
 /// Between two pieces that are **both** there.
-const SEP: &str = " · ";
+const SEP: &str = " ∙ ";
 /// Below this many trailing rule columns the row stops reading as a divider, so the strip is
 /// dropped entirely and the plain rule comes back.
 const MIN_RULE: usize = 4;
@@ -389,14 +389,14 @@ mod tests {
         // directly — no separator, no reserved gap, nothing for a later piece to trip over.
         let out = strip(60, "/home/ruma/zyris-code", Some("/home/ruma"), None);
         assert!(out.starts_with("─ ~/zyris-code ─"), "no residue where git would be: {out:?}");
-        assert!(!out.contains('·'), "a separator with nothing on one side: {out:?}");
+        assert!(!out.contains('∙'), "a separator with nothing on one side: {out:?}");
     }
 
     #[test]
     fn the_separator_appears_only_between_two_present_pieces() {
         let out = strip(60, "/home/ruma/zyris-code", Some("/home/ruma"), Some(&dirty()));
-        assert_eq!(out.matches('·').count(), 1, "exactly one join: {out:?}");
-        assert!(out.contains("~/zyris-code · * main"), "{out:?}");
+        assert_eq!(out.matches('∙').count(), 1, "exactly one join: {out:?}");
+        assert!(out.contains("~/zyris-code ∙ * main"), "{out:?}");
     }
 
     #[test]

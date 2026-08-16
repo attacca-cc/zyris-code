@@ -99,6 +99,10 @@ pub struct Config {
     /// terminal the dark palette's text sits at 1.19:1 against the paper — unreadable.
     #[serde(default)]
     pub theme: ThemeChoice,
+    /// What to do when a newer release exists. **Default `auto`**: a client that hands a machine
+    /// to an agent is one where being a version behind is a thing to fix, not a preference.
+    #[serde(default)]
+    pub update: crate::update::Policy,
 }
 
 /// The file where the settings live. Same directory as the credentials and the language.
@@ -111,7 +115,7 @@ impl Config {
         let Some(at) = store() else { return Config::default() };
         let Ok(text) = std::fs::read_to_string(&at) else { return Config::default() };
         serde_json::from_str(&text).unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "couldn't read the settings — using the defaults");
+            tracing::warn!(error = %e, "couldn't read the settings ‒ using the defaults");
             Config::default()
         })
     }
@@ -154,7 +158,11 @@ mod tests {
     /// whole round trip the command relies on.
     #[test]
     fn a_saved_config_round_trips() {
-        let c = Config { dir_access: DirAccess::Allow, default_mode: Some(Mode::Job), ..Config::default() };
+        let c = Config {
+            dir_access: DirAccess::Allow,
+            default_mode: Some(Mode::Job),
+            ..Config::default()
+        };
         let text = serde_json::to_string(&c).unwrap();
         let back: Config = serde_json::from_str(&text).unwrap();
         assert_eq!(back, c);

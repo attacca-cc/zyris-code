@@ -24,7 +24,10 @@ pub enum EntryKind {
     /// `spawn_thought_title` labels each block with a small model and updates the event in place,
     /// so a card that opened untitled fills in by itself (the `seq`-keyed upsert is what makes that
     /// land in the same row). `None` until that lands, and forever if the side model is off.
-    Thinking { title: Option<String>, text: String },
+    Thinking {
+        title: Option<String>,
+        text: String,
+    },
     Tool {
         name: String,
         /// What was run, against what. Built by `tool_view::action`.
@@ -44,6 +47,31 @@ pub enum EntryKind {
     Error(String),
 }
 
+/// Whether a `question` tool result means the answer actually arrived.
+///
+/// **A call that returned is not a question that was answered.** The waiter hands back
+/// `status: "timeout"` as an ordinary *success* when nobody replied in time, and
+/// `run_in_background: true` returns `{"acknowledged": true}` without waiting at all. In both the
+/// question is still open and the answer is expected as the user's next message — so reading
+/// "there is a result" as "it was answered" hides the one screen that can answer it, and a
+/// question asked while nobody was looking becomes unanswerable for good.
+///
+/// So it counts as answered only when the result says so. The two ways of being wrong are not
+/// alike: reopening a question that was already dealt with costs one Esc, while closing one that
+/// was not costs the answer.
+fn question_answered(result: Option<&Value>, failed: bool) -> bool {
+    // A call that errored will not consume an answer, so there is nothing to offer.
+    if failed {
+        return true;
+    }
+    let Some(result) = result else { return false };
+    match result.get("status").and_then(Value::as_str) {
+        Some(status) => status == "answered",
+        // A deployment that says nothing about status: fall back to whether an answer came with it.
+        None => result.get("answer").is_some_and(|a| !a.is_null()),
+    }
+}
+
 /// `None` when there is nothing to render.
 ///
 /// `recall` and `chat_system` are model-only events and are deliberately dropped — drawing them
@@ -55,7 +83,11 @@ pub fn entry_from(event: &ZSessionEvent) -> Option<Entry> {
         "chat_agent" => EntryKind::Agent(text(p, "content")),
         "work_summary" => EntryKind::WorkStart(text(p, "content")),
         "thinking" => EntryKind::Thinking {
-            title: p.get("title").and_then(Value::as_str).filter(|s| !s.trim().is_empty()).map(str::to_string),
+            title: p
+                .get("title")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_string),
             text: text(p, "content"),
         },
         "error" => EntryKind::Error(text(p, "message")),
@@ -70,8 +102,8 @@ pub fn entry_from(event: &ZSessionEvent) -> Option<Entry> {
             // Questions arrive as tool calls, but they must become a pickable screen, not a one-line summary.
             if name == "question" {
                 if let Some(steps) = p.get("arguments").and_then(crate::question::parse) {
-                    // If a result is attached, the answer is already in. Asking again would be wrong.
-                    let answered = p.get("result").is_some_and(|r| !r.is_null()) || failed;
+                    let answered =
+                        question_answered(p.get("result").filter(|v| !v.is_null()), failed);
                     return Some(Entry {
                         seq: event.seq,
                         kind: EntryKind::Question { steps, answered },
@@ -118,7 +150,6 @@ mod tests {
     fn wire(tool: &str) -> String {
         format!("zyris__arch__terminal__{tool}")
     }
-
 
     /// **The readable path must be the one that actually reaches the screen.** If only
     /// `tool_view::detail` is right and `entry_from` doesn't call it, the person still sees raw JSON.
@@ -178,7 +209,8 @@ mod tests {
     /// **Dropping that title is what made the client clip a mid-sentence heading of its own.**
     #[test]
     fn a_thinking_event_keeps_the_title_the_server_gave_it() {
-        let e = ev(3, "thinking", json!({"content": "먼저 …", "title": "현재 파일 상태를 읽는 중"}));
+        let e =
+            ev(3, "thinking", json!({"content": "먼저 …", "title": "현재 파일 상태를 읽는 중"}));
         assert_eq!(
             entry_from(&e).unwrap().kind,
             EntryKind::Thinking {
@@ -296,6 +328,48 @@ mod tests {
         );
         match entry_from(&e).unwrap().kind {
             EntryKind::Question { answered, .. } => assert!(answered),
+            other => panic!("it must be a question: {other:?}"),
+        }
+    }
+
+    /// **A returned call is not an answered question.** The waiter hands `status: "timeout"` back
+    /// as an ordinary *success* when nobody replied in time, and the question is still open — the
+    /// answer arrives as the user's next message. Reading "there is a result" as "it was answered"
+    /// hides the one screen that can answer it.
+    #[test]
+    fn a_question_that_timed_out_is_still_unanswered() {
+        let e = ev(
+            10,
+            "tool_call",
+            json!({
+                "kind": "tool_call", "call_id": "c4", "name": "question",
+                "arguments": {"questions": [{"question": "UUID를 알려주세요"}]},
+                "result": {"status": "timeout", "waited_secs": 600}, "error": null
+            }),
+        );
+        match entry_from(&e).unwrap().kind {
+            EntryKind::Question { answered, .. } => {
+                assert!(!answered, "a timeout leaves the question open")
+            }
+            other => panic!("it must be a question: {other:?}"),
+        }
+    }
+
+    /// `run_in_background: true` returns the moment it is asked. The question has not been seen,
+    /// let alone answered.
+    #[test]
+    fn a_backgrounded_question_is_still_unanswered() {
+        let e = ev(
+            11,
+            "tool_call",
+            json!({
+                "kind": "tool_call", "call_id": "c5", "name": "question",
+                "arguments": {"questions": [{"question": "어느 쪽?"}]},
+                "result": {"acknowledged": true}, "error": null
+            }),
+        );
+        match entry_from(&e).unwrap().kind {
+            EntryKind::Question { answered, .. } => assert!(!answered),
             other => panic!("it must be a question: {other:?}"),
         }
     }

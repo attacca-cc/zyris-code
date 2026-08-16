@@ -1,7 +1,9 @@
-//! Talks to one local MCP server over stdio.
+//! Talks to one MCP server — a local child process over stdio, or a remote one over HTTP.
 //!
 //! **We don't pull in an SDK.** All we use is the `initialize`·`tools/list`·`tools/call` trio, and
-//! the transport is line-delimited JSON-RPC. There's no reason to add another dependency for that much.
+//! over stdio the transport is line-delimited JSON-RPC. There's no reason to add another dependency
+//! for that much. The HTTP half lives next door in `http.rs`; everything above the pipe — what a
+//! tool is, how its name is washed, how a result is flattened — is shared and lives here.
 //!
 //! The server is a child process. **stderr goes to the log** — if it leaks to the terminal it lands in the middle of the TUI,
 //! and ratatui's double buffer treats that spot as "unchanged" and won't redraw it either.
@@ -27,75 +29,51 @@ pub struct McpTool {
     pub input_schema: Value,
 }
 
-pub struct McpClient {
-    child: Child,
-    stdin: ChildStdin,
-    stdout: Lines<BufReader<ChildStdout>>,
-    next_id: u64,
-}
+/// What this app calls itself in the MCP handshake.
+const CLIENT: &str = "zyris-code";
 
-/// Builds the command that starts an MCP server.
+/// One server, however it is reached.
 ///
-/// **On Windows it goes through `cmd /C`.** Rust's `Command` resolves a bare name on `PATH` by
-/// appending `.exe` only — it does not honour `PATHEXT`. The canonical MCP entry is
-/// `"command": "npx"`, and on Windows npx is `npx.cmd`, so every npx-based server failed to spawn
-/// with "program not found" and was reported in `/mcp` as a broken server. Batch launchers
-/// (`npx`, `pnpm`, `yarn`) are the common case, so the shell has to resolve it.
-fn spawner(command: &str, args: &[String]) -> tokio::process::Command {
-    if cfg!(windows) {
-        let mut c = tokio::process::Command::new("cmd");
-        c.arg("/C").arg(command).args(args);
-        return c;
-    }
-    let mut c = tokio::process::Command::new(command);
-    c.args(args);
-    c
+/// **Only the pipe varies.** What a tool is, how its name is washed for the wire, and how a result
+/// is flattened are the same either way, so they live out here and each transport only has to
+/// answer one JSON-RPC request at a time.
+///
+/// **Both sides are boxed.** A child process handle and an HTTP client are wildly different sizes,
+/// and every `McpClient` would otherwise be as big as the larger of them — one per server, held
+/// for the life of the app.
+pub enum McpClient {
+    Stdio(Box<StdioClient>),
+    Http(Box<crate::mcp::http::HttpClient>),
 }
 
 impl McpClient {
-    /// Spawns the server and completes the handshake. If this fails, we treat that server as nonexistent.
+    /// Spawns a local server and completes the handshake.
     pub async fn spawn(
         command: &str,
         args: &[String],
         env: &HashMap<String, String>,
     ) -> Result<McpClient> {
-        let mut child = spawner(command, args)
-            .envs(env)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .with_context(|| format!("MCP 서버를 띄우지 못했습니다: {command}"))?;
+        Ok(McpClient::Stdio(Box::new(StdioClient::spawn(command, args, env).await?)))
+    }
 
-        let stdin = child.stdin.take().context("stdin이 없습니다")?;
-        let stdout = child.stdout.take().context("stdout이 없습니다")?;
-        if let Some(stderr) = child.stderr.take() {
-            let name = command.to_string();
-            tokio::spawn(async move {
-                let mut lines = BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    tracing::debug!(server = %name, "{line}");
-                }
-            });
+    /// Reaches a remote server over HTTP and completes the handshake.
+    pub async fn connect(url: &str, headers: &HashMap<String, String>) -> Result<McpClient> {
+        let http = crate::mcp::http::HttpClient::connect(
+            url,
+            headers,
+            PROTOCOL,
+            CLIENT,
+            env!("CARGO_PKG_VERSION"),
+        )
+        .await?;
+        Ok(McpClient::Http(Box::new(http)))
+    }
+
+    async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
+        match self {
+            McpClient::Stdio(c) => c.request(method, params).await,
+            McpClient::Http(c) => c.request(method, params).await,
         }
-
-        let mut client =
-            McpClient { child, stdin, stdout: BufReader::new(stdout).lines(), next_id: 0 };
-
-        client
-            .request(
-                "initialize",
-                json!({
-                    "protocolVersion": PROTOCOL,
-                    "capabilities": {},
-                    "clientInfo": {"name": "zyris-code", "version": env!("CARGO_PKG_VERSION")},
-                }),
-            )
-            .await?;
-        // A notification, so there is no reply. Some servers won't hand out tools if this is skipped.
-        client.notify("notifications/initialized", json!({})).await?;
-        Ok(client)
     }
 
     /// The tools this server offers. Names are washed; collisions get a number appended.
@@ -130,7 +108,86 @@ impl McpClient {
         Ok(json!({ "content": flatten_content(&result) }))
     }
 
-    async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
+    /// Shuts the server down. A remote one has nothing to shut down — dropping it is the whole of it.
+    pub async fn shutdown(self) {
+        if let McpClient::Stdio(c) = self {
+            c.shutdown().await;
+        }
+    }
+}
+
+pub struct StdioClient {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: Lines<BufReader<ChildStdout>>,
+    next_id: u64,
+}
+
+/// Builds the command that starts an MCP server.
+///
+/// **On Windows it goes through `cmd /C`.** Rust's `Command` resolves a bare name on `PATH` by
+/// appending `.exe` only — it does not honour `PATHEXT`. The canonical MCP entry is
+/// `"command": "npx"`, and on Windows npx is `npx.cmd`, so every npx-based server failed to spawn
+/// with "program not found" and was reported in `/mcp` as a broken server. Batch launchers
+/// (`npx`, `pnpm`, `yarn`) are the common case, so the shell has to resolve it.
+fn spawner(command: &str, args: &[String]) -> tokio::process::Command {
+    if cfg!(windows) {
+        let mut c = tokio::process::Command::new("cmd");
+        c.arg("/C").arg(command).args(args);
+        return c;
+    }
+    let mut c = tokio::process::Command::new(command);
+    c.args(args);
+    c
+}
+
+impl StdioClient {
+    /// Spawns the server and completes the handshake. If this fails, we treat that server as nonexistent.
+    pub async fn spawn(
+        command: &str,
+        args: &[String],
+        env: &HashMap<String, String>,
+    ) -> Result<StdioClient> {
+        let mut child = spawner(command, args)
+            .envs(env)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .with_context(|| format!("MCP 서버를 띄우지 못했습니다: {command}"))?;
+
+        let stdin = child.stdin.take().context("stdin이 없습니다")?;
+        let stdout = child.stdout.take().context("stdout이 없습니다")?;
+        if let Some(stderr) = child.stderr.take() {
+            let name = command.to_string();
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    tracing::debug!(server = %name, "{line}");
+                }
+            });
+        }
+
+        let mut client =
+            StdioClient { child, stdin, stdout: BufReader::new(stdout).lines(), next_id: 0 };
+
+        client
+            .request(
+                "initialize",
+                json!({
+                    "protocolVersion": PROTOCOL,
+                    "capabilities": {},
+                    "clientInfo": {"name": CLIENT, "version": env!("CARGO_PKG_VERSION")},
+                }),
+            )
+            .await?;
+        // A notification, so there is no reply. Some servers won't hand out tools if this is skipped.
+        client.notify("notifications/initialized", json!({})).await?;
+        Ok(client)
+    }
+
+    pub(crate) async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
         self.next_id += 1;
         let id = self.next_id;
         self.write(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params})).await?;
@@ -172,7 +229,7 @@ impl McpClient {
     }
 
     /// Shuts the server down. There's `kill_on_drop`, but we also keep an explicit way to close it.
-    pub async fn shutdown(mut self) {
+    pub(crate) async fn shutdown(mut self) {
         let _ = self.child.kill().await;
     }
 }
@@ -301,9 +358,23 @@ mod tests {
         assert!(out.contains("image"), "it must say what is missing: {out}");
     }
 
+    /// Is `python3` actually runnable? The fake server is a Python script, and Python is not
+    /// guaranteed to be installed — on some Windows boxes `python3.exe` is only the Microsoft
+    /// Store stub, which reports an error instead of running anything.
+    fn python3_available() -> bool {
+        std::process::Command::new("python3")
+            .arg("-c")
+            .arg("print(1)")
+            .output()
+            .is_ok_and(|o| o.status.success())
+    }
+
     /// **Spawns a real process.** A mock wouldn't catch stdio framing mistakes.
     #[tokio::test]
     async fn it_talks_to_a_real_stdio_server() {
+        if !python3_available() {
+            return;
+        }
         let (_dir, script) = fake_server();
         let mut c = McpClient::spawn("python3", &[script], &HashMap::new())
             .await
@@ -324,6 +395,9 @@ mod tests {
     /// If the server returns an error, its words must come through unchanged — swallowing them hides the cause.
     #[tokio::test]
     async fn a_server_error_comes_back_as_an_error() {
+        if !python3_available() {
+            return;
+        }
         let (_dir, script) = fake_server();
         let mut c = McpClient::spawn("python3", &[script], &HashMap::new()).await.unwrap();
         let e = c.call("boom", json!({})).await.unwrap_err();
@@ -334,6 +408,9 @@ mod tests {
     /// Mistaking a notification wedged between replies for the reply shifts everything after it by one.
     #[tokio::test]
     async fn a_notification_between_replies_does_not_shift_anything() {
+        if !python3_available() {
+            return;
+        }
         let (_dir, script) = fake_server();
         let mut c = McpClient::spawn("python3", &[script], &HashMap::new()).await.unwrap();
         // The fake server sends one notification first for every tools/call.

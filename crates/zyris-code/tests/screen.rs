@@ -125,6 +125,7 @@ fn a_user_message_appears_above_the_input() {
         &Action::Frame(AppFrame::Event {
             cursor: 1,
             entry: Some(Entry { seq: 1, kind: EntryKind::User("안녕하세요".into()) }),
+            todo: None,
         }),
     );
     let screen = dump(&mut s, 40, 10);
@@ -140,6 +141,8 @@ fn a_user_message_appears_above_the_input() {
 #[test]
 fn what_was_just_submitted_is_on_screen_without_waiting_for_the_server() {
     let mut s = State::new();
+    // Attached — nothing is sent before the first connection.
+    s.ever_connected = true;
     apply(&mut s, &Action::Submit("이걸 해 주세요".into()));
     let screen = dump(&mut s, 40, 10);
     assert!(screen.contains("이걸 해 주세요"), "\n{screen}");
@@ -155,6 +158,7 @@ fn the_servers_copy_of_a_submitted_message_does_not_double_it() {
         &Action::Frame(AppFrame::Event {
             cursor: 1,
             entry: Some(Entry { seq: 1, kind: EntryKind::User("안녕하세요".into()) }),
+            todo: None,
         }),
     );
     let screen = dump(&mut s, 40, 12);
@@ -190,7 +194,8 @@ fn cell_bg(state: &mut State, w: u16, h: u16, x: u16, y: u16) -> Option<ratatui:
 }
 
 fn said(state: &mut State, seq: i64, kind: EntryKind) {
-    apply(state, &Action::Frame(AppFrame::Event { cursor: seq, entry: Some(Entry { seq, kind }) }));
+    let entry = Some(Entry { seq, kind });
+    apply(state, &Action::Frame(AppFrame::Event { cursor: seq, entry, todo: None }));
 }
 
 /// **A scrolled-up view keeps looking at the same words when the width changes.**
@@ -447,6 +452,7 @@ fn there_is_no_header_taking_up_the_top_line() {
         &Action::Frame(AppFrame::Event {
             cursor: 1,
             entry: Some(Entry { seq: 1, kind: EntryKind::User("첫 줄".into()) }),
+            todo: None,
         }),
     );
     let screen = dump(&mut s, 40, 10);
@@ -466,6 +472,7 @@ fn drawing_at_a_very_narrow_width_does_not_panic() {
             entry: Some(Entry {
                 seq: 1, kind: EntryKind::Agent("한글 **강조** `코드`".into())
             }),
+            todo: None,
         }),
     );
     let _ = dump(&mut s, 12, 6);
@@ -520,6 +527,228 @@ fn what_is_happening_now_sits_between_the_chat_and_the_input_box() {
         lines[lines.len() - ACTIVITY_FROM_BOTTOM].contains("작업 중"),
         "작업 중이 안 뜬다:\n{screen}"
     );
+}
+
+/// Puts one task on the session's plan, the way the server does: a `todo_add` tool call.
+fn planned(state: &mut State, seq: i64, content: &str, status: &str) {
+    let event = zyris_attacca::ZSessionEvent {
+        seq,
+        cursor: seq,
+        kind: "tool_call".into(),
+        payload: serde_json::json!({
+            "name": "todo_add",
+            "arguments": {"content": content},
+            "result": {"id": format!("t{seq}"), "content": content, "status": status},
+        }),
+        created_at: None,
+    };
+    apply(
+        state,
+        &Action::Frame(AppFrame::Event {
+            cursor: seq,
+            entry: zyris_code::event::entry_from(&event),
+            todo: zyris_code::todos::change_from(&event),
+        }),
+    );
+}
+
+/// **How far along the plan is rides on the line that says what is happening.** Otherwise nothing
+/// on screen says the todo list exists, and the key that opens it is one nobody would press.
+#[test]
+fn the_activity_line_counts_the_plan_beside_what_it_is_doing() {
+    let mut s = State::new();
+    s.lang = zyris_code::lang::Lang::Ko;
+    s.connected = true;
+    s.running = true;
+    planned(&mut s, 1, "테스트 고치기", "completed");
+    planned(&mut s, 2, "빌드 돌리기", "pending");
+    let screen = dump(&mut s, 40, 12);
+    let lines: Vec<&str> = screen.lines().collect();
+    let at = lines.len() - ACTIVITY_FROM_BOTTOM;
+    assert!(lines[at].contains("작업 중"), "{screen}");
+    assert!(lines[at].contains("(1/2)"), "the plan is not counted:\n{screen}");
+}
+
+/// **A session with no plan says nothing about one.** An empty `(0/0)` on every screen is noise.
+#[test]
+fn a_session_without_a_plan_shows_no_count() {
+    let mut s = State::new();
+    s.lang = zyris_code::lang::Lang::Ko;
+    s.connected = true;
+    let screen = dump(&mut s, 40, 12);
+    assert!(!screen.contains("(0/0)"), "{screen}");
+}
+
+/// **The plan opens under the line that counted it, and takes its room from the conversation.**
+/// The input box and the bottom bar must stay exactly where they were — the room a person types
+/// in cannot shrink because the agent wrote itself a longer list.
+#[test]
+fn the_plan_unfolds_under_the_line_that_counts_it() {
+    let mut s = State::new();
+    s.lang = zyris_code::lang::Lang::Ko;
+    s.connected = true;
+    planned(&mut s, 1, "테스트 고치기", "completed");
+    planned(&mut s, 2, "빌드 돌리기", "in_progress");
+    let folded = dump(&mut s, 40, 14);
+    assert!(!folded.contains("1. 테스트 고치기"), "it must start folded:\n{folded}");
+
+    apply(&mut s, &Action::ToggleTodos);
+    let screen = dump(&mut s, 40, 14);
+    let lines: Vec<&str> = screen.lines().collect();
+    let at = lines.iter().position(|l| l.contains("쉬는 중")).expect(&screen);
+    assert!(lines[at + 1].contains("1. 테스트 고치기"), "{screen}");
+    assert!(lines[at + 2].contains("2. 빌드 돌리기"), "{screen}");
+    // Everything below the plan is where it always was.
+    assert!(lines[lines.len() - 2].starts_with('─'), "the rule moved:\n{screen}");
+    assert!(lines[lines.len() - 1].contains("일반"), "the bottom bar moved:\n{screen}");
+}
+
+/// **The `/github` screen draws both rows and never the token.** A form whose pure side is right
+/// is no use if the widget does not put it on screen, and a token on screen is a token in every
+/// screenshot and scrollback of this session.
+#[test]
+fn the_github_screen_shows_both_rows_and_hides_the_token() {
+    let mut s = State::new();
+    s.lang = zyris_code::lang::Lang::Ko;
+    s.github_form = Some(zyris_code::githubform::Form::new(Some("ruma".into()), None));
+    let screen = dump(&mut s, 80, 20);
+    assert!(screen.contains("ruma"), "the connected account is missing:\n{screen}");
+    assert!(screen.contains("리뷰 계정"), "the reviewer row is missing:\n{screen}");
+
+    // Paste a token into the reviewer row and it must not appear.
+    apply(&mut s, &Action::FormNext);
+    apply(&mut s, &Action::Paste("github_pat_11ABCDE_secretsecret".into()));
+    let screen = dump(&mut s, 80, 20);
+    assert!(!screen.contains("secretsecret"), "the token was drawn:\n{screen}");
+    assert!(screen.contains("github_pat_"), "the token's kind is not shown:\n{screen}");
+}
+
+/// **The person's row takes no typing.** Letting it swallow keys would look like a field that
+/// never fills, and the keys would be gone.
+#[test]
+fn typing_on_the_account_row_of_the_github_screen_goes_nowhere() {
+    let mut s = State::new();
+    s.github_form = Some(zyris_code::githubform::Form::new(None, None));
+    apply(&mut s, &Action::Insert('x'));
+    let form = s.github_form.as_ref().expect("the screen closed");
+    assert!(form.token.text.is_empty(), "{:?}", form.token.text);
+}
+
+/// Esc closes it, and Enter on the reviewer row asks the I/O side for what was pasted.
+#[test]
+fn the_github_screen_hands_a_pasted_token_to_the_io_side() {
+    let mut s = State::new();
+    s.github_form = Some(zyris_code::githubform::Form::new(Some("ruma".into()), None));
+    apply(&mut s, &Action::FormNext);
+    apply(&mut s, &Action::Paste("github_pat_abc".into()));
+    apply(&mut s, &Action::FormConfirm);
+    assert_eq!(
+        s.github_out,
+        Some(zyris_code::githubform::Ask::SetReviewer("github_pat_abc".into()))
+    );
+    apply(&mut s, &Action::FormCancel);
+    assert!(s.github_form.is_none(), "Esc must close it");
+}
+
+/// **Signing in must not freeze the app.** Device flow is a wait of up to fifteen minutes, and
+/// running it on the draw loop took the whole screen down — including the code it was waiting on.
+/// The code arrives as a frame instead, from a task off the loop.
+#[test]
+fn the_device_code_reaches_the_github_screen_as_a_frame() {
+    use zyris_code::app::GithubNews;
+    let mut s = State::new();
+    s.lang = zyris_code::lang::Lang::Ko;
+    s.github_form = Some(zyris_code::githubform::Form::new(None, None));
+    apply(&mut s, &Action::FormConfirm);
+    assert_eq!(s.github_out, Some(zyris_code::githubform::Ask::LoginUser));
+
+    apply(
+        &mut s,
+        &Action::Frame(AppFrame::Github(GithubNews::Code {
+            code: "WXQR-7KBD".into(),
+            uri: "https://github.com/login/device".into(),
+        })),
+    );
+    let screen = dump(&mut s, 80, 24);
+    assert!(screen.contains("WXQR-7KBD"), "the code is not on screen:\n{screen}");
+    assert!(screen.contains("github.com/login/device"), "{screen}");
+    // And the address is Ctrl+clickable, like the enrolment window's.
+    let link = s
+        .screen_links
+        .iter()
+        .find(|l| l.url == "https://github.com/login/device")
+        .expect("the address was not registered as a link");
+    assert_eq!(s.link_at(link.start, link.row).as_deref(), Some("https://github.com/login/device"));
+}
+
+/// When it settles, the code goes and the answer takes its place.
+#[test]
+fn the_github_screen_takes_the_answer_when_the_sign_in_settles() {
+    use zyris_code::app::GithubNews;
+    let mut s = State::new();
+    s.lang = zyris_code::lang::Lang::Ko;
+    let mut form = zyris_code::githubform::Form::new(None, None);
+    form.pending = Some(("WXQR-7KBD".into(), "https://github.com/login/device".into()));
+    form.busy = true;
+    s.github_form = Some(form);
+    apply(
+        &mut s,
+        &Action::Frame(AppFrame::Github(GithubNews::Settled {
+            note: "이었습니다".into(),
+            worked: true,
+        })),
+    );
+    let form = s.github_form.as_ref().expect("the screen closed");
+    assert!(form.pending.is_none(), "the spent code is still up");
+    assert!(!form.busy);
+    let screen = dump(&mut s, 80, 24);
+    assert!(!screen.contains("WXQR-7KBD"), "{screen}");
+    assert!(screen.contains("이었습니다"), "{screen}");
+}
+
+/// **Closing the screen must not lose the answer.** Esc closes it while the sign-in carries on in
+/// the background, so what it has to say goes where everything without a window goes.
+#[test]
+fn an_answer_that_arrives_after_the_screen_closed_is_still_said() {
+    use zyris_code::app::GithubNews;
+    let mut s = State::new();
+    s.lang = zyris_code::lang::Lang::Ko;
+    apply(
+        &mut s,
+        &Action::Frame(AppFrame::Github(GithubNews::Settled {
+            note: "이었습니다".into(),
+            worked: true,
+        })),
+    );
+    let screen = dump(&mut s, 80, 14);
+    assert!(screen.contains("이었습니다"), "{screen}");
+}
+
+/// **A form takes the keys, never the server's news.**
+///
+/// Both forms returned early for every action, frames included — so while one was open, timeline
+/// events were dropped and `last_cursor` stopped advancing, which puts a resume in the wrong
+/// place. It is also how the GitHub screen's own device code failed to reach it.
+#[test]
+fn a_form_being_open_does_not_swallow_what_the_server_says() {
+    for open_a_form in [0, 1] {
+        let mut s = State::new();
+        if open_a_form == 0 {
+            s.new_project = Some(zyris_code::newproject::Form::new());
+        } else {
+            s.github_form = Some(zyris_code::githubform::Form::new(None, None));
+        }
+        apply(
+            &mut s,
+            &Action::Frame(AppFrame::Event {
+                cursor: 42,
+                entry: Some(Entry { seq: 42, kind: EntryKind::Agent("들어온 말".into()) }),
+                todo: None,
+            }),
+        );
+        assert_eq!(s.last_cursor, Some(42), "the resume position was lost (form {open_a_form})");
+        assert_eq!(s.timeline.items().len(), 1, "the event was dropped (form {open_a_form})");
+    }
 }
 
 /// The quit hint must show before anything else.
@@ -660,6 +889,7 @@ fn clicking_a_work_card_toggles_it() {
         &Action::Frame(AppFrame::Event {
             cursor: 1,
             entry: Some(Entry { seq: 1, kind: EntryKind::WorkStart("작업".into()) }),
+            todo: None,
         }),
     );
     // Streaming reasoning gives the card a chip, so there are two targets to tell apart.
@@ -709,6 +939,7 @@ fn dragging_selects_text_and_the_selection_survives_the_release() {
             entry: Some(Entry {
                 seq: 1, kind: EntryKind::Agent("안녕하세요 반갑습니다".into())
             }),
+            todo: None,
         }),
     );
     let _ = dump(&mut s, 60, 12);
@@ -734,6 +965,7 @@ fn a_click_without_moving_does_not_select() {
         &Action::Frame(AppFrame::Event {
             cursor: 1,
             entry: Some(Entry { seq: 1, kind: EntryKind::Agent("본문".into()) }),
+            todo: None,
         }),
     );
     let _ = dump(&mut s, 60, 12);
@@ -755,6 +987,7 @@ fn the_selection_survives_releasing_the_mouse() {
             entry: Some(Entry {
                 seq: 1, kind: EntryKind::Agent("안녕하세요 반갑습니다".into())
             }),
+            todo: None,
         }),
     );
     let _ = dump(&mut s, 60, 12);
@@ -780,6 +1013,7 @@ fn moving_after_release_does_not_grow_the_selection() {
             entry: Some(Entry {
                 seq: 1, kind: EntryKind::Agent("안녕하세요 반갑습니다".into())
             }),
+            todo: None,
         }),
     );
     let _ = dump(&mut s, 60, 12);
@@ -805,6 +1039,7 @@ fn scrolling_keeps_the_selection() {
                 entry: Some(Entry {
                     seq: i, kind: EntryKind::Agent(format!("줄 {i} 내용입니다"))
                 }),
+                todo: None,
             }),
         );
     }
@@ -837,6 +1072,7 @@ fn the_highlight_covers_only_the_selected_columns() {
         &Action::Frame(AppFrame::Event {
             cursor: 1,
             entry: Some(Entry { seq: 1, kind: EntryKind::Agent("abcdefghij".into()) }),
+            todo: None,
         }),
     );
     let _ = dump(&mut s, 60, 12);
@@ -869,7 +1105,10 @@ fn typing_drops_the_selection() {
         &mut s,
         &Action::Frame(AppFrame::Event {
             cursor: 1,
-            entry: Some(Entry { seq: 1, kind: EntryKind::Agent("안녕하세요 반갑습니다".into()) }),
+            entry: Some(Entry {
+                seq: 1, kind: EntryKind::Agent("안녕하세요 반갑습니다".into())
+            }),
+            todo: None,
         }),
     );
     let _ = dump(&mut s, 60, 12);
@@ -903,6 +1142,7 @@ fn question_event(seq: i64, result: serde_json::Value) -> AppFrame {
             }),
             created_at: None,
         }),
+        todo: None,
     }
 }
 
@@ -919,6 +1159,43 @@ fn a_question_opens_for_answering_and_shows_its_options() {
     assert!(screen.contains("A안"), "\n{screen}");
     assert!(screen.contains("빠르다"), "the description must be shown too\n{screen}");
     assert!(screen.contains("직접 입력"), "no free-input alternative\n{screen}");
+}
+
+/// **A question with no options is a question all the same.** The tool asks for a free-text step by
+/// leaving `options` out, and that is what an open-ended question looks like on the wire — drawn as
+/// anything but an answerable screen, there is no way to reply to it.
+///
+/// It arrives here the way the reported one did: with its wait already run out. A `timeout` result
+/// is an ordinary success meaning "nobody replied yet", so the question is still open and the
+/// screen has to come up — reopening the thread is the only way back to it.
+#[test]
+fn an_open_ended_question_whose_wait_ran_out_is_still_answerable() {
+    let asked = AppFrame::Event {
+        cursor: 1,
+        entry: zyris_code::event::entry_from(&zyris_attacca::ZSessionEvent {
+            seq: 1,
+            cursor: 1,
+            kind: "tool_call".into(),
+            payload: serde_json::json!({
+                "kind": "tool_call", "name": "question",
+                "arguments": {"questions": [
+                    {"header": "푸시 알림 대상", "question": "계정 UUID를 알려주세요"}
+                ]},
+                "result": {"status": "timeout", "waited_secs": 600}, "error": null
+            }),
+            created_at: None,
+        }),
+        todo: None,
+    };
+
+    let mut s = State::new();
+    s.lang = zyris_code::lang::Lang::Ko;
+    apply(&mut s, &Action::Frame(asked));
+    assert!(s.asking.is_some(), "a question that timed out is still waiting to be answered");
+
+    let screen = dump(&mut s, 70, 16);
+    assert!(screen.contains("계정 UUID를 알려주세요"), "\n{screen}");
+    assert!(screen.contains("직접 입력"), "an open-ended question is all free input\n{screen}");
 }
 
 /// An already-answered question must not reopen.
@@ -1040,6 +1317,7 @@ fn the_picker_overlays_the_conversation_and_takes_the_keys() {
         &Action::Frame(AppFrame::Event {
             cursor: 1,
             entry: Some(Entry { seq: 1, kind: EntryKind::Agent("뒤에 있는 대화".into()) }),
+            todo: None,
         }),
     );
     s.picker = Some(Picker::projects(
@@ -1164,7 +1442,7 @@ fn long_picker_labels_are_truncated_inside_the_box() {
         vec![(
             "s1".into(),
             "아주아주 긴 세션 제목이 여기 들어가고 계속 이어집니다 정말로 깁니다".into(),
-            Some(zyris_code::picker::ThreadStatus::Running),
+            zyris_code::picker::ThreadStatus::Running,
         )],
         zyris_code::lang::Lang::Ko,
     ));
@@ -1252,6 +1530,7 @@ fn the_picker_box_stays_inside_the_screen_with_wide_text_behind() {
                         "한글이 잔뜩 들어간 아주 긴 줄입니다 계속 이어집니다".into(),
                     ),
                 }),
+                todo: None,
             }),
         );
     }
@@ -1282,6 +1561,7 @@ fn typed_answers_look_different_from_chosen_ones_in_history() {
                 seq: 1,
                 kind: EntryKind::User("질문?\n  - A안 (설명)\n  - 직접 입력: 내가 쓴 답".into()),
             }),
+            todo: None,
         }),
     );
     let screen = dump(&mut s, 70, 12);
@@ -1454,6 +1734,8 @@ fn usage_is_dropped_when_the_bottom_bar_is_too_narrow() {
 #[test]
 fn the_bottom_bar_says_how_many_messages_are_waiting() {
     let mut s = State::new();
+    // Attached — nothing is sent, or queued to be sent, before the first connection.
+    s.ever_connected = true;
     s.lang = zyris_code::lang::Lang::Ko;
     s.agent = "Main Agent".into();
     s.running = true;
@@ -1526,6 +1808,7 @@ fn state_with_edit_tool() -> State {
             entry: Some(Entry {
                 seq: 1, kind: EntryKind::WorkStart("파일을 고치는 중".into())
             }),
+            todo: None,
         }),
     );
     apply(
@@ -1550,6 +1833,7 @@ fn state_with_edit_tool() -> State {
                     }),
                 },
             }),
+            todo: None,
         }),
     );
     s.folds.insert(1, Fold { open: true, user_touched: true });
@@ -1607,7 +1891,14 @@ fn a_running_command_is_named_in_the_activity_line() {
     let mut s = State::new();
     s.connected = true;
     s.running = true;
-    apply(&mut s, &Action::Frame(AppFrame::ExecStart { id: 1, command: "cargo build -j2".into() }));
+    apply(
+        &mut s,
+        &Action::Frame(AppFrame::ExecStart {
+            id: 1,
+            command: "cargo build -j2".into(),
+            session: None,
+        }),
+    );
     let screen = dump(&mut s, 80, 12);
     assert!(screen.contains("cargo build -j2"), "what is running is not visible:\n{screen}");
     assert!(
@@ -1623,7 +1914,10 @@ fn a_finished_command_leaves_the_activity_line() {
     s.lang = zyris_code::lang::Lang::Ko;
     s.connected = true;
     s.running = true;
-    apply(&mut s, &Action::Frame(AppFrame::ExecStart { id: 1, command: "cargo build".into() }));
+    apply(
+        &mut s,
+        &Action::Frame(AppFrame::ExecStart { id: 1, command: "cargo build".into(), session: None }),
+    );
     apply(&mut s, &Action::Frame(AppFrame::ExecDone { id: 1 }));
     let screen = dump(&mut s, 80, 12);
     assert!(!screen.contains("cargo build"), "a finished command is still shown:\n{screen}");
@@ -1639,7 +1933,10 @@ fn finishing_another_command_does_not_clear_the_running_one() {
     let mut s = State::new();
     s.connected = true;
     s.running = true;
-    apply(&mut s, &Action::Frame(AppFrame::ExecStart { id: 2, command: "cargo test".into() }));
+    apply(
+        &mut s,
+        &Action::Frame(AppFrame::ExecStart { id: 2, command: "cargo test".into(), session: None }),
+    );
     apply(&mut s, &Action::Frame(AppFrame::ExecDone { id: 1 }));
     let screen = dump(&mut s, 80, 12);
     assert!(screen.contains("cargo test"), "the wrong id was cleared:\n{screen}");
@@ -1653,7 +1950,10 @@ fn the_activity_line_counts_the_seconds() {
     s.lang = zyris_code::lang::Lang::Ko;
     s.connected = true;
     s.running = true;
-    apply(&mut s, &Action::Frame(AppFrame::ExecStart { id: 1, command: "sleep 30".into() }));
+    apply(
+        &mut s,
+        &Action::Frame(AppFrame::ExecStart { id: 1, command: "sleep 30".into(), session: None }),
+    );
     let start = s.running_exec.as_ref().unwrap().2;
     let (_, label, _) = zyris_code::widgets::activity_parts_at(&s, start + Duration::from_secs(12));
     assert!(label.contains("12초"), "{label}");
@@ -1682,6 +1982,66 @@ fn enroll_view() -> zyris_code::app::EnrollView {
         expires_at: std::time::Instant::now() + std::time::Duration::from_secs(600),
         phase: zyris_code::app::EnrollPhase::Waiting,
     }
+}
+
+/// **Approving is the moment this computer changes hands**, so the window that shows the code is
+/// where whose account it is has to be said. Afterwards there is nothing left to warn about.
+///
+/// It also draws whole. Both sentences here are longer than the box, and the first one used to run
+/// off the right border and simply stop — reported 2026-08-14 as the notice at the top being cut.
+#[test]
+fn the_enroll_window_says_whose_account_to_approve_with_and_says_it_whole() {
+    for lang in [zyris_code::lang::Lang::Ko, zyris_code::lang::Lang::En] {
+        let mut s = State::new();
+        s.lang = lang;
+        apply(&mut s, &Action::Frame(AppFrame::Enroll(enroll_view())));
+        let screen = dump(&mut s, 80, 30);
+
+        // Every word of both sentences reached the screen — not just the start of them.
+        for sentence in [lang.enroll_steps(), lang.enroll_warning()] {
+            for word in sentence.split_whitespace() {
+                assert!(screen.contains(word), "{word:?} never made it onto the screen\n{screen}");
+            }
+        }
+        // The code and the address are still there — the warning did not push them off.
+        assert!(screen.contains("WXQR-7KBD"), "\n{screen}");
+        assert!(screen.contains("https://attacca.example/settings/zyris/device"), "\n{screen}");
+    }
+}
+
+/// **The address in the enrolment window is Ctrl+clickable.**
+///
+/// Links used to be found only inside the conversation (`view_links`), so the one URL a person has
+/// to open — the page where the code goes — was the one URL they could not click. An overlay's
+/// links are registered in absolute screen cells as it draws (`State::screen_links`).
+#[test]
+fn the_address_in_the_enroll_window_can_be_opened() {
+    let mut s = State::new();
+    apply(&mut s, &Action::Frame(AppFrame::Enroll(enroll_view())));
+    let screen = dump(&mut s, 80, 24);
+    let uri = "https://attacca.example/settings/zyris/device";
+    assert!(screen.contains(uri), "{screen}");
+
+    let found = s.screen_links.iter().find(|l| l.url == uri).expect("no link was registered");
+    // **Clickable where it is drawn.** Registering a link on a row nothing was painted on would
+    // open a URL from a click on whatever is really there.
+    assert_eq!(s.link_at(found.start, found.row).as_deref(), Some(uri));
+    assert_eq!(s.link_at(found.end - 1, found.row).as_deref(), Some(uri));
+    assert_eq!(s.link_at(found.end, found.row), None, "past the end of the link");
+    assert_eq!(s.link_at(found.start, found.row + 1), None, "a different row");
+}
+
+/// **A closed overlay leaves nothing clickable behind.** The registry is rebuilt every frame, so a
+/// cell it used to own goes back to whatever is under it.
+#[test]
+fn closing_the_enroll_window_takes_its_link_with_it() {
+    let mut s = State::new();
+    apply(&mut s, &Action::Frame(AppFrame::Enroll(enroll_view())));
+    let _ = dump(&mut s, 80, 24);
+    assert!(!s.screen_links.is_empty());
+    apply(&mut s, &Action::EnrollClose);
+    let _ = dump(&mut s, 80, 24);
+    assert!(s.screen_links.is_empty(), "{:?}", s.screen_links);
 }
 
 /// The enrollment code appears in a box in the middle of the screen — not the old stdout box.
@@ -1718,6 +2078,7 @@ fn the_enroll_window_overlays_the_conversation() {
         &Action::Frame(AppFrame::Event {
             cursor: 1,
             entry: Some(Entry { seq: 1, kind: EntryKind::Agent("뒤에 있는 대화".into()) }),
+            todo: None,
         }),
     );
     apply(&mut s, &Action::Frame(AppFrame::Enroll(enroll_view())));
@@ -1733,7 +2094,7 @@ fn long_session_list(n: usize) -> zyris_code::picker::Picker {
         "zyris".into(),
         (0..n)
             .map(|i| {
-                (format!("s{i}"), format!("쓰레드 {i}"), None)
+                (format!("s{i}"), format!("쓰레드 {i}"), zyris_code::picker::ThreadStatus::Unknown)
             })
             .collect(),
         zyris_code::lang::Lang::Ko,
@@ -1832,12 +2193,7 @@ fn without_git_the_rule_resumes_right_after_the_path() {
 /// the buffer directly, because `dump` counts the escape bytes as width and skips cells.
 #[test]
 fn a_link_in_an_answer_is_wrapped_in_osc8() {
-    let mut s = State::new();
-    said(&mut s, 1, EntryKind::Agent("[문서](https://example.com/x) 끝".into()));
-    let mut term = Terminal::new(TestBackend::new(60, 12)).unwrap();
-    term.draw(|f| widgets::draw(f, &mut s)).unwrap();
-    let buf = term.backend().buffer().clone();
-    let syms: Vec<String> = buf.content.iter().map(|c| c.symbol().to_string()).collect();
+    let syms = link_cells(true);
     assert!(
         syms.iter().any(|sym| sym.starts_with("\u{1b}]8;;https://example.com/x")),
         "no OSC 8 open sequence: {syms:?}"
@@ -1846,6 +2202,55 @@ fn a_link_in_an_answer_is_wrapped_in_osc8() {
         syms.iter().any(|sym| sym.contains("\u{1b}]8;;\u{1b}\\")),
         "no OSC 8 close sequence: {syms:?}"
     );
+}
+
+/// **A terminal that never learned OSC 8 prints the bytes.** Then the sequence is not merely
+/// ignored — it lands across the transcript as rubbish, and the diff believes those cells are
+/// right, so it stays until something forces a full repaint.
+///
+/// Nothing is lost by holding it back: the app opens URLs itself on Ctrl+click (`open_url`)
+/// rather than leaving it to the emulator, so the link still works and only the underline goes.
+#[test]
+fn a_terminal_that_cannot_read_osc8_is_not_sent_any() {
+    let syms = link_cells(false);
+    assert!(
+        !syms.iter().any(|sym| sym.contains("\u{1b}]8;;")),
+        "escape bytes went to a terminal that would have printed them: {syms:?}"
+    );
+    // The text itself is untouched — it is the sequence around it that is held back.
+    assert!(syms.iter().any(|sym| sym == "문"), "the link text went missing: {syms:?}");
+}
+
+/// **Whoever draws the link owns its decoration.** A terminal that reads OSC 8 styles hyperlinks
+/// itself, and most of them underline on hover — so the renderer's own underline sat underneath
+/// that permanently and read as a doubled underline that never went away.
+///
+/// Where no sequence was sent there is nothing to style the link with, so the underline stays and
+/// is the only sign the text is a link at all.
+#[test]
+fn the_underline_is_ours_only_where_the_terminal_was_sent_no_link() {
+    let underlined = |hyperlinks: bool| {
+        link_buffer(hyperlinks)
+            .content
+            .iter()
+            .any(|c| c.modifier.contains(ratatui::style::Modifier::UNDERLINED))
+    };
+    assert!(!underlined(true), "our underline stacked under the terminal's own");
+    assert!(underlined(false), "a link with no sequence and no underline is invisible");
+}
+
+/// Draws one agent answer holding a link, with the terminal declared able to read OSC 8 or not.
+fn link_buffer(hyperlinks: bool) -> ratatui::buffer::Buffer {
+    let mut s = State::new();
+    s.caps.hyperlinks = hyperlinks;
+    said(&mut s, 1, EntryKind::Agent("[문서](https://example.com/x) 끝".into()));
+    let mut term = Terminal::new(TestBackend::new(60, 12)).unwrap();
+    term.draw(|f| widgets::draw(f, &mut s)).unwrap();
+    term.backend().buffer().clone()
+}
+
+fn link_cells(hyperlinks: bool) -> Vec<String> {
+    link_buffer(hyperlinks).content.iter().map(|c| c.symbol().to_string()).collect()
 }
 
 /// A bare URL in plain text is not wrapped — the terminal detects those itself.
@@ -1891,10 +2296,14 @@ fn show_a_work_card() {
 
     let events = vec![
         ev(1, "work_summary", serde_json::json!({"content": "위젯 picker 테스트를 배경에서 실행"})),
-        ev(10, "thinking", serde_json::json!({
-            "content": "rows.rs가 대화 화면의 정본이므로 거기부터 본다.",
-            "title": "현재 파일 상태를 읽는 중",
-        })),
+        ev(
+            10,
+            "thinking",
+            serde_json::json!({
+                "content": "rows.rs가 대화 화면의 정본이므로 거기부터 본다.",
+                "title": "현재 파일 상태를 읽는 중",
+            }),
+        ),
         tool(
             11,
             "read",
@@ -1905,10 +2314,14 @@ fn show_a_work_card() {
                 "content": "fn row_line(&self) -> Line {\n    …\n}",
             }),
         ),
-        ev(12, "thinking", serde_json::json!({
-            "content": "지금은 오른쪽 끝에 있다. 커서 표시 뒤, 레이블 앞으로 옮긴다.",
-            "title": "상태 점을 왼쪽으로 옮긴다",
-        })),
+        ev(
+            12,
+            "thinking",
+            serde_json::json!({
+                "content": "지금은 오른쪽 끝에 있다. 커서 표시 뒤, 레이블 앞으로 옮긴다.",
+                "title": "상태 점을 왼쪽으로 옮긴다",
+            }),
+        ),
         tool(
             13,
             "grep",

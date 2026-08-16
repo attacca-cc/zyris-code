@@ -30,7 +30,7 @@ env0 = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
 for a in (["init","-q","-b","main"],["add","-A"],["commit","-qm","first"]):
     subprocess.run(["git"]+a, cwd=ORIGIN, env=env0, check=True, capture_output=True)
 
-env = dict(os.environ, ZYRIS_PROFILE="zyris-code",
+env = dict(os.environ, ZYRIS_CODE_LANG="ko", ZYRIS_PROFILE="zyris-code",
            ZYRIS_CODE_LOG="/tmp/zyris-code-plugin.log")
 p, r = pty.openpty()
 p_fd = p
@@ -41,7 +41,8 @@ buf, ok, n = [], True, 0
 def until(needle, secs, label):
     t = time.time() + secs
     while True:
-        if needle in ANSI.sub("", "".join(buf)): return True
+        wanted = (needle,) if isinstance(needle, str) else tuple(needle)
+        if any(w in ANSI.sub("", "".join(buf)) for w in wanted): return True
         if time.time() >= t: print(f"  ✗ {label}: '{needle}' 못 봤다"); return False
         rr,_,_ = select.select([p],[],[],0.5)
         if rr: buf.append(os.read(p,65536).decode("utf-8","replace"))
@@ -97,13 +98,17 @@ def close_panel():
     os.write(p, b"\x1b"); time.sleep(0.6)
 
 try:
-    if not until("일반", 30, "첫 프레임"): sys.exit(1)
+    if not until(("일반", "계획", "작업", "일"), 30, "첫 프레임"): sys.exit(1)
     print("  ✓ 떴다"); n += 1
     time.sleep(2)
     buf.clear(); send("/plugin")
     check(until("플러그인이 없습니다", 8, "빈 목록"), "처음엔 비어 있다고 말한다")
     close_panel()
     buf.clear(); send(f"/plugin add {ORIGIN}")
+    # **It asks where before it fetches.** On this machine it is there for every project; in the
+    # project it lands in the repo. Enter takes the first row, which is the machine.
+    check(until("어디에", 8, "설치 위치"), "어디에 받을지 먼저 묻는다")
+    send("\r")
     until("받았습니다", 25, "설치")
     shown = snapshot()
     check("시험플러그인" in shown, "로컬 리포에서 받는다")
@@ -119,11 +124,12 @@ try:
     check(until("지웠습니다", 10, "삭제"), "보이는 이름으로 지운다")
     check(not os.path.exists(f"{HOME}/.config/zyris-code/plugins/원본플러그인"), "디스크에서 실제로 사라진다")
     buf.clear(); send("/plugin add 없는사람/없는리포")
+    send("\r")
     check(until("git", 25, "실패 사유") or until("찾", 3, "x"), "못 받으면 사유를 말한다")
 finally:
     if proc.poll() is None: proc.send_signal(signal.SIGKILL)
     os.close(p)
     # The real home was used, so it must be cleaned up.
     shutil.rmtree(f"{HOME}/.config/zyris-code/plugins/원본플러그인", ignore_errors=True)
-print(f"\n{n}/11 통과")
-sys.exit(0 if ok and n == 11 else 1)
+print(f"\n{n}/12 통과")
+sys.exit(0 if ok and n == 12 else 1)

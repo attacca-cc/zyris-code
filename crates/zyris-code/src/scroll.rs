@@ -42,11 +42,8 @@ impl Scroll {
     /// Moves `delta` lines up (`up`) or down, clamped to what exists.
     fn move_by(&mut self, delta: usize, up: bool, total: usize, height: usize) {
         let max_top = total.saturating_sub(height);
-        self.top = if up {
-            self.top.saturating_sub(delta)
-        } else {
-            (self.top + delta).min(max_top)
-        };
+        self.top =
+            if up { self.top.saturating_sub(delta) } else { (self.top + delta).min(max_top) };
         // Reaching the bottom revives stickiness.
         self.stick = self.top >= max_top;
     }

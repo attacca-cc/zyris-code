@@ -108,6 +108,7 @@ mod tests {
                 tool: tool.name.clone(),
                 params: zyris::Payload::from_json(serde_json::json!({"path": "a"})),
                 serialization: zyris::Serialization::Json,
+                meta: zyris::Payload::default(),
             };
             assert!(
                 cap.dispatch(call).await.is_err(),
@@ -133,6 +134,7 @@ mod tests {
             tool: "remove".into(),
             params: zyris::Payload::from_json(serde_json::json!({"path": "a"})),
             serialization: zyris::Serialization::Json,
+            meta: zyris::Payload::default(),
         };
         assert!(cap.dispatch(call).await.is_err(), "a filtered tool must not be callable");
     }
