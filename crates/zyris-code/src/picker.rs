@@ -417,7 +417,13 @@ impl Picker {
                 status: None,
             })
             .collect();
-        Self { level: Level::History { query: query.to_string() }, rows, cursor: 0, top: 0, loading: false }
+        Self {
+            level: Level::History { query: query.to_string() },
+            rows,
+            cursor: 0,
+            top: 0,
+            loading: false,
+        }
     }
 
     /// An empty file list waiting for the walk.

@@ -84,8 +84,8 @@ impl Caps {
             // Windows out — it only means the old console, which supports neither.
             || var("WT_SESSION").is_some();
 
-        let hyperlinks = override_of(var("ZYRIS_CODE_HYPERLINKS").as_deref())
-            .unwrap_or(named && !dumb);
+        let hyperlinks =
+            override_of(var("ZYRIS_CODE_HYPERLINKS").as_deref()).unwrap_or(named && !dumb);
         // **OSC 52 is the same guess but a weaker one.** Several terminals that draw hyperlinks
         // keep clipboard writes switched off by default (xterm, and Alacritty until told
         // otherwise), so a true here means "worth trying", not "will work". Trying costs nothing:
@@ -152,7 +152,11 @@ mod tests {
     /// `TERM_PROGRAM` makes every terminal inside tmux look like tmux, and they all lose their links.
     #[test]
     fn a_terminal_keeps_its_name_through_tmux() {
-        let c = caps(&[("TERM_PROGRAM", "tmux"), ("LC_TERMINAL", "iTerm2"), ("TERM", "screen-256color")]);
+        let c = caps(&[
+            ("TERM_PROGRAM", "tmux"),
+            ("LC_TERMINAL", "iTerm2"),
+            ("TERM", "screen-256color"),
+        ]);
         assert!(c.hyperlinks, "the terminal underneath tmux was not seen");
     }
 

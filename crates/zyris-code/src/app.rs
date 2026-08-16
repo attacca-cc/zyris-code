@@ -938,8 +938,10 @@ pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
         // **The history search types into itself, not into the draft.** It is opened over
         // whatever is being written — often a half-finished message — and a search that ate those
         // keystrokes would destroy the very draft someone opened it to help finish.
-        let searching =
-            matches!(state.picker.as_ref().map(|p| &p.level), Some(crate::picker::Level::History { .. }));
+        let searching = matches!(
+            state.picker.as_ref().map(|p| &p.level),
+            Some(crate::picker::Level::History { .. })
+        );
         if searching {
             return match key.code {
                 KeyCode::Up => vec![Action::PickUp],
@@ -1754,22 +1756,22 @@ pub fn apply(state: &mut State, action: &Action) {
     // the commands behind one of them have no session to act on.
     if state.ever_connected
         && matches!(
-        action,
-        Action::Insert(_)
-            | Action::Backspace
-            | Action::Delete
-            | Action::DeleteWord
-            | Action::DeleteWordBefore
-            | Action::DeleteWordAfter
-            | Action::KillToStart
-            | Action::KillToEnd
-            | Action::Yank
-            | Action::Left
-            | Action::Right
-            | Action::WordLeft
-            | Action::WordRight
-            | Action::Home
-            | Action::End
+            action,
+            Action::Insert(_)
+                | Action::Backspace
+                | Action::Delete
+                | Action::DeleteWord
+                | Action::DeleteWordBefore
+                | Action::DeleteWordAfter
+                | Action::KillToStart
+                | Action::KillToEnd
+                | Action::Yank
+                | Action::Left
+                | Action::Right
+                | Action::WordLeft
+                | Action::WordRight
+                | Action::Home
+                | Action::End
         )
     {
         follow_the_slash(state);
@@ -6763,14 +6765,20 @@ mod tests {
     fn a_command_this_conversation_did_not_ask_for_is_not_shown() {
         let mut s = state();
         s.connected = true;
-        apply(&mut s, &Action::Frame(Frame::ExecStart { id: 1, command: "sleep 30".into(), session: None }));
+        apply(
+            &mut s,
+            &Action::Frame(Frame::ExecStart { id: 1, command: "sleep 30".into(), session: None }),
+        );
         let (_, text, hint) = crate::widgets::activity_parts_at(&s, std::time::Instant::now());
         assert!(!text.contains("sleep 30"), "somebody else's command was narrated: {text}");
         assert_eq!(hint, "", "this session has no turn to stop");
 
         // Ours, though, is exactly what this line is for.
         apply(&mut s, &Action::Frame(Frame::Status { running: true }));
-        apply(&mut s, &Action::Frame(Frame::ExecStart { id: 2, command: "cargo test".into(), session: None }));
+        apply(
+            &mut s,
+            &Action::Frame(Frame::ExecStart { id: 2, command: "cargo test".into(), session: None }),
+        );
         let (_, text, hint) = crate::widgets::activity_parts_at(&s, std::time::Instant::now());
         assert!(text.contains("cargo test"), "{text}");
         assert_eq!(hint, s.lang.esc_stops());
@@ -7201,10 +7209,7 @@ mod file_reference {
         assert!(!s.files_wanted, "the walk was asked for twice");
 
         // When it lands, the list fills in and narrows to what has been typed so far.
-        apply(
-            &mut s,
-            &Action::Frame(Frame::Files(vec!["src/app.rs".into(), "README.md".into()])),
-        );
+        apply(&mut s, &Action::Frame(Frame::Files(vec!["src/app.rs".into(), "README.md".into()])));
         let p = s.picker.as_ref().unwrap();
         assert!(!p.loading);
         // Both hold an "a"; the one whose *name* starts with it comes first.
@@ -7250,10 +7255,7 @@ mod file_reference {
         let pick = s.picker.as_ref().unwrap().pick().unwrap();
         assert_eq!(
             pick,
-            crate::picker::Pick::InsertPath {
-                at: 5,
-                path: "crates/zyris-code/src/app.rs".into()
-            }
+            crate::picker::Pick::InsertPath { at: 5, path: "crates/zyris-code/src/app.rs".into() }
         );
         let crate::picker::Pick::InsertPath { at, path } = &pick else { unreachable!() };
         insert_path(&mut s, *at, path);
@@ -7267,11 +7269,8 @@ mod file_reference {
     /// first makes the list feel like it ignored what was typed.
     #[test]
     fn the_file_you_named_ranks_above_a_path_that_merely_contains_it() {
-        let all: Vec<String> = vec![
-            "docs/apparatus/notes.md".into(),
-            "src/app.rs".into(),
-            "src/happy.rs".into(),
-        ];
+        let all: Vec<String> =
+            vec!["docs/apparatus/notes.md".into(), "src/app.rs".into(), "src/happy.rs".into()];
         let p = crate::picker::Picker::files(&all, "app", 0);
         let labels: Vec<&str> = p.rows.iter().map(|r| r.label.as_str()).collect();
         assert_eq!(labels, vec!["src/app.rs", "src/happy.rs", "docs/apparatus/notes.md"]);

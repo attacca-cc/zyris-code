@@ -36,7 +36,8 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Run {
     let Some(first) = args.first().map(String::as_str) else {
         return Run::Screen;
     };
-    let prompt = |text: &str| Run::Print((!text.trim().is_empty()).then(|| text.trim().to_string()));
+    let prompt =
+        |text: &str| Run::Print((!text.trim().is_empty()).then(|| text.trim().to_string()));
     match first {
         "-h" | "--help" => Run::Help,
         "-V" | "--version" => Run::Version,

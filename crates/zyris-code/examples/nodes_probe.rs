@@ -137,7 +137,8 @@ async fn register_a_child(creds: Arc<dyn Credentials>) -> Option<String> {
         );
         let _ = runner.try_run().await;
     });
-    let out = tokio::time::timeout(Duration::from_secs(30), rx.recv()).await.ok().flatten().flatten();
+    let out =
+        tokio::time::timeout(Duration::from_secs(30), rx.recv()).await.ok().flatten().flatten();
     task.abort();
     out
 }

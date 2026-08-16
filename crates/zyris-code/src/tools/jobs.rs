@@ -582,11 +582,7 @@ mod jobs_tests {
         let j = jobs();
         // `cmd /C` on Windows uses `&` to separate commands, not `;`. ASCII only — a Korean
         // word would come back in the console codepage rather than UTF-8 and never match.
-        let cmd = if cfg!(windows) {
-            "echo hi & echo err 1>&2"
-        } else {
-            "echo hi; echo err 1>&2"
-        };
+        let cmd = if cfg!(windows) { "echo hi & echo err 1>&2" } else { "echo hi; echo err 1>&2" };
         let id = j.start(shell(cmd)).unwrap();
         wait_for(&j, &id).await;
         let text = j.read(&id, 0).unwrap().text;
@@ -667,12 +663,8 @@ mod jobs_tests {
         let id = j
             .start(Spec {
                 command: Some(
-                    if cfg!(windows) {
-                        "echo %NO_COLOR%-%TERM%"
-                    } else {
-                        "echo $NO_COLOR-$TERM"
-                    }
-                    .into(),
+                    if cfg!(windows) { "echo %NO_COLOR%-%TERM%" } else { "echo $NO_COLOR-$TERM" }
+                        .into(),
                 ),
                 env: vec![("TERM".into(), "xterm".into())],
                 ..Default::default()

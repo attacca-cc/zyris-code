@@ -107,7 +107,6 @@ pub fn program() -> String {
         .unwrap_or_else(|| "zyris-code".into())
 }
 
-
 /// What the newest release is called, or `None` if the question could not be answered.
 ///
 /// **A failure here is silence.** Not reaching GitHub is the ordinary condition of a laptop on a
@@ -166,7 +165,8 @@ pub fn helper_script(tag: &str, dir: &Path, program: &str, pid: u32) -> String {
 /// **Detached is the whole point.** A child that dies with its parent would be killed by the very
 /// exit it is waiting for.
 pub fn spawn_helper(tag: &str) -> anyhow::Result<()> {
-    let dir = install_dir().ok_or_else(|| anyhow::anyhow!("could not find where this is installed"))?;
+    let dir =
+        install_dir().ok_or_else(|| anyhow::anyhow!("could not find where this is installed"))?;
     let program = program();
     let pid = std::process::id();
     let script = helper_script(tag, &dir, &program, pid);

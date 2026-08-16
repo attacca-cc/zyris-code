@@ -298,7 +298,11 @@ mod tests {
     /// The bridge tests stand the server up with `cat`, which Windows does not ship, and no
     /// Python (the other option) is not guaranteed either.
     fn echo_server() -> Option<&'static str> {
-        if cfg!(windows) { None } else { Some("cat") }
+        if cfg!(windows) {
+            None
+        } else {
+            Some("cat")
+        }
     }
 
     /// **MCP's inputSchema must become the request_schema as-is.**

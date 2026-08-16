@@ -198,10 +198,9 @@ impl Form {
                 Some(m) => 1 + Mode::ALL.iter().position(|it| *it == m).unwrap_or(0),
             },
             Setting::Theme => THEMES.iter().position(|t| *t == self.draft.theme).unwrap_or(0),
-            Setting::Update => crate::update::Policy::ALL
-                .iter()
-                .position(|p| *p == self.draft.update)
-                .unwrap_or(0),
+            Setting::Update => {
+                crate::update::Policy::ALL.iter().position(|p| *p == self.draft.update).unwrap_or(0)
+            }
         }
     }
 

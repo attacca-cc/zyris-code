@@ -296,7 +296,10 @@ mod tests {
         let s = LocalSearch::new(d.path().to_path_buf());
         let out = s.glob("**/*.rs".into(), None, None).await.unwrap();
         assert!(out.iter().any(|x| x == &p("src/app.rs")), "{out:?}");
-        assert!(!out.iter().any(|x| x.starts_with(p("target/").as_str())), "gitignore did not apply: {out:?}");
+        assert!(
+            !out.iter().any(|x| x.starts_with(p("target/").as_str())),
+            "gitignore did not apply: {out:?}"
+        );
     }
 
     /// **Paths are relative.** Given an absolute path, the home directory name rides on every result.

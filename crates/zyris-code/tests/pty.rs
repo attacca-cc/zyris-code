@@ -247,11 +247,7 @@ fn the_app_draws_on_a_pseudo_terminal_and_takes_a_keystroke() {
     app.wait_until_ready();
 
     app.send(b"hello");
-    assert!(
-        app.wait_for_text("hello"),
-        "a keystroke never reached the input box:\n{}",
-        app.text()
-    );
+    assert!(app.wait_for_text("hello"), "a keystroke never reached the input box:\n{}", app.text());
 }
 
 /// **The app ends when it is told to.** Ctrl+C arms the quit and the second one takes it; an app
@@ -292,11 +288,7 @@ fn quitting_gives_the_terminal_back() {
         ("mouse tracking", "\x1b[?1000l"),
         ("line wrapping", "\x1b[?7h"),
     ] {
-        assert!(
-            app.wait_for(seq),
-            "{what} was left switched on ({seq:?}):\n{}",
-            app.text()
-        );
+        assert!(app.wait_for(seq), "{what} was left switched on ({seq:?}):\n{}", app.text());
     }
 
     assert!(app.wait_for_exit().is_some(), "the app did not end after Ctrl+C:\n{}", app.text());

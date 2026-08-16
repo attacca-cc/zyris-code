@@ -664,7 +664,11 @@ mod tests {
     /// A command that runs for ~30s so an `until` call can time out against it.
     /// `cmd` has no `sleep`; `ping -n N 127.0.0.1` is the reliable wait there.
     fn long_running() -> &'static str {
-        if cfg!(windows) { "ping -n 35 127.0.0.1 >nul" } else { "sleep 30" }
+        if cfg!(windows) {
+            "ping -n 35 127.0.0.1 >nul"
+        } else {
+            "sleep 30"
+        }
     }
 
     /// **The canonical statement of the bug.** Not finished is not a failure — the agent
