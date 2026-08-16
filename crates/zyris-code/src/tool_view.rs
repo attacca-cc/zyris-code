@@ -94,7 +94,7 @@ pub fn action(name: &str, args: Option<&Value>, result: Option<&Value>) -> Strin
         // A shell line is the whole story. Whitespace is folded so a heredoc stays one row.
         (_, "exec") => s("command").map(one_line),
         // The changed file is authoritative from the result — the argument's path may be relative.
-        (_, "edit" | "multi_edit" | "write") => result
+        (_, "edit" | "write") => result
             .and_then(|r| r.get("path"))
             .and_then(Value::as_str)
             .filter(|v| !v.is_empty())
@@ -342,7 +342,7 @@ fn body_of(r: &Value, label: &str) -> Option<Detail> {
 /// point.** The result shape is ours (`tools::edit::EditResult`), but it came back around the
 /// server as JSON, so anything can arrive.
 fn diff_of(name: &str, r: &Value) -> Option<Diff> {
-    if !matches!(tail(name), "edit" | "multi_edit" | "write") {
+    if !matches!(tail(name), "edit" | "write") {
         return None;
     }
     Diff::parse(

@@ -175,7 +175,7 @@ what you open here is what you look up there.
 |---|---|
 | `search` | `glob`, `grep` — respects `.gitignore`, skips binaries |
 | `file_io` | `stat`, `list`, `read`, `read_stream` — **read only** |
-| `code_edit` | `edit`, `multi_edit`, `write` |
+| `code_edit` | `edit`, `write` |
 | `terminal` | `exec`, plus a full PTY: `open`, `read`, `write`, `screen`, `resize`, `close` |
 | `skill` | `list`, `load` |
 | `work` | `start`, `status`, `list`, `say`, `stop`, `resume` — hands a goal to attacca |
