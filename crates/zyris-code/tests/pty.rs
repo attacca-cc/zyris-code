@@ -21,10 +21,25 @@
 //! lost twenty minutes to exactly that. `read_until` gives up and hands back what it saw.
 
 use std::io::{Read, Write};
-use std::sync::mpsc;
+use std::sync::{mpsc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use portable_pty::{CommandBuilder, PtySize};
+
+/// **One pseudo-terminal at a time.**
+///
+/// Each of these starts a real app on a real console and drives it by hand. Two at once on a
+/// two-core runner starve each other: keystrokes written to one arrive late enough that the app
+/// has drawn past them, and which test loses is decided by the scheduler. On Windows they took
+/// turns failing run after run, one passing while the other did not and then the other way round
+/// — which is what contention looks like and what a real fault does not.
+static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+
+/// Held for the length of a test. **A panic elsewhere must not close this door** — a poisoned lock
+/// still hands over the turn, and the test that poisoned it has already reported its own failure.
+fn one_at_a_time() -> MutexGuard<'static, ()> {
+    ONE_AT_A_TIME.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// How long any one wait may take. Generous enough for a debug build starting on a loaded
 /// machine, short enough that a stuck test is still a test result.
@@ -188,11 +203,12 @@ impl Session {
     /// consumed, and would then faithfully redraw a half-typed line.
     fn type_and_see(&mut self, text: &str) -> bool {
         self.send(text.as_bytes());
-        for _ in 0..10 {
+        // Twenty tries at a second each, so the whole loop is bounded by `PATIENCE` even on a
+        // runner that is being slow rather than broken.
+        for _ in 0..20 {
             let looking_for = text.to_string();
-            if self.wait_until_by(Duration::from_millis(500), move |s| {
-                s.plain().contains(&looking_for)
-            }) {
+            if self.wait_until_by(Duration::from_secs(1), move |s| s.plain().contains(&looking_for))
+            {
                 return true;
             }
             self.send(b"\x0c");
@@ -239,6 +255,7 @@ impl Drop for Session {
 #[cfg(unix)]
 #[test]
 fn only_the_mouse_modes_this_app_reads_are_switched_on() {
+    let _turn = one_at_a_time();
     let mut app = Session::start();
     app.wait_until_ready();
     let out = app.text();
@@ -306,6 +323,7 @@ fn strip_escapes(raw: &str) -> String {
 /// shape most terminal differences take.
 #[test]
 fn the_app_draws_on_a_pseudo_terminal_and_takes_a_keystroke() {
+    let _turn = one_at_a_time();
     let mut app = Session::start();
     app.wait_until_ready();
 
@@ -316,6 +334,7 @@ fn the_app_draws_on_a_pseudo_terminal_and_takes_a_keystroke() {
 /// that cannot be closed from the keyboard is one a person has to kill from another window.
 #[test]
 fn ctrl_c_twice_ends_the_app() {
+    let _turn = one_at_a_time();
     let mut app = Session::start();
     app.wait_until_ready();
     app.send(b"\x03");
@@ -334,6 +353,7 @@ fn ctrl_c_twice_ends_the_app() {
 #[cfg(unix)]
 #[test]
 fn quitting_gives_the_terminal_back() {
+    let _turn = one_at_a_time();
     let mut app = Session::start();
     app.wait_until_ready();
 
@@ -369,6 +389,7 @@ fn quitting_gives_the_terminal_back() {
 /// writes that query only from its unix path — so what this guards is the unix build.
 #[test]
 fn a_terminal_that_answers_nothing_does_not_stall_the_app() {
+    let _turn = one_at_a_time();
     let mut app = Session::start();
     app.wait_until_ready();
 
