@@ -2372,3 +2372,18 @@ fn show_a_work_card() {
         }
     }
 }
+
+/// **A terminal that reports no room must not take the app down.**
+///
+/// Found by measurement, not by guesswork: a pseudo-terminal opened without a window size gave the
+/// app a zero-height area, and the cursor line subtracted one from it. A debug build panicked
+/// outright; a release build would wrap to 65535 and put the cursor nowhere. Terminals do report
+/// this — a detached session, a window mid-resize, `script` with no controlling terminal.
+#[test]
+fn a_screen_with_no_room_is_drawn_without_panicking() {
+    for (w, h) in [(0, 0), (0, 10), (10, 0), (1, 1), (2, 3)] {
+        let mut state = State::new();
+        // The point is that it returns at all; what it drew in nought cells is not a question.
+        let _ = dump(&mut state, w, h);
+    }
+}
