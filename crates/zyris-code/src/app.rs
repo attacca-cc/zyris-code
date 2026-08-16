@@ -2016,15 +2016,12 @@ fn apply_frame(state: &mut State, frame: &Frame) {
         // **The screen says when it dropped.** The activity line turns to "connecting…" and
         // the reason goes by once as a notice. Reconnecting is the Runner's job, and
         // `api_rx` tells us once it is back.
-        // **Only said, never done, here.** `apply` is pure; installing is the I/O side's, and it
-        // reads `update_wanted` the same way `/update` sets it.
+        // **Only mentioned here, never installed.** Installing happens on the plain terminal
+        // before this screen exists (`update::at_launch`), so what reaches this frame is the
+        // `notify` case: a release that exists and is waiting to be asked for. Under `auto` this
+        // process is already the new version and there is nothing to report.
         Frame::UpdateFound(tag) => {
-            if state.config.update == crate::update::Policy::Auto {
-                state.update_wanted = true;
-                state.set_status(state.lang.update_installing(tag));
-            } else {
-                state.set_status(state.lang.update_available(tag));
-            }
+            state.set_status(state.lang.update_available(tag));
             state.update_tag = Some(tag.clone());
         }
         Frame::Disconnected(why) => {
@@ -3062,10 +3059,9 @@ async fn run_inner(
     if git_on {
         spawn_git(&state.cwd, &tx, &git_busy);
     }
-    // **Asked once per run, before anything is waited on.** A release that appeared while this was
-    // open is not worth a second request, and the answer is only acted on when the screen is there
-    // to say so.
-    spawn_update_check(state.config.update, tx.clone());
+    // **Nothing here looks for a release.** That happened before this screen existed, on the
+    // terminal `main` still had (`update::at_launch`) — under `auto` this process is already the
+    // new version, and under `notify` the tag arrives as a frame through the bridge.
 
     let mut keys = EventStream::new();
     let mut ticker = tokio::time::interval(frame_interval());
@@ -3799,20 +3795,15 @@ async fn run_inner(
             }
         }
 
-        // **Every turn of the loop, not only after a keystroke.** The answer to "is there a newer
-        // release" arrives on its own, from a task nobody is waiting on, so a hand-over that was
-        // only checked in the key arm needed someone to press something before it could happen.
-        // Measured against a real release: the app sat on 0.2.0 with 0.2.1 published and did not
-        // move until a key was sent, which is not what `auto` promises.
-        //
-        // **Handing over is leaving.** The helper is already waiting on this process to end before
-        // it touches the binary, so these two must not be ordered the other way round — on Windows
-        // a running `.exe` cannot be replaced at all until this exits.
+        // **Asking for an update is leaving.** Nothing about installing belongs on this side: the
+        // installer prints as it works and the new version needs this terminal, and neither is
+        // possible while ratatui holds the screen. So the screen closes, and `main` — back on the
+        // plain terminal — does it. On Windows this is the whole bug: the old shape started the
+        // new binary from a process that was ending, which gave it a console of its own and left
+        // the window somebody was watching with nothing in it.
         if std::mem::take(&mut state.update_wanted) {
-            match hand_over_to_update(&mut state).await {
-                Ok(()) => break 'app,
-                Err(e) => state.set_error(state.lang.update_failed(&e.to_string())),
-            }
+            crate::update::request();
+            break 'app;
         }
     }
 
@@ -4906,40 +4897,6 @@ async fn send(
 ///
 /// **Abandoning does not stop the turn**; it keeps running on the server and is read back as
 /// history on return.
-/// Starts the helper that installs the newest release and comes back on it.
-///
-/// **The tag is whatever the check already found.** Asking again would open a window in which
-/// `latest` moves, and then what installs is not what was reported.
-async fn hand_over_to_update(state: &mut State) -> anyhow::Result<()> {
-    let tag = match state.update_tag.clone() {
-        Some(tag) => tag,
-        None => crate::update::latest_tag()
-            .await
-            .ok_or_else(|| anyhow::anyhow!("could not reach GitHub"))?,
-    };
-    if !crate::update::is_newer(&tag, env!("CARGO_PKG_VERSION")) {
-        state.timeline.say(state.lang.update_current().to_string());
-        anyhow::bail!("already current");
-    }
-    crate::update::spawn_helper(&tag)
-}
-
-/// Asks GitHub once, off the loop, whether there is a newer release.
-///
-/// **Off the loop and never blocking.** The answer is worth having and worth nothing if getting it
-/// costs a frozen screen — a laptop with no network would otherwise pay ten seconds at every start.
-fn spawn_update_check(policy: crate::update::Policy, tx: mpsc::UnboundedSender<AppMsg>) {
-    if policy == crate::update::Policy::Off {
-        return;
-    }
-    tokio::spawn(async move {
-        let Some(tag) = crate::update::latest_tag().await else { return };
-        if crate::update::is_newer(&tag, env!("CARGO_PKG_VERSION")) {
-            let _ = tx.send((None, Action::Frame(Frame::UpdateFound(tag))));
-        }
-    });
-}
-
 fn spawn_stream(
     api: Arc<AttaccaApiClient>,
     session: &mut Session,
@@ -5071,27 +5028,21 @@ mod tests {
         assert_eq!(mouse_actions(&s, ctrl), vec![Action::Press(12, 9)]);
     }
 
-    /// **The policy decides whether a machine replaces its own binary.** `auto` hands over on its
-    /// own; anything else says so and waits to be asked. Getting this backwards would either
-    /// install without consent or never install at all, and neither is visible until it happens.
+    /// **The screen never installs anything on its own, whatever the policy says.** Installing is
+    /// done on the plain terminal before this screen exists (`update::at_launch`), so a release
+    /// reported to it is news and nothing more. The old shape acted on `auto` from here, closed
+    /// itself, and left a detached script to start the new version — which on Windows opened a
+    /// console of its own and looked, from the window somebody was watching, like quitting.
     #[test]
-    fn only_auto_hands_over_on_its_own() {
-        use crate::update::Policy;
-        let found = |policy| {
+    fn a_release_found_while_the_screen_is_up_is_only_mentioned() {
+        for policy in crate::update::Policy::ALL {
             let mut s = state();
             s.config.update = policy;
             apply(&mut s, &Action::Frame(Frame::UpdateFound("v9.9.9".into())));
-            s
-        };
-
-        let auto = found(Policy::Auto);
-        assert!(auto.update_wanted, "auto did not ask for the handover");
-        assert_eq!(auto.update_tag.as_deref(), Some("v9.9.9"));
-
-        let notify = found(Policy::Notify);
-        assert!(!notify.update_wanted, "notify installed without being asked");
-        assert_eq!(notify.update_tag.as_deref(), Some("v9.9.9"), "but it still knows the tag");
-        assert!(notify.status().is_some(), "and it said so");
+            assert!(!s.update_wanted, "{policy:?} installed from the screen");
+            assert_eq!(s.update_tag.as_deref(), Some("v9.9.9"), "{policy:?} lost the tag");
+            assert!(s.status().is_some(), "{policy:?} said nothing about it");
+        }
     }
 
     /// `/update` asks for the handover whatever the policy is — that is what it is for, and

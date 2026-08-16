@@ -40,6 +40,14 @@ async fn main() -> ExitCode {
             println!("{program} {}", env!("CARGO_PKG_VERSION"));
             return ExitCode::SUCCESS;
         }
+        // **Nothing else is built for this.** No credential, no node, no screen — just the
+        // installer on the terminal that asked. On success it does not return: the new version
+        // takes this window over.
+        zyris_code::cli::Run::Update => {
+            zyris_code::lang::set(zyris_code::lang::startup());
+            zyris_code::update::install_now().await;
+            return ExitCode::SUCCESS;
+        }
         zyris_code::cli::Run::Bad(what) => {
             eprintln!("{program}: cannot read {what:?}. Try `{program} --help`.");
             return ExitCode::from(2);
@@ -95,6 +103,26 @@ async fn main() -> ExitCode {
     // **Decide the screen language first.** Even the words that go to the shell before connecting (`notice`) use this value.
     // Order: `$ZYRIS_CODE_LANG` → last choice → locale.
     zyris_code::lang::set(zyris_code::lang::startup());
+
+    // **Updating happens here, on the terminal, before anything else is built.**
+    //
+    // It used to happen from inside the screen: the app asked for an update, wrote a script out,
+    // started it detached and left; the script waited for the exit, installed, and started the new
+    // binary. On Windows that last step opens a **new console window** for a console program, so in
+    // `cmd` the app simply disappeared — reported 2026-08-17, and not fixable from that shape,
+    // because a process that is ending cannot hand its console to anything.
+    //
+    // Doing it here costs a moment at launch and gives the installer the terminal it needs to say
+    // what it is doing. `auto` does not come back from this line at all: it becomes the new version
+    // in this same window. What is left is a tag to mention, which only `notify` produces.
+    //
+    // **Print mode does not look.** `-p` is what a script runs; an install writing to its stdout
+    // would land in whatever it was piped into.
+    let newer = if printing.is_some() {
+        None
+    } else {
+        zyris_code::update::at_launch(zyris_code::config::Config::load().update).await
+    };
 
     // Credentials live in **an app-specific directory** — `~/.config/zyris-code/`.
     //
@@ -263,6 +291,13 @@ async fn main() -> ExitCode {
         ));
     }
     let _instance_lock = window;
+
+    // **`notify` says it here, through the same door as every other notice.** The check happened
+    // before the screen existed, so this is the one way the tag reaches it — and the bridge holds
+    // frames until the screen attaches, so saying it early loses nothing.
+    if let Some(tag) = newer {
+        bridge.frame(zyris_code::app::Frame::UpdateFound(tag));
+    }
     //
     // **The enrollment code is sent to the screen by upstream's `EnrollmentUi` hook** (`enroll.rs`, upstream PR #6).
     // Only when there's no screen (the extreme where the app couldn't start) does it fall to a stdout box. The old
@@ -390,7 +425,15 @@ async fn main() -> ExitCode {
         // silently with a bare exit code is worse in a script than anywhere else: the caller sees
         // a non-zero and nothing to act on.
         RunnerEnded::App(app_result) => match app_result {
-            Ok(Ok(())) => ExitCode::SUCCESS,
+            Ok(Ok(())) => {
+                // **`/update` is finished here, not on the screen.** The screen closed for it, so
+                // the terminal is back and the installer can be watched; on success this does not
+                // return at all, because the new version takes over this same window.
+                if zyris_code::update::requested() {
+                    zyris_code::update::install_now().await;
+                }
+                ExitCode::SUCCESS
+            }
             Ok(Err(e)) => {
                 if printing.is_some() {
                     eprintln!("{program}: {e}");

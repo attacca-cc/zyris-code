@@ -19,6 +19,12 @@ pub enum Run {
     Print(Option<String>),
     Help,
     Version,
+    /// Install the newest release now, whatever the policy says, and come back on it.
+    ///
+    /// **Its own invocation rather than a screen command.** Under `notify` the thing being reported
+    /// is that a version exists; opening the app to ask it to close again is a detour, and on a
+    /// machine where the screen will not start it is the only way in.
+    Update,
     /// Something we could not read. Held rather than printed here, so the one place that writes to
     /// the shell stays in `main`.
     Bad(String),
@@ -41,6 +47,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Run {
     match first {
         "-h" | "--help" => Run::Help,
         "-V" | "--version" => Run::Version,
+        "--update" => Run::Update,
         // Everything after the flag is the prompt, joined back with the spaces the shell split on.
         // Taking one word would silently drop the rest of an unquoted sentence — a shorter
         // question, answered, with nothing to show it had been cut.
@@ -66,6 +73,7 @@ USAGE
 
 OPTIONS
     -p, --print <prompt>  Print mode. Only the agent's answer goes to stdout, so it pipes.
+        --update          Install the newest release now and restart on it.
     -h, --help            This.
     -V, --version         Version.
 
@@ -134,6 +142,14 @@ mod tests {
         );
     }
 
+    /// **Updating is reachable without the screen.** Under `notify` it is the only thing to do
+    /// about what was reported, and on a machine whose terminal cannot run the app it is the only
+    /// way to move off a broken version.
+    #[test]
+    fn updating_is_an_invocation_of_its_own() {
+        assert_eq!(parse_of("--update"), Run::Update);
+    }
+
     #[test]
     fn help_and_version_are_answered() {
         for line in ["-h", "--help"] {
@@ -158,7 +174,7 @@ mod tests {
     #[test]
     fn every_flag_is_in_the_help() {
         let text = help("zyris");
-        for flag in ["-p", "--print", "-h", "--help", "-V", "--version"] {
+        for flag in ["-p", "--print", "--update", "-h", "--help", "-V", "--version"] {
             assert!(text.contains(flag), "{flag} is not in the help");
         }
     }
