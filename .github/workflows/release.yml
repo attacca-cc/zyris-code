@@ -160,11 +160,15 @@ jobs:
           # carry a pull request number and no description of the change.
           prev="$(git describe --tags --abbrev=0 "$TAG^" 2>/dev/null || true)"
           # **A release that needs something said goes and says it, at the top.**
-          # `docs/release-notes/<tag>.md` is read if it is there and ignored if it is not, so a
+          # `.github/release-notes/<tag>.md` is read if it is there and ignored if it is not, so a
           # one-off — an upgrade that behaves oddly once, a setting whose meaning changed — is
           # written for the release it belongs to and cannot follow the next one out. A paragraph
           # kept in this file instead would, and nobody would notice for a version or two.
-          note="docs/release-notes/$TAG.md"
+          #
+          # **Beside the workflow that reads it, because `docs/` is ignored here.** Put there
+          # first, the file was skipped by `git add` without a word and the workflow would have
+          # gone looking for something that never left the machine it was written on.
+          note=".github/release-notes/$TAG.md"
           {
             if [ -f "$note" ]; then
               cat "$note"
