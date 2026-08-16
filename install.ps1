@@ -50,12 +50,61 @@ $base = if ($Version) {
 }
 
 # ── Fetch ────────────────────────────────────────────────────────────────────
+#
+# **The archive is fetched by hand so it can say how far along it is.** `Invoke-WebRequest` has a
+# progress display of its own, but in Windows PowerShell it is a full-width banner drawn over the
+# top of the console and it costs more time than it explains — measurably several times the
+# download itself, because the bar is redrawn per read. Reading the stream here means one line,
+# rewritten in place, and no such cost.
+#
+# Everything smaller stays on `Invoke-WebRequest`: a bar for a one-line checksum file is noise.
+function Get-Archive {
+    param([string] $Url, [string] $Path)
+
+    # **Only drawn for somebody watching.** Redirected to a file or a build log, `\r` does not
+    # return anywhere and every update becomes another line.
+    $watching = -not [Console]::IsOutputRedirected
+
+    $response = ([Net.WebRequest]::Create($Url)).GetResponse()
+    $total = $response.ContentLength
+    $in = $response.GetResponseStream()
+    $out = [IO.File]::Create($Path)
+    try {
+        $buffer = New-Object byte[] 131072
+        $done = 0
+        $shown = -1
+        while (($read = $in.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            $out.Write($buffer, 0, $read)
+            $done += $read
+            # Redrawn when the number changes, not per read: at 128 KiB a chunk that is hundreds
+            # of writes for the same picture.
+            if ($watching -and $total -gt 0) {
+                $percent = [int](100 * $done / $total)
+                if ($percent -ne $shown) {
+                    $shown = $percent
+                    $filled = [int](28 * $percent / 100)
+                    # `#` and `.`, because a block-drawing character is a box in half the fonts a
+                    # Windows console ships with.
+                    $bar = ('#' * $filled) + ('.' * (28 - $filled))
+                    $size = '{0,6:N1}/{1:N1} MB' -f ($done / 1MB), ($total / 1MB)
+                    Write-Host ("`r  [{0}] {1,3}%  {2}" -f $bar, $percent, $size) -NoNewline
+                }
+            }
+        }
+        if ($shown -ge 0) { Write-Host '' }
+    } finally {
+        $out.Close()
+        $in.Close()
+        $response.Close()
+    }
+}
+
 $tmp = Join-Path ([IO.Path]::GetTempPath()) ("zyris-code-" + [Guid]::NewGuid())
 New-Item -ItemType Directory -Path $tmp -Force | Out-Null
 try {
     Write-Host "downloading $archive"
     try {
-        Invoke-WebRequest -Uri "$base/$archive" -OutFile (Join-Path $tmp $archive) -UseBasicParsing
+        Get-Archive -Url "$base/$archive" -Path (Join-Path $tmp $archive)
     } catch {
         throw "no build for $target in that release. See https://github.com/$Repo/releases"
     }
