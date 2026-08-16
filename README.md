@@ -1,8 +1,13 @@
 # zyris-code
 
+[![release](https://img.shields.io/github/v/release/attacca-cc/zyris-code?label=release&color=blue)](https://github.com/attacca-cc/zyris-code/releases/latest)
+[![check](https://github.com/attacca-cc/zyris-code/actions/workflows/check.yml/badge.svg)](https://github.com/attacca-cc/zyris-code/actions/workflows/check.yml)
+[![licence](https://img.shields.io/badge/licence-MIT%20OR%20Apache--2.0-blue)](#licence)
+
 A terminal coding client for [Attacca](https://attacca.cc) agents, built with
 [ratatui](https://ratatui.rs) and connected over the
 [Zyris](https://github.com/attacca-cc/zyris) protocol.
+Introduction and screenshots: **[zyris.attacca.cc/zyris-code](https://zyris.attacca.cc/zyris-code)**.
 
 It is not just a chat window. **It hands your machine to the agent**: reading and
 editing files, searching the tree, running shell commands, and exposing the tools
@@ -196,27 +201,10 @@ them; `status` and `list` are reads and go through.
 Type `/` and the command list opens; it narrows as you type. Commands run locally;
 only `/agent` and `/account` ask the server, for exactly what they need.
 
-| Command | Does |
-|---|---|
-| `/help` | List these |
-| `/mode [normal\|plan]` | Show or change the mode |
-| `/config [option value]` | Settings form, or set one: `dir allow\|deny`, `theme auto\|dark\|light`, `lang ko\|en`, `mode …\|off` |
-| `/account [logout]` | Who this node is attached as (email, plan, granted scopes); `logout` clears the stored credentials |
-| `/agent [name]` | Pick an agent (see below) |
-| `/mcp` | Connected MCP servers, and why any failed |
-| `/skills` | Available skills |
-| `/plugin [add\|remove\|update]` | Install and manage plugins |
-| `/rules` | Which `CLAUDE.md` / `AGENTS.md` files this session loaded |
-| `/reconnect` | Attach again — the way back when tool calls sit with no answer |
-| `/cwd` | Where tools resolve relative paths |
-| `/status` | Session, agent, mode and usage at a glance |
-| `/changes` | Files changed in this directory, with `+N −N` |
-| `/undo` | Revert the last edit |
-| `/clear` | Clear the screen — the session history on the server is untouched |
-| `/quit` | Leave. A running turn is stopped on the server first |
-
-`/help` also prints the key bindings — the table below is the same list, but a
-README is not open at the moment you need it.
+**`/help` is the list**, and it prints the keys too. There is deliberately no copy of
+either here: a table in a README drifts from the program one release at a time, and
+each page goes on looking right on its own. The list that ships with your build is the
+one that is true for your build.
 
 ### `/agent` opens a new thread
 
@@ -336,20 +324,12 @@ Plugins are loaded at startup, so restart to pick up a newly installed one.
 
 ## Keys
 
-| Key | Does |
-|---|---|
-| `Enter` | Send |
-| `Shift+Tab` | Cycle mode: normal → plan → work → job |
-| `Ctrl+O` | Fold / unfold the latest work card |
-| `←` | Project and session picker |
-| `↑` / `↓` | Recall previous messages |
-| `PageUp` / `PageDown` | Scroll the conversation by a page (works without a wheel) |
-| `Esc` | Cancel the running turn; close the enrollment-code panel (the only key that does) |
-| `Ctrl+C` | Cancel the running turn; press again to arm quitting, once more to quit |
-| Wheel · drag | Scroll · select and copy |
+`/help` prints the bindings your build actually has. What follows is only the handful
+whose behaviour is worth explaining rather than listing.
 
-The second `Ctrl+C` arms quitting even while a turn is still running, so a server
-that has stopped answering cannot trap you in the window.
+`Ctrl+C` cancels a running turn; pressing it again arms quitting, and once more quits.
+**The second press arms quitting even while a turn is still running**, so a server that
+has stopped answering cannot trap you in the window.
 
 **Closing the window stops the turn on the server.** The turn runs there, not
 here — left alone it keeps thinking, fails every tool call looking for a node
@@ -423,10 +403,19 @@ old one aside — which is also why an update there needs no manual step.
 ## Print mode
 
 ```bash
-zyris -p "what does this repo do?"     # one turn, the answer on stdout, exit
+zyris -p what does this repo do        # one turn, the answer on stdout, exit
 cat notes.md | zyris -p                # the prompt from stdin
 zyris -p "..." > answer.md             # only the answer is printed, so it pipes
 ```
+
+**No quotes needed** — everything after the flag is the prompt.
+
+The exception is zsh, and it is not this program's doing: a prompt containing `?` or `*` is read
+as a filename pattern, and when nothing matches, zsh refuses to run the command at all. The binary
+is never started, so it cannot help. `install.sh` therefore leaves an alias in `.zshrc` that runs
+these two names under `noglob`, after which `zyris -p what broke here?` works as typed. Without
+that alias, quote the prompt. bash needs none of this, and PowerShell passes arguments through
+untouched.
 
 `cargo install` puts the binary down as `zyris-code`; `install.sh` adds a `zyris` symlink beside
 it. They are the same file, so either name takes `-p`.
