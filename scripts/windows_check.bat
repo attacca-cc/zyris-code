@@ -1,7 +1,6 @@
 @echo off
-setlocal enabledelayedexpansion
-rem ============================================================================
-rem  zyris-code — Windows check
+rem ===========================================================================
+rem  zyris-code - Windows check
 rem
 rem  Fetches the develop branch, builds it, runs everything that can run without
 rem  a person watching, and writes a report next to this file.
@@ -9,15 +8,21 @@ rem
 rem  Usage:   windows_check.bat [work-dir]
 rem           work-dir defaults to %TEMP%\zyris-code-check
 rem
-rem  The pseudo-terminal tests DO run here: tests\pty.rs drives the app through a
-rem  ConPTY, so `cargo test` below covers drawing, keystrokes and shutdown on a
-rem  real console. The older scripts\*.py smokes remain unix-only.
+rem  The pseudo-terminal tests DO run here: tests\pty.rs drives the app through
+rem  a ConPTY, so the cargo test below covers drawing, keystrokes and shutdown
+rem  on a real console. The older scripts\*.py smokes remain unix-only.
 rem
-rem  What is left over needs eyes — colours, glyph widths, whether a drag looks
-rem  right — and that is the checklist at the end of the report.
-rem ============================================================================
+rem  What is left over needs eyes - colours, glyph widths, whether a drag looks
+rem  right - and that is the checklist at the end of the report.
+rem
+rem  THIS FILE MUST KEEP CRLF LINE ENDINGS AND STAY PURE ASCII.
+rem  cmd.exe seeks through a batch file by byte offset, so with LF endings the
+rem  position drifts by one per line and it starts running from the middle of
+rem  lines - "rem" becomes "m", and every line after that loses more. That is
+rem  what happened the first time this was handed over. .gitattributes pins it.
+rem ===========================================================================
 
-rem UTF-8, or the width section below prints mojibake and proves nothing.
+rem UTF-8, so the width section below prints glyphs rather than mojibake.
 chcp 65001 >nul 2>&1
 
 set "BRANCH=develop"
@@ -25,104 +30,169 @@ set "REPO=https://github.com/attacca-cc/zyris-code.git"
 set "WORKDIR=%~1"
 if "%WORKDIR%"=="" set "WORKDIR=%TEMP%\zyris-code-check"
 
-rem Timestamp for the report name. WMIC is gone on recent Windows, so fall back.
-for /f "usebackq tokens=*" %%t in (`powershell -NoProfile -Command "Get-Date -Format yyyy-MM-dd-HHmm"`) do set "STAMP=%%t"
-if "%STAMP%"=="" set "STAMP=report"
-set "REPORT=%~dp0windows-check-%STAMP%.md"
+rem A fixed name on purpose. %DATE% is formatted by locale, so slicing it for a filename
+rem produces different rubbish on every Windows this might run on - and a report that failed
+rem to be written is worse than one that overwrote the last.
+set "REPORT=%~dp0windows-check.md"
 
 echo.
 echo   zyris-code Windows check
-echo   branch    %BRANCH%
-echo   work dir  %WORKDIR%
-echo   report    %REPORT%
+echo     branch    %BRANCH%
+echo     work dir  %WORKDIR%
+echo     report    %REPORT%
 echo.
 
-> "%REPORT%" echo # zyris-code — Windows check
+> "%REPORT%" echo # zyris-code - Windows check
 >> "%REPORT%" echo.
->> "%REPORT%" echo Run at %DATE% %TIME% on branch `%BRANCH%`.
+>> "%REPORT%" echo Run at %DATE% %TIME% on branch %BRANCH%.
+
+rem --------------------------------------------------------------- machine --
+echo   == machine
 >> "%REPORT%" echo.
+>> "%REPORT%" echo ## Machine
+>> "%REPORT%" echo.
+>> "%REPORT%" echo ```
+ver >> "%REPORT%" 2>&1
+powershell -NoProfile -Command "(Get-CimInstance Win32_OperatingSystem) | Select-Object Caption,Version,OSArchitecture | Format-List" >> "%REPORT%" 2>&1
+>> "%REPORT%" echo ```
 
-rem ---------------------------------------------------------------- machine --
-call :section "Machine"
-call :run "ver" ver
-call :run "systeminfo (OS name and version)" powershell -NoProfile -Command "(Get-CimInstance Win32_OperatingSystem) | Select-Object Caption,Version,OSArchitecture | Format-List"
-
-rem ------------------------------------------------------------------ tools --
-call :section "Toolchain"
+rem ----------------------------------------------------------------- tools --
+echo   == toolchain
+>> "%REPORT%" echo.
+>> "%REPORT%" echo ## Toolchain
+>> "%REPORT%" echo.
+>> "%REPORT%" echo ```
 where git >nul 2>&1
 if errorlevel 1 (
-  call :fail "git is not on PATH. Install it from https://git-scm.com/download/win and run this again."
-  goto :finish
+  echo   !! git is not on PATH. Install from https://git-scm.com/download/win
+  >> "%REPORT%" echo git is NOT on PATH - install from https://git-scm.com/download/win
+  >> "%REPORT%" echo ```
+  goto :done
 )
 where cargo >nul 2>&1
 if errorlevel 1 (
-  call :fail "cargo is not on PATH. Install Rust from https://rustup.rs and run this again."
-  goto :finish
+  echo   !! cargo is not on PATH. Install Rust from https://rustup.rs
+  >> "%REPORT%" echo cargo is NOT on PATH - install Rust from https://rustup.rs
+  >> "%REPORT%" echo ```
+  goto :done
 )
-call :run "git --version" git --version
-call :run "rustc --version" rustc --version
-call :run "cargo --version" cargo --version
+git --version >> "%REPORT%" 2>&1
+rustc --version >> "%REPORT%" 2>&1
+cargo --version >> "%REPORT%" 2>&1
+>> "%REPORT%" echo ```
 
-rem ------------------------------------------------------------------ fetch --
-call :section "Source"
+rem ----------------------------------------------------------------- fetch --
+echo   == source
+>> "%REPORT%" echo.
+>> "%REPORT%" echo ## Source
+>> "%REPORT%" echo.
+>> "%REPORT%" echo ```
 if exist "%WORKDIR%\.git" (
-  echo   updating existing checkout...
+  echo      updating existing checkout
   pushd "%WORKDIR%"
-  call :run "git fetch" git fetch origin %BRANCH% --depth 50
-  call :run "git checkout" git checkout -B %BRANCH% origin/%BRANCH%
+  git fetch origin %BRANCH% --depth 50 >> "%REPORT%" 2>&1
+  git checkout -B %BRANCH% origin/%BRANCH% >> "%REPORT%" 2>&1
 ) else (
-  echo   cloning...
-  if not exist "%WORKDIR%" mkdir "%WORKDIR%"
-  call :run "git clone" git clone --branch %BRANCH% --depth 50 "%REPO%" "%WORKDIR%"
+  echo      cloning
+  git clone --branch %BRANCH% --depth 50 "%REPO%" "%WORKDIR%" >> "%REPORT%" 2>&1
   pushd "%WORKDIR%"
 )
-call :run "git log -1" git log -1 --format="%%H %%an %%ad %%s" --date=short
+git log -1 --format="%%H %%an %%ad %%s" --date=short >> "%REPORT%" 2>&1
+>> "%REPORT%" echo ```
 
-rem ------------------------------------------------------------------ build --
-call :section "Build"
-call :run "cargo build --workspace" cargo build --workspace
+rem ----------------------------------------------------------------- build --
+echo   == build (this takes a while)
+>> "%REPORT%" echo.
+>> "%REPORT%" echo ## Build
+>> "%REPORT%" echo.
+>> "%REPORT%" echo ```
+cargo build --workspace >> "%REPORT%" 2>&1
+if errorlevel 1 (
+  echo      FAILED
+  >> "%REPORT%" echo ```
+  >> "%REPORT%" echo **cargo build FAILED - see above.**
+  goto :eyes
+)
+>> "%REPORT%" echo ```
+>> "%REPORT%" echo OK.
 
-call :section "Tests"
-rem Includes tests\pty.rs, which runs the app under a ConPTY.
-call :run "cargo test --workspace" cargo test --workspace
-call :run "cargo test (pseudo-terminal, verbose)" cargo test -p zyris-code --test pty -- --nocapture
+rem ----------------------------------------------------------------- tests --
+echo   == tests
+>> "%REPORT%" echo.
+>> "%REPORT%" echo ## Tests
+>> "%REPORT%" echo.
+>> "%REPORT%" echo ```
+cargo test --workspace >> "%REPORT%" 2>&1
+if errorlevel 1 (
+  echo      FAILED
+  >> "%REPORT%" echo ```
+  >> "%REPORT%" echo **cargo test FAILED - see above.**
+) else (
+  >> "%REPORT%" echo ```
+  >> "%REPORT%" echo OK.
+)
 
-call :section "Clippy"
-call :run "cargo clippy --workspace --all-targets" cargo clippy --workspace --all-targets
+echo   == pseudo-terminal tests
+>> "%REPORT%" echo.
+>> "%REPORT%" echo ## Pseudo-terminal (ConPTY)
+>> "%REPORT%" echo.
+>> "%REPORT%" echo ```
+cargo test -p zyris-code --test pty -- --nocapture >> "%REPORT%" 2>&1
+if errorlevel 1 (
+  echo      FAILED
+  >> "%REPORT%" echo ```
+  >> "%REPORT%" echo **The ConPTY tests FAILED - this is the interesting one.**
+) else (
+  >> "%REPORT%" echo ```
+  >> "%REPORT%" echo OK.
+)
 
-rem ------------------------------------------------------- terminal capability
-call :section "What this terminal looks like from inside the app"
-call :run "cargo run --example term_report" cargo run --quiet --example term_report
+echo   == clippy
+>> "%REPORT%" echo.
+>> "%REPORT%" echo ## Clippy
+>> "%REPORT%" echo.
+>> "%REPORT%" echo ```
+cargo clippy --workspace --all-targets >> "%REPORT%" 2>&1
+>> "%REPORT%" echo ```
 
-popd
+rem ------------------------------------------------------------ capability --
+echo   == terminal capability
+>> "%REPORT%" echo.
+>> "%REPORT%" echo ## What this terminal looks like from inside the app
+>> "%REPORT%" echo.
+>> "%REPORT%" echo ```
+cargo run --quiet --example term_report >> "%REPORT%" 2>&1
+>> "%REPORT%" echo ```
 
-rem -------------------------------------------------------------- eyes-only --
+:eyes
 echo.
 echo   ------------------------------------------------------------------
-echo   The width check below has to be looked at, not parsed. Every ']'
-echo   should sit in the SAME column. One that is further right means that
-echo   character is drawn two columns wide here, which shifts every cell
-echo   after it and is the main reason this app breaks on some terminals.
+echo   Look at the rows below rather than reading them. Every ']' should
+echo   sit in the SAME column. One further right means that character is
+echo   drawn two columns wide here, which shifts everything after it and
+echo   is the main reason this app breaks on some terminals.
 echo   ------------------------------------------------------------------
 echo.
-pushd "%WORKDIR%"
 cargo run --quiet --example term_report 2>nul | findstr /C:"]"
-popd
 echo.
+popd
 
-call :section "Checklist — please fill in"
+rem ------------------------------------------------------------- checklist --
+>> "%REPORT%" echo.
+>> "%REPORT%" echo ## Checklist - please fill in
+>> "%REPORT%" echo.
 >> "%REPORT%" echo These need a person and a real terminal. Replace [ ] with [x] or [FAIL],
 >> "%REPORT%" echo and add a line under anything that failed.
 >> "%REPORT%" echo.
->> "%REPORT%" echo Terminal used: ^<Windows Terminal / cmd.exe / PowerShell window / other^>
+>> "%REPORT%" echo Terminal used: (Windows Terminal / cmd.exe / PowerShell window / other)
 >> "%REPORT%" echo.
->> "%REPORT%" echo - [ ] The app starts and draws a screen (`cargo run -p zyris-code`)
+>> "%REPORT%" echo - [ ] The app starts and draws a screen (cargo run -p zyris-code)
 >> "%REPORT%" echo - [ ] Typing shows in the input box, Backspace deletes
 >> "%REPORT%" echo - [ ] Ctrl+U clears back to the start, Ctrl+W deletes a word, Ctrl+Y puts it back
 >> "%REPORT%" echo - [ ] Shift+Enter makes a newline (if not, Alt+Enter must)
 >> "%REPORT%" echo - [ ] Arrow keys and Home/End move the cursor
 >> "%REPORT%" echo - [ ] Shift+Tab cycles the mode shown at the bottom left
->> "%REPORT%" echo - [ ] `/` opens the command list and typing narrows it
+>> "%REPORT%" echo - [ ] Typing / opens the command list and typing narrows it
 >> "%REPORT%" echo - [ ] Mouse wheel scrolls the conversation
 >> "%REPORT%" echo - [ ] Dragging over text highlights it
 >> "%REPORT%" echo - [ ] After a drag, Ctrl+V into Notepad pastes that text
@@ -134,17 +204,16 @@ call :section "Checklist — please fill in"
 >> "%REPORT%" echo - [ ] Ctrl+C once stops a running turn, twice quits
 >> "%REPORT%" echo - [ ] After quitting, the shell is normal again (colours, cursor, long lines wrap)
 >> "%REPORT%" echo - [ ] No stray escape characters anywhere on screen
+>> "%REPORT%" echo - [ ] zyris-code -p "say hello" prints an answer and exits
 >> "%REPORT%" echo.
->> "%REPORT%" echo If something failed, run again with these and say whether it changed:
+>> "%REPORT%" echo If something failed, set one of these and say whether it changed:
 >> "%REPORT%" echo.
->> "%REPORT%" echo ```
->> "%REPORT%" echo set ZYRIS_CODE_MOUSE=0        ^&rem hand selection back to the terminal
->> "%REPORT%" echo set ZYRIS_CODE_HYPERLINKS=0   ^&rem stop sending OSC 8
->> "%REPORT%" echo set ZYRIS_CODE_OSC52=0        ^&rem stop sending clipboard writes
->> "%REPORT%" echo set ZYRIS_CODE_HEAL_MS=300    ^&rem redraw more often, for leftover characters
->> "%REPORT%" echo ```
+>> "%REPORT%" echo     set ZYRIS_CODE_MOUSE=0          hand selection back to the terminal
+>> "%REPORT%" echo     set ZYRIS_CODE_HYPERLINKS=0     stop sending OSC 8
+>> "%REPORT%" echo     set ZYRIS_CODE_OSC52=0          stop sending clipboard writes
+>> "%REPORT%" echo     set ZYRIS_CODE_HEAL_MS=300      redraw more often, for leftover characters
 
-:finish
+:done
 echo.
 echo   Done. Report written to:
 echo   %REPORT%
@@ -152,49 +221,3 @@ echo.
 echo   Please fill in the checklist at the end of it and send the file back.
 echo.
 pause
-endlocal
-exit /b 0
-
-rem ---------------------------------------------------------------- helpers --
-
-:section
->> "%REPORT%" echo.
->> "%REPORT%" echo ## %~1
->> "%REPORT%" echo.
-echo   == %~1
-exit /b 0
-
-:run
-rem %1 is the label, the rest is the command.
-set "LABEL=%~1"
-shift
-set "CMD=%1"
-:build_cmd
-shift
-if "%1"=="" goto :run_it
-set "CMD=!CMD! %1"
-goto :build_cmd
-:run_it
-echo   - %LABEL%
->> "%REPORT%" echo ### %LABEL%
->> "%REPORT%" echo.
->> "%REPORT%" echo ```
-!CMD! >> "%REPORT%" 2>&1
-set "RC=!errorlevel!"
->> "%REPORT%" echo ```
->> "%REPORT%" echo.
-if not "!RC!"=="0" (
-  echo       FAILED with exit code !RC!
-  >> "%REPORT%" echo **FAILED — exit code !RC!**
-  >> "%REPORT%" echo.
-) else (
-  >> "%REPORT%" echo OK.
-  >> "%REPORT%" echo.
-)
-exit /b 0
-
-:fail
-echo   !! %~1
->> "%REPORT%" echo **%~1**
->> "%REPORT%" echo.
-exit /b 0
