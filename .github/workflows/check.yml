@@ -53,8 +53,12 @@ jobs:
       - name: Pseudo-terminal
         run: cargo test -p zyris-code --test pty -- --nocapture
 
+      # **Warnings are errors here.** This repo's rule is zero of them, and without this nothing
+      # enforced it: a Windows check came back with six that neither job had ever failed on,
+      # because they only appear on the platform none of us builds on (2026-08-17). A
+      # contributor's first build of a public repo should not open with a wall of them.
       - name: Clippy
-        run: cargo clippy --workspace --all-targets
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       # **The installers are the only code here nothing else compiles.** They are also what every
       # first install and every automatic update runs, so a typo in one is a release that cannot be
