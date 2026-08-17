@@ -90,8 +90,7 @@ pub fn extract(rows: &[String], drag: &Drag) -> String {
 /// bottom while every row between kept its dividers, which reads as damage rather than tidying.
 fn is_code_fence(row: &str) -> bool {
     let rest = row.trim_start_matches(' ');
-    (rest.starts_with('┌') || rest.starts_with('└'))
-        && !rest.contains(['┐', '┘', '┬', '┴'])
+    (rest.starts_with('┌') || rest.starts_with('└')) && !rest.contains(['┐', '┘', '┬', '┴'])
 }
 
 /// The per-row column spans the drag highlights, as `(row, from, to)` with `to` exclusive. Empty

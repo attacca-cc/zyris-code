@@ -488,14 +488,15 @@ fn an_update_keeps_the_terminal_it_was_started_in() {
 /// `Ctrl+U` takes the draft, `Ctrl+Y` puts it back — the one pair where losing the second key costs
 /// work, because this input box has no undo and what `Ctrl+U` took is nowhere else. It was reported
 /// not to work on Windows (2026-08-17), and nothing here could say whether the key was even
-/// arriving: the handling is shared with `Ctrl+U`, which does work, so the suspicion was that the
-/// console never delivers it. A pseudo-terminal is where that question has an answer — and on
-/// Windows this one is a ConPTY, the same path a console takes.
+/// arriving: the handling is shared with `Ctrl+U`, which does work. A pseudo-terminal is where that
+/// question has an answer, and on Windows this one is a ConPTY — the same path a console takes.
 ///
-/// **Judged by the two words ending up joined**, never by one of them going away. What is read here
-/// is everything the app has ever written, so text that has been erased is still in it — an
-/// assertion that something is absent would pass on a screen that still shows it. `betaalpha` can
-/// only be there if the second key put back what the first one took.
+/// **Judged by the word being written to the screen again**, not by finding it joined to another.
+/// Only changed cells go out, and replacing a five-cell word with a four-cell one puts a rubbing-out
+/// space and a backspace between them — so the two words are on screen side by side while the bytes
+/// that drew them are not adjacent, and looking for them joined fails on a screen that is correct.
+/// Counting is also why this cannot be fooled by a repaint: with the draft cut the word is not on
+/// screen, so nothing can draw it again until something puts it back.
 ///
 /// The bytes are the control codes themselves (`0x15`, `0x19`), because that is what a terminal
 /// sends and what a console turns back into a key event.
@@ -506,19 +507,16 @@ fn what_ctrl_u_takes_ctrl_y_puts_back() {
     app.wait_until_ready();
 
     assert!(app.type_and_see("alpha"), "the draft never arrived:\n{}", app.text());
-    app.send(b"\x15"); // Ctrl+U — with the cursor at the end, the whole draft.
-    assert!(app.type_and_see("beta"), "nothing could be typed after the cut:\n{}", app.text());
-    app.send(b"\x19"); // Ctrl+Y — `alpha` comes back, after `beta`.
 
-    // Only changed cells go out, so the two words are unlikely to be sent as one run. Ctrl+L asks
-    // for the whole screen again, which is what `type_and_see` does for the same reason.
-    let mut back = false;
-    for _ in 0..20 {
-        if app.wait_until_by(Duration::from_secs(1), |s| s.plain().contains("betaalpha")) {
-            back = true;
-            break;
-        }
-        app.send(b"\x0c");
-    }
+    app.send(b"\x15"); // Ctrl+U — with the cursor at the end, the whole draft.
+
+    // Let the screen go quiet. The periodic self-heal redraws everything every couple of seconds,
+    // and this keeps reading it — with the draft cut, none of it can say `alpha`. Draining matters
+    // in its own right: a pty nobody reads fills up and stops the app drawing.
+    app.wait_until_by(Duration::from_secs(3), |_| false);
+    let before = app.plain().matches("alpha").count();
+
+    app.send(b"\x19"); // Ctrl+Y — it comes back.
+    let back = app.wait_until(move |s| s.plain().matches("alpha").count() > before);
     assert!(back, "Ctrl+Y did not put back what Ctrl+U took:\n{}", app.text());
 }
