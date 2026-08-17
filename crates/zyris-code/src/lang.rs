@@ -1445,6 +1445,12 @@ impl Lang {
     pub fn update_current(self) -> &'static str {
         self.pick("이미 최신입니다.", "Already the newest release.")
     }
+    /// While `/update` is finding out whether there is a newer release. **Something has to be said
+    /// meanwhile**: the answer can take a few seconds, and a command that appears to do nothing
+    /// reads as one that did not go in.
+    pub fn update_checking(self) -> &'static str {
+        self.pick("새 버전을 확인하는 중…", "Looking for a newer release…")
+    }
     /// Said when the release could not be looked up, or the handover could not be started.
     pub fn update_failed(self, why: &str) -> String {
         match self {

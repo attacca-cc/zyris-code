@@ -185,6 +185,22 @@ pub fn draw(frame: &mut Frame, state: &mut State) {
     // colour that is about to be laid over it.
     state.screen = screen_rows(frame.buffer_mut());
 
+    // **While the button is down, the anchor follows its line and the far end stays under the
+    // pointer.** Which line is at the top is only settled by drawing, so this is where the anchor
+    // can be worked out; `apply` is pure and could not. Riding both ends together, right once the
+    // button is up, slid the highlight away from the pointer as the conversation scrolled.
+    state.reanchor_drag();
+    // Then what the highlight covers is what gets copied. The text is normally built on the drag
+    // itself, which is enough because a drag runs at hand speed — but a scroll moves the words
+    // under a pointer that never moved, and there is no drag event to rebuild it. The screen it
+    // reads was snapshotted a few lines up, so it is the one now under the highlight.
+    if std::mem::take(&mut state.selection_stale) {
+        if let Some(drag) = state.drag.filter(|d| !d.is_click()) {
+            let text = crate::selection::extract(&state.screen, &drag);
+            state.selection = (!text.trim().is_empty()).then_some(text);
+        }
+    }
+
     // **Mouse selection follows the text, not a box.** Every cell under the drag's per-line
     // spans is washed in a faint theme colour (`selection_bg`) so the highlight shows exactly
     // the text that will be copied — blank cells before the start stay untouched. This runs

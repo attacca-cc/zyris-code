@@ -52,16 +52,46 @@ pub fn extract(rows: &[String], drag: &Drag) -> String {
     let from = |row: &str, at: usize| at.max(body_start(row));
 
     if r0 == r1 {
+        if is_code_fence(&rows[r0]) {
+            return String::new();
+        }
         let (a, b) = (c0.min(c1), c0.max(c1) + 1);
         return slice_cols(&rows[r0], from(&rows[r0], a), b);
     }
 
-    let mut out = vec![slice_cols(&rows[r0], from(&rows[r0], c0), usize::MAX)];
-    for row in &rows[r0 + 1..r1] {
-        out.push(slice_cols(row, body_start(row), usize::MAX));
+    // **A fence is not a line of the text, so it does not leave one behind.** Dropping it rather
+    // than emptying it is the difference between pasting the code and pasting the code with a
+    // blank line top and bottom.
+    let mut out = Vec::new();
+    if !is_code_fence(&rows[r0]) {
+        out.push(slice_cols(&rows[r0], from(&rows[r0], c0), usize::MAX));
     }
-    out.push(slice_cols(&rows[r1], body_start(&rows[r1]), c1 + 1));
+    for row in &rows[r0 + 1..r1] {
+        if !is_code_fence(row) {
+            out.push(slice_cols(row, body_start(row), usize::MAX));
+        }
+    }
+    if !is_code_fence(&rows[r1]) {
+        out.push(slice_cols(&rows[r1], body_start(&rows[r1]), c1 + 1));
+    }
     out.join("\n")
+}
+
+/// Is this row the top or bottom edge the screen draws around a code block?
+///
+/// **The whole row is furniture, not just its margin.** `body_start` takes the rule off the front
+/// of a code line, but these two rows are drawn entirely by the renderer — dragging across a block
+/// came back with `┌─ powershell` and `└─` around the code, which is neither code nor anything that
+/// can be pasted (reported 2026-08-17). The language on the opening one goes with it: it labels the
+/// frame, and it was never in what the agent wrote.
+///
+/// **A table's border is left alone.** It uses the same corners but closes them (`┐`, `┘`) and
+/// divides its columns (`┬`, `┴`); dropping those rows would paste a table missing its top and
+/// bottom while every row between kept its dividers, which reads as damage rather than tidying.
+fn is_code_fence(row: &str) -> bool {
+    let rest = row.trim_start_matches(' ');
+    (rest.starts_with('┌') || rest.starts_with('└'))
+        && !rest.contains(['┐', '┘', '┬', '┴'])
 }
 
 /// The per-row column spans the drag highlights, as `(row, from, to)` with `to` exclusive. Empty
@@ -403,5 +433,44 @@ mod tests {
     #[test]
     fn selecting_nothing_gives_an_empty_string() {
         assert_eq!(extract(&[], &Drag::new((0, 0))), "");
+    }
+
+    /// **The frame around a code block is not part of the code.** Dragging over a block came back
+    /// with `┌─ powershell` and `└─` wrapped around it — drawn by the screen, written by nobody,
+    /// and nothing a shell will take. They are dropped rather than blanked, so what is pasted is
+    /// the code and not the code with an empty line at each end.
+    #[test]
+    fn the_frame_drawn_around_a_code_block_is_not_copied() {
+        let rows = vec![
+            "  ┌─ powershell ".to_string(),
+            "  │ Get-Date".to_string(),
+            "  │ exit 0".to_string(),
+            "  └─".to_string(),
+        ];
+        let d = Drag { from: (0, 0), to: (3, 20) };
+        assert_eq!(extract(&rows, &d), "Get-Date\nexit 0");
+    }
+
+    /// Landing entirely on a fence selects nothing, rather than a line of drawing.
+    #[test]
+    fn a_drag_that_covers_only_the_fence_takes_nothing() {
+        let rows = vec!["  ┌─ sh ".to_string()];
+        assert_eq!(extract(&rows, &Drag { from: (0, 0), to: (0, 7) }), "");
+    }
+
+    /// **A table keeps its border.** The corners are the same characters, but a table's border
+    /// closes and divides — dropping those rows would paste a table with no top or bottom while
+    /// every row between kept its dividers, which reads as damage rather than tidying.
+    #[test]
+    fn a_tables_border_is_left_where_it_is() {
+        let rows = vec![
+            "  ┌────┬────┐".to_string(),
+            "  │ a  │ b  │".to_string(),
+            "  └────┴────┘".to_string(),
+        ];
+        let d = Drag { from: (0, 0), to: (2, 20) };
+        let got = extract(&rows, &d);
+        assert!(got.contains('┌'), "the table lost its top:\n{got}");
+        assert!(got.contains('┘'), "the table lost its bottom:\n{got}");
     }
 }
