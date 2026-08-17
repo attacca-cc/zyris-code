@@ -192,9 +192,29 @@ pub fn install_dir() -> Option<PathBuf> {
 ///
 /// **Read before anything is installed, and kept.** Once the file has been replaced, Linux reports
 /// `/proc/self/exe` as the old path with ` (deleted)` on the end, and starting that goes nowhere.
+///
+/// **Brought back from the extended-length form.** On Windows `canonicalize` returns a `\\?\C:\…`
+/// path, and this directory is handed to the installer's PowerShell — where `Join-Path` cannot
+/// parse that prefix and fails with a null drive, which is exactly what broke self-update there.
 fn exe_path() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
-    Some(std::fs::canonicalize(&exe).unwrap_or(exe))
+    let resolved = std::fs::canonicalize(&exe).unwrap_or(exe);
+    match resolved.to_str().and_then(strip_extended_prefix) {
+        Some(ordinary) => Some(PathBuf::from(ordinary)),
+        None => Some(resolved),
+    }
+}
+
+/// Turn a Windows extended-length path (`\\?\C:\…`, or the UNC form `\\?\UNC\server\share`) into
+/// the ordinary one, or `None` when there is no such prefix.
+///
+/// **Always compiled, so it is tested off Windows.** `canonicalize` only ever produces these
+/// there, but cfg-gating the logic would put it past the reach of the check that runs here.
+fn strip_extended_prefix(s: &str) -> Option<String> {
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        return Some(format!(r"\\{rest}"));
+    }
+    s.strip_prefix(r"\\?\").map(str::to_string)
 }
 
 /// The name the binary was started under, so the relaunch is the same command.
@@ -522,5 +542,26 @@ mod tests {
             assert_eq!(Policy::parse(p.as_str()), Some(p));
         }
         assert_eq!(Policy::default(), Policy::Auto);
+    }
+
+    /// **The installer is handed an ordinary path, never the extended-length one.**
+    /// `canonicalize` returns `\\?\C:\…` on Windows, and the PowerShell that places the binary
+    /// fails on that prefix — `Join-Path` reports a null drive and the update dies at exit 1
+    /// before anything is replaced. This is the shape that has to come off.
+    #[test]
+    fn an_extended_length_windows_path_is_brought_back_to_an_ordinary_one() {
+        assert_eq!(
+            strip_extended_prefix(r"\\?\C:\Users\win11\AppData\Local\Programs\zyris-code")
+                .as_deref(),
+            Some(r"C:\Users\win11\AppData\Local\Programs\zyris-code"),
+        );
+        assert_eq!(
+            strip_extended_prefix(r"\\?\UNC\server\share\zyris-code").as_deref(),
+            Some(r"\\server\share\zyris-code"),
+            "the UNC form comes back to \\\\server\\share, not a bare drive",
+        );
+        // Anything without the prefix is left for the caller to keep as-is.
+        assert_eq!(strip_extended_prefix(r"C:\Program Files\zyris-code"), None);
+        assert_eq!(strip_extended_prefix("/home/ruma/.local/bin"), None);
     }
 }

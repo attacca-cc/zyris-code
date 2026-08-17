@@ -2076,7 +2076,11 @@ fn apply_frame(state: &mut State, frame: &Frame) {
         // `notify` case: a release that exists and is waiting to be asked for. Under `auto` this
         // process is already the new version and there is nothing to report.
         Frame::UpdateFound(tag) => {
-            state.set_status(state.lang.update_available(tag));
+            // **Into the conversation, not onto the status line.** This lands right after connect,
+            // and "connected" comes in behind it and takes the status line within the moment — so
+            // the one time there is something new to say, it was gone before it could be read. The
+            // transcript holds it where the prompt is, so it stays until it is scrolled past.
+            state.timeline.say(state.lang.update_available(tag));
             state.update_tag = Some(tag.clone());
         }
         Frame::Disconnected(why) => {
@@ -3526,22 +3530,6 @@ async fn run_inner(
                     }
                     apply(&mut state, &action);
 
-                    // **The turn stream starts once the history is in.** It resumes from just
-                    // past what was re-read, and that cursor exists only after the replay —
-                    // opening it before would either re-deliver the whole thread or skip the
-                    // events that arrived while it was loading.
-                    if matches!(action, Action::Frame(Frame::History { .. })) {
-                        if let Some(id) = session.id().map(str::to_string) {
-                            spawn_stream(
-                                Arc::clone(&api),
-                                &mut session,
-                                id,
-                                state.last_cursor,
-                                tx.clone(),
-                            );
-                        }
-                    }
-
                     // **Selected text goes to the clipboard the moment the mouse is
                     // released.** There is no key to press — leaving Ctrl+C as the one stop
                     // key is less confusing when it matters. `apply` sets the range, so
@@ -3699,6 +3687,21 @@ async fn run_inner(
                     }
                 }
                 apply(&mut state, &action);
+
+                // **The turn stream opens once the history is in — and this is where it lands.**
+                // A switch reaches a session through `spawn_history`, whose frame arrives here on
+                // the channel, so the live turn feed has to be opened from here. It used to be
+                // opened from the key path, where `Frame::History` never appears — `on_key` only
+                // ever produces user actions — so switching into a session that was still working
+                // showed its past and then nothing, reading as "Taking a break". It resumes from
+                // just past what was re-read; that cursor exists only after the replay, so opening
+                // any earlier would re-deliver the whole thread or skip what arrived while it
+                // loaded.
+                if matches!(action, Action::Frame(Frame::History { .. })) {
+                    if let Some(id) = session.id().map(str::to_string) {
+                        spawn_stream(Arc::clone(&api), &mut session, id, state.last_cursor, tx.clone());
+                    }
+                }
                 // If background polling changed the title, the window title follows. `switch`
                 // changes state.title too, so both are watched here in one place.
                 if state.title != shown_title {
@@ -4439,7 +4442,24 @@ async fn finish_command(
                 crate::lang::save(lang);
             }
         }
-        Command::Config(None) => {}
+        // **Read the files at the moment it is opened.** Another window may have written these
+        // settings since this one launched, so the form has to show what is on disk now, not the
+        // copy this window loaded at start — that stale view was the whole complaint, and worse, a
+        // save from here would then write the old values back over the other window's change. The
+        // same read-at-open that `Mcp(None)` does. The palette and the directory policy are the two
+        // that change behaviour, so the window follows what it now shows rather than displaying one
+        // value while acting on another. `run_command` built the panel from the in-memory copy;
+        // rebuild it from disk.
+        Command::Config(None) => {
+            state.config = crate::config::Config::load();
+            if let Some(l) = crate::lang::load() {
+                crate::lang::set(l);
+                state.lang = l;
+            }
+            crate::theme::set(state.config.theme.resolve());
+            bridge.sync(state.mode, &state.config);
+            state.panel = Some(crate::panel::config(state.lang, state.config));
+        }
         Command::Changes => {
             let said = match bridge.undo() {
                 Some(undo) => state.lang.changes_text(&undo.changed(), &state.cwd),
@@ -5125,7 +5145,12 @@ mod tests {
             apply(&mut s, &Action::Frame(Frame::UpdateFound("v9.9.9".into())));
             assert!(!s.update_wanted, "{policy:?} installed from the screen");
             assert_eq!(s.update_tag.as_deref(), Some("v9.9.9"), "{policy:?} lost the tag");
-            assert!(s.status().is_some(), "{policy:?} said nothing about it");
+            // **Into the transcript, not the status line.** The status line is taken by
+            // "connected" the moment after, so the notice has to live where it can be read.
+            let mentioned = s.timeline.items().iter().any(|item| {
+                matches!(item, crate::timeline::Item::System { text, .. } if text.contains("v9.9.9"))
+            });
+            assert!(mentioned, "{policy:?} did not say the new version in the conversation");
         }
     }
 

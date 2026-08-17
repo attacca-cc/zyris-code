@@ -525,8 +525,24 @@ pub fn help_text(lang: crate::lang::Lang) -> String {
         Lang::En => ("Commands you can type.\n", "\n\n**Keys**\n"),
     };
     let mut s = String::from(head);
-    for (name, note) in catalogue(lang) {
-        s.push_str(&format!("\n- `{name}` ‒ {note}"));
+    // **The other names a command answers to are printed beside it.** They are in `COMMANDS`
+    // already and the parser has always taken them — `/exit` has worked as long as `/quit` has —
+    // but nothing said so anywhere, and a name nobody can see is a name nobody types.
+    //
+    // **Only here, not in the `/` list.** That list's rows are what gets typed into the input when
+    // one is picked, so a label carrying `(exit)` would put those characters in the draft and
+    // narrow against them as you type. The help is read; the list is used.
+    for c in COMMANDS {
+        let note = match lang {
+            Lang::Ko => c.note_ko,
+            Lang::En => c.note_en,
+        };
+        let others = if c.aliases.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", c.aliases.join(", "))
+        };
+        s.push_str(&format!("\n- `{}{}` ‒ {note}", c.name, others));
     }
     s.push_str(keys_head);
     for (key, note) in keys(lang) {
@@ -706,6 +722,33 @@ mod tests {
     }
 
     /// The help text comes from the list — written by hand, one would go stale.
+    /// **A name nobody can see is a name nobody types.** The parser has taken these all along —
+    /// `/exit` for `/quit`, `/diff` for `/changes` — and the help said nothing about any of them.
+    #[test]
+    fn the_help_names_the_other_words_a_command_answers_to() {
+        for lang in [crate::lang::Lang::Ko, crate::lang::Lang::En] {
+            let text = help_text(lang);
+            for c in COMMANDS {
+                for alias in c.aliases {
+                    assert!(
+                        text.contains(alias),
+                        "{lang:?}: /{} answers to {alias} and the help never says so",
+                        c.name
+                    );
+                }
+            }
+        }
+    }
+
+    /// **And the `/` list does not carry them**, because picking a row types it: a label reading
+    /// `/quit (exit)` would put that in the draft and narrow against it as you type.
+    #[test]
+    fn the_command_list_keeps_the_bare_names() {
+        for (name, _) in catalogue(crate::lang::Lang::En) {
+            assert!(!name.contains('('), "{name} is a label, not something that can be typed");
+        }
+    }
+
     #[test]
     fn the_help_text_lists_everything_in_the_catalogue() {
         let help = help_text(crate::lang::Lang::Ko);

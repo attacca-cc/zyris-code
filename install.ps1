@@ -22,6 +22,17 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# A self-update hands us the install directory it read with Rust's canonicalize, which on Windows
+# is the extended-length form (\\?\C:\...). PowerShell's path cmdlets cannot parse that prefix:
+# Join-Path fails with "the value of argument 'drive' is null" and the install dies at exit 1
+# before the binary is placed, so the update never takes and every launch tries again. Bring it
+# back to an ordinary path. Written to tolerate old binaries too — they fetch this script fresh.
+if ($Dir) {
+    if ($Dir.StartsWith('\\?\UNC\')) { $Dir = '\\' + $Dir.Substring('\\?\UNC\'.Length) }
+    elseif ($Dir.StartsWith('\\?\')) { $Dir = $Dir.Substring('\\?\'.Length) }
+}
+
 # Without this, older PowerShell hosts negotiate a TLS version GitHub no longer accepts and the
 # download fails with something that reads like a network fault.
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
