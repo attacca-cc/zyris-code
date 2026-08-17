@@ -185,6 +185,28 @@ pub fn border_light() -> Color {
     pick((0x4a, 0x3e, 0x36), (0xb3, 0xa6, 0x97))
 }
 
+/// A colour mixed `amount` of the way toward the background, where 0 is the colour untouched and 1
+/// is the background itself.
+///
+/// **This is what fading means on a terminal.** There is no opacity to turn down — a cell has one
+/// foreground colour and that is all — so the way to make something recede is to move its colour
+/// toward what is behind it. The web page this app is modelled on does the same thing with
+/// `opacity`, and against a solid background the two are the same arithmetic.
+///
+/// **`Modifier::DIM` is not a substitute.** It is one step, terminals disagree about how big a step
+/// it is, and some ignore it — so an animation built on it either does not move or jumps.
+///
+/// Anything that is not true colour is returned untouched: there is nothing to interpolate between
+/// on a sixteen-colour terminal, and a guess would be worse than leaving it alone.
+pub fn fade(colour: Color, amount: f64) -> Color {
+    let amount = amount.clamp(0.0, 1.0);
+    let (Color::Rgb(r, g, b), Color::Rgb(br, bg_, bb)) = (colour, bg()) else {
+        return colour;
+    };
+    let mix = |from: u8, to: u8| (from as f64 + (to as f64 - from as f64) * amount).round() as u8;
+    Color::Rgb(mix(r, br), mix(g, bg_), mix(b, bb))
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Text
 // ─────────────────────────────────────────────────────────────────────────────
@@ -315,6 +337,25 @@ mod tests {
         set(theme);
         body();
         set(before);
+    }
+
+    /// **Fading is the terminal's opacity.** A cell has one foreground colour, so the only way to
+    /// make something recede is to move it toward what is behind it — and the two ends have to be
+    /// exactly the colour and exactly the background, or an animation would jump at its edges.
+    #[test]
+    fn fading_walks_a_colour_to_the_background_and_no_further() {
+        with(Theme::Dark, || {
+            let c = warning();
+            assert_eq!(fade(c, 0.0), c, "no fade must change nothing");
+            assert_eq!(fade(c, 1.0), bg(), "a full fade must land on the background");
+            assert_eq!(fade(c, -1.0), c);
+            assert_eq!(fade(c, 2.0), bg());
+
+            let (mid, (a, b)) = (rgb(fade(c, 0.5)), (rgb(c), rgb(bg())));
+            for (m, (x, y)) in [(mid.0, (a.0, b.0)), (mid.1, (a.1, b.1)), (mid.2, (a.2, b.2))] {
+                assert!(m >= x.min(y) && m <= x.max(y), "half a fade left the range");
+            }
+        });
     }
 
     fn rgb(c: Color) -> (f64, f64, f64) {

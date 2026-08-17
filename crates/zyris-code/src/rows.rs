@@ -143,16 +143,23 @@ pub type Folds = HashMap<i64, Fold>;
 
 /// What the turn is doing right now, as far as drawing is concerned.
 ///
-/// **Two flags that always travel together.** `running` decides whether cards and chips are open
-/// (see [`effective_open`]) and `blink` is the phase a pending tool's dot is drawn at; splitting
-/// them across signatures only made every layer carry two more parameters.
+/// **Two values that always travel together.** `running` decides whether cards and chips are open
+/// (see [`effective_open`]) and `pulse` is how far a waiting tool's dot has receded; splitting them
+/// across signatures only made every layer carry two more parameters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Turn {
     pub running: bool,
-    /// The bright half of the pending dot's blink. Driven by the frame counter, not a clock, so
-    /// drawing stays pure.
-    pub blink: bool,
+    /// How far toward the background a waiting dot is drawn, in sixteenths — 0 is full colour and
+    /// 16 is invisible. **A number rather than the flag it replaced**: on and off is a hard flicker
+    /// that pulls the eye off what is being read, and the page this app is modelled on breathes the
+    /// colour instead. Held in whole steps so it can be compared, which is what the row cache needs
+    /// to decide whether a card has to be built again.
+    pub pulse: u8,
 }
+
+/// The steps a pulse is quantised to. **Not smoother than this on purpose**: every distinct value
+/// is a rebuild of the card being worked on, and past a certain point the eye cannot tell anyway.
+pub const PULSE_STEPS: u8 = 16;
 
 /// The rendered result. Along with the lines it gives **which line is the head of which work card**.
 ///
@@ -253,6 +260,32 @@ fn live_card(items: &[Item], running: bool) -> Option<i64> {
         Some(Item::Work { seq, .. }) if running => Some(*seq),
         _ => None,
     }
+}
+
+/// The seqs of everything that folds *inside* the card with this seq — its reasoning chips and its
+/// tool rows. Empty for anything that is not a card, because nothing else has children.
+///
+/// **Used to forget what was open inside a card the person just closed.** Every node lives in one
+/// flat `Folds` map, so closing a card left its children's entries behind and reopening it brought
+/// back a tool somebody had opened several minutes and one collapse ago (reported 2026-08-18).
+/// Closing something is how a person says they are finished with it, and what is inside it goes
+/// with it.
+pub fn inside(items: &[Item], card: i64) -> Vec<i64> {
+    items
+        .iter()
+        .find_map(|item| match item {
+            Item::Work { seq, parts, .. } if *seq == card => Some(
+                parts
+                    .iter()
+                    .map(|part| match part {
+                        Part::Think(t) => t.seq,
+                        Part::Step(s) => s.seq,
+                    })
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .unwrap_or_default()
 }
 
 /// Where an item sits. `begin` is the start **including the separator blank line before it**.
@@ -377,7 +410,7 @@ impl Cache {
             if skip == Some(seq) {
                 continue;
             }
-            let turn = Turn { running: live == Some(seq), blink: turn.blink };
+            let turn = Turn { running: live == Some(seq), pulse: turn.pulse };
             // `affecting` is already exactly "(node, effective open)" for every node in this
             // item, so the click handler reads it from here rather than recomputing the rule.
             let now = affecting(item, folds, turn.running);
@@ -485,7 +518,7 @@ fn blank() -> Line<'static> {
 /// lockstep with `out`: **every** line pushed must push a link entry, empty unless the line's
 /// text came from a link.
 fn make(item: &Item, width: u16, folds: &Folds, turn: Turn, lang: crate::lang::Lang) -> Made {
-    let Turn { running, blink } = turn;
+    let Turn { running, pulse } = turn;
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut links: Vec<Vec<crate::markdown::Link>> = Vec::new();
     let mut heads: Vec<(usize, i64)> = Vec::new();
@@ -697,7 +730,7 @@ fn make(item: &Item, width: u16, folds: &Folds, turn: Turn, lang: crate::lang::L
                     }
                     Part::Step(step) => {
                         let open = effective_open(NodeKind::Tool, &fold_of(folds, step.seq), false);
-                        let (rows, clickable) = tool_row(step, open, blink, width, lang);
+                        let (rows, clickable) = tool_row(step, open, pulse, width, lang);
                         if clickable {
                             heads.push((out.len(), step.seq));
                         }
@@ -718,22 +751,22 @@ fn make(item: &Item, width: u16, folds: &Folds, turn: Turn, lang: crate::lang::L
 fn tool_row(
     step: &Step,
     open: bool,
-    blink: bool,
+    pulse: u8,
     width: u16,
     lang: crate::lang::Lang,
 ) -> (Vec<Line<'static>>, bool) {
     use crate::tool_view::{Detail, ToolState};
     let mut out: Vec<Line<'static>> = Vec::new();
     let can_open = !matches!(step.detail, Detail::None);
-    // **The dot reads the call, not the turn.** Pending is yellow and blinks, a failure is red, a
+    // **The dot reads the call, not the turn.** Waiting is yellow and breathes, a failure is red, a
     // return is green. Painting "the last tool of a running turn" yellow instead would call every
     // other in-flight call finished.
     let dot = match step.state {
         ToolState::Failed => Span::styled("● ", Style::default().fg(theme::danger())),
         ToolState::Ok => Span::styled("● ", Style::default().fg(theme::success())),
         ToolState::Pending => {
-            let style = Style::default().fg(theme::warning());
-            Span::styled("● ", if blink { style } else { style.add_modifier(Modifier::DIM) })
+            let amount = f64::from(pulse.min(PULSE_STEPS)) / f64::from(PULSE_STEPS);
+            Span::styled("● ", Style::default().fg(theme::fade(theme::warning(), amount)))
         }
     };
     let mut head = vec![
@@ -1162,7 +1195,7 @@ mod tests {
     /// Draws with the last card being worked on right now — the state most of these assertions are
     /// about, since a finished stretch folds itself away.
     fn live(items: &[Item], width: u16, folds: &Folds, lang: crate::lang::Lang) -> Rendered {
-        rows_with(items, width, folds, None, lang, Turn { running: true, blink: false })
+        rows_with(items, width, folds, None, lang, Turn { running: true, pulse: 0 })
     }
 
     /// The first chip's fold key, so a test can open a single chip.
@@ -1459,7 +1492,7 @@ mod tests {
                 40,
                 &folds,
                 None,
-                Turn { running: false, blink: false },
+                Turn { running: false, pulse: 0 },
                 crate::lang::Lang::Ko,
             );
 
@@ -1482,7 +1515,7 @@ mod tests {
             40,
             &folds,
             None,
-            Turn { running: false, blink: false },
+            Turn { running: false, pulse: 0 },
             crate::lang::Lang::Ko,
         );
         for (from, to) in [(0usize, 3usize), (2, 5), (1, cache.total()), (0, cache.total())] {
@@ -1509,7 +1542,7 @@ mod tests {
             40,
             &folds,
             None,
-            Turn { running: false, blink: false },
+            Turn { running: false, pulse: 0 },
             crate::lang::Lang::Ko,
         );
         let first = cache.renders();
@@ -1520,7 +1553,7 @@ mod tests {
             40,
             &folds,
             None,
-            Turn { running: false, blink: false },
+            Turn { running: false, pulse: 0 },
             crate::lang::Lang::Ko,
         );
         assert_eq!(cache.renders(), first, "unchanged, not a single row is drawn again");
@@ -1534,7 +1567,7 @@ mod tests {
             40,
             &folds,
             None,
-            Turn { running: false, blink: false },
+            Turn { running: false, pulse: 0 },
             crate::lang::Lang::Ko,
         );
         assert_eq!(cache.renders(), first + 1, "only the changed one is drawn again");
@@ -1553,7 +1586,7 @@ mod tests {
             40,
             &Folds::new(),
             None,
-            Turn { running: false, blink: false },
+            Turn { running: false, pulse: 0 },
             crate::lang::Lang::Ko,
         );
         let before = cache.renders();
@@ -1566,7 +1599,7 @@ mod tests {
             40,
             &opened,
             None,
-            Turn { running: false, blink: false },
+            Turn { running: false, pulse: 0 },
             crate::lang::Lang::Ko,
         );
         assert_eq!(cache.renders(), before + 1, "only the card holding that chip is drawn again");
@@ -1587,7 +1620,7 @@ mod tests {
             40,
             &folds,
             None,
-            Turn { running: false, blink: false },
+            Turn { running: false, pulse: 0 },
             crate::lang::Lang::Ko,
         );
         let before = cache.renders();
@@ -1597,7 +1630,7 @@ mod tests {
             80,
             &folds,
             None,
-            Turn { running: false, blink: false },
+            Turn { running: false, pulse: 0 },
             crate::lang::Lang::Ko,
         );
         assert_eq!(cache.renders(), before + items.len() as u64);
@@ -1623,7 +1656,7 @@ mod tests {
             40,
             &Folds::new(),
             Some(2),
-            Turn { running: false, blink: false },
+            Turn { running: false, pulse: 0 },
             crate::lang::Lang::Ko,
         );
         assert!(
@@ -1637,7 +1670,7 @@ mod tests {
             40,
             &Folds::new(),
             None,
-            Turn { running: false, blink: false },
+            Turn { running: false, pulse: 0 },
             crate::lang::Lang::Ko,
         );
         assert!(
@@ -1913,7 +1946,7 @@ mod tests {
             60,
             &card_open,
             None,
-            Turn { running: false, blink: false },
+            Turn { running: false, pulse: 0 },
             crate::lang::Lang::Ko,
         );
         let before = cache.renders();
@@ -1925,7 +1958,7 @@ mod tests {
             60,
             &both,
             None,
-            Turn { running: false, blink: false },
+            Turn { running: false, pulse: 0 },
             crate::lang::Lang::Ko,
         );
         assert_eq!(cache.renders(), before + 1, "a tool was unfolded but nothing was redrawn");
@@ -2060,7 +2093,7 @@ mod tests {
             &Folds::new(),
             None,
             crate::lang::Lang::Ko,
-            Turn { running: true, blink: false },
+            Turn { running: true, pulse: 0 },
         ))
         .remove(0);
         assert!(running.contains("보고서 작성 중"), "{running:?}");
@@ -2084,7 +2117,7 @@ mod tests {
             &Folds::new(),
             None,
             crate::lang::Lang::Ko,
-            Turn { running: true, blink: false },
+            Turn { running: true, pulse: 0 },
         ));
         assert_eq!(out[0].trim_end_matches([' ', '▾']), "✻ 결과를 보고 중", "{out:?}");
     }
@@ -2103,7 +2136,7 @@ mod tests {
                 60,
                 &Folds::new(),
                 None,
-                Turn { running, blink: false },
+                Turn { running, pulse: 0 },
                 crate::lang::Lang::Ko,
             );
             cache.plain()

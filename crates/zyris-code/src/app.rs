@@ -436,6 +436,9 @@ pub struct State {
     ///
     /// `None` when the press did not land in the conversation, where there is nothing to scroll.
     pub drag_anchor: Option<usize>,
+    /// When each open fold was opened, for as long as its body is still arriving. Entries are
+    /// dropped as they finish, so this is empty on an idle screen.
+    pub opened_at: std::collections::HashMap<i64, Instant>,
     /// The highlight moved without the mouse moving, so the text under it is no longer what was
     /// copied. Recomputed once the next frame has been drawn — that is when the screen it reads
     /// from is the screen it now covers.
@@ -626,6 +629,7 @@ impl Default for State {
             drag: None,
             drag_top: 0,
             drag_anchor: None,
+            opened_at: std::collections::HashMap::new(),
             selection_stale: false,
             dragging: false,
             screen: Vec::new(),
@@ -671,6 +675,14 @@ impl Default for State {
 
 /// After one Ctrl+C, pressing again within this window quits.
 pub const QUIT_WINDOW: Duration = Duration::from_millis(1500);
+
+/// How long the body of a fold takes to arrive.
+///
+/// **Short enough to be over before it is waited on.** This is feedback that something opened, not
+/// a thing to watch; the web page this app is modelled on lands its rows in 320ms and this is the
+/// same order. It also bounds the extra drawing — the frame loop keeps redrawing for exactly this
+/// long after a fold and then goes quiet again.
+const FADE_IN: Duration = Duration::from_millis(260);
 
 /// A column past the right of any terminal, for the end of a selection that carries on below what
 /// can be seen. Both the highlight and the extraction clamp a column to the width they are given,
@@ -820,6 +832,66 @@ impl State {
         if !self.drag_can_scroll() {
             self.drag = None;
         }
+    }
+
+    /// Opens a foldable node if it is shut, shuts it if it is open — and remembers that a person
+    /// decided, so the run stops deciding for them.
+    ///
+    /// **Flips what is drawn, not what is stored.** A running card draws open while its stored fold
+    /// still says `open: false`; flipping the stored one there does nothing visible at all. Written
+    /// back at once rather than left to the next frame, so two clicks arriving before a repaint do
+    /// not both read the same stale state and fold twice.
+    ///
+    /// **Closing a card forgets what was open inside it.** Every node lives in one flat map keyed by
+    /// seq, so a chip or a tool row opened inside a card kept its entry when the card shut — and
+    /// opening the card again brought all of it back, spilling out reasoning and tool output nobody
+    /// had asked for since (reported 2026-08-18). Closing something is how a person says they are
+    /// done with it.
+    ///
+    /// **One place, because there are two ways in** — a click and Ctrl+O. Written twice, one of them
+    /// would eventually be the one that did not get the fix.
+    pub fn flip_fold(&mut self, seq: i64) {
+        let shown = self.view_open.get(&seq).copied();
+        let fold = self.folds.entry(seq).or_default();
+        fold.open = !shown.unwrap_or(fold.open);
+        fold.user_touched = true;
+        let now = fold.open;
+        self.view_open.insert(seq, now);
+        if now {
+            // **Stamped where it happened**, the same way a notice is (`status_at`) — the frame
+            // that draws it has no way to know when the fold was opened, and threading a clock
+            // through the drawing side to find out would be worse than stamping it here.
+            self.opened_at.insert(seq, Instant::now());
+        } else {
+            self.opened_at.remove(&seq);
+            for child in crate::rows::inside(self.timeline.items(), seq) {
+                self.folds.remove(&child);
+                self.view_open.remove(&child);
+                self.opened_at.remove(&child);
+            }
+        }
+    }
+
+    /// Is anything still fading in? The frame loop keeps drawing while this is true and stops on
+    /// its own when it goes false, so an idle screen is idle again a moment after the last fold.
+    pub fn opening(&self) -> bool {
+        self.opened_at.values().any(|at| at.elapsed() < FADE_IN)
+    }
+
+    /// How far the body of each node has yet to come, as the fraction of the way to the background
+    /// it is still drawn at — 1 is invisible, 0 is arrived. Nodes that have finished are left out.
+    ///
+    /// **Read while drawing rather than stored per line.** The lines a fold reveals are already
+    /// built and cached; only their colour changes over these few frames, so this stays out of the
+    /// cache entirely and is applied to the copies `Cache::window` hands back each frame.
+    pub fn fading_in(&self) -> std::collections::HashMap<i64, f64> {
+        self.opened_at
+            .iter()
+            .filter_map(|(seq, at)| {
+                let left = FADE_IN.checked_sub(at.elapsed())?;
+                Some((*seq, left.as_secs_f64() / FADE_IN.as_secs_f64()))
+            })
+            .collect()
     }
 
     /// What a scroll does to the selection.
@@ -1603,12 +1675,7 @@ pub fn apply(state: &mut State, action: &Action) {
                 _ => None,
             });
             if let Some(key) = key {
-                let shown = state.view_open.get(&key).copied();
-                let fold = state.folds.entry(key).or_default();
-                fold.open = !shown.unwrap_or(fold.open);
-                fold.user_touched = true;
-                let now = fold.open;
-                state.view_open.insert(key, now);
+                state.flip_fold(key);
             }
         }
         Action::ToggleTodos => state.todos_open = !state.todos_open,
@@ -1679,15 +1746,7 @@ pub fn apply(state: &mut State, action: &Action) {
                 state.drag = None;
                 let content = state.content_at(drag.from.1 as u16, drag.from.0 as u16);
                 if let Some(&seq) = content.and_then(|(r, _)| state.view_cards.get(&r)) {
-                    let shown = state.view_open.get(&seq).copied();
-                    let fold = state.folds.entry(seq).or_default();
-                    fold.open = !shown.unwrap_or(fold.open);
-                    fold.user_touched = true;
-                    // **Written back at once, not left to the next frame.** Two clicks landing
-                    // before a repaint would otherwise both read the same stale state and fold
-                    // twice.
-                    let now = fold.open;
-                    state.view_open.insert(seq, now);
+                    state.flip_fold(seq);
                 }
             }
         }
@@ -3931,6 +3990,13 @@ async fn run_inner(
                 // While working the dot has to blink, so keep redrawing. One frame is around
                 // 0.2ms, so it is no burden — before, this was not possible.
                 if state.running {
+                    dirty = true;
+                }
+                // Something is still fading in, so the next frame is a different picture even
+                // though nothing happened. **Ends by itself** — `opening` only answers true for the
+                // few hundred milliseconds after a fold was opened, so an idle screen goes back to
+                // being drawn only when it changes.
+                if state.opening() {
                     dirty = true;
                 }
                 // A running thread's status dot in the picker blinks too, so the list must be
@@ -6445,6 +6511,80 @@ mod tests {
         apply(&mut s, &Action::Press(1, 2));
         apply(&mut s, &Action::Release);
         assert_eq!(s.folds.get(&5).map(|f| f.open), Some(true));
+    }
+
+    /// **Closing a card forgets what was opened inside it.** Every foldable node lives in one flat
+    /// map keyed by seq, so a tool row opened inside a card kept its entry when the card was shut —
+    /// and opening the card again spilled that tool's output back out, long after anyone had asked
+    /// for it (reported 2026-08-18). Closing something is how a person says they are done with it.
+    #[test]
+    fn closing_a_card_forgets_what_was_open_inside_it() {
+        let mut s = state();
+        apply(&mut s, &work_start(1));
+        apply(
+            &mut s,
+            &Action::Frame(Frame::Event {
+                cursor: 2,
+                entry: Some(Entry {
+                    seq: 2,
+                    kind: EntryKind::Tool {
+                        name: "read".into(),
+                        action: "src/app.rs".into(),
+                        state: crate::tool_view::ToolState::Ok,
+                        detail: crate::tool_view::Detail::Body {
+                            label: "src/app.rs".into(),
+                            text: "what it said".into(),
+                        },
+                    },
+                }),
+                todo: None,
+            }),
+        );
+
+        // Open the card, then the tool inside it.
+        s.flip_fold(1);
+        s.flip_fold(2);
+        assert_eq!(s.folds.get(&2).map(|f| f.open), Some(true), "the tool never opened");
+
+        // Close the card. What was inside goes with it.
+        s.flip_fold(1);
+        assert_eq!(s.folds.get(&2), None, "the tool kept its own state past the card closing");
+
+        // So opening the card again shows the tool shut, the way it starts out.
+        s.flip_fold(1);
+        assert_eq!(
+            s.folds.get(&2).map(|f| f.open),
+            None,
+            "reopening the card brought the tool back open",
+        );
+    }
+
+    /// **Opening starts the body arriving; closing stops it.** The frame loop keeps drawing while
+    /// anything is fading, so an entry left behind by a node that was closed again would hold an
+    /// idle screen redrawing for nothing.
+    #[test]
+    fn opening_a_fold_starts_it_arriving_and_closing_it_stops() {
+        let mut s = state();
+        apply(&mut s, &work_start(1));
+
+        s.flip_fold(1);
+        assert!(s.opening(), "opening said nothing was arriving");
+        assert!(s.fading_in().contains_key(&1), "the body it revealed is not fading in");
+
+        s.flip_fold(1);
+        assert!(!s.opening(), "closing left the screen redrawing for a body nobody can see");
+        assert!(s.fading_in().is_empty());
+    }
+
+    /// And it finishes by itself, so the screen goes back to being drawn only when it changes.
+    #[test]
+    fn an_arrival_ends_on_its_own() {
+        let mut s = state();
+        apply(&mut s, &work_start(1));
+        s.flip_fold(1);
+        s.opened_at.insert(1, Instant::now() - FADE_IN - Duration::from_millis(1));
+        assert!(!s.opening(), "the fade never ended");
+        assert!(s.fading_in().is_empty(), "a finished fade is still being applied");
     }
 
     /// **A highlight in the conversation rides along with it.** Scrolling moves the text and the
