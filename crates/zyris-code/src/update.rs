@@ -259,6 +259,16 @@ async fn newest(within: Duration) -> Option<String> {
     }
 }
 
+/// The newest release if it is newer than `current`, and nothing if it is not.
+///
+/// **What `/update` asks before the screen closes.** Closing is what hands the installer the
+/// terminal, so it cannot be undone once done — and doing it first meant a `/update` on an
+/// up-to-date copy threw the conversation away to report that there was nothing to do. The same
+/// question `install_now` asks; asked while there is still something to keep.
+pub async fn newer_than(current: &str) -> Option<String> {
+    newest(ASK_TIMEOUT).await.filter(|tag| is_newer(tag, current))
+}
+
 /// Where the installer for `tag` is fetched from.
 ///
 /// **Pinned to the release being installed**, never `latest`: between the check and the install a

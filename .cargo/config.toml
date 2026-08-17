@@ -1,0 +1,23 @@
+# **The Windows build carries its own C runtime.**
+#
+# An MSVC build links `VCRUNTIME140.dll` by default, and that DLL is not part of Windows — it
+# arrives with the Visual C++ redistributable. On a machine without it the binary does not start at
+# all: Windows puts up its own dialog saying the program could not be started and that reinstalling
+# it may fix the problem, which is a lie in a helpful voice, since reinstalling brings the same
+# binary and the same missing DLL. That was reported, and reading the shipped exe's import table on
+# a Windows 11 machine confirmed it — `VCRUNTIME140.dll` alongside the `api-ms-win-crt-*` set.
+#
+# The UCRT half (`api-ms-win-crt-*`) ships with Windows 10 and later and would have been fine on
+# its own. It is `VCRUNTIME140.dll` that has to go, and static linking is what removes it.
+#
+# **The cost is a larger binary**, and that the C runtime can only be updated by shipping a new
+# release. For a single self-updating executable people download and run, that is the better side
+# of the trade: one that cannot start is worth nothing at all.
+#
+# `cc` builds the C dependencies (aws-lc-sys, by way of rustls) with `/MT` rather than `/MD` when
+# it sees this, so the whole binary agrees about which runtime it uses.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

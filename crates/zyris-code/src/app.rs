@@ -36,6 +36,14 @@ pub enum Frame {
     /// A newer release was found. Carried as a frame rather than acted on where it was found,
     /// because the check runs off the loop and `apply` is the one place that changes state.
     UpdateFound(String),
+    /// The answer to a `/update` that had to go and ask. `Some` is the release to install, `None`
+    /// that this is already it.
+    ///
+    /// **Asked before the screen closes, not after.** Installing needs the plain terminal, so the
+    /// screen has to go — but it used to go before anyone had checked, and a `/update` on a current
+    /// copy threw the session away to print "already the newest" at a shell prompt (reported
+    /// 2026-08-18). Nothing is worth closing a conversation for until there is something to install.
+    UpdateChecked(Option<String>),
     /// The agent opened a shell. **Not saying so leaves a ghost shell running.**
     ShellOpened {
         id: String,
@@ -416,6 +424,22 @@ pub struct State {
     /// Which line of the conversation was at the top when the highlight was made, so the drawing
     /// side can work out how far its text has moved since.
     pub drag_top: usize,
+    /// The conversation line the drag was started on, while the button is still down.
+    ///
+    /// **The end held under the mouse and the end left behind move differently.** Scrolling moves
+    /// the text, so the anchor has to travel with it to stay on the word it was put on — but the
+    /// mouse has not moved, so its end must stay exactly where it is. Riding both ends along
+    /// together, which is right once the button is up, made a scroll slide the whole highlight
+    /// away from the pointer instead of extending it (reported 2026-08-18). Keeping the anchor's
+    /// line here is what lets it be worked out afresh at any scroll position — and worked out
+    /// again correctly when scrolled back, which clamping it to the edge alone could not do.
+    ///
+    /// `None` when the press did not land in the conversation, where there is nothing to scroll.
+    pub drag_anchor: Option<usize>,
+    /// The highlight moved without the mouse moving, so the text under it is no longer what was
+    /// copied. Recomputed once the next frame has been drawn — that is when the screen it reads
+    /// from is the screen it now covers.
+    pub selection_stale: bool,
     /// Is the button held down right now? The range only grows while it is.
     pub dragging: bool,
     /// The visible text of the last drawn frame, one `String` per screen row. Mouse selection
@@ -601,6 +625,8 @@ impl Default for State {
             screen_links: Vec::new(),
             drag: None,
             drag_top: 0,
+            drag_anchor: None,
+            selection_stale: false,
             dragging: false,
             screen: Vec::new(),
             asking: None,
@@ -645,6 +671,14 @@ impl Default for State {
 
 /// After one Ctrl+C, pressing again within this window quits.
 pub const QUIT_WINDOW: Duration = Duration::from_millis(1500);
+
+/// A column past the right of any terminal, for the end of a selection that carries on below what
+/// can be seen. Both the highlight and the extraction clamp a column to the width they are given,
+/// so this reads as "to the end of the line" without either having to be told about the other.
+///
+/// **Not `usize::MAX`**: the end column has one added to it before it is clamped, and that would
+/// wrap.
+const PAST_THE_RIGHT_EDGE: usize = u16::MAX as usize;
 
 /// The gap that marks a paste burst. Terminals without bracketed paste let a paste through
 /// as keys arriving a few ms apart — a speed no human can type at.
@@ -785,6 +819,63 @@ impl State {
     pub fn drop_drag_that_cannot_scroll(&mut self) {
         if !self.drag_can_scroll() {
             self.drag = None;
+        }
+    }
+
+    /// What a scroll does to the selection.
+    ///
+    /// **A drag still being made is never let go of.** Scrolling out past the edge is how a
+    /// selection longer than the screen gets made at all, and the far end is pinned to a pointer
+    /// rather than to the text, so it cannot slide out from under the anchor — which is the whole
+    /// reason a finished highlight spanning the bars is dropped instead. The anchor is put back on
+    /// its line while drawing (`reanchor_drag`), where the new top is known.
+    pub fn hold_or_drop_drag(&mut self) {
+        if self.dragging && self.drag_anchor.is_some() {
+            return;
+        }
+        self.drop_drag_that_cannot_scroll();
+    }
+
+    /// Puts the anchor of a drag still being made back on the line it was started on.
+    ///
+    /// **This is the one case where the two ends do not move together.** The anchor is on a word,
+    /// so it goes wherever that word went; the far end is under a pointer that did not move, so it
+    /// stays on its cell. Carrying both — right for a finished highlight, which rides the text as
+    /// one piece — slid the whole thing away from the pointer, so scrolling to reach further
+    /// selected no more than before it (reported 2026-08-18).
+    ///
+    /// **Called from the drawing side, every frame the button is down.** Which line is at the top
+    /// is worked out while drawing (`view_top`), so `apply` cannot know where the anchor has got
+    /// to — the same reason the viewport size is left here for it to read. Doing it every frame
+    /// rather than on scrolls alone also covers the text moving underneath on its own, which is
+    /// what a conversation stuck to the bottom does while an answer streams in.
+    ///
+    /// Afterwards the drag reads in current screen coordinates, so `drag_top` comes level: the
+    /// travel it stood for has just been paid into the anchor.
+    pub fn reanchor_drag(&mut self) {
+        if !self.dragging {
+            return;
+        }
+        let (Some(anchor), Some(drag)) = (self.drag_anchor, self.drag.as_mut()) else { return };
+        let (oy, height) = (self.view_origin.1 as isize, self.view_height as isize);
+        let row = oy + anchor as isize - self.view_top as isize;
+        // Off either end, the anchor is held at the edge **and taken to the far side of the line**,
+        // so the row still visible there is covered the whole way rather than stopping at whichever
+        // column the drag happened to begin on. The line it truly sits on is kept in `drag_anchor`,
+        // so scrolling back puts it exactly where it was rather than where it was clamped.
+        let was = drag.from;
+        drag.from = if row < oy {
+            (oy as usize, 0)
+        } else if row >= oy + height {
+            ((oy + height - 1).max(oy) as usize, PAST_THE_RIGHT_EDGE)
+        } else {
+            (row as usize, drag.from.1)
+        };
+        self.drag_top = self.view_top;
+        // The pointer did not move but what it covers did, so the words under the highlight are no
+        // longer the ones that were copied.
+        if drag.from != was {
+            self.selection_stale = true;
         }
     }
 
@@ -1489,14 +1580,14 @@ pub fn apply(state: &mut State, action: &Action) {
             }
             let (total, height) = (state.view_total, state.view_height);
             state.scroll.wheel(*notches, total, height);
-            state.drop_drag_that_cannot_scroll();
+            state.hold_or_drop_drag();
         }
         Action::Page(dir) => {
             // PageUp/PageDown with a panel open never reach here — `on_key` routes them
             // to the panel's own scroll first. So this is always the transcript.
             let (total, height) = (state.view_total, state.view_height);
             state.scroll.page(*dir, total, height);
-            state.drop_drag_that_cannot_scroll();
+            state.hold_or_drop_drag();
         }
         Action::ToggleFold => {
             // **The key only ever reaches the last work card's head** — the whole stretch of
@@ -1542,6 +1633,11 @@ pub fn apply(state: &mut State, action: &Action) {
             // Where the conversation stood when this began. Everything after it is measured
             // against this, so the highlight can be drawn wherever its text has got to.
             state.drag_top = state.view_top;
+            // **And which line of the conversation it was put on**, so that while the button is
+            // down the anchor can follow that line and leave the pointer's end where the pointer
+            // is. `None` off the conversation — the bars and the input do not scroll, so there is
+            // nothing for an anchor there to follow.
+            state.drag_anchor = state.content_at(*x, *y).map(|(row, _)| row);
             state.dragging = true;
         }
         Action::DragTo(x, y) => {
@@ -2083,6 +2179,18 @@ fn apply_frame(state: &mut State, frame: &Frame) {
             state.timeline.say(state.lang.update_available(tag));
             state.update_tag = Some(tag.clone());
         }
+        // The answer to a `/update` that had to ask. **Only a release closes the screen**; being
+        // current is said here and the conversation carries on.
+        Frame::UpdateChecked(found) => {
+            state.clear_status();
+            match found {
+                Some(tag) => {
+                    state.update_tag = Some(tag.clone());
+                    state.update_wanted = true;
+                }
+                None => state.timeline.say(state.lang.update_current().to_string()),
+            }
+        }
         Frame::Disconnected(why) => {
             state.connected = false;
             // **Losing the connection is a failure, not news** — silent failure is the worst
@@ -2346,7 +2454,19 @@ pub fn run_command(state: &mut State, text: &str) -> Option<crate::command::Comm
         // **Purely I/O** — dropping the socket happens in `finish_command`.
         Command::Reconnect => {}
         // The work is the I/O side's; this only asks for it.
-        Command::Update => state.update_wanted = true,
+        //
+        // **Leaving is only right once there is something to install.** Closing the screen is what
+        // gives the installer the terminal, so it used to happen first and the check came after —
+        // which meant a `/update` on an up-to-date copy tore the conversation down to say "already
+        // the newest" at a shell prompt. With the release already known this can go straight out;
+        // without it, `finish_command` asks, and `Frame::UpdateChecked` decides.
+        Command::Update => {
+            if state.update_tag.is_some() {
+                state.update_wanted = true;
+            } else {
+                state.set_status(state.lang.update_checking());
+            }
+        }
         Command::Config(Some(action)) => match action {
             crate::command::ConfigAction::Dir(access) => {
                 state.config.dir_access = *access;
@@ -2842,7 +2962,18 @@ impl crossterm::Command for MouseCapture {
 ///
 /// **On unix the escape is all there is**, and that path is unchanged.
 ///
-/// The rectangle that started this is still unexplained. It will not be guessed at a second time.
+/// **The rectangle that started this is not this call's doing** (read out of crossterm 0.29,
+/// 2026-08-18). `enable_mouse_capture` sets the console input mode to exactly
+/// `ENABLE_MOUSE_INPUT | ENABLE_EXTENDED_FLAGS | ENABLE_WINDOW_INPUT` — quick edit, which is the
+/// console's own rectangular select, is not among them, and the extended flag that makes leaving it
+/// out count *is*. So a console that accepted this request does not draw rectangles, and the two
+/// things left are both visible from outside this function: either the request failed, which the
+/// line below writes to the log, or the selection was the terminal's own — Windows Terminal does it
+/// on Shift+drag and makes it a block on Alt+Shift+drag, over the top of any app.
+///
+/// **So the log answers it.** A report of a rectangle with no `no console mouse mode` line in the
+/// log is the terminal selecting, not this app; with one, it is a console that would not be told.
+/// Neither needs guessing at again.
 fn take_the_mouse(on: bool) {
     let (label, command) = if on {
         ("mouse capture", MouseCapture::On)
@@ -4551,6 +4682,20 @@ async fn finish_command(
                 state.timeline.say(said);
             }
         }
+        // **Ask before closing anything.** `run_command` has already decided to leave if the
+        // release was known; this is the other case, where nobody has looked yet — under `off`
+        // nothing ever did, and under the others the answer is as old as this process.
+        //
+        // **Off the loop**, like every other network call the screen makes: the check waits up to
+        // ten seconds, and keys and drawing must not.
+        Command::Update if !state.update_wanted => {
+            let tx = tx.clone();
+            let current = env!("CARGO_PKG_VERSION");
+            tokio::spawn(async move {
+                let found = crate::update::newer_than(current).await;
+                let _ = tx.send((None, Action::Frame(Frame::UpdateChecked(found))));
+            });
+        }
         _ => {}
     }
 }
@@ -5213,6 +5358,42 @@ mod tests {
             run_command(&mut s, "/update");
             assert!(s.update_wanted, "/update did nothing under {policy:?}");
         }
+    }
+
+    /// **Nothing to install is not worth closing a conversation for.** Closing the screen is what
+    /// gives the installer the terminal, so it used to come first and the check after — and
+    /// `/update` on an up-to-date copy threw the session away to print "already the newest" at a
+    /// shell prompt (reported 2026-08-18). With no release known, the command goes and asks, and
+    /// only an answer that names one leaves.
+    #[test]
+    fn update_with_nothing_newer_says_so_and_keeps_the_conversation() {
+        let mut s = state();
+        assert_eq!(s.update_tag, None, "this is the case where nothing has been found");
+
+        run_command(&mut s, "/update");
+        assert!(!s.update_wanted, "it left before anybody had looked");
+        assert!(s.status().is_some(), "it went quiet while it looked");
+
+        // The check comes back with nothing newer.
+        apply(&mut s, &Action::Frame(Frame::UpdateChecked(None)));
+        assert!(!s.update_wanted, "being current closed the screen anyway");
+        let said = s.timeline.items().iter().any(|item| {
+            matches!(item, crate::timeline::Item::System { text, .. }
+                if text.contains(crate::lang::Lang::En.update_current()))
+        });
+        assert!(said, "it closed nothing and said nothing either");
+    }
+
+    /// And when the answer does name a release, that is when it leaves.
+    #[test]
+    fn update_that_finds_a_release_is_what_closes_the_screen() {
+        let mut s = state();
+        run_command(&mut s, "/update");
+        assert!(!s.update_wanted, "it left before the answer came");
+
+        apply(&mut s, &Action::Frame(Frame::UpdateChecked(Some("v9.9.9".into()))));
+        assert!(s.update_wanted, "a release was found and it stayed put");
+        assert_eq!(s.update_tag.as_deref(), Some("v9.9.9"));
     }
 
     /// Deciding on the answer to `CSI ? u`. The format is `CSI ? <flags> u` — only a terminal
@@ -6288,8 +6469,72 @@ mod tests {
         apply(&mut s, &Action::Press(0, 1));
         // Past `view_height`: onto the input line.
         apply(&mut s, &Action::DragTo(5, 12));
+        // **Let go of it first.** A finished highlight is carried as one piece, which is what it
+        // cannot survive here; one still being made has its far end pinned to the pointer instead
+        // and is kept — see the test below.
+        apply(&mut s, &Action::Release);
         apply(&mut s, &Action::Wheel(-1));
         assert!(s.drag.is_none(), "it was left to slide over rows that never move");
+    }
+
+    /// **Scrolling with the button still down extends the selection; it does not slide it.** The
+    /// anchor is on a word and goes where that word goes, while the far end is under a pointer that
+    /// did not move and stays on its cell. Carrying both — right once the button is up — moved the
+    /// whole highlight away from the pointer, so scrolling to reach further took in nothing new
+    /// (reported 2026-08-18).
+    #[test]
+    fn scrolling_mid_drag_moves_the_anchor_and_leaves_the_pointer_end_alone() {
+        let mut s = scrollable();
+        s.view_top = 50;
+        apply(&mut s, &Action::Press(0, 4));
+        assert_eq!(s.drag_anchor, Some(54), "the anchor did not remember its line");
+        apply(&mut s, &Action::DragTo(5, 2));
+
+        // Three lines' worth of scrolling up: the text — and the word the drag was started on —
+        // moves three rows down the screen. The pointer has not moved.
+        s.view_top = 47;
+        s.reanchor_drag();
+
+        let drag = s.drag.expect("a drag being made is never let go of");
+        assert_eq!(drag.from.0, 7, "the anchor did not travel with the text it was put on");
+        assert_eq!(drag.to, (2, 5), "the end under the pointer moved away from the pointer");
+        assert_eq!(s.drag_top, 47, "the travel was counted twice — once here and once when drawn");
+    }
+
+    /// The anchor is held at the edge while its line is off-screen, but the line itself is what is
+    /// remembered — so scrolling back puts it where it was rather than where it was clamped.
+    #[test]
+    fn an_anchor_scrolled_out_of_sight_comes_back_to_the_line_it_was_put_on() {
+        let mut s = scrollable();
+        s.view_top = 50;
+        apply(&mut s, &Action::Press(0, 4));
+        apply(&mut s, &Action::DragTo(5, 2));
+
+        // Far enough that the anchor's line is above the top of the conversation.
+        s.view_top = 80;
+        s.reanchor_drag();
+        assert_eq!(s.drag.expect("still being made").from.0, 0, "it was not held at the edge");
+
+        s.view_top = 50;
+        s.reanchor_drag();
+        assert_eq!(
+            s.drag.expect("still being made").from,
+            (4, 0),
+            "clamping it to the edge lost which line it was on",
+        );
+    }
+
+    /// A drag reaching onto the input line survives scrolling **while it is being made** — dragging
+    /// out past the edge and then scrolling is how a selection longer than the screen is made, and
+    /// the far end cannot slide out from under the anchor because it is pinned to the pointer.
+    #[test]
+    fn a_drag_still_being_made_survives_scrolling_even_when_it_reaches_the_bars() {
+        let mut s = scrollable();
+        s.view_top = 50;
+        apply(&mut s, &Action::Press(0, 1));
+        apply(&mut s, &Action::DragTo(5, 12));
+        apply(&mut s, &Action::Wheel(-1));
+        assert!(s.drag.is_some(), "scrolling to reach further threw the selection away");
     }
 
     /// Where the conversation stood is written down when the drag begins, because that is what
@@ -6330,11 +6575,20 @@ mod tests {
         apply(&mut inside, &Action::Page(1));
         assert!(inside.drag.is_some(), "a page threw away what a notch keeps");
 
+        // Reaching onto the input line and **let go of**, so it is carried as one piece and
+        // cannot be. Still being made, a page keeps it for the same reason a notch does.
         let mut over = scrollable();
         apply(&mut over, &Action::Press(0, 1));
         apply(&mut over, &Action::DragTo(5, 12));
+        apply(&mut over, &Action::Release);
         apply(&mut over, &Action::Page(1));
         assert!(over.drag.is_none());
+
+        let mut held = scrollable();
+        apply(&mut held, &Action::Press(0, 1));
+        apply(&mut held, &Action::DragTo(5, 12));
+        apply(&mut held, &Action::Page(1));
+        assert!(held.drag.is_some(), "a page threw away a selection still being made");
     }
 
     /// The title is written by the server — text we did not write. A control character mixed
