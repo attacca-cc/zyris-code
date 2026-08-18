@@ -139,17 +139,7 @@ impl Github {
                 ],
             )
             .await?;
-        // **The highest number, not the first.** A branch reused after its pull request landed
-        // has two, and the old one is the one that is over.
-        let Some(number) = listed
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|p| p.get("number").and_then(Value::as_u64))
-            .max()
-        else {
-            return Ok(None);
-        };
+        let Some(number) = pick_pull(&listed) else { return Ok(None) };
 
         let pull =
             self.get(&format!("/repos/{}/{}/pulls/{number}", repo.owner, repo.name), &[]).await?;
@@ -393,6 +383,28 @@ async fn read(response: reqwest::Response) -> Result<Value> {
     Ok(serde_json::from_str(&text).unwrap_or(Value::Null))
 }
 
+/// Which of a branch's pull requests the strip should be about.
+///
+/// **Anything still open beats the highest number.** A long-lived branch has a row of closed pull
+/// requests behind it — `develop` here has eight — and picking by number alone would put a
+/// release that landed weeks ago on the row instead of the one waiting for review right now.
+/// Among equals it is the newest, because that is the one being worked on.
+///
+/// Pure: the choice is the whole of what a person sees, and it should not need a network to check.
+pub fn pick_pull(listed: &Value) -> Option<u64> {
+    let rank = |p: &Value| -> (u8, u64) {
+        let number = p.get("number").and_then(Value::as_u64).unwrap_or_default();
+        let open = text_at(p, "state") == "open";
+        (open as u8, number)
+    };
+    listed
+        .as_array()?
+        .iter()
+        .filter(|p| p.get("number").and_then(Value::as_u64).is_some())
+        .max_by_key(|p| rank(p))
+        .and_then(|p| p.get("number").and_then(Value::as_u64))
+}
+
 /// What a pile of check runs adds up to.
 ///
 /// **Anything still going wins, then anything failed.** A run that is half green and half still
@@ -614,6 +626,28 @@ mod tests {
             "number": 53, "state": "closed", "merged_at": "2026-08-18T00:00:00Z",
         }));
         assert_eq!(merged["state"], "merged");
+    }
+
+    /// **Anything open beats the highest number.** A long-lived branch trails a row of closed
+    /// pull requests — `develop` in this repository had eight behind it — and picking by number
+    /// alone puts a release that landed weeks ago on the strip instead of the one waiting for
+    /// review right now.
+    #[test]
+    fn the_pull_request_on_the_strip_is_the_one_still_open() {
+        let closed = |n: u64| json!({"number": n, "state": "closed"});
+        let open = |n: u64| json!({"number": n, "state": "open"});
+
+        assert_eq!(pick_pull(&json!([closed(5), closed(12), closed(8)])), Some(12));
+        assert_eq!(
+            pick_pull(&json!([closed(12), open(9)])),
+            Some(9),
+            "an open request is the one being worked on, however old its number",
+        );
+        // Among equals, the newest.
+        assert_eq!(pick_pull(&json!([open(9), open(13)])), Some(13));
+        // A branch nobody has opened anything for, and an answer that is not a list.
+        assert_eq!(pick_pull(&json!([])), None);
+        assert_eq!(pick_pull(&json!({"message": "Not Found"})), None);
     }
 
     /// **Still running beats failed beats passed.** A pull request whose checks are half green
