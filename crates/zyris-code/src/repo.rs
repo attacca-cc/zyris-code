@@ -386,7 +386,7 @@ mod tests {
 
     /// **The marks are painted, not merely printed.** `?3 ↑2 ↓1` spelled in one grey says three
     /// different things in a single voice, and the only way to tell them apart is to stop and read
-    /// the glyph. Deliberately put back to `text_muted()` to watch this fail.
+    /// the glyph.
     #[test]
     fn the_marks_carry_the_colours_that_tell_them_apart() {
         let repo = Repo {
