@@ -331,6 +331,18 @@ impl Lang {
         }
     }
 
+    /// **Says what will happen next, not just that something opened.** A plan-mode job answers with
+    /// a plan and then waits, and a person who does not know that is left watching a job that looks
+    /// like it stopped halfway.
+    pub fn opened_plan(self, id: &str) -> String {
+        match self {
+            Lang::Ko => format!("계획 **{id}**을 걸었습니다. 조사한 뒤 계획을 내놓고 기다립니다."),
+            Lang::En => {
+                format!("Planning **{id}**. It will investigate, hand back a plan, and wait.")
+            }
+        }
+    }
+
     pub fn connecting(self) -> &'static str {
         self.pick("연결 중…", "Connecting…")
     }

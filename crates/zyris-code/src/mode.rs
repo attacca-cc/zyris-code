@@ -13,15 +13,26 @@
 //!            gate::decide        Route
 //!            (run the tool?)    (where my words go)
 //! normal     pass               same conversation     ← default
-//! plan       deny writes        same conversation
+//! plan       deny until the     create_job{plan_mode} → job session
+//!            plan is approved
 //! work       pass               create_work → planner session
 //! job        pass               create_job  → job session
 //! ```
 //!
-//! **The point is that `Normal` and `Plan` share the same route.** So moving between the two
-//! doesn't break the conversation, and plan mode can be switched on briefly mid-conversation —
-//! that is the only way plan mode is useful. `Work`·`Job`, by contrast, **create something new on
-//! the server** — and only once, from the first message; after that they append to an open session.
+//! **Plan mode is attacca's, not one assembled here** (2026-08-18 user decision). It used to be a
+//! plain session that this node simply refused to run writes on, with nothing on the server side
+//! knowing a plan was being made — a workflow of our own wearing the name. attacca has the real
+//! thing: `plan_mode` seeds the session with guidance to investigate and hand the plan back with
+//! `submit_plan`, which parks the turn on the user until they decide.
+//!
+//! **It has to be a job, because that is the only door the protocol opens.** `ZNewJob` carries
+//! `plan_mode`; `ZNewSession` has no such field and attacca's zyris gateway passes `false` for
+//! every session a node opens. So plan mode no longer continues the conversation you are in — it
+//! opens one — and the note that used to stand here saying `Normal` and `Plan` share a route is
+//! what changed. Getting the real thing was worth the switch.
+//!
+//! `Work`·`Job` were already like this: they **create something new on the server**, once, from
+//! the first message; after that they append to the open session.
 
 use ratatui::style::Color;
 
@@ -34,7 +45,8 @@ pub enum Mode {
     /// Runs without asking. The default. Talks in one plain session.
     #[default]
     Normal,
-    /// Does not run; lays out what to do first.
+    /// Investigates and hands back a plan to approve before anything is done. attacca's plan mode
+    /// (`ZNewJob::plan_mode`), not a local imitation of one.
     Plan,
     /// Opens a work on attacca with the next message as the goal. Two gates and a task graph are attached.
     Work,
@@ -56,6 +68,12 @@ pub enum Route {
     Work,
     /// `create_job`. The first message becomes the task.
     Job,
+    /// `create_job` with `plan_mode`. The first message becomes the thing to plan, and the agent
+    /// hands a plan back rather than doing it.
+    ///
+    /// **The same call as [`Route::Job`] with one flag flipped**, which is exactly what it is on
+    /// the server too — a job whose session was seeded with plan guidance.
+    Plan,
 }
 
 impl Mode {
@@ -94,7 +112,8 @@ impl Mode {
     /// Where my words go.
     pub fn route(self) -> Route {
         match self {
-            Mode::Normal | Mode::Plan => Route::Session,
+            Mode::Normal => Route::Session,
+            Mode::Plan => Route::Plan,
             Mode::Work => Route::Work,
             Mode::Job => Route::Job,
         }
@@ -165,17 +184,31 @@ mod tests {
         }
     }
 
-    /// **Normal and plan go to the same place.** If this breaks, turning on plan mode mid-conversation
-    /// cuts off what was being said.
+    /// **Only the plain mode stays in the conversation.** This used to say that plan mode did too,
+    /// and that was the shape of the problem: plan mode was a plain session this node happened to
+    /// refuse writes on, with nothing on the server knowing a plan was being made. attacca's plan
+    /// mode is a flag set when the thing is created, and `ZNewJob` is the only place the protocol
+    /// carries it — so asking for a plan opens something, the way asking for work does.
     #[test]
-    fn normal_and_plan_go_to_the_same_place() {
+    fn only_the_plain_mode_carries_on_the_conversation() {
         assert_eq!(Mode::Normal.route(), Route::Session);
-        assert_eq!(Mode::Plan.route(), Route::Session);
+        for opens_its_own in [Mode::Plan, Mode::Work, Mode::Job] {
+            assert_ne!(
+                opens_its_own.route(),
+                Route::Session,
+                "{opens_its_own:?} quietly appended to the conversation instead of opening",
+            );
+        }
     }
 
+    /// **Plan is a job with one flag flipped**, which is what it is on the server too — a job
+    /// whose session was seeded with attacca's plan guidance. They must not be the same route
+    /// though, or asking for a plan sets the work going instead.
     #[test]
-    fn work_and_job_each_open_their_own_thing() {
+    fn each_of_the_three_opens_its_own_thing() {
         assert_eq!(Mode::Work.route(), Route::Work);
         assert_eq!(Mode::Job.route(), Route::Job);
+        assert_eq!(Mode::Plan.route(), Route::Plan);
+        assert_ne!(Route::Plan, Route::Job);
     }
 }

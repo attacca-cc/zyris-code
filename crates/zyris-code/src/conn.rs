@@ -793,7 +793,8 @@ impl Session {
             None => mode.route(),
         };
         match route {
-            Route::Job => self.open_job(api, agent_id, message).await,
+            Route::Job => self.open_job(api, agent_id, message, false).await,
+            Route::Plan => self.open_job(api, agent_id, message, true).await,
             Route::Work => self.open_work(api, agent_id, message).await,
             Route::Session => {
                 let id = self.ensure(api, agent_id).await?;
@@ -808,6 +809,7 @@ impl Session {
         api: &AttaccaApiClient,
         agent_id: &str,
         message: &str,
+        plan_mode: bool,
     ) -> Result<Opened> {
         let job = within(
             api,
@@ -820,11 +822,12 @@ impl Session {
                 // Use the deployed build's timezone as is. Forcing this machine's timezone in would make
                 // answers diverge from other jobs in the same account.
                 timezone: None,
-                // **Leave both off.** `planning` hands the job over to work, and `plan_mode` receives a plan
-                // inside the job and stops; here the mode already is that branch ‒
-                // job mode means "set it going", and when planning is needed that's plan mode or work mode.
+                // **`planning` stays off in both.** It hands the job over to a work, which is what
+                // work mode is for. `plan_mode` is the one that differs: it seeds the session with
+                // attacca's plan guidance, so the agent investigates and hands a plan back with
+                // `submit_plan` instead of doing the thing. That is the whole of plan mode now.
                 planning: false,
-                plan_mode: false,
+                plan_mode,
                 data: vec![],
             }),
         )
@@ -836,7 +839,11 @@ impl Session {
             .clone()
             .ok_or_else(|| anyhow!(crate::lang::current().job_no_session(&job.id)))?;
         self.id = Some(id.clone());
-        Ok(Opened { id, sent: true, announced: Some((Route::Job, job.id)) })
+        let route = match plan_mode {
+            true => Route::Plan,
+            false => Route::Job,
+        };
+        Ok(Opened { id, sent: true, announced: Some((route, job.id)) })
     }
 
     /// **The first message becomes the goal** (`ZNewWork::message`). That's why `sent` is true.
@@ -1463,7 +1470,9 @@ mod tests {
         );
         assert_eq!(route_for(None, false, Mode::Work), Route::Work);
         assert_eq!(route_for(None, false, Mode::Normal), Route::Session);
-        assert_eq!(route_for(None, false, Mode::Plan), Route::Session);
+        // Plan mode opens a job of its own too ‒ attacca's plan mode is a flag set at creation,
+        // so there is nothing to turn on in a session that already exists.
+        assert_eq!(route_for(None, false, Mode::Plan), Route::Plan);
 
         // If there's a conversation to continue, continue it — a job must not spawn on every message.
         assert_eq!(route_for(None, true, Mode::Job), Route::Session);

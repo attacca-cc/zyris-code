@@ -5486,6 +5486,7 @@ fn opened_text(
     match announced? {
         (crate::mode::Route::Work, id) => Some(lang.opened_work(&id)),
         (crate::mode::Route::Job, id) => Some(lang.opened_job(&id)),
+        (crate::mode::Route::Plan, id) => Some(lang.opened_plan(&id)),
         (crate::mode::Route::Session, _) => None,
     }
 }
