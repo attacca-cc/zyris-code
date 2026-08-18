@@ -72,11 +72,13 @@ pub fn requested() -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Policy {
-    /// Install it and come back on the new version. The default: a client that hands a machine to
-    /// an agent is one where being a version behind is a thing to fix, not a preference.
-    #[default]
+    /// Install it and come back on the new version.
     Auto,
-    /// Say so and wait to be asked (`/update`).
+    /// Say so and wait to be asked (`/update`). **The default** (2026-08-18): installing without
+    /// being asked replaces the program somebody is in the middle of using, and the few seconds it
+    /// takes land on a launch they meant to be doing something else with. Saying so costs a line in
+    /// the conversation and leaves the moment to them.
+    #[default]
     Notify,
     /// Do not even look.
     Off,
@@ -407,15 +409,15 @@ pub async fn install_now() {
     // newer than itself, and it installs and restarts without end. `at_launch` is guarded the same
     // way; this is the arm somebody reaches by name.
     if std::env::var_os(RELAUNCH_MARK).is_some() {
-        println!("{}", lang.update_now_on(env!("CARGO_PKG_VERSION")));
+        crate::cli::say(&lang.update_now_on(env!("CARGO_PKG_VERSION")));
         return;
     }
     let Some(tag) = newest(ASK_TIMEOUT).await else {
-        eprintln!("{}", lang.update_failed(lang.update_no_answer()));
+        crate::cli::warn(&lang.update_failed(lang.update_no_answer()));
         return;
     };
     if !is_newer(&tag, env!("CARGO_PKG_VERSION")) {
-        println!("{}", lang.update_current());
+        crate::cli::say(lang.update_current());
         return;
     }
     let _ = carry_out(&tag).await;
@@ -427,18 +429,18 @@ pub async fn install_now() {
 /// terminal that went quiet right after a command is one somebody reaches for Ctrl+C in.
 async fn carry_out(tag: &str) -> anyhow::Result<()> {
     let lang = lang::current();
-    println!("{}", lang.update_installing_from(env!("CARGO_PKG_VERSION"), tag));
+    crate::cli::say(&lang.update_installing_from(env!("CARGO_PKG_VERSION"), tag));
     if let Err(e) = install(tag).await {
-        eprintln!("{}", lang.update_failed(&e.to_string()));
+        crate::cli::warn(&lang.update_failed(&e.to_string()));
         return Err(e);
     }
-    println!("{}", lang.update_restarting(tag));
+    crate::cli::say(&lang.update_restarting(tag));
     match relaunch(tag) {
         Ok(never) => match never {},
         Err(e) => {
             // Installed, but this process could not become the new one. Saying so is the whole
             // difference between "run it again" and a version number that never changes.
-            eprintln!("{}", lang.update_installed_not_started(&e.to_string()));
+            crate::cli::warn(&lang.update_installed_not_started(&e.to_string()));
             Err(e)
         }
     }
@@ -551,7 +553,11 @@ mod tests {
         for p in Policy::ALL {
             assert_eq!(Policy::parse(p.as_str()), Some(p));
         }
-        assert_eq!(Policy::default(), Policy::Auto);
+        assert_eq!(
+            Policy::default(),
+            Policy::Notify,
+            "the default must not install a new version without being asked",
+        );
     }
 
     /// **The installer is handed an ordinary path, never the extended-length one.**

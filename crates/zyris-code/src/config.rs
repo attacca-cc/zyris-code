@@ -99,8 +99,9 @@ pub struct Config {
     /// terminal the dark palette's text sits at 1.19:1 against the paper — unreadable.
     #[serde(default)]
     pub theme: ThemeChoice,
-    /// What to do when a newer release exists. **Default `auto`**: a client that hands a machine
-    /// to an agent is one where being a version behind is a thing to fix, not a preference.
+    /// What to do when a newer release exists. **Default `notify`**: installing unasked replaces
+    /// the program somebody is in the middle of using, and the wait lands on a launch they meant to
+    /// spend on something else. `auto` is still a setting away for anyone who wants it.
     #[serde(default)]
     pub update: crate::update::Policy,
 }

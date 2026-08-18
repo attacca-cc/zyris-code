@@ -53,11 +53,11 @@ async fn main() -> ExitCode {
     let printing = match zyris_code::cli::parse(std::env::args().skip(1)) {
         zyris_code::cli::Run::Screen => None,
         zyris_code::cli::Run::Help => {
-            print!("{}", zyris_code::cli::help(&program));
+            zyris_code::cli::say(&zyris_code::cli::help(&program));
             return ExitCode::SUCCESS;
         }
         zyris_code::cli::Run::Version => {
-            println!("{program} {}", env!("CARGO_PKG_VERSION"));
+            zyris_code::cli::say(&format!("{program} {}", env!("CARGO_PKG_VERSION")));
             return ExitCode::SUCCESS;
         }
         // **Nothing else is built for this.** No credential, no node, no screen — just the
@@ -69,14 +69,16 @@ async fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         zyris_code::cli::Run::Bad(what) => {
-            eprintln!("{program}: cannot read {what:?}. Try `{program} --help`.");
+            zyris_code::cli::warn(&format!(
+                "{program}: cannot read {what:?}. Try `{program} --help`."
+            ));
             return ExitCode::from(2);
         }
         zyris_code::cli::Run::Print(Some(text)) => Some(text),
         zyris_code::cli::Run::Print(None) => match zyris_code::print::prompt_from_stdin() {
             Ok(text) => Some(text),
             Err(e) => {
-                eprintln!("{program}: {e}");
+                zyris_code::cli::warn(&format!("{program}: {e}"));
                 return ExitCode::from(2);
             }
         },
@@ -459,13 +461,13 @@ async fn main() -> ExitCode {
             // is named because the reason a connection failed is in it and nowhere else.
             Ok(Err(e)) => {
                 if printing.is_some() {
-                    eprintln!("{program}: {e}. Details in {}", log.display());
+                    zyris_code::cli::warn(&format!("{program}: {e}. Details in {}", log.display()));
                 }
                 ExitCode::FAILURE
             }
             Err(e) => {
                 if printing.is_some() {
-                    eprintln!("{program}: {e}. Details in {}", log.display());
+                    zyris_code::cli::warn(&format!("{program}: {e}. Details in {}", log.display()));
                 }
                 ExitCode::FAILURE
             }
