@@ -86,10 +86,9 @@ fn only_reads(call: &Call) -> bool {
         // **Reading a repository is reading.** Plan mode is "look before you touch anything", and
         // a plan for a change starts with the log and the diff. What alters the checkout — moving
         // branch, committing, pushing — does not pass.
-        "git" => matches!(tool, "status" | "log" | "diff" | "branches"),
-        // Same split on GitHub's side: looking at issues and pull requests is how a plan gets
-        // written; opening one, commenting or reviewing is doing something.
-        "github" => matches!(tool, "me" | "issues" | "issue" | "pulls" | "pull" | "pull_diff"),
+        // The issues and pull requests are where the reason for a change usually is, so they
+        // read too. Opening one, commenting or reviewing is doing something, and does not.
+        "git" => matches!(tool, "status" | "log" | "diff" | "branches" | "issues" | "pulls"),
         // Only looking passes. `start` runs a command, and `stop` kills a running build — an
         // **irreversible write**. `until` runs a command only when it is a probe.
         "wait" => match tool {
@@ -451,19 +450,18 @@ mod tests {
                 "git.{tool} changed the checkout while planning",
             );
         }
-        for tool in ["issues", "pull", "pull_diff"] {
-            assert!(!matches!(
-                decide(Mode::Plan, &config, &call("github", tool, "")),
-                Decision::Refuse(_)
-            ));
-        }
-        for tool in ["comment", "create_pull", "review"] {
+        // The same capability holds what GitHub knows, and the same split applies: the issues
+        // and pull requests are where the reason for a change usually is.
+        for tool in ["issues", "pulls"] {
             assert!(
-                matches!(
-                    decide(Mode::Plan, &config, &call("github", tool, "")),
-                    Decision::Refuse(_)
-                ),
-                "github.{tool} spoke to the world while planning",
+                !matches!(decide(Mode::Plan, &config, &call("git", tool, "")), Decision::Refuse(_)),
+                "git.{tool} was refused while planning",
+            );
+        }
+        for tool in ["comment", "create_pull", "review", "request_review", "create_issue"] {
+            assert!(
+                matches!(decide(Mode::Plan, &config, &call("git", tool, "")), Decision::Refuse(_)),
+                "git.{tool} spoke to the world while planning",
             );
         }
     }
