@@ -21,9 +21,9 @@ pub fn draw(
     form: &Form,
     lang: crate::lang::Lang,
 ) -> Option<crate::app::ScreenLink> {
-    // Two rows, a blank, the hint, and a note when there is one — plus the two border lines. A
+    // Three rows, a blank, the hint, and a note when there is one — plus the two border lines. A
     // code being waited on takes three more.
-    let h = 7u16
+    let h = 8u16
         .saturating_add(form.note.is_some() as u16)
         .saturating_add(if form.pending.is_some() { 3 } else { 0 });
     let h = h.min(area.height.saturating_sub(2)).max(6);
@@ -80,6 +80,19 @@ pub fn draw(
         width,
     ));
 
+    // Signing. **A button too** — what it says is the address commits go out signed as, which is
+    // GitHub's noreply for the account and never something anybody types.
+    lines.push(row(
+        lang.github_row_signing(),
+        match &form.signing {
+            Some(email) => email.clone(),
+            None => lang.github_signing_off().to_string(),
+        },
+        form.signing.is_some(),
+        form.field == Field::Signing,
+        width,
+    ));
+
     // **A code being waited on comes before the hint**, because it is the only thing on the
     // screen the person can act on and it stops being any use when it expires.
     let mut uri_row = None;
@@ -108,6 +121,11 @@ pub fn draw(
                     false => lang.github_enter_browser().to_string(),
                 },
                 Field::Reviewer => lang.github_reviewer_help().to_string(),
+                Field::Signing => match (form.signing.is_some(), form.user.is_some()) {
+                    (true, _) => lang.github_enter_stop_signing().to_string(),
+                    (false, true) => lang.github_enter_sign().to_string(),
+                    (false, false) => lang.github_sign_needs_an_account().to_string(),
+                },
             },
         },
         Style::default().fg(theme::text_muted()),

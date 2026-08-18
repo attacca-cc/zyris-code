@@ -87,6 +87,49 @@ impl Github {
         Ok(body.get("login").and_then(Value::as_str).unwrap_or_default().to_string())
     }
 
+    /// The account, and what this token is allowed to do with it.
+    ///
+    /// **The scopes come off the header, not from anything remembered.** A token saved before a
+    /// feature existed has the scopes it was granted then, and asking GitHub is the only way to
+    /// tell that apart from one granted today — guessing produces a request that fails with a 404
+    /// that reads like the endpoint is gone.
+    pub async fn account(&self) -> Result<Account> {
+        let response = self
+            .http
+            .get(format!("{API}/user"))
+            .bearer_auth(&self.token)
+            .header("user-agent", AGENT)
+            .header("accept", "application/vnd.github+json")
+            .send()
+            .await
+            .context("could not reach GitHub for /user")?;
+        let scopes = response
+            .headers()
+            .get("x-oauth-scopes")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let body = read(response).await?;
+        Ok(Account {
+            id: body.get("id").and_then(Value::as_u64).unwrap_or_default(),
+            login: text_at(&body, "login"),
+            scopes: split_scopes(&scopes),
+        })
+    }
+
+    /// Puts a public key on the account. **Answers what is already there as success** — turning
+    /// signing on twice must not fail on the second try.
+    pub async fn add_gpg_key(&self, armored: &str, name: &str) -> Result<Value> {
+        match self
+            .post("/user/gpg_keys", json!({"armored_public_key": armored, "name": name}))
+            .await
+        {
+            Ok(added) => Ok(added),
+            Err(e) if already_there(&e) => Ok(Value::Null),
+            Err(e) => Err(e),
+        }
+    }
+
     pub async fn issues(&self, repo: &Repo, state: &str, limit: usize) -> Result<Value> {
         let body = self
             .get(
@@ -267,6 +310,38 @@ async fn read(response: reqwest::Response) -> Result<Value> {
     Ok(serde_json::from_str(&text).unwrap_or(Value::Null))
 }
 
+/// Whether a failure is GitHub saying it already has this.
+///
+/// **Not an error to us.** Setting signing up again after a reinstall finds the same key already
+/// on the account, and failing there would leave the person with no way forward that is not
+/// "delete the key on github.com first".
+fn already_there(e: &anyhow::Error) -> bool {
+    let said = e.to_string().to_ascii_lowercase();
+    said.contains("already been taken") || said.contains("key_id already exists")
+}
+
+/// The `x-oauth-scopes` header, as a list.
+///
+/// Pure, because the whole decision about whether to send somebody through the browser again
+/// hangs off it.
+pub fn split_scopes(header: &str) -> Vec<String> {
+    header.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect()
+}
+
+/// An account and what this token may do with it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Account {
+    pub id: u64,
+    pub login: String,
+    pub scopes: Vec<String>,
+}
+
+impl Account {
+    pub fn may(&self, scope: &str) -> bool {
+        self.scopes.iter().any(|s| s == scope)
+    }
+}
+
 fn first_line(text: &str) -> String {
     let line = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
     line.chars().take(200).collect()
@@ -391,6 +466,27 @@ fn slim_file(v: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **Scopes are read off the header, because a saved token carries what it was granted then.**
+    /// A token from before signing existed cannot add a key, and the only way to tell it from one
+    /// granted today is to ask — guessing produces a 404 that reads like a broken endpoint.
+    #[test]
+    fn what_a_token_may_do_is_read_from_what_github_answered() {
+        let account = Account {
+            id: 7,
+            login: "ruma".into(),
+            scopes: split_scopes("repo, read:user, write:gpg_key"),
+        };
+        assert!(account.may("write:gpg_key"));
+        assert!(account.may("repo"));
+        assert!(!account.may("workflow"));
+
+        // An older token, and the header a token with nothing at all comes back with.
+        let older = Account { scopes: split_scopes("repo,read:user"), ..Account::default() };
+        assert!(!older.may("write:gpg_key"));
+        assert!(Account { scopes: split_scopes(""), ..Account::default() }.scopes.is_empty());
+        assert!(Account { scopes: split_scopes("  ,  "), ..Account::default() }.scopes.is_empty());
+    }
 
     #[test]
     fn a_repo_is_read_from_either_a_name_or_a_remote() {
