@@ -922,7 +922,11 @@ fn clicking_a_work_card_toggles_it() {
 
     // **A running card draws open**, so the first click folds it.
     click(&mut s, row);
-    assert_eq!(s.folds[&seq], Fold { open: false, user_touched: true }, "a click must fold it");
+    assert_eq!(
+        s.folds[&seq],
+        Fold { open: false, user_touched: true, ..Fold::default() },
+        "a click must fold it"
+    );
     click(&mut s, row);
     assert!(s.folds[&seq].open, "clicking again must unfold it");
 }
@@ -1840,13 +1844,13 @@ fn state_with_edit_tool() -> State {
             todo: None,
         }),
     );
-    s.folds.insert(1, Fold { open: true, user_touched: true });
+    s.folds.insert(1, Fold { open: true, user_touched: true, ..Fold::default() });
     s
 }
 
 fn expand_the_tool_row(state: &mut State) {
     use zyris_code::rows::Fold;
-    state.folds.insert(2, Fold { open: true, user_touched: true });
+    state.folds.insert(2, Fold { open: true, user_touched: true, ..Fold::default() });
 }
 
 /// Even folded, how much changed must be visible.
@@ -2367,7 +2371,7 @@ fn show_a_work_card() {
     }
     let items = t.items().to_vec();
 
-    let open = Fold { open: true, user_touched: true };
+    let open = Fold { open: true, user_touched: true, ..Fold::default() };
     for keys in [vec![12], vec![10, 11, 12, 13, 14, 15]] {
         println!("─── 펼친 것: {keys:?} ───");
         let folds: Folds = keys.into_iter().map(|k| (k, open)).collect();

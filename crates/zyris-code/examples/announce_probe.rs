@@ -199,7 +199,7 @@ fn check_the_diff_paints(events: &[zyris_attacca::ZSessionEvent]) {
     for event in events {
         if let Some(entry) = zyris_code::event::entry_from(event) {
             // Open them all, as they would be at the moment the tool was used.
-            folds.insert(entry.seq, Fold { open: true, user_touched: true });
+            folds.insert(entry.seq, Fold { open: true, user_touched: true, ..Fold::default() });
             timeline.upsert(entry);
         }
     }

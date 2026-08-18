@@ -80,6 +80,18 @@ pub struct Diff {
     pub removed: usize,
 }
 
+impl Diff {
+    /// Whether there is anything here worth a reader's eye.
+    ///
+    /// **`+0 -0` is not worth drawing.** It was measured and absence was not, which is why the
+    /// two stay apart in [`Repo::diverged`] — but on the row they say the same thing to the person
+    /// reading it, and the shorter way to say it is not to. Reported on Windows 2026-08-18, where
+    /// a branch level with its base sat there showing zeros.
+    pub fn is_nothing(self) -> bool {
+        self.added == 0 && self.removed == 0
+    }
+}
+
 impl Repo {
     /// Nothing to commit and nothing to push.
     pub fn is_clean(&self) -> bool {
@@ -281,7 +293,7 @@ fn pieces(
     if let (Some(r), true) =
         (repo, matches!(level, Level::Full | Level::NoUntracked | Level::NoAhead | Level::NoChecks))
     {
-        if let Some(d) = r.diverged {
+        if let Some(d) = r.diverged.filter(|d| !d.is_nothing()) {
             diverged.push(Span::styled(
                 format!("+{}", d.added),
                 Style::default().fg(theme::diff_add()),
@@ -304,7 +316,8 @@ fn pieces(
             false => Style::default().fg(theme::warning()),
         };
         pr.push(Span::styled(format!("#{}", p.number), state));
-        if !matches!(level, Level::NoPullSize | Level::NoCounts) {
+        let size = Diff { added: p.added, removed: p.removed };
+        if !matches!(level, Level::NoPullSize | Level::NoCounts) && !size.is_nothing() {
             pr.push(Span::styled(format!(" +{}", p.added), Style::default().fg(theme::diff_add())));
             pr.push(Span::styled(
                 format!(" -{}", p.removed),
@@ -768,8 +781,27 @@ mod tests {
         assert_eq!(out.matches('∙').count(), 2, "path ∙ git ∙ diverged: {out:?}");
     }
 
-    /// **Absent is not zero.** A branch that could not be measured — no remote, no `origin/HEAD`,
-    /// a git that failed — must show nothing, or it claims it changed no code at all.
+    /// **A branch level with its base draws nothing either.** It was measured and absence was
+    /// not, which is why they stay apart in the measurement — but `+0 -0` says the same thing to
+    /// a reader as nothing does, in more characters. Reported on Windows 2026-08-18.
+    #[test]
+    fn a_branch_that_changed_nothing_says_nothing() {
+        let level = Repo { diverged: Some(Diff::default()), ..dirty() };
+        let text = strip(100, "/w", None, Some(&level));
+        assert!(!text.contains("+0"), "{text}");
+        assert!(!text.contains("-0"), "{text}");
+        // The branch's own marks are untouched — this is about the piece, not the row.
+        assert!(text.contains("+2"), "{text}");
+
+        // And a pull request that changed nothing keeps its number and drops its zeros.
+        let empty = Pull { number: 53, added: 0, removed: 0, ..open_pull() };
+        let text = strip_with(100, "/w", None, Some(&dirty()), Some(&empty));
+        assert!(text.contains("#53"), "{text}");
+        assert!(!text.contains("+0") && !text.contains("-0"), "{text}");
+    }
+
+    /// **A branch with nothing to compare against draws nothing**, and it is a different case
+    /// from one measured at zero — the measurement keeps them apart even though the row does not.
     #[test]
     fn a_branch_with_nothing_to_compare_against_shows_no_counts() {
         let repo = dirty();

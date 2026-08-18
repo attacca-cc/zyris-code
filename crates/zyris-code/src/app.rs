@@ -445,7 +445,10 @@ pub struct State {
     pub drag_anchor: Option<usize>,
     /// When each open fold was opened, for as long as its body is still arriving. Entries are
     /// dropped as they finish, so this is empty on an idle screen.
-    pub opened_at: std::collections::HashMap<i64, Instant>,
+    pub opened_at: std::collections::HashMap<i64, Fade>,
+    /// How long one frame is meant to take, so the drawing side can turn `tick` into a duration
+    /// without reading a clock. Set once from `frame_interval`.
+    pub frame_ms: u64,
     /// The highlight moved without the mouse moving, so the text under it is no longer what was
     /// copied. Recomputed once the next frame has been drawn — that is when the screen it reads
     /// from is the screen it now covers.
@@ -643,6 +646,7 @@ impl Default for State {
             drag_top: 0,
             drag_anchor: None,
             opened_at: std::collections::HashMap::new(),
+            frame_ms: 50,
             selection_stale: false,
             dragging: false,
             screen: Vec::new(),
@@ -691,13 +695,21 @@ impl Default for State {
 /// After one Ctrl+C, pressing again within this window quits.
 pub const QUIT_WINDOW: Duration = Duration::from_millis(1500);
 
-/// How long the body of a fold takes to arrive.
+/// A fold on the move, and which way.
+#[derive(Debug, Clone, Copy)]
+pub struct Fade {
+    pub at: Instant,
+    /// Going away rather than arriving.
+    pub out: bool,
+}
+
+/// How long the body of a fold takes to arrive, or to leave.
 ///
 /// **Short enough to be over before it is waited on.** This is feedback that something opened, not
 /// a thing to watch; the web page this app is modelled on lands its rows in 320ms and this is the
 /// same order. It also bounds the extra drawing — the frame loop keeps redrawing for exactly this
 /// long after a fold and then goes quiet again.
-const FADE_IN: Duration = Duration::from_millis(260);
+pub const FADE_IN: Duration = Duration::from_millis(260);
 
 /// A column past the right of any terminal, for the end of a selection that carries on below what
 /// can be seen. Both the highlight and the extraction clamp a column to the width they are given,
@@ -870,27 +882,62 @@ impl State {
         let fold = self.folds.entry(seq).or_default();
         fold.open = !shown.unwrap_or(fold.open);
         fold.user_touched = true;
+        // **Both ways round, and closing is the one that needs saying.** Opening reveals lines
+        // that are already laid out, so they only have to be drawn washed out and brought up.
+        // Closing has to draw lines that are on their way to not existing, and the way that is
+        // done here is that they go on existing: `Fold::closing` keeps the node laid out open
+        // until `settle_folds` ends the fade. Nothing is spliced back into a layout that dropped
+        // it, which is the version of this that once smeared a fade across the whole screen.
+        fold.closing = !fold.open;
         let now = fold.open;
         self.view_open.insert(seq, now);
-        if now {
-            // **Stamped where it happened**, the same way a notice is (`status_at`) — the frame
-            // that draws it has no way to know when the fold was opened, and threading a clock
-            // through the drawing side to find out would be worse than stamping it here.
-            self.opened_at.insert(seq, Instant::now());
-        } else {
+        // **Stamped where it happened**, the same way a notice is (`status_at`) — the frame that
+        // draws it has no way to know when the fold was touched, and threading a clock through the
+        // drawing side to find out would be worse than stamping it here.
+        self.opened_at.insert(seq, Fade { at: Instant::now(), out: !now });
+    }
+
+    /// Ends the fades that have run their course, and collapses what was waiting on one.
+    ///
+    /// **The children are forgotten here rather than at the click.** Dropping them while the
+    /// parent is still laid out open would change the shape of the very body being faded — the
+    /// thing the person is watching would rearrange itself on the way out.
+    ///
+    /// Answers whether anything changed, so the frame loop knows to draw.
+    pub fn settle_folds(&mut self) -> bool {
+        let done: Vec<(i64, bool)> = self
+            .opened_at
+            .iter()
+            .filter(|(_, fade)| fade.at.elapsed() >= FADE_IN)
+            .map(|(seq, fade)| (*seq, fade.out))
+            .collect();
+        if done.is_empty() {
+            return false;
+        }
+        for (seq, out) in done {
             self.opened_at.remove(&seq);
+            if !out {
+                continue;
+            }
+            if let Some(fold) = self.folds.get_mut(&seq) {
+                fold.closing = false;
+            }
+            // **Closing something is how a person says they are done with it.** Opening the card
+            // again brought all of it back, spilling out reasoning and tool output nobody had
+            // asked for since (reported 2026-08-18).
             for child in crate::rows::inside(self.timeline.items(), seq) {
                 self.folds.remove(&child);
                 self.view_open.remove(&child);
                 self.opened_at.remove(&child);
             }
         }
+        true
     }
 
     /// Is anything still fading in? The frame loop keeps drawing while this is true and stops on
     /// its own when it goes false, so an idle screen is idle again a moment after the last fold.
     pub fn opening(&self) -> bool {
-        self.opened_at.values().any(|at| at.elapsed() < FADE_IN)
+        self.opened_at.values().any(|fade| fade.at.elapsed() < FADE_IN)
     }
 
     /// How far the body of each node has yet to come, as the fraction of the way to the background
@@ -902,9 +949,11 @@ impl State {
     pub fn fading_in(&self) -> std::collections::HashMap<i64, f64> {
         self.opened_at
             .iter()
-            .filter_map(|(seq, at)| {
-                let left = FADE_IN.checked_sub(at.elapsed())?;
-                Some((*seq, left.as_secs_f64() / FADE_IN.as_secs_f64()))
+            .filter_map(|(seq, fade)| {
+                let left = FADE_IN.checked_sub(fade.at.elapsed())?;
+                let part = left.as_secs_f64() / FADE_IN.as_secs_f64();
+                // Opening arrives, closing leaves: the same journey, walked the other way.
+                Some((*seq, if fade.out { 1.0 - part } else { part }))
             })
             .collect()
     }
@@ -3424,7 +3473,9 @@ async fn run_inner(
     // new version, and under `notify` the tag arrives as a frame through the bridge.
 
     let mut keys = EventStream::new();
-    let mut ticker = tokio::time::interval(frame_interval());
+    let frame = frame_interval();
+    state.frame_ms = frame.as_millis().max(1) as u64;
+    let mut ticker = tokio::time::interval(frame);
     let mut last_size: Option<(u16, u16)> = None;
     let mut dirty = true;
 
@@ -3624,7 +3675,9 @@ async fn run_inner(
     // cancelled and re-polled by a different waker.
     drop(keys);
     let mut keys = EventStream::new();
-    let mut ticker = tokio::time::interval(frame_interval());
+    let frame = frame_interval();
+    state.frame_ms = frame.as_millis().max(1) as u64;
+    let mut ticker = tokio::time::interval(frame);
     let mut poll = tokio::time::interval(POLL_INTERVAL);
     let mut git = tokio::time::interval(git_every.unwrap_or(Duration::from_secs(86400)));
     let mut pull = tokio::time::interval(pull_every.unwrap_or(Duration::from_secs(86400)));
@@ -4083,6 +4136,15 @@ async fn run_inner(
             }
             _ = ticker.tick() => {
                 state.tick = state.tick.wrapping_add(1);
+                // **What has happened since the last draw, before this tick adds to it.** The
+                // batching below is about that: a frame carrying a streaming chunk is 3.4KB,
+                // while one where only an animation moved is the handful of cells that moved.
+                let mut content = dirty;
+                // A fade that has run its course ends here — and a fold that was waiting on one
+                // finally collapses.
+                if state.settle_folds() {
+                    dirty = true;
+                }
                 let pending = state.quit_pending();
                 // We have to redraw at the moment a notice fades too. Without it the erased
                 // text stays on screen — same reason as the armed quit.
@@ -4090,6 +4152,7 @@ async fn run_inner(
                 if has_status != last_had_status {
                     last_had_status = has_status;
                     dirty = true;
+                    content = true;
                 }
                 if pending != last_quit_pending {
                     last_quit_pending = pending;
@@ -4099,6 +4162,7 @@ async fn run_inner(
                         state.quit_armed_at = None;
                     }
                     dirty = true;
+                    content = true;
                 }
                 // While working the dot has to blink, so keep redrawing. One frame is around
                 // 0.2ms, so it is no burden — before, this was not possible.
@@ -4126,10 +4190,15 @@ async fn run_inner(
                 if state.enroll.is_some() {
                     dirty = true;
                 }
-                // While a turn runs, batch the drawing. One streaming chunk is 3.4KB, so
-                // twenty a second is the heaviest thing for a remote terminal — ten or
-                // twenty looks the same to the eye but halves the volume out.
-                let held = state.running && last_draw.elapsed() < STREAM_MIN_GAP;
+                // While a turn runs, batch the drawing of what the turn is sending. One streaming
+                // chunk is 3.4KB, so twenty a second is the heaviest thing for a remote terminal —
+                // ten or twenty looks the same to the eye but halves the volume out.
+                //
+                // **The animation is not that, and must not be held with it.** A frame where only
+                // the crest moved is the few cells it moved across; holding those back cut the
+                // wave to ten frames a second, on top of it stepping unevenly, and it looked
+                // exactly as bad as that sounds (reported 2026-08-18).
+                let held = content && state.running && last_draw.elapsed() < STREAM_MIN_GAP;
                 if dirty && !held {
                     terminal.draw(|f| widgets::draw(f, &mut state))?;
                     dirty = false;
@@ -6808,8 +6877,17 @@ mod tests {
         s.flip_fold(2);
         assert_eq!(s.folds.get(&2).map(|f| f.open), Some(true), "the tool never opened");
 
-        // Close the card. What was inside goes with it.
+        // Close the card. What was inside goes with it — **once the fade is over**, not while
+        // it is running: dropping the children mid-fade would rearrange the very body being
+        // watched on its way out.
         s.flip_fold(1);
+        assert_eq!(
+            s.folds.get(&2).map(|f| f.open),
+            Some(true),
+            "the body rearranged itself while it was still being drawn",
+        );
+        s.opened_at.insert(1, Fade { at: Instant::now() - FADE_IN, out: true });
+        s.settle_folds();
         assert_eq!(s.folds.get(&2), None, "the tool kept its own state past the card closing");
 
         // So opening the card again shows the tool shut, the way it starts out.
@@ -6821,11 +6899,10 @@ mod tests {
         );
     }
 
-    /// **Opening starts the body arriving; closing stops it.** The frame loop keeps drawing while
-    /// anything is fading, so an entry left behind by a node that was closed again would hold an
-    /// idle screen redrawing for nothing.
+    /// **Both ways move, and both ways end.** The frame loop keeps drawing while anything is
+    /// fading, so a fade that never finished would hold an idle screen redrawing for ever.
     #[test]
-    fn opening_a_fold_starts_it_arriving_and_closing_it_stops() {
+    fn opening_a_fold_starts_it_arriving_and_closing_starts_it_leaving() {
         let mut s = state();
         apply(&mut s, &work_start(1));
 
@@ -6834,6 +6911,12 @@ mod tests {
         assert!(s.fading_in().contains_key(&1), "the body it revealed is not fading in");
 
         s.flip_fold(1);
+        assert!(s.opening(), "closing snapped shut instead of leaving");
+        assert!(s.fading_in().contains_key(&1), "the body on its way out is not fading");
+
+        // And it is over once the fade has run, whichever way it went.
+        s.opened_at.insert(1, Fade { at: Instant::now() - FADE_IN, out: true });
+        s.settle_folds();
         assert!(!s.opening(), "closing left the screen redrawing for a body nobody can see");
         assert!(s.fading_in().is_empty());
     }
@@ -6844,7 +6927,8 @@ mod tests {
         let mut s = state();
         apply(&mut s, &work_start(1));
         s.flip_fold(1);
-        s.opened_at.insert(1, Instant::now() - FADE_IN - Duration::from_millis(1));
+        let long_ago = Instant::now() - FADE_IN - Duration::from_millis(1);
+        s.opened_at.insert(1, Fade { at: long_ago, out: false });
         assert!(!s.opening(), "the fade never ended");
         assert!(s.fading_in().is_empty(), "a finished fade is still being applied");
     }
@@ -7200,6 +7284,47 @@ mod tests {
         );
         apply(&mut s, &Action::Frame(Frame::PullGone(53)));
         assert_eq!(s.pull.as_ref().map(|p| p.number), Some(54), "#54 was cleared by #53's timer");
+    }
+
+    /// **Closing fades too, and the way it does is that nothing is spliced.** Drawing lines on
+    /// their way out means drawing lines the layout has dropped; putting them back is the version
+    /// of this that once smeared a fade over the whole screen. So the node goes on laying out as
+    /// open until the fade ends, and only then collapses.
+    #[test]
+    fn closing_a_fold_keeps_it_laid_out_until_the_fade_is_over() {
+        let mut s = state();
+        s.view_open.insert(7, true);
+        s.flip_fold(7);
+
+        let fold = s.folds[&7];
+        assert!(!fold.open, "the fold itself is shut ‒ a second click has to reopen it");
+        assert!(fold.closing, "but it is still drawn, or there is nothing to fade");
+        assert!(!s.view_open[&7]);
+        assert!(s.opening(), "the frame loop has to keep drawing while it goes");
+
+        // Partway through it is on its way out, not on its way in.
+        let amount = s.fading_in().get(&7).copied().expect("it is fading");
+        assert!(amount < 0.5, "a fade just begun should still be near the text: {amount}");
+
+        // Nothing settles before its time.
+        assert!(!s.settle_folds(), "it ended early");
+        assert!(s.folds[&7].closing);
+
+        s.opened_at.insert(7, Fade { at: Instant::now() - FADE_IN, out: true });
+        assert!(s.settle_folds(), "the fade was over and nothing happened");
+        assert!(!s.folds[&7].closing, "it never actually collapsed");
+        assert!(!s.opening(), "and the screen goes quiet again");
+    }
+
+    /// Opening is the same journey walked the other way, and it still ends by itself.
+    #[test]
+    fn opening_a_fold_arrives_rather_than_appearing() {
+        let mut s = state();
+        s.view_open.insert(7, false);
+        s.flip_fold(7);
+        assert!(s.folds[&7].open && !s.folds[&7].closing);
+        let amount = s.fading_in().get(&7).copied().expect("it is fading");
+        assert!(amount > 0.5, "a reveal just begun should still be near the background: {amount}");
     }
 
     /// **A frame from a stale session must not reach the screen.** Leave work running and

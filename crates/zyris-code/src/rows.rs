@@ -46,6 +46,15 @@ pub struct Fold {
     pub open: bool,
     /// Set when the person explicitly opened/closed this node. Auto-open/auto-fold then leaves it alone.
     pub user_touched: bool,
+    /// Closed, but still laid out while its body fades away.
+    ///
+    /// **This is the whole of the closing animation, and it is deliberately the only part of it.**
+    /// Fading something out means drawing lines that are on their way to not existing; splicing
+    /// them back into a layout that has already dropped them is what once left the fade smeared
+    /// across the whole screen. So nothing is spliced: the node simply goes on laying out as open
+    /// for [`crate::app::FADE_IN`], its body washes toward the background, and then it collapses
+    /// in one step with nothing left to see. `app::State::settle_folds` is what ends it.
+    pub closing: bool,
 }
 
 /// The kind of a foldable node.
@@ -63,6 +72,11 @@ enum NodeKind {
 /// the cache's change detection and the renderer must agree, or the cache would think nothing
 /// changed when the run ends and the screen would keep the run's shape forever.
 fn effective_open(kind: NodeKind, f: &Fold, running: bool) -> bool {
+    // **On its way out is still on screen.** The body has to be there to be drawn fading, and
+    // this is the one place the open state is decided, so it is the one place that can say so.
+    if f.closing {
+        return true;
+    }
     match kind {
         // **A card is open while it is being worked on and folds itself when it is done.** The
         // answer is no longer inside it — the agent speaking is what ends the card — so what is
@@ -81,6 +95,27 @@ fn effective_open(kind: NodeKind, f: &Fold, running: bool) -> bool {
         // screen with second thoughts while saying nothing about what is being done.
         NodeKind::Chip => f.open,
         NodeKind::Tool => f.open,
+    }
+}
+
+#[cfg(test)]
+mod closing_is_still_drawn {
+    use super::*;
+
+    /// **A node on its way out is still laid out.** The whole of the closing animation is that its
+    /// body goes on existing while it fades; without this there is nothing on screen to fade, and
+    /// the alternative — splicing dropped lines back into a layout — is what once smeared a fade
+    /// across the entire screen.
+    #[test]
+    fn a_fold_that_is_closing_draws_open() {
+        let shut = Fold { open: false, user_touched: true, closing: false };
+        let leaving = Fold { closing: true, ..shut };
+        for kind in [NodeKind::Card, NodeKind::Chip, NodeKind::Tool] {
+            assert!(!effective_open(kind, &shut, false), "{kind:?} was drawn open while shut");
+            assert!(effective_open(kind, &leaving, false), "{kind:?} vanished before it faded");
+            // And not because a turn is running ‒ nobody is clicking folds mid-run.
+            assert!(effective_open(kind, &leaving, true), "{kind:?} vanished mid-run");
+        }
     }
 }
 
@@ -1263,10 +1298,10 @@ mod tests {
             return Folds::new();
         };
         let mut f = Folds::new();
-        f.insert(*seq, Fold { open: true, user_touched: true });
+        f.insert(*seq, Fold { open: true, user_touched: true, ..Fold::default() });
         for p in parts {
             if let Part::Think(t) = p {
-                f.insert(t.seq, Fold { open: true, user_touched: true });
+                f.insert(t.seq, Fold { open: true, user_touched: true, ..Fold::default() });
             }
         }
         f
@@ -1346,7 +1381,10 @@ mod tests {
     /// under a fold the person can't tell what the agent is doing.
     #[test]
     fn a_folded_chip_hides_thinking_but_shows_tools() {
-        let shut = Folds::from([(chip_key(&work()), Fold { open: false, user_touched: true })]);
+        let shut = Folds::from([(
+            chip_key(&work()),
+            Fold { open: false, user_touched: true, ..Fold::default() },
+        )]);
         let out = plain(&live(&[work()], 40, &shut, crate::lang::Lang::Ko));
         assert!(out[0].contains("스크롤 계산 위치를 찾는 중"), "no card head: {out:?}");
         assert!(out.iter().any(|l| l.contains("먼저 구조를 본다")), "no chip title: {out:?}");
@@ -1614,7 +1652,10 @@ mod tests {
     #[test]
     fn the_cache_draws_exactly_what_the_plain_path_draws() {
         let items = mixed();
-        for folds in [Folds::new(), Folds::from([(2, Fold { open: true, user_touched: true })])] {
+        for folds in [
+            Folds::new(),
+            Folds::from([(2, Fold { open: true, user_touched: true, ..Fold::default() })]),
+        ] {
             let want = rows(&items, 40, &folds, crate::lang::Lang::Ko);
             let mut cache = Cache::new();
             cache.layout(
@@ -1722,7 +1763,7 @@ mod tests {
         let before = cache.renders();
 
         let chip = chip_key(&items[1]);
-        let open = Fold { open: true, user_touched: true };
+        let open = Fold { open: true, user_touched: true, ..Fold::default() };
         let opened = Folds::from([(chip, open), (items[1].seq(), open)]);
         cache.layout(
             &items,
@@ -1827,7 +1868,7 @@ mod tests {
         );
 
         let mut both = card_open.clone();
-        both.insert(100, Fold { open: true, user_touched: true });
+        both.insert(100, Fold { open: true, user_touched: true, ..Fold::default() });
         let open = plain(&rows(&items, 60, &both, crate::lang::Lang::Ko));
         assert!(open.iter().any(|l| l.contains("인자")), "the detail is not shown: {open:?}");
         assert!(open.iter().any(|l| l.contains("viewport")), "{open:?}");
@@ -1858,7 +1899,7 @@ mod tests {
     #[test]
     fn a_folded_card_has_nothing_clickable_inside_it() {
         let items = [work_at(1)];
-        let folds = Folds::from([(1, Fold { open: false, user_touched: true })]);
+        let folds = Folds::from([(1, Fold { open: false, user_touched: true, ..Fold::default() })]);
         let r = rows(&items, 60, &folds, crate::lang::Lang::Ko);
         let by_seq: Vec<i64> = r.cards.values().copied().collect();
         assert_eq!(by_seq, vec![1], "only the card head is clickable when it is folded");
@@ -1870,8 +1911,8 @@ mod tests {
     fn a_folded_card_hides_open_tool_details() {
         let items = [work_at(1)];
         let folds = Folds::from([
-            (1, Fold { open: false, user_touched: true }),
-            (100, Fold { open: true, user_touched: true }),
+            (1, Fold { open: false, user_touched: true, ..Fold::default() }),
+            (100, Fold { open: true, user_touched: true, ..Fold::default() }),
         ]);
         let out = plain(&rows(&items, 60, &folds, crate::lang::Lang::Ko));
         assert!(!out.iter().any(|l| l.contains("grep")), "a folded card hides its rows: {out:?}");
@@ -2082,7 +2123,7 @@ mod tests {
         let before = cache.renders();
 
         let mut both = card_open.clone();
-        both.insert(100, Fold { open: true, user_touched: true });
+        both.insert(100, Fold { open: true, user_touched: true, ..Fold::default() });
         cache.layout(
             &items,
             60,
@@ -2202,9 +2243,9 @@ mod tests {
     #[test]
     fn the_card_head_still_says_whether_it_is_folded() {
         let items = [work_at(1)];
-        let open = Folds::from([(1, Fold { open: true, user_touched: true })]);
+        let open = Folds::from([(1, Fold { open: true, user_touched: true, ..Fold::default() })]);
         assert!(plain(&rows(&items, 78, &open, crate::lang::Lang::Ko))[0].ends_with('▾'));
-        let shut = Folds::from([(1, Fold { open: false, user_touched: true })]);
+        let shut = Folds::from([(1, Fold { open: false, user_touched: true, ..Fold::default() })]);
         assert!(plain(&rows(&items, 78, &shut, crate::lang::Lang::Ko))[0].ends_with('▸'));
     }
 
@@ -2296,8 +2337,12 @@ mod tests {
     #[test]
     fn a_user_opened_chip_stays_open() {
         let items = [work_at(1)];
-        let mut folds = Folds::from([(1, Fold { open: true, user_touched: true })]);
-        folds.insert(chip_key(&items[0]), Fold { open: true, user_touched: true });
+        let mut folds =
+            Folds::from([(1, Fold { open: true, user_touched: true, ..Fold::default() })]);
+        folds.insert(
+            chip_key(&items[0]),
+            Fold { open: true, user_touched: true, ..Fold::default() },
+        );
         let mut cache = Cache::new();
         cache.layout(&items, 60, &folds, None, Turn::default(), crate::lang::Lang::Ko);
         assert!(cache.plain().iter().any(|l| l.contains('┊')), "{:?}", cache.plain());

@@ -33,15 +33,32 @@ pub fn pulse_at(ms: u64) -> u8 {
     ((travelled as u32 * DEEPEST) / half as u32) as u8
 }
 
-/// How many cells the crest of the head's wave has travelled by `ms`.
+/// About how long the crest should take to cross one cell.
+const MS_PER_CELL: u64 = 55;
+
+/// How many frames the crest spends on each cell, at a frame every `frame_ms`.
+///
+/// **A whole number, and never zero.** This is the whole of why the wave was uneven: it moved on a
+/// wall clock at one cell every 55ms while frames land every 50ms, so drawn frames took it one
+/// cell, then one, then two, then one — a limp rather than a run. Tying it to the frame instead
+/// means every drawn frame moves it the same distance, and rounding keeps the speed about what it
+/// was whatever `$ZYRIS_CODE_FPS` is set to.
+pub fn frames_per_cell(frame_ms: u64) -> u64 {
+    let frame_ms = frame_ms.max(1);
+    ((MS_PER_CELL + frame_ms / 2) / frame_ms).max(1)
+}
+
+/// How many cells the crest of the head's wave has travelled by frame `tick`.
 ///
 /// **One cell at a time, always forward.** The pulse goes out and comes back, and a crest driven by
 /// it would slide along the line and then reverse; a wave runs. Whole cells because that is what
 /// the screen has, and because a crest that has not moved a cell leaves the line byte for byte
 /// identical — which is what keeps this off the wire on the frames between.
-pub fn wave_at(ms: u64) -> u32 {
-    const MS_PER_CELL: u64 = 55;
-    (ms / MS_PER_CELL) as u32
+///
+/// **Counted in frames, not milliseconds.** The rest of this app's animation already works that
+/// way (`State.tick`), and it is the only way the step is the same size every time.
+pub fn wave_at(tick: u64, frame_ms: u64) -> u32 {
+    (tick / frames_per_cell(frame_ms)) as u32
 }
 
 /// Which line a node's head sits on, if it is on screen at all.
@@ -62,6 +79,26 @@ pub fn head_of(heads: &HashMap<usize, i64>, seq: i64) -> Option<usize> {
 pub fn body_of(heads: &HashMap<usize, i64>, head: usize, stop: usize) -> std::ops::Range<usize> {
     let next = heads.keys().copied().filter(|line| *line > head).min().unwrap_or(stop);
     (head + 1).min(stop)..next.min(stop)
+}
+
+/// The lines a node put on screen, which is what a fade is applied to.
+///
+/// **A card's is its whole card, chips and all.** [`body_of`] stops at the next head, which is
+/// right for a chip — the head after it is its sibling — and wrong for the card wrapping them,
+/// whose first chip is the very next head. The wrapper's reveal was therefore the nothing between
+/// the two, and expanding it read as no animation at all (reported 2026-08-18).
+///
+/// `owns_the_item` is whether this head is the item's own, which is how the two are told apart.
+pub fn revealed(
+    heads: &HashMap<usize, i64>,
+    head: usize,
+    end: usize,
+    owns_the_item: bool,
+) -> std::ops::Range<usize> {
+    match owns_the_item {
+        true => (head + 1).min(end)..end,
+        false => body_of(heads, head, end),
+    }
 }
 
 /// Moves every span on `line` `amount` of the way to the background.
@@ -87,14 +124,13 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut State) {
     // The question being answered in the panel below is not drawn again inside the conversation.
     let skip = state.asking.as_ref().map(|(seq, _)| *seq);
 
-    // How far a waiting tool's dot has receded right now. Wall-clock based, so it moves without
-    // anything having to be stored between frames.
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
+    // **Driven by the frame counter, not by the clock.** Wall time and the frame rate do not
+    // divide into each other, so a wall-clock animation lands a different distance on each drawn
+    // frame — which is what the wave was doing. `State.tick` is what everything else that moves
+    // here already uses, and it also keeps this side free of a clock read per frame.
+    let now_ms = state.tick.saturating_mul(state.frame_ms);
     let pulse = pulse_at(now_ms);
-    let crest = wave_at(now_ms);
+    let crest = wave_at(state.tick, state.frame_ms);
 
     // **What the viewport was looking at, taken before the relayout.** `Scroll.top` is an
     // absolute line index and `layout` rebuilds the line list from scratch, so a width change or
@@ -141,7 +177,14 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut State) {
     // cache is untouched — see `body_of`.
     for (seq, amount) in state.fading_in() {
         let Some(head) = head_of(state.rows_cache.cards(), seq) else { continue };
-        let body = body_of(state.rows_cache.cards(), head, state.rows_cache.item_end(head));
+        // **A card's body is its whole card, chips and all.** `body_of` stops at the next head,
+        // which is right for a chip — the head after it is its sibling — and wrong for the card
+        // wrapping them, whose first chip is the very next head. The wrapper's reveal therefore
+        // covered the nothing between the two and read as no animation at all (reported
+        // 2026-08-18). An item's own head is told apart by its seq being the item's own.
+        let owns_the_item = state.rows_cache.anchor_at(head).is_some_and(|(item, _)| item == seq);
+        let end = state.rows_cache.item_end(head);
+        let body = revealed(state.rows_cache.cards(), head, end, owns_the_item);
         for line in body.start.max(start)..body.end.min(end) {
             if let Some(row) = shown.get_mut(line - start) {
                 *row = faded(std::mem::take(row), amount);
@@ -210,6 +253,52 @@ mod tests {
     fn the_breath_repeats() {
         for ms in [0u64, 137, 799, 1200] {
             assert_eq!(pulse_at(ms), pulse_at(ms + 1600), "the period does not close at {ms}");
+        }
+    }
+
+    /// **The wrapper reveals its whole card, not the gap above its first chip.** Its chips are
+    /// heads of their own, so stopping at "the next head" left the fade nothing to touch and
+    /// expanding a Thinking card looked like it had no animation at all.
+    #[test]
+    fn a_card_reveals_everything_inside_it_and_a_chip_only_its_own_body() {
+        // A card head at 0, chips at 2 and 6, the card ending at 10.
+        let heads = HashMap::from([(0usize, 1i64), (2, 2), (6, 3)]);
+        assert_eq!(
+            revealed(&heads, 0, 10, true),
+            1..10,
+            "the wrapper's reveal stopped at its first chip",
+        );
+        // A chip inside it still stops where its sibling begins.
+        assert_eq!(revealed(&heads, 2, 10, false), 3..6);
+        assert_eq!(revealed(&heads, 6, 10, false), 7..10);
+        // And an empty card is an empty range, not a backwards one.
+        assert!(revealed(&HashMap::from([(4usize, 1i64)]), 4, 4, true).is_empty());
+    }
+
+    /// **The frames a cell gets are a whole number of them.** The wave used to move on a wall
+    /// clock at one cell every 55ms while frames land every 50ms, so a drawn frame took it one
+    /// cell, then one, then two — a limp rather than a run, and the reason it was reported as
+    /// stuttering. Tied to the frame, every step is the same size.
+    #[test]
+    fn the_crest_moves_the_same_distance_on_every_frame() {
+        for frame_ms in [50u64, 16, 100, 1] {
+            let per_cell = frames_per_cell(frame_ms);
+            assert!(per_cell >= 1, "a cell cannot take no frames at {frame_ms}ms");
+            let steps: Vec<u32> =
+                (0..40).map(|t| wave_at(t + 1, frame_ms) - wave_at(t, frame_ms)).collect();
+            let moved: Vec<u32> = steps.iter().copied().filter(|s| *s > 0).collect();
+            assert!(moved.iter().all(|s| *s == 1), "uneven steps at {frame_ms}ms: {steps:?}");
+        }
+    }
+
+    /// And the speed stays about what it was however fast frames come, so turning the frame rate
+    /// up makes it smoother rather than faster.
+    #[test]
+    fn the_crest_travels_at_about_the_same_speed_whatever_the_frame_rate() {
+        for frame_ms in [50u64, 33, 16] {
+            let a_second = 1000 / frame_ms;
+            let cells = wave_at(a_second, frame_ms);
+            assert!((14..=24).contains(&cells), "{cells} cells a second at {frame_ms}ms");
         }
     }
 
