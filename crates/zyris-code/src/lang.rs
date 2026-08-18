@@ -357,21 +357,25 @@ impl Lang {
             (Lang::En, false) => "Ctrl+P to open",
         };
         match self {
-            Lang::Ko => format!("Enter 승인 · 고칠 점은 그냥 적으세요 · {fold}"),
-            Lang::En => format!("Enter approves · type to ask for changes · {fold}"),
+            // **`∙`, not `·`.** The middle dot is East Asian Ambiguous: one column here and two
+            // on a terminal set for CJK, which shifts everything after it on the row.
+            Lang::Ko => format!("Enter 승인 ∙ 고칠 점은 그냥 적으세요 ∙ {fold}"),
+            Lang::En => format!("Enter approves ∙ type to ask for changes ∙ {fold}"),
         }
     }
     pub fn plan_more(self, n: usize) -> String {
         match self {
-            Lang::Ko => format!("↓ {n}줄 더 — 위 대화에서 전체를 볼 수 있습니다"),
-            Lang::En => format!("↓ {n} more lines — the whole plan is in the conversation above"),
+            // **`,` rather than an em dash.** `—` is East Asian Ambiguous, and a row that shifts
+            // by a column on a CJK terminal cannot be repaired by redrawing it.
+            Lang::Ko => format!("↓ {n}줄 더, 전체는 위 대화에 있습니다"),
+            Lang::En => format!("↓ {n} more lines, the whole plan is in the conversation above"),
         }
     }
     /// What Enter on an empty draft sends. **The agent reads this as the decision**, so it has to
     /// say approval and nothing else — attacca tells it the message is the decision, and anything
     /// hedged reads as changes.
     pub fn plan_approved(self) -> &'static str {
-        self.pick("승인합니다. 계획대로 진행해 주세요.", "Approved — go ahead with the plan.")
+        self.pick("승인합니다. 계획대로 진행해 주세요.", "Approved, go ahead with the plan.")
     }
 
     pub fn connecting(self) -> &'static str {
