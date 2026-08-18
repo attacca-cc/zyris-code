@@ -497,3 +497,141 @@ impl GitCap for Git {
         Ok(json!({"remote": remote, "branch": branch, "said": ran.err.trim()}))
     }
 }
+
+/// Against a real repository, because the whole of this module is what git does when it is run.
+///
+/// **A repository made here, never the one this checkout sits in.** A test that commits into the
+/// working tree it is running from is a test that eventually commits something nobody meant to.
+#[cfg(test)]
+mod against_a_real_repository {
+    use super::*;
+
+    /// A repository with one commit in it, and an identity of its own.
+    ///
+    /// **The identity is written into the repository, not into the environment.** Tests run beside
+    /// each other in one process, so a `set_var` here would be read by whatever else is running.
+    async fn repo() -> (tempfile::TempDir, Git) {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let at = dir.path().to_path_buf();
+        let run = |args: Vec<&str>| {
+            let at = at.clone();
+            let args: Vec<String> = args.into_iter().map(str::to_string).collect();
+            async move {
+                let out = tokio::process::Command::new("git")
+                    .current_dir(&at)
+                    .args(&args)
+                    .output()
+                    .await
+                    .expect("git has to be installed to run these");
+                assert!(
+                    out.status.success(),
+                    "git {args:?}: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+        };
+        run(vec!["init", "-q", "-b", "main"]).await;
+        run(vec!["config", "user.name", "A Tester"]).await;
+        run(vec!["config", "user.email", "tester@example.invalid"]).await;
+        // Signing is a machine-wide setting here; a repository under test must not pick it up.
+        run(vec!["config", "commit.gpgsign", "false"]).await;
+        std::fs::write(at.join("first.txt"), "one\n").expect("write");
+        run(vec!["add", "."]).await;
+        run(vec!["commit", "-q", "-m", "first"]).await;
+        let git = Git::new(at);
+        (dir, git)
+    }
+
+    /// **A clean tree says so, and a dirty one names what changed.** This is the answer a plan is
+    /// written from, so "clean" has to mean it.
+    #[tokio::test]
+    async fn status_reads_the_branch_and_what_changed() {
+        let (dir, git) = repo().await;
+        let clean = git.status().await.expect("status");
+        assert_eq!(clean["branch"], "main");
+        assert_eq!(clean["clean"], true);
+        assert_eq!(clean["upstream"], serde_json::Value::Null, "a fresh repository has no remote");
+
+        std::fs::write(dir.path().join("first.txt"), "two\n").expect("write");
+        std::fs::write(dir.path().join("new.txt"), "new\n").expect("write");
+        let dirty = git.status().await.expect("status");
+        assert_eq!(dirty["clean"], false);
+        assert_eq!(dirty["unstaged"][0], "first.txt");
+        assert_eq!(dirty["untracked"][0], "new.txt");
+    }
+
+    /// **Committing names the files it takes.** Staging by hand first and committing second is two
+    /// round trips for what is one intention.
+    #[tokio::test]
+    async fn a_commit_takes_the_paths_it_was_given_and_answers_the_sha() {
+        let (dir, git) = repo().await;
+        std::fs::write(dir.path().join("second.txt"), "two\n").expect("write");
+        let made = git
+            .commit("feat: a second file".into(), vec!["second.txt".into()], false)
+            .await
+            .expect("commit");
+        assert!(!made["sha"].as_str().unwrap_or_default().is_empty(), "{made}");
+        assert_eq!(made["subject"], "feat: a second file");
+        assert_eq!(git.status().await.expect("status")["clean"], true);
+
+        let log = git.log(5).await.expect("log");
+        assert_eq!(log[0]["subject"], "feat: a second file");
+        assert_eq!(log[1]["subject"], "first");
+    }
+
+    /// **A commit with nothing staged is a failure, and it says git's own words.** Answering
+    /// success there would have the agent believe work was saved that was not.
+    #[tokio::test]
+    async fn a_commit_with_nothing_to_commit_says_so() {
+        let (_dir, git) = repo().await;
+        let why = git.commit("nothing".into(), vec![], false).await.expect_err("must refuse");
+        assert!(why.to_string().to_lowercase().contains("nothing"), "{why}");
+        // And a commit with no message never reaches git at all.
+        assert!(git.commit("  ".into(), vec![], false).await.is_err());
+    }
+
+    /// Making a branch, and being on it afterwards. **`branches` has to agree** — the two answers
+    /// are read together and disagreeing is worse than either being missing.
+    #[tokio::test]
+    async fn a_branch_can_be_made_and_switched_to() {
+        let (_dir, git) = repo().await;
+        git.switch("feature".into(), true).await.expect("switch -c");
+        assert_eq!(git.status().await.expect("status")["branch"], "feature");
+        let listed = git.branches().await.expect("branches");
+        assert_eq!(listed["current"], "feature");
+        let names: Vec<String> = listed["branches"]
+            .as_array()
+            .expect("a list")
+            .iter()
+            .map(|b| b.as_str().unwrap_or_default().to_string())
+            .collect();
+        assert!(names.contains(&"main".to_string()) && names.contains(&"feature".to_string()));
+
+        // Switching to something that is not there fails with git's reason, not with a guess.
+        assert!(git.switch("nowhere".into(), false).await.is_err());
+    }
+
+    /// **`against` measures from where the two last parted.** Pulling the base in must not credit
+    /// this branch with everybody else's work — the same three-dot rule the strip uses.
+    #[tokio::test]
+    async fn a_diff_can_be_taken_against_another_branch() {
+        let (dir, git) = repo().await;
+        git.switch("feature".into(), true).await.expect("switch -c");
+        std::fs::write(dir.path().join("first.txt"), "one\ntwo\n").expect("write");
+        git.commit("more".into(), vec!["first.txt".into()], false).await.expect("commit");
+
+        let patch = git.diff(false, String::new(), "main".into()).await.expect("diff");
+        assert!(patch.contains("+two"), "{patch}");
+        // Nothing uncommitted, so the plain diff is empty while the one against main is not.
+        assert!(git.diff(false, String::new(), String::new()).await.expect("diff").is_empty());
+    }
+
+    /// **Nowhere to push is said before anything is attempted.** A push that fails inside git
+    /// answers with git's networking wording, which does not mention the missing remote.
+    #[tokio::test]
+    async fn pushing_without_a_remote_says_that_rather_than_failing_inside_git() {
+        let (_dir, git) = repo().await;
+        let why = git.push(false).await.expect_err("must refuse");
+        assert!(why.to_string().contains("remote"), "{why}");
+    }
+}
