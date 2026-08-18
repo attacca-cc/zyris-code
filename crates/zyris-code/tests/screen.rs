@@ -927,11 +927,12 @@ fn clicking_a_work_card_toggles_it() {
         apply(s, &Action::Release);
     };
 
-    // **A running card draws open**, so the first click folds it.
+    // **A running card draws open**, so the first click folds it — and `closing` is set, because
+    // a fold on its way out goes on being laid out while its body fades away.
     click(&mut s, row);
     assert_eq!(
         s.folds[&seq],
-        Fold { open: false, user_touched: true, ..Fold::default() },
+        Fold { open: false, user_touched: true, closing: true },
         "a click must fold it"
     );
     click(&mut s, row);
