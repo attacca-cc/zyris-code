@@ -58,16 +58,26 @@ pub fn lines(items: &[Todo], lang: Lang, width: usize, rows: usize) -> Vec<Line<
 
 /// One task: `  ● 3. what it says`.
 fn row(todo: &Todo, number: usize, width: usize) -> Line<'static> {
-    // The dot's colour is the only thing that moves as a task progresses — grey waiting, orange
-    // under way, green finished. Same three the thread list uses, for the same three meanings.
+    // **The title says it too, not only the dot** (2026-08-18 user request). A dot is two cells at
+    // the far left of a row that can run the width of the screen; the eye reading down a plan is on
+    // the words, and asking it to keep glancing back to the margin to find out which task is in
+    // hand is asking for something a colour can just say.
+    //
+    // Waiting is plain text, in hand is blue, and a finished task is struck through and dimmed —
+    // the one state where the words themselves are no longer worth reading, said in the way every
+    // checklist everywhere says it.
     let (dot, title_style) = match todo.status {
-        Status::Pending => (theme::border_light(), Style::default().fg(theme::text_muted())),
-        Status::Doing => {
-            (theme::accent(), Style::default().fg(theme::text()).add_modifier(Modifier::BOLD))
-        }
+        Status::Pending => (theme::border_light(), Style::default().fg(theme::text())),
+        Status::Doing => (
+            theme::accent(),
+            Style::default().fg(theme::in_progress()).add_modifier(Modifier::BOLD),
+        ),
         // **A finished task dims but stays.** Dropping it would make the list shrink as work goes
         // on, and the count on the activity line would have nothing to point at.
-        Status::Done => (theme::success(), Style::default().fg(theme::text_muted())),
+        Status::Done => (
+            theme::success(),
+            Style::default().fg(theme::text_muted()).add_modifier(Modifier::CROSSED_OUT),
+        ),
     };
     let head = format!("{number}. ");
     // A title is one line here however it was written, so its own newlines are folded away.
@@ -116,6 +126,41 @@ mod tests {
         let before = plain(&row(&todo("빌드", Status::Pending), 1, 40));
         for status in [Status::Doing, Status::Done] {
             assert_eq!(plain(&row(&todo("빌드", status), 1, 40)), before);
+        }
+    }
+
+    /// **The words say the state as well as the dot does** (2026-08-18 user request). Reading down
+    /// a plan, the eye is on the titles; making it glance back to a two-cell dot in the margin to
+    /// find out which task is in hand is work a colour can do for it.
+    #[test]
+    fn a_tasks_own_words_say_which_state_it_is_in() {
+        let title_of = |status| {
+            let line = row(&todo("빌드", status), 1, 40);
+            line.spans.last().expect("a row ends with its title").style
+        };
+        let waiting = title_of(Status::Pending);
+        let doing = title_of(Status::Doing);
+        let done = title_of(Status::Done);
+
+        assert_eq!(
+            waiting.fg,
+            Some(theme::text()),
+            "a task nobody has started reads as plain text"
+        );
+        assert_eq!(doing.fg, Some(theme::in_progress()), "the one in hand is not marked out");
+        assert_eq!(done.fg, Some(theme::text_muted()), "a finished task did not dim");
+        assert!(
+            done.add_modifier.contains(Modifier::CROSSED_OUT),
+            "a finished task is not struck through",
+        );
+        // And the three do not read as each other.
+        assert_ne!(waiting.fg, doing.fg);
+        assert_ne!(doing.fg, done.fg);
+        assert_ne!(waiting.fg, done.fg);
+        // Only the finished one is struck through ‒ a line through work still to do reads as
+        // cancelled.
+        for still_to_do in [waiting, doing] {
+            assert!(!still_to_do.add_modifier.contains(Modifier::CROSSED_OUT));
         }
     }
 

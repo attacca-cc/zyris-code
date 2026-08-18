@@ -344,6 +344,16 @@ pub fn link() -> Color {
 ///
 /// `success()`/`danger()` are not reused. Those two say "the tool worked / did not", so a deleted
 /// line inside a *successful* edit painted the same red as a failed tool would be misread.
+/// A task somebody is on right now.
+///
+/// **Its own role, not the accent.** The accent is the furniture — borders, the cursor, the input
+/// prompt — and a task in hand is not furniture; a colour carrying both meanings means a change
+/// made for one of them moves the other. Blue because the other two states of a task are already
+/// spoken for, and because it reads as "in hand" beside a green that reads as "done".
+pub fn in_progress() -> Color {
+    pick((0x6f, 0x9c, 0xe0), (0x1f, 0x5c, 0xa8))
+}
+
 /// A pull request that has landed.
 ///
 /// **Purple because it is the one state that is finished.** Yellow says "waiting on somebody",
