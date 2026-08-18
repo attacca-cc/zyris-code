@@ -186,14 +186,15 @@ fn pieces(path: &str, repo: Option<&Repo>, level: Level) -> Vec<Vec<Span<'static
             count(r.staged, '+', warn);
             count(r.unstaged, '~', warn);
             if level == Level::Full {
-                // Files git does not know are usually build litter. In a warning colour this
-                // would be lit permanently and stop being read.
-                count(r.untracked, '?', muted);
+                // Files git does not know are usually build litter, so this stays quiet — but
+                // quiet in its own tint, not the paint the path is wearing.
+                count(r.untracked, '?', Style::default().fg(theme::untracked()));
             }
             if matches!(level, Level::Full | Level::NoUntracked) {
-                // Pushing is less urgent than committing, so these stay quiet too.
-                count(r.ahead, '↑', muted);
-                count(r.behind, '↓', muted);
+                // Pushing is a later errand than committing, so these keep away from `warning()`
+                // — but they point opposite ways and are read together, so they part in colour.
+                count(r.ahead, '↑', Style::default().fg(theme::ahead()));
+                count(r.behind, '↓', Style::default().fg(theme::behind()));
             }
         }
     }
@@ -381,6 +382,35 @@ mod tests {
             ahead: 1,
             behind: 0,
         }
+    }
+
+    /// **The marks are painted, not merely printed.** `?3 ↑2 ↓1` spelled in one grey says three
+    /// different things in a single voice, and the only way to tell them apart is to stop and read
+    /// the glyph. Deliberately put back to `text_muted()` to watch this fail.
+    #[test]
+    fn the_marks_carry_the_colours_that_tell_them_apart() {
+        let repo = Repo {
+            branch: "main".into(),
+            staged: 1,
+            unstaged: 0,
+            untracked: 3,
+            conflicts: 0,
+            ahead: 2,
+            behind: 1,
+        };
+        let spans = super::spans(
+            80,
+            Path::new("/home/ruma/zyris-code"),
+            Some(Path::new("/home/ruma")),
+            Some(&repo),
+        );
+        let colour_of =
+            |mark: char| spans.iter().find(|s| s.content.contains(mark)).and_then(|s| s.style.fg);
+        assert_eq!(colour_of('?'), Some(theme::untracked()), "untracked wears its own tint");
+        assert_eq!(colour_of('↑'), Some(theme::ahead()), "ahead is yours to push");
+        assert_eq!(colour_of('↓'), Some(theme::behind()), "behind came from elsewhere");
+        assert_ne!(colour_of('↑'), colour_of('↓'), "the two directions must not look alike");
+        assert_ne!(colour_of('?'), colour_of('↑'), "litter must not look like work to send");
     }
 
     #[test]
