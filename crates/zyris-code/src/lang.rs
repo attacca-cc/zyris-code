@@ -1851,6 +1851,32 @@ impl Lang {
     pub fn question_refused(self) -> &'static str {
         self.pick("이 질문에는 답하지 않겠습니다.", "I won't answer this question.")
     }
+    /// The answer sent back when a question arrives in print mode, where no screen exists to put
+    /// it on.
+    ///
+    /// **Addressed to the agent, because it is delivered as the answer** — the server's
+    /// `question_waiter` takes the next ordinary message as the reply, so this text is what the
+    /// turn reads. A bare refusal would leave it free to ask again and block a second time, so it
+    /// says what to do instead.
+    pub fn question_unattended(self) -> &'static str {
+        self.pick(
+            "이 턴은 화면 없이 돌고 있어 답할 사람이 없습니다. 다시 묻지 마세요. 안전한 기본값으로 \
+             진행하거나, 그럴 수 없다면 무엇이 필요했는지 적고 멈추세요.",
+            "This turn is running with no screen, so there is nobody to answer. Do not ask again: \
+             either carry on with the safe default, or stop and say what you needed.",
+        )
+    }
+    /// Said on stderr when that happens.
+    ///
+    /// **Not on stdout**, which is the agent's answer and nothing else — `-p` exists to be piped.
+    /// A reader of the script's log needs to know the answer they are holding was produced without
+    /// the decision they were asked for.
+    pub fn question_unattended_notice(self) -> &'static str {
+        self.pick(
+            "에이전트가 물었지만 -p 에는 답할 화면이 없습니다:",
+            "The agent asked something, and `-p` has no screen to answer it on:",
+        )
+    }
     pub fn all_skipped(self) -> &'static str {
         self.pick("모두 건너뛰었습니다.", "Skipped them all.")
     }
@@ -2296,6 +2322,8 @@ mod tests {
             (ko.action_edit(), en.action_edit()),
             (ko.action_reject(), en.action_reject()),
             (ko.question_refused(), en.question_refused()),
+            (ko.question_unattended(), en.question_unattended()),
+            (ko.question_unattended_notice(), en.question_unattended_notice()),
             (ko.all_skipped(), en.all_skipped()),
             (ko.detail_args(), en.detail_args()),
             (ko.detail_output(), en.detail_output()),
@@ -2369,6 +2397,8 @@ mod tests {
             en.action_edit(),
             en.action_reject(),
             en.question_refused(),
+            en.question_unattended(),
+            en.question_unattended_notice(),
             en.all_skipped(),
             en.free_mark(),
             en.detail_args(),
