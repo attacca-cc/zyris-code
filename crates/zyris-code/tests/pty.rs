@@ -21,6 +21,7 @@
 //! lost twenty minutes to exactly that. `read_until` gives up and hands back what it saw.
 
 use std::io::{Read, Write};
+use std::path::PathBuf;
 use std::sync::{mpsc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -57,6 +58,15 @@ struct Session {
     _master: Box<dyn portable_pty::MasterPty + Send>,
 }
 
+/// Where the app under test keeps its settings.
+///
+/// **One place, because a test may have to write one.** Updating by itself is not the default any
+/// more (0.2.8), so the test that walks the whole handover has to turn it on — and it can only do
+/// that by putting a settings file where the app under test will read it.
+fn config_dir() -> PathBuf {
+    std::env::temp_dir().join(format!("zyris-pty-{}", std::process::id()))
+}
+
 impl Session {
     fn start() -> Session {
         Session::start_with(&[])
@@ -78,7 +88,7 @@ impl Session {
         // Refused at once rather than left hanging, so the screen settles quickly.
         cmd.env("ZYRIS_SERVER_URL", "ws://127.0.0.1:1");
         // Somewhere empty, so a real credential on this machine is never read or written.
-        let dir = std::env::temp_dir().join(format!("zyris-pty-{}", std::process::id()));
+        let dir = config_dir();
         let _ = std::fs::create_dir_all(&dir);
         cmd.env("ZYRIS_CONFIG_DIR", &dir);
         // Off: the self-heal reprints the whole screen on a timer, which would make "what arrived
@@ -449,6 +459,15 @@ fn an_update_keeps_the_terminal_it_was_started_in() {
         format!("#!/bin/sh\nprintf '%s' \"$2\" > '{}'\n", marker.display())
     };
     std::fs::write(&script, text).expect("could not write the stand-in installer");
+
+    // **Asked for, because it is no longer what happens by itself.** The default became `notify`
+    // in 0.2.8 — a new version is mentioned and waits to be asked for — and what this test is about
+    // is the handover that `auto` performs, which still has to work and still has to end up drawing
+    // on the terminal it started on.
+    let settings = config_dir();
+    let _ = std::fs::create_dir_all(&settings);
+    std::fs::write(settings.join("config.json"), br#"{"update":"auto"}"#)
+        .expect("could not ask for updates to install themselves");
 
     let mut app = Session::start_with(&[
         ("ZYRIS_CODE_UPDATE_TAG", "v99.0.0".into()),
