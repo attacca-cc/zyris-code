@@ -83,6 +83,13 @@ fn only_reads(call: &Call) -> bool {
         // work creates work on the **server**, not this computer. Only the two that look are reads —
         // waking a sub-agent is exactly what plan mode is meant to stop.
         "work" => matches!(tool, "status" | "list"),
+        // **Reading a repository is reading.** Plan mode is "look before you touch anything", and
+        // a plan for a change starts with the log and the diff. What alters the checkout — moving
+        // branch, committing, pushing — does not pass.
+        "git" => matches!(tool, "status" | "log" | "diff" | "branches"),
+        // Same split on GitHub's side: looking at issues and pull requests is how a plan gets
+        // written; opening one, commenting or reviewing is doing something.
+        "github" => matches!(tool, "me" | "issues" | "issue" | "pulls" | "pull" | "pull_diff"),
         // Only looking passes. `start` runs a command, and `stop` kills a running build — an
         // **irreversible write**. `until` runs a command only when it is a probe.
         "wait" => match tool {
@@ -174,7 +181,14 @@ pub fn secret_path(
 ///   machine**, which is every bit as bad as it sounds.
 /// - `github.json` — the GitHub tokens (`github::auth`).
 /// - `mcp.json` — server definitions, which routinely carry API keys in `env`.
+/// - anything under `gnupg/` — the commit signing key (`github::signing`). **A whole directory,
+///   not a file**: GnuPG spreads one key over `private-keys-v1.d/`, `pubring.kbx` and a trust
+///   database, and naming only the ones known today would leave the next one readable. Whoever
+///   holds it can sign commits as the person, which is the badge this app exists to earn.
 pub fn is_secret_file(app_dir: &Path, path: &Path) -> bool {
+    if path.starts_with(app_dir.join("gnupg")) {
+        return true;
+    }
     if path.parent() != Some(app_dir) {
         return false;
     }
@@ -391,6 +405,66 @@ mod tests {
                     config.dir_access
                 );
             }
+        }
+    }
+
+    /// **The signing key is a directory, not a file.** GnuPG spreads one key over several files
+    /// under `gnupg/`, and naming only the ones that exist today would leave whatever it writes
+    /// next readable. Whoever holds it can sign commits as the person.
+    #[test]
+    fn no_setting_hands_over_the_commit_signing_key() {
+        let allow = Config { dir_access: DirAccess::Allow, ..Config::default() };
+        for path in [
+            format!("{APP}/gnupg/private-keys-v1.d/AABB.key"),
+            format!("{APP}/gnupg/pubring.kbx"),
+            format!("{APP}/gnupg"),
+        ] {
+            let asked = reaching("file_io", "read", json!({ "path": path }));
+            assert!(
+                matches!(decide(Mode::Normal, &allow, &asked), Decision::Refuse(_)),
+                "{path} was handed over",
+            );
+        }
+        // And the fence is around that directory, not the whole config directory ‒ skills and
+        // plugins live beside it and are ordinary files somebody may well be editing.
+        let ordinary = reaching("file_io", "read", json!({ "path": format!("{APP}/skills/a.md") }));
+        assert!(!matches!(decide(Mode::Normal, &allow, &ordinary), Decision::Refuse(_)));
+    }
+
+    /// **Plan mode is "look before you touch", so looking has to work.** A plan for a change is
+    /// written from the log and the diff; refusing those sends the agent back to `terminal.exec`,
+    /// which plan mode refuses too, and it stops with nothing to say.
+    #[test]
+    fn planning_can_read_a_repository_but_not_change_it() {
+        let config = Config::default();
+        for tool in ["status", "log", "diff", "branches"] {
+            let asked = call("git", tool, "");
+            assert!(
+                !matches!(decide(Mode::Plan, &config, &asked), Decision::Refuse(_)),
+                "git.{tool} was refused while planning",
+            );
+        }
+        for tool in ["commit", "push", "switch"] {
+            let asked = call("git", tool, "");
+            assert!(
+                matches!(decide(Mode::Plan, &config, &asked), Decision::Refuse(_)),
+                "git.{tool} changed the checkout while planning",
+            );
+        }
+        for tool in ["issues", "pull", "pull_diff"] {
+            assert!(!matches!(
+                decide(Mode::Plan, &config, &call("github", tool, "")),
+                Decision::Refuse(_)
+            ));
+        }
+        for tool in ["comment", "create_pull", "review"] {
+            assert!(
+                matches!(
+                    decide(Mode::Plan, &config, &call("github", tool, "")),
+                    Decision::Refuse(_)
+                ),
+                "github.{tool} spoke to the world while planning",
+            );
         }
     }
 

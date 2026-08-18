@@ -991,6 +991,9 @@ pub enum GithubNews {
     Code { code: String, uri: String },
     /// It finished, one way or the other. The screen says so and re-reads who is connected.
     Settled { note: String, worked: bool },
+    /// Where a long set-up has got to. **Not `Settled`** — the screen must stay busy, because the
+    /// step after this one is still coming.
+    Step(String),
 }
 
 /// A clickable URL somewhere on the screen, in absolute cells.
@@ -2190,6 +2193,14 @@ fn apply_frame(state: &mut State, frame: &Frame) {
                 GithubNews::Code { code, uri } => {
                     if let Some(form) = state.github_form.as_mut() {
                         form.pending = Some((code.clone(), uri.clone()));
+                    }
+                }
+                // **A step keeps the screen busy.** Making a key can take seconds; saying nothing
+                // there reads as a hang, and saying "done" would be a lie with work still to do.
+                GithubNews::Step(step) => {
+                    if let Some(form) = state.github_form.as_mut() {
+                        form.pending = None;
+                        form.note = Some(step.clone());
                     }
                 }
                 GithubNews::Settled { note, worked } => {
@@ -4874,7 +4885,156 @@ fn run_github_ask(
             };
             settle_github(state, note, worked);
         }
+        // **Off the loop as well.** Making a key can take seconds on a machine short of entropy,
+        // and it may need a trip through the browser for one more permission first.
+        Ask::SetUpSigning => spawn_github_signing(state.lang, tx),
+        Ask::StopSigning => {
+            let worked = crate::github::signing::Signing::forget();
+            let note = match worked {
+                true => state.lang.github_signing_stopped().to_string(),
+                false => state.lang.github_nothing_to_log_out().to_string(),
+            };
+            settle_github(state, note, worked);
+        }
     }
+}
+
+/// Sets commit signing up, in the background.
+///
+/// **Four things have to be true and each is checked rather than assumed**: GnuPG is on this
+/// machine, the token may add a key to the account, a key exists for the account's noreply
+/// address, and GitHub has its public half. Any of them failing says which one it was — a single
+/// "could not set signing up" would leave the person with nowhere to go.
+///
+/// The scope is the interesting one. A token saved before this feature existed cannot add keys, so
+/// this walks the person through the browser again asking for one more permission. **That is the
+/// grant the feature was described in terms of** — nobody is asked for it until they ask for this.
+fn spawn_github_signing(lang: crate::lang::Lang, tx: &mpsc::UnboundedSender<AppMsg>) {
+    use crate::github::{api, auth, signing};
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let say = |news: GithubNews| {
+            let _ = tx.send((None, Action::Frame(Frame::Github(news))));
+        };
+        let failed = |why: String| GithubNews::Settled {
+            note: lang.github_signing_failed(&why),
+            worked: false,
+        };
+
+        // **First, because it is the one this app cannot work around.** Everything else can be
+        // arranged from here; a machine with no GnuPG needs a person to install it.
+        if !signing::installed().await {
+            return say(GithubNews::Settled {
+                note: lang.github_signing_no_gpg().to_string(),
+                worked: false,
+            });
+        }
+
+        let Some(account) = auth::Accounts::load().for_role(auth::Role::User).cloned() else {
+            return say(failed("nobody is signed in".into()));
+        };
+        let client = match api::Github::new(account.token.clone()) {
+            Ok(c) => c,
+            Err(e) => return say(failed(e.to_string())),
+        };
+        let who = match client.account().await {
+            Ok(who) => who,
+            Err(e) => return say(failed(e.to_string())),
+        };
+
+        // The token is either already allowed to add a key, or the person goes through the
+        // browser once more for exactly that.
+        let (token, who) = match who.may(signing::GPG_SCOPE) {
+            true => (account.token.clone(), who),
+            false => match ask_for_the_gpg_scope(lang, &tx).await {
+                Ok(pair) => pair,
+                Err(why) => return say(failed(why)),
+            },
+        };
+
+        let email = signing::noreply(who.id, &who.login);
+        say(GithubNews::Step(lang.github_signing_step("making a key")));
+        let fingerprint = match signing::generate(&email, &who.login).await {
+            Ok(f) => f,
+            Err(e) => return say(failed(e.to_string())),
+        };
+        let armored = match signing::public_key(&fingerprint).await {
+            Ok(a) => a,
+            Err(e) => return say(failed(e.to_string())),
+        };
+        say(GithubNews::Step(lang.github_signing_step("telling GitHub about it")));
+        let client = match api::Github::new(token) {
+            Ok(c) => c,
+            Err(e) => return say(failed(e.to_string())),
+        };
+        if let Err(e) = client
+            .add_gpg_key(
+                &armored,
+                &format!(
+                    "zyris-code on {}",
+                    zyris::machine_name().unwrap_or_else(|| "this machine".to_string())
+                ),
+            )
+            .await
+        {
+            return say(failed(e.to_string()));
+        }
+
+        // **Saved last.** The record is what makes every later commit set `commit.gpgsign`, so it
+        // must not exist until there is a key on both sides to back it up.
+        let record = signing::Signing { fingerprint, email: email.clone(), login: who.login };
+        say(match record.save() {
+            Ok(()) => GithubNews::Settled { note: lang.github_signing_on(&email), worked: true },
+            Err(e) => failed(e.to_string()),
+        });
+    });
+}
+
+/// Walks the person through the browser once more, for a token that may add a key.
+///
+/// **The new token replaces the old one.** It carries everything the old one did and one thing
+/// more, so keeping both would mean deciding which to use on every call for no gain.
+async fn ask_for_the_gpg_scope(
+    lang: crate::lang::Lang,
+    tx: &mpsc::UnboundedSender<AppMsg>,
+) -> Result<(String, crate::github::api::Account), String> {
+    use crate::github::{api, auth, signing};
+    let say = |news: GithubNews| {
+        let _ = tx.send((None, Action::Frame(Frame::Github(news))));
+    };
+    let pending = auth::begin_with(signing::SIGNING_SCOPES).await.map_err(|e| e.to_string())?;
+    say(GithubNews::Code {
+        code: pending.user_code.clone(),
+        uri: pending.verification_uri.clone(),
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(pending.expires_in);
+    let mut wait = std::time::Duration::from_secs(pending.interval);
+    let token = loop {
+        if std::time::Instant::now() >= deadline {
+            return Err(lang.github_login_failed("the code expired"));
+        }
+        tokio::time::sleep(wait).await;
+        match auth::poll(&pending).await {
+            auth::Poll::Waiting { interval } => wait = std::time::Duration::from_secs(interval),
+            auth::Poll::Failed(why) => return Err(why),
+            auth::Poll::Done(token) => break token,
+        }
+    };
+    let client = api::Github::new(token.clone()).map_err(|e| e.to_string())?;
+    let who = client.account().await.map_err(|e| e.to_string())?;
+    // **Refused rather than carried on with.** Approving the screen without the extra permission
+    // is possible, and going on would fail at the upload with GitHub's own 404 — which reads like
+    // this app is broken rather than like a box that was left unticked.
+    if !who.may(signing::GPG_SCOPE) {
+        return Err(lang.github_signing_failed("the extra permission was not granted"));
+    }
+    let mut accounts = auth::Accounts::load();
+    accounts.set(
+        auth::Role::User,
+        Some(auth::Account { token: token.clone(), login: who.login.clone() }),
+    );
+    accounts.save().map_err(|e| e.to_string())?;
+    Ok((token, who))
 }
 
 /// Runs the browser sign-in in the background, reporting through `Frame::Github`.
