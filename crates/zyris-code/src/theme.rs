@@ -265,6 +265,35 @@ pub fn notice() -> Color {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// The repository strip
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Commits this checkout has and its upstream does not — yours to push.
+///
+/// **These three used to be one muted grey.** The strip could say six different things and three
+/// of them looked identical, so the only way to learn that a branch was behind was to read the
+/// arrow rather than see it. They stay away from `warning()`, which is reserved here for what is
+/// not committed yet: pushing is a later, calmer errand than committing.
+pub fn ahead() -> Color {
+    pick((0x6f, 0xb0, 0x7a), (0x2f, 0x6f, 0x3f))
+}
+
+/// Commits the upstream has and this checkout does not — someone else's, waiting to be pulled.
+/// Blue against `ahead()`'s green, because the two are opposite directions and are read together.
+pub fn behind() -> Color {
+    pick((0x6f, 0x9c, 0xc4), (0x2a, 0x5c, 0x86))
+}
+
+/// Files git does not track.
+///
+/// **Quiet on purpose.** These are usually build litter, and in an alarming colour the strip would
+/// be lit permanently and stop being read. But quiet is not the same as invisible: it carries a
+/// tint so it does not read as the path beside it.
+pub fn untracked() -> Color {
+    pick((0x8c, 0x8f, 0xa6), (0x5c, 0x60, 0x7a))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Modes
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -315,6 +344,15 @@ pub fn link() -> Color {
 ///
 /// `success()`/`danger()` are not reused. Those two say "the tool worked / did not", so a deleted
 /// line inside a *successful* edit painted the same red as a failed tool would be misread.
+/// A pull request that has landed.
+///
+/// **Purple because it is the one state that is finished.** Yellow says "waiting on somebody",
+/// which is what an open pull request is; green and red are already spoken for by what CI said,
+/// and a merged pull request is neither of those — it is over.
+pub fn merged() -> Color {
+    pick((0xa3, 0x71, 0xf7), (0x82, 0x50, 0xdf))
+}
+
 pub fn diff_add() -> Color {
     pick((0x7e, 0xc0, 0x50), (0x2f, 0x7a, 0x1f))
 }
@@ -356,6 +394,37 @@ mod tests {
                 assert!(m >= x.min(y) && m <= x.max(y), "half a fade left the range");
             }
         });
+    }
+
+    /// **No two marks on the repository strip may share a colour.** Untracked, ahead and behind
+    /// were all one muted grey, so three of the six things that row can report looked identical —
+    /// the arrow had to be read rather than seen. They must also stay off the paint already spoken
+    /// for beside them: `danger()` for a conflict, `warning()` for what is not committed yet, and
+    /// the muted colour the path and the branch wear.
+    ///
+    /// Both palettes, because a colour that only separates in the dark is not a distinction.
+    #[test]
+    fn no_two_marks_on_the_repository_strip_share_a_colour() {
+        for theme in [Theme::Dark, Theme::Light] {
+            with(theme, || {
+                let marks = [
+                    ("conflict", danger()),
+                    ("uncommitted", warning()),
+                    ("untracked", untracked()),
+                    ("ahead", ahead()),
+                    ("behind", behind()),
+                    ("the path itself", text_muted()),
+                    // A landed pull request sits on this row too, and it must not read as any of
+                    // the states above it — least of all as the green that means CI passed.
+                    ("merged", merged()),
+                ];
+                for (i, (an, a)) in marks.iter().enumerate() {
+                    for (bn, b) in marks.iter().skip(i + 1) {
+                        assert_ne!(a, b, "{an} and {bn} are one colour in {theme:?}");
+                    }
+                }
+            });
+        }
     }
 
     fn rgb(c: Color) -> (f64, f64, f64) {

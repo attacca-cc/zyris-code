@@ -14,6 +14,7 @@ pub mod config;
 pub mod conn;
 pub mod enroll;
 pub mod event;
+pub mod git;
 pub mod github;
 pub mod githubform;
 pub mod hooks;

@@ -1,82 +1,75 @@
-//! Asks GitHub for a device code, and stops there.
+//! Drives the GitHub reads against the real API, with whatever account is signed in here.
 //!
-//! **Proves the OAuth app is real and has device flow switched on** — the two things that cannot
-//! be checked from a unit test, and the two that fail in ways nobody would guess from the message.
-//! An app that exists but has device flow off answers `device_flow_disabled`, which is the whole
-//! reason this probe is separate from signing in.
+//! **Judged by what comes back, not by asking an agent.** A model that says a tool worked is not
+//! evidence it did — this repository has been fooled by that before. Every line below is a real
+//! request and a real answer.
 //!
-//! It stops before the wait, so **nothing is approved and no token is written.** The code it prints
-//! expires by itself in a few minutes.
+//! Read-only on purpose. Opening an issue or a pull request to check that opening works leaves
+//! something behind on a public repository that somebody then has to close.
 //!
-//! ```sh
+//! ```text
 //! cargo run -p zyris-code --example github_probe
 //! ```
 
-#[tokio::main]
-async fn main() {
-    // **Signed in already? Then read something, and stop.** Asking for a device code when there is
-    // a working token would only produce a code nobody needs.
-    let accounts = zyris_code::github::auth::Accounts::load();
-    if accounts.exactly(zyris_code::github::auth::Role::User).is_some() {
-        return read_something(&accounts).await;
-    }
+use zyris_code::github::{api, auth, repo_of};
 
-    let Some(id) = zyris_code::github::auth::client_id() else {
-        eprintln!("no OAuth app is configured for this build");
-        std::process::exit(1);
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> anyhow::Result<()> {
+    let cwd = std::env::current_dir()?;
+    let Some(repo) = repo_of(&cwd) else {
+        anyhow::bail!("{} has no GitHub remote", cwd.display());
     };
-    println!("client id: {id}");
-    match zyris_code::github::auth::begin().await {
-        Ok(pending) => {
-            println!("device flow is on.");
-            println!("  open {} and enter: {}", pending.verification_uri, pending.user_code);
-            println!("  it expires in {}s. nothing was saved.", pending.expires_in);
-        }
-        Err(why) => {
-            eprintln!("GitHub refused: {why}");
-            eprintln!("if it says device_flow_disabled, tick 'Enable Device Flow' on the app.");
-            std::process::exit(1);
-        }
-    }
-}
+    println!("repository  {}/{}", repo.owner, repo.name);
 
-/// **Reads, never writes.** A probe that opened an issue to prove it could would leave the proof
-/// behind on a real repository.
-async fn read_something(accounts: &zyris_code::github::auth::Accounts) {
-    use zyris_code::github::auth::Role;
-
-    for role in [Role::User, Role::Reviewer] {
-        match accounts.exactly(role) {
-            Some(a) => println!("{:9} {}", role.code(), a.login),
-            None => println!("{:9} — not connected", role.code()),
-        }
-    }
-    let token = accounts.for_role(Role::User).expect("checked above").token.clone();
-    let client = match zyris_code::github::api::Github::new(token) {
-        Ok(c) => c,
-        Err(e) => return eprintln!("could not build the client: {e}"),
+    let Some(account) = auth::Accounts::load().for_role(auth::Role::User).cloned() else {
+        anyhow::bail!("nobody is signed in ‒ run `/github login` in the app first");
     };
-    match client.me().await {
-        Ok(login) => println!("\nGitHub answers to this token as: {login}"),
-        Err(e) => return eprintln!("\nthe token does not work: {e}"),
-    }
+    let client = api::Github::new(account.token)?;
 
-    let cwd = std::env::current_dir().unwrap_or_default();
-    let Some(repo) = zyris_code::github::repo_of(&cwd) else {
-        return println!("no GitHub remote here, so there is nothing to read");
-    };
-    println!("repository here: {}/{}", repo.owner, repo.name);
-
-    match client.pulls(&repo, "all", 3).await {
-        Ok(pulls) => {
-            let n = pulls.as_array().map_or(0, Vec::len);
-            println!("\npull requests ({n} read):");
-            println!("{}", serde_json::to_string_pretty(&pulls).unwrap_or_default());
+    let who = client.account().await?;
+    println!("signed in   {} (id {})", who.login, who.id);
+    println!("may         {}", who.scopes.join(", "));
+    println!(
+        "signing     {}",
+        match who.may(zyris_code::github::signing::GPG_SCOPE) {
+            true => "this token could put a key on the account",
+            false => "this token cannot add a key ‒ /github would ask again",
         }
-        Err(e) => println!("\npull requests: {e}"),
+    );
+
+    let issues = client.issues(&repo, "open", 3).await?;
+    println!("open issues {}", issues.as_array().map(Vec::len).unwrap_or(0));
+
+    let pulls = client.pulls(&repo, "all", 3).await?;
+    for pull in pulls.as_array().into_iter().flatten() {
+        println!("  #{} {} [{}]", pull["number"], pull["title"], pull["state"]);
     }
-    match client.issues(&repo, "open", 3).await {
-        Ok(issues) => println!("\nopen issues: {}", issues.as_array().map_or(0, Vec::len)),
-        Err(e) => println!("\nissues: {e}"),
+
+    // One in full, which is the call that costs three requests and folds the checks.
+    if let Some(number) =
+        pulls.as_array().and_then(|list| list.first()).and_then(|p| p["number"].as_u64())
+    {
+        let one = client.pull(&repo, number).await?;
+        println!(
+            "pull #{number}  +{} -{}  checks={}  files={}",
+            one["added"],
+            one["removed"],
+            one["checks"],
+            one["files"].as_array().map(Vec::len).unwrap_or(0),
+        );
     }
+
+    // What the strip polls for, on the branch that is checked out.
+    let branch = String::from_utf8(
+        std::process::Command::new("git").arg("branch").arg("--show-current").output()?.stdout,
+    )?;
+    let branch = branch.trim();
+    match client.branch_pull(&repo, branch).await? {
+        Some(p) => println!(
+            "strip       #{} +{} -{} {:?} merged={}",
+            p.number, p.added, p.removed, p.checks, p.merged
+        ),
+        None => println!("strip       nothing open for `{branch}`"),
+    }
+    Ok(())
 }

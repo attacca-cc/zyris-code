@@ -198,13 +198,23 @@ fn http() -> Result<reqwest::Client> {
 
 /// Asks GitHub for a code to show.
 pub async fn begin() -> Result<Pending> {
+    begin_with(SCOPES).await
+}
+
+/// The same, asking for something other than the usual scopes.
+///
+/// **Turning commit signing on is the one caller.** Adding a key to an account is a permission
+/// worth asking for at the moment it is wanted rather than on every first sign-in — see
+/// [`crate::github::signing::SIGNING_SCOPES`].
+pub async fn begin_with(scopes: &str) -> Result<Pending> {
     let Some(client_id) = client_id() else {
         bail!("no GitHub OAuth app is configured for this build");
     };
+    let scopes = scopes.trim();
     let body: Value = http()?
         .post(DEVICE_CODE)
         .header("accept", "application/json")
-        .form(&[("client_id", client_id.as_str()), ("scope", SCOPES)])
+        .form(&[("client_id", client_id.as_str()), ("scope", scopes)])
         .send()
         .await
         .context("could not reach GitHub")?

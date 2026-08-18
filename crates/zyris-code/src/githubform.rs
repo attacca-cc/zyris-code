@@ -23,6 +23,8 @@ pub enum Field {
     User,
     /// The token reviews go out under. Typed or pasted.
     Reviewer,
+    /// Whether commits made through this node are signed. Enter sets a key up, or stops using it.
+    Signing,
 }
 
 /// What the screen is asking the I/O side to do.
@@ -37,6 +39,13 @@ pub enum Ask {
     SetReviewer(String),
     /// Forget the reviewer.
     ClearReviewer,
+    /// Make a signing key, put it on the account and use it from now on. **This asks for another
+    /// scope**, so it goes through the browser again.
+    SetUpSigning,
+    /// Stop signing. **The key stays on the GitHub account** — the same shape as signing out, and
+    /// for the same reason: taking something off somebody's account is not a thing to do on the
+    /// way past.
+    StopSigning,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -45,6 +54,8 @@ pub struct Form {
     pub user: Option<String>,
     /// The login reviews go out under, if a separate one is connected.
     pub reviewer: Option<String>,
+    /// The address commits are signed as, when signing is set up.
+    pub signing: Option<String>,
     /// What is being typed into the reviewer row.
     pub token: Input,
     pub field: Field,
@@ -63,27 +74,35 @@ pub struct Form {
 
 impl Form {
     pub fn new(user: Option<String>, reviewer: Option<String>) -> Form {
-        Form { user, reviewer, ..Form::default() }
+        Form { user, reviewer, signing: signed_as(), ..Form::default() }
     }
 
-    /// Moves down a row, wrapping. With two rows either direction is the other one.
+    /// Moves down a row, wrapping.
     pub fn next(&mut self) {
         self.field = match self.field {
             Field::User => Field::Reviewer,
-            Field::Reviewer => Field::User,
+            Field::Reviewer => Field::Signing,
+            Field::Signing => Field::User,
         };
         self.note = None;
     }
 
+    /// **Up is its own direction now.** With two rows it did not matter and this called `next`;
+    /// with three that would walk the cursor the wrong way, which reads as a stuck key.
     pub fn prev(&mut self) {
-        self.next();
+        self.field = match self.field {
+            Field::User => Field::Signing,
+            Field::Reviewer => Field::User,
+            Field::Signing => Field::Reviewer,
+        };
+        self.note = None;
     }
 
     /// The field keystrokes go into. **Only the reviewer row takes text** — the person's row is a
     /// button, and letting it swallow keys would look like a field that never fills.
     pub fn typing(&mut self) -> Option<&mut Input> {
         match self.field {
-            Field::User => None,
+            Field::User | Field::Signing => None,
             Field::Reviewer => Some(&mut self.token),
         }
     }
@@ -108,6 +127,13 @@ impl Form {
                 }
                 Some(Ask::SetReviewer(token))
             }
+            // **Signing needs an account to sign for.** The key is put on a GitHub account and the
+            // address comes from it, so with nobody connected there is nothing to set up.
+            Field::Signing => match (self.signing.is_some(), self.user.is_some()) {
+                (true, _) => Some(Ask::StopSigning),
+                (false, true) => Some(Ask::SetUpSigning),
+                (false, false) => None,
+            },
         }
     }
 
@@ -121,7 +147,15 @@ impl Form {
         if worked {
             self.token = Input::new();
         }
+        // The signing row reads off disk, so an attempt that changed it is reflected without the
+        // I/O side having to remember to say so as well.
+        self.signing = signed_as();
     }
+}
+
+/// The address commits are signed as, or nothing.
+fn signed_as() -> Option<String> {
+    crate::github::signing::Signing::load().map(|s| s.email)
 }
 
 /// What a token looks like on screen.
@@ -195,6 +229,47 @@ mod tests {
         assert_eq!(f.submit(), None);
         f.reviewer = Some("bot".into());
         assert_eq!(f.submit(), Some(Ask::ClearReviewer));
+    }
+
+    /// **Up is its own direction.** With two rows it did not matter and `prev` called `next`;
+    /// with three that walks the cursor the wrong way, which reads as a key that is not working.
+    #[test]
+    fn the_cursor_walks_both_ways_through_three_rows() {
+        let mut f = form();
+        f.next();
+        assert_eq!(f.field, Field::Reviewer);
+        f.next();
+        assert_eq!(f.field, Field::Signing);
+        f.next();
+        assert_eq!(f.field, Field::User, "the last row wraps to the first");
+        f.prev();
+        assert_eq!(f.field, Field::Signing, "up from the first goes to the last");
+        f.prev();
+        assert_eq!(f.field, Field::Reviewer);
+    }
+
+    /// **Signing needs an account to sign for.** The key goes onto a GitHub account and the
+    /// address comes off it, so with nobody connected Enter must do nothing rather than start
+    /// something that cannot finish.
+    #[test]
+    fn signing_cannot_be_set_up_before_an_account_is_connected() {
+        let mut f = Form::new(None, None);
+        f.field = Field::Signing;
+        f.signing = None;
+        assert_eq!(f.submit(), None);
+        f.user = Some("ruma".into());
+        assert_eq!(f.submit(), Some(Ask::SetUpSigning));
+        f.signing = Some("1+ruma@users.noreply.github.com".into());
+        assert_eq!(f.submit(), Some(Ask::StopSigning));
+    }
+
+    /// **The signing row is a button too.** It shows an address nobody types — GitHub's noreply
+    /// for the account — so letting it swallow keys would look like a field that never fills.
+    #[test]
+    fn the_signing_row_does_not_take_typing() {
+        let mut f = form();
+        f.field = Field::Signing;
+        assert!(f.typing().is_none());
     }
 
     /// **The token is wiped once it is stored.** It is a credential and leaving it on screen after

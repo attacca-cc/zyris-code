@@ -81,3 +81,12 @@ jobs:
             exit 1
           }
           Write-Host 'install.ps1 parses'
+
+      # **Parsing is not enough for the one function that has to work twice.** Replacing a binary
+      # that is being run is the whole of self-update on Windows, and it broke the second time
+      # round -- which no amount of reading the script tells you. This runs it against real
+      # processes holding real files.
+      - name: Installer replaces a running binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: pwsh -NoProfile -File scripts/installer_smoke.ps1

@@ -12,6 +12,7 @@
 
 pub mod api;
 pub mod auth;
+pub mod signing;
 
 use serde_json::{json, Value};
 

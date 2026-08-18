@@ -131,6 +131,13 @@ pub enum Frame {
     /// background arm sends the answer in and the strip above the input picks it up. `None`
     /// means there is nothing to say — no repository, no git, or it timed out.
     Git(Option<crate::repo::Repo>),
+    /// **The pull request this branch is on**, if there is one. Read from GitHub, so it costs
+    /// network and is polled far more slowly than git — see `repo::pull_interval`.
+    Pull(Option<crate::repo::Pull>),
+    /// Time is up on a pull request that landed. **A number, not a flag**: by the time this
+    /// arrives the poll may have moved on to a different one, and clearing that would take a live
+    /// pull request off the strip.
+    PullGone(u64),
     /// **The socket dropped.** The zyris `Runner` reconnects on its own, but meanwhile the
     /// screen looks like nothing happened — silent failure is the worst kind. Carries the
     /// reason verbatim.
@@ -512,6 +519,12 @@ pub struct State {
     /// What git says about `cwd` right now. `None` is the ordinary case on a machine without
     /// git, and the strip then shows the path with nothing after it.
     pub repo: Option<crate::repo::Repo>,
+    /// The pull request this branch is on. **Held apart from `repo`** — the git poll runs every
+    /// few seconds and would wipe this one every time it landed.
+    pub pull: Option<crate::repo::Pull>,
+    /// A pull request that landed, was shown, and has had its moment. **Never drawn again** —
+    /// otherwise the next poll puts it straight back and it never goes away.
+    pub pull_let_go: Option<u64>,
     /// The home directory, for shortening the path to `~/…`. Read once — the strip is drawn
     /// every frame and must not touch the environment.
     pub home: Option<std::path::PathBuf>,
@@ -655,6 +668,8 @@ impl Default for State {
             // definition.
             cwd: crate::tools::working_dir(),
             repo: None,
+            pull: None,
+            pull_let_go: None,
             home: crate::conn::user_home(),
             shells: Vec::new(),
             jobs: Vec::new(),
@@ -991,6 +1006,9 @@ pub enum GithubNews {
     Code { code: String, uri: String },
     /// It finished, one way or the other. The screen says so and re-reads who is connected.
     Settled { note: String, worked: bool },
+    /// Where a long set-up has got to. **Not `Settled`** — the screen must stay busy, because the
+    /// step after this one is still coming.
+    Step(String),
 }
 
 /// A clickable URL somewhere on the screen, in absolute cells.
@@ -2108,6 +2126,21 @@ fn apply_frame(state: &mut State, frame: &Frame) {
         // Replace, never merge. Leaving a repository behind has to clear the strip, and the
         // background arm only sends this when the value actually changed.
         Frame::Git(got) => state.repo = got.clone(),
+        Frame::Pull(got) => {
+            // A pull request already seen out does not come back. The poll knows nothing about
+            // what the screen has finished with, so the filtering has to happen here.
+            let stale = got.as_ref().is_some_and(|p| Some(p.number) == state.pull_let_go);
+            state.pull = match stale {
+                true => None,
+                false => got.clone(),
+            };
+        }
+        Frame::PullGone(number) => {
+            state.pull_let_go = Some(*number);
+            if state.pull.as_ref().is_some_and(|p| p.number == *number) {
+                state.pull = None;
+            }
+        }
         Frame::Files(paths) => {
             state.files = paths.clone();
             // **Only fill in the list if it is still the one waiting.** The walk takes as long as
@@ -2190,6 +2223,14 @@ fn apply_frame(state: &mut State, frame: &Frame) {
                 GithubNews::Code { code, uri } => {
                     if let Some(form) = state.github_form.as_mut() {
                         form.pending = Some((code.clone(), uri.clone()));
+                    }
+                }
+                // **A step keeps the screen busy.** Making a key can take seconds; saying nothing
+                // there reads as a hang, and saying "done" would be a lie with work still to do.
+                GithubNews::Step(step) => {
+                    if let Some(form) = state.github_form.as_mut() {
+                        form.pending = None;
+                        form.note = Some(step.clone());
                     }
                 }
                 GithubNews::Settled { note, worked } => {
@@ -3279,6 +3320,59 @@ fn spawn_git(
     });
 }
 
+/// How long a landed pull request stays on the strip before it is let go.
+///
+/// **Long enough to be read, short enough not to become furniture.** The row's job is to say what
+/// is happening now, and a pull request that merged is a thing that has stopped happening.
+const MERGED_SHOWS_FOR: Duration = Duration::from_secs(5);
+
+/// Asks GitHub about the pull request this branch is on, in the background.
+///
+/// **Everything that would make this pointless is checked before the network is touched**: nobody
+/// signed in, no GitHub remote, no branch. Each of those is the ordinary state of some perfectly
+/// normal checkout, and none of them is worth three requests to discover again every half minute.
+fn spawn_pull(
+    cwd: &std::path::Path,
+    branch: Option<String>,
+    tx: &mpsc::UnboundedSender<AppMsg>,
+    busy: &Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::sync::atomic::Ordering;
+    let Some(branch) = branch.filter(|b| !b.is_empty()) else { return };
+    let Some(repo) = crate::github::repo_of(cwd) else { return };
+    let Some(account) = crate::github::auth::Accounts::load()
+        .for_role(crate::github::auth::Role::User)
+        .map(|a| a.token.clone())
+    else {
+        return;
+    };
+    if busy.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let tx = tx.clone();
+    let busy = Arc::clone(busy);
+    tokio::spawn(async move {
+        let found = match crate::github::api::Github::new(account) {
+            Ok(client) => client.branch_pull(&repo, &branch).await.ok().flatten(),
+            Err(_) => None,
+        };
+        busy.store(false, Ordering::SeqCst);
+        // **A failed lookup says nothing rather than saying "no pull request".** A flaky network
+        // must not take a live pull request off the strip and put it back a minute later.
+        if let Some(pull) = found {
+            let merged = pull.merged.then_some(pull.number);
+            // No session tag: this is about the machine, not the conversation.
+            let _ = tx.send((None, Action::Frame(Frame::Pull(Some(pull)))));
+            // **The countdown starts when it is shown, not when it merged.** A pull request that
+            // landed while the app was closed still gets its five seconds on the row.
+            if let Some(number) = merged {
+                tokio::time::sleep(MERGED_SHOWS_FOR).await;
+                let _ = tx.send((None, Action::Frame(Frame::PullGone(number))));
+            }
+        }
+    });
+}
+
 async fn run_inner(
     terminal: &mut ratatui::DefaultTerminal,
     mut api_rx: ApiRx,
@@ -3320,6 +3414,11 @@ async fn run_inner(
     if git_on {
         spawn_git(&state.cwd, &tx, &git_busy);
     }
+    // The pull request on the strip. **Off by the same shape as git**, and far slower — it costs
+    // three requests to GitHub, and nothing it says changes in three seconds.
+    let pull_every = crate::repo::pull_interval();
+    let pull_on = pull_every.is_some();
+    let pull_busy = Arc::new(std::sync::atomic::AtomicBool::new(false));
     // **Nothing here looks for a release.** That happened before this screen existed, on the
     // terminal `main` still had (`update::at_launch`) — under `auto` this process is already the
     // new version, and under `notify` the tag arrives as a frame through the bridge.
@@ -3528,6 +3627,7 @@ async fn run_inner(
     let mut ticker = tokio::time::interval(frame_interval());
     let mut poll = tokio::time::interval(POLL_INTERVAL);
     let mut git = tokio::time::interval(git_every.unwrap_or(Duration::from_secs(86400)));
+    let mut pull = tokio::time::interval(pull_every.unwrap_or(Duration::from_secs(86400)));
     // When the last key event happened — the basis for detecting a paste burst on a
     // terminal without bracketed paste.
     let mut last_key_at: Option<Instant> = None;
@@ -3876,6 +3976,13 @@ async fn run_inner(
                         continue;
                     }
                 }
+                // Same for the pull request: polled on its own timer, and redrawing an idle
+                // terminal every half minute for a value that did not move is the same waste.
+                if let Action::Frame(Frame::Pull(got)) = &action {
+                    if got == &state.pull {
+                        continue;
+                    }
+                }
                 apply(&mut state, &action);
 
                 // **The turn stream opens once the history is in — and this is where it lands.**
@@ -3934,6 +4041,12 @@ async fn run_inner(
             // **git runs outside the loop, exactly like `poll`.** `read` shells out to a
             // process; awaiting that here would stall keys and drawing for as long as it takes.
             _ = git.tick(), if git_on => spawn_git(&state.cwd, &tx, &git_busy),
+            // **The branch comes from the git poll**, so this asks about whatever was last read
+            // rather than running git again to find out.
+            _ = pull.tick(), if pull_on => {
+                let branch = state.repo.as_ref().map(|r| r.branch.clone());
+                spawn_pull(&state.cwd, branch, &tx, &pull_busy);
+            }
             _ = poll.tick() => {
                 if let Some(id) = session.id().map(str::to_string) {
                     let api = Arc::clone(&api);
@@ -4874,7 +4987,156 @@ fn run_github_ask(
             };
             settle_github(state, note, worked);
         }
+        // **Off the loop as well.** Making a key can take seconds on a machine short of entropy,
+        // and it may need a trip through the browser for one more permission first.
+        Ask::SetUpSigning => spawn_github_signing(state.lang, tx),
+        Ask::StopSigning => {
+            let worked = crate::github::signing::Signing::forget();
+            let note = match worked {
+                true => state.lang.github_signing_stopped().to_string(),
+                false => state.lang.github_nothing_to_log_out().to_string(),
+            };
+            settle_github(state, note, worked);
+        }
     }
+}
+
+/// Sets commit signing up, in the background.
+///
+/// **Four things have to be true and each is checked rather than assumed**: GnuPG is on this
+/// machine, the token may add a key to the account, a key exists for the account's noreply
+/// address, and GitHub has its public half. Any of them failing says which one it was — a single
+/// "could not set signing up" would leave the person with nowhere to go.
+///
+/// The scope is the interesting one. A token saved before this feature existed cannot add keys, so
+/// this walks the person through the browser again asking for one more permission. **That is the
+/// grant the feature was described in terms of** — nobody is asked for it until they ask for this.
+fn spawn_github_signing(lang: crate::lang::Lang, tx: &mpsc::UnboundedSender<AppMsg>) {
+    use crate::github::{api, auth, signing};
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let say = |news: GithubNews| {
+            let _ = tx.send((None, Action::Frame(Frame::Github(news))));
+        };
+        let failed = |why: String| GithubNews::Settled {
+            note: lang.github_signing_failed(&why),
+            worked: false,
+        };
+
+        // **First, because it is the one this app cannot work around.** Everything else can be
+        // arranged from here; a machine with no GnuPG needs a person to install it.
+        if !signing::installed().await {
+            return say(GithubNews::Settled {
+                note: lang.github_signing_no_gpg().to_string(),
+                worked: false,
+            });
+        }
+
+        let Some(account) = auth::Accounts::load().for_role(auth::Role::User).cloned() else {
+            return say(failed("nobody is signed in".into()));
+        };
+        let client = match api::Github::new(account.token.clone()) {
+            Ok(c) => c,
+            Err(e) => return say(failed(e.to_string())),
+        };
+        let who = match client.account().await {
+            Ok(who) => who,
+            Err(e) => return say(failed(e.to_string())),
+        };
+
+        // The token is either already allowed to add a key, or the person goes through the
+        // browser once more for exactly that.
+        let (token, who) = match who.may(signing::GPG_SCOPE) {
+            true => (account.token.clone(), who),
+            false => match ask_for_the_gpg_scope(lang, &tx).await {
+                Ok(pair) => pair,
+                Err(why) => return say(failed(why)),
+            },
+        };
+
+        let email = signing::noreply(who.id, &who.login);
+        say(GithubNews::Step(lang.github_signing_step("making a key")));
+        let fingerprint = match signing::generate(&email, &who.login).await {
+            Ok(f) => f,
+            Err(e) => return say(failed(e.to_string())),
+        };
+        let armored = match signing::public_key(&fingerprint).await {
+            Ok(a) => a,
+            Err(e) => return say(failed(e.to_string())),
+        };
+        say(GithubNews::Step(lang.github_signing_step("telling GitHub about it")));
+        let client = match api::Github::new(token) {
+            Ok(c) => c,
+            Err(e) => return say(failed(e.to_string())),
+        };
+        if let Err(e) = client
+            .add_gpg_key(
+                &armored,
+                &format!(
+                    "zyris-code on {}",
+                    zyris::machine_name().unwrap_or_else(|| "this machine".to_string())
+                ),
+            )
+            .await
+        {
+            return say(failed(e.to_string()));
+        }
+
+        // **Saved last.** The record is what makes every later commit set `commit.gpgsign`, so it
+        // must not exist until there is a key on both sides to back it up.
+        let record = signing::Signing { fingerprint, email: email.clone(), login: who.login };
+        say(match record.save() {
+            Ok(()) => GithubNews::Settled { note: lang.github_signing_on(&email), worked: true },
+            Err(e) => failed(e.to_string()),
+        });
+    });
+}
+
+/// Walks the person through the browser once more, for a token that may add a key.
+///
+/// **The new token replaces the old one.** It carries everything the old one did and one thing
+/// more, so keeping both would mean deciding which to use on every call for no gain.
+async fn ask_for_the_gpg_scope(
+    lang: crate::lang::Lang,
+    tx: &mpsc::UnboundedSender<AppMsg>,
+) -> Result<(String, crate::github::api::Account), String> {
+    use crate::github::{api, auth, signing};
+    let say = |news: GithubNews| {
+        let _ = tx.send((None, Action::Frame(Frame::Github(news))));
+    };
+    let pending = auth::begin_with(signing::SIGNING_SCOPES).await.map_err(|e| e.to_string())?;
+    say(GithubNews::Code {
+        code: pending.user_code.clone(),
+        uri: pending.verification_uri.clone(),
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(pending.expires_in);
+    let mut wait = std::time::Duration::from_secs(pending.interval);
+    let token = loop {
+        if std::time::Instant::now() >= deadline {
+            return Err(lang.github_login_failed("the code expired"));
+        }
+        tokio::time::sleep(wait).await;
+        match auth::poll(&pending).await {
+            auth::Poll::Waiting { interval } => wait = std::time::Duration::from_secs(interval),
+            auth::Poll::Failed(why) => return Err(why),
+            auth::Poll::Done(token) => break token,
+        }
+    };
+    let client = api::Github::new(token.clone()).map_err(|e| e.to_string())?;
+    let who = client.account().await.map_err(|e| e.to_string())?;
+    // **Refused rather than carried on with.** Approving the screen without the extra permission
+    // is possible, and going on would fail at the upload with GitHub's own 404 — which reads like
+    // this app is broken rather than like a box that was left unticked.
+    if !who.may(signing::GPG_SCOPE) {
+        return Err(lang.github_signing_failed("the extra permission was not granted"));
+    }
+    let mut accounts = auth::Accounts::load();
+    accounts.set(
+        auth::Role::User,
+        Some(auth::Account { token: token.clone(), login: who.login.clone() }),
+    );
+    accounts.save().map_err(|e| e.to_string())?;
+    Ok((token, who))
 }
 
 /// Runs the browser sign-in in the background, reporting through `Frame::Github`.
@@ -6891,6 +7153,53 @@ mod tests {
         let mut s = state();
         apply(&mut s, &Action::Frame(Frame::Event { cursor: 42, entry: None, todo: None }));
         assert_eq!(s.last_cursor, Some(42));
+    }
+
+    /// **A pull request that landed is let go, and does not come back.** The poll knows nothing
+    /// about what the screen has finished with, so without the filtering here the next answer
+    /// half a minute later would put the same merged request straight back on the row — for
+    /// ever, since it stays merged.
+    #[test]
+    fn a_merged_pull_request_goes_and_stays_gone() {
+        let landed = crate::repo::Pull {
+            number: 53,
+            added: 118,
+            removed: 30,
+            merged: true,
+            ..Default::default()
+        };
+        let mut s = state();
+        apply(&mut s, &Action::Frame(Frame::Pull(Some(landed.clone()))));
+        assert_eq!(s.pull.as_ref().map(|p| p.number), Some(53), "it has to be seen first");
+
+        apply(&mut s, &Action::Frame(Frame::PullGone(53)));
+        assert!(s.pull.is_none(), "it did not go");
+
+        apply(&mut s, &Action::Frame(Frame::Pull(Some(landed))));
+        assert!(s.pull.is_none(), "the next poll put it back");
+
+        // **A different pull request is a different thing.** Reusing the branch opens a new one,
+        // and that one has not had its moment.
+        let next = crate::repo::Pull { number: 54, ..Default::default() };
+        apply(&mut s, &Action::Frame(Frame::Pull(Some(next))));
+        assert_eq!(s.pull.as_ref().map(|p| p.number), Some(54));
+    }
+
+    /// **The countdown names the request it was started for.** By the time it fires the poll may
+    /// have moved on, and clearing whatever happens to be there would take a live pull request
+    /// off the row.
+    #[test]
+    fn a_countdown_that_fires_late_only_clears_what_it_was_about() {
+        let mut s = state();
+        apply(
+            &mut s,
+            &Action::Frame(Frame::Pull(Some(crate::repo::Pull {
+                number: 54,
+                ..Default::default()
+            }))),
+        );
+        apply(&mut s, &Action::Frame(Frame::PullGone(53)));
+        assert_eq!(s.pull.as_ref().map(|p| p.number), Some(54), "#54 was cleared by #53's timer");
     }
 
     /// **A frame from a stale session must not reach the screen.** Leave work running and

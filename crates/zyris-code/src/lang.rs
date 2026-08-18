@@ -1101,6 +1101,61 @@ impl Lang {
             "Paste a fine-grained token and press Enter. One repository, Pull requests: write, is enough.",
         )
     }
+    pub fn github_row_signing(self) -> &'static str {
+        self.pick("커밋 서명", "Signing")
+    }
+    pub fn github_signing_off(self) -> &'static str {
+        self.pick("꺼져 있음", "off")
+    }
+    /// **Says what it costs before it happens.** Approving this hands over the right to add keys to
+    /// the account, and the address commits carry changes — both are worth knowing beforehand.
+    pub fn github_enter_sign(self) -> &'static str {
+        self.pick(
+            "Enter로 서명 키를 만듭니다. 권한을 하나 더 승인해야 하고, 이 앱이 만드는 커밋은 GitHub noreply 주소로 남습니다.",
+            "Enter makes a signing key. It asks for one more permission, and commits made here will carry your GitHub noreply address.",
+        )
+    }
+    pub fn github_enter_stop_signing(self) -> &'static str {
+        self.pick(
+            "Enter로 서명을 끕니다. 키는 GitHub 계정에 그대로 남습니다.",
+            "Enter stops signing. The key stays on your GitHub account.",
+        )
+    }
+    pub fn github_sign_needs_an_account(self) -> &'static str {
+        self.pick("먼저 위에서 GitHub에 이어야 합니다.", "Connect a GitHub account above first.")
+    }
+    /// What the signing set-up is doing right now. **Each step is named** — making a key can take
+    /// a while on a machine with little entropy, and silence there reads as a hang.
+    pub fn github_signing_step(self, step: &str) -> String {
+        match self {
+            Lang::Ko => format!("서명 설정: {step}"),
+            Lang::En => format!("Signing: {step}"),
+        }
+    }
+    pub fn github_signing_no_gpg(self) -> &'static str {
+        self.pick(
+            "이 컴퓨터에 GnuPG가 없습니다. 설치한 뒤 다시 시도해 주세요 (Windows는 gpg4win.org).",
+            "GnuPG is not installed on this machine. Install it and try again (Windows: gpg4win.org).",
+        )
+    }
+    pub fn github_signing_on(self, email: &str) -> String {
+        match self {
+            Lang::Ko => format!("이제 커밋에 서명합니다. 작성자 주소는 {email} 입니다."),
+            Lang::En => format!("Commits are signed from now on, authored as {email}."),
+        }
+    }
+    pub fn github_signing_stopped(self) -> &'static str {
+        self.pick(
+            "서명을 껐습니다. 키는 GitHub 계정에 남아 있으니 필요하면 직접 지워 주세요.",
+            "Signing is off. The key is still on your GitHub account ‒ remove it there if you want it gone.",
+        )
+    }
+    pub fn github_signing_failed(self, why: &str) -> String {
+        match self {
+            Lang::Ko => format!("서명 설정에 실패했습니다: {why}"),
+            Lang::En => format!("Could not set signing up: {why}"),
+        }
+    }
     /// While a code is waiting. **Says to open it, not just that something is happening** — the
     /// address right above is the only thing that moves this along.
     pub fn github_approve_it(self) -> &'static str {

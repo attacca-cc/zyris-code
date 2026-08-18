@@ -153,13 +153,32 @@ try {
     #
     # This is what lets zyris-code update itself. Without it a self-update could only ever tell
     # you to close the thing you were using.
+    #
+    # **The name moved aside has to be one nothing is using.** A fixed `.exe.old` is only free the
+    # first time. Update once while a copy is running, and that copy goes on executing the file now
+    # called `.exe.old`; update again and it can neither be deleted nor renamed onto, so the new
+    # binary has nowhere to go and Copy-Item fails with "the process cannot access the file" -- on
+    # the name it was never asked to touch. That is exactly the report this handles: the first
+    # update worked, the second one, from a window still running the first version, did not.
     function Install-Binary($From, $To) {
         if (Test-Path $To) {
-            $old = "$To.old"
-            # Last update's leftover, now that nothing is holding it.
-            Remove-Item $old -Force -ErrorAction SilentlyContinue
+            # Everything earlier updates left behind, now that nothing is holding it. Whatever is
+            # still running keeps its file and is skipped.
+            $dir = Split-Path $To
+            $leaf = Split-Path $To -Leaf
+            Get-ChildItem -Path $dir -Filter "$leaf.old*" -File -ErrorAction SilentlyContinue |
+                ForEach-Object { Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue }
+
+            # A free name. `.old` for the ordinary case, `.old2` and on while older copies are
+            # still executing the ones before it.
+            $aside = "$To.old"
+            $n = 2
+            while ((Test-Path $aside) -and ($n -lt 100)) {
+                $aside = "$To.old$n"
+                $n++
+            }
             try {
-                Move-Item $To $old -Force
+                Move-Item $To $aside -Force
             } catch {
                 # Renaming failed for some other reason; overwriting may still work.
             }

@@ -87,6 +87,103 @@ impl Github {
         Ok(body.get("login").and_then(Value::as_str).unwrap_or_default().to_string())
     }
 
+    /// The account, and what this token is allowed to do with it.
+    ///
+    /// **The scopes come off the header, not from anything remembered.** A token saved before a
+    /// feature existed has the scopes it was granted then, and asking GitHub is the only way to
+    /// tell that apart from one granted today — guessing produces a request that fails with a 404
+    /// that reads like the endpoint is gone.
+    pub async fn account(&self) -> Result<Account> {
+        let response = self
+            .http
+            .get(format!("{API}/user"))
+            .bearer_auth(&self.token)
+            .header("user-agent", AGENT)
+            .header("accept", "application/vnd.github+json")
+            .send()
+            .await
+            .context("could not reach GitHub for /user")?;
+        let scopes = response
+            .headers()
+            .get("x-oauth-scopes")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let body = read(response).await?;
+        Ok(Account {
+            id: body.get("id").and_then(Value::as_u64).unwrap_or_default(),
+            login: text_at(&body, "login"),
+            scopes: split_scopes(&scopes),
+        })
+    }
+
+    /// The pull request `branch` is on, with the counts and what CI says about its head.
+    ///
+    /// **Three calls, because no one of them answers all of it.** The list endpoint finds the
+    /// number but leaves out `additions`/`deletions`; the single pull request has those and the
+    /// head sha; the checks hang off that sha. This is why it is polled slowly and not with git.
+    ///
+    /// `Ok(None)` is the ordinary answer for a branch nobody has opened anything for.
+    pub async fn branch_pull(
+        &self,
+        repo: &Repo,
+        branch: &str,
+    ) -> Result<Option<crate::repo::Pull>> {
+        let listed = self
+            .get(
+                &format!("/repos/{}/{}/pulls", repo.owner, repo.name),
+                &[
+                    ("head", format!("{}:{branch}", repo.owner)),
+                    ("state", "all".into()),
+                    ("per_page", "10".into()),
+                ],
+            )
+            .await?;
+        let Some(number) = pick_pull(&listed) else { return Ok(None) };
+
+        let pull =
+            self.get(&format!("/repos/{}/{}/pulls/{number}", repo.owner, repo.name), &[]).await?;
+        let head = pull
+            .get("head")
+            .and_then(|h| h.get("sha"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        // **Checks failing to answer is `Quiet`, not an error.** A repository with no CI, or a
+        // token that cannot see it, must not take the pull request off the strip with it.
+        let checks = match head.is_empty() {
+            true => crate::repo::Checks::Quiet,
+            false => self
+                .get(
+                    &format!("/repos/{}/{}/commits/{head}/check-runs", repo.owner, repo.name),
+                    &[("per_page", "100".into())],
+                )
+                .await
+                .map(|body| fold_checks(&body))
+                .unwrap_or_default(),
+        };
+        Ok(Some(crate::repo::Pull {
+            number,
+            added: pull.get("additions").and_then(Value::as_u64).unwrap_or_default() as usize,
+            removed: pull.get("deletions").and_then(Value::as_u64).unwrap_or_default() as usize,
+            checks,
+            merged: pull.get("merged_at").is_some_and(|m| !m.is_null()),
+        }))
+    }
+
+    /// Puts a public key on the account. **Answers what is already there as success** — turning
+    /// signing on twice must not fail on the second try.
+    pub async fn add_gpg_key(&self, armored: &str, name: &str) -> Result<Value> {
+        match self
+            .post("/user/gpg_keys", json!({"armored_public_key": armored, "name": name}))
+            .await
+        {
+            Ok(added) => Ok(added),
+            Err(e) if already_there(&e) => Ok(Value::Null),
+            Err(e) => Err(e),
+        }
+    }
+
     pub async fn issues(&self, repo: &Repo, state: &str, limit: usize) -> Result<Value> {
         let body = self
             .get(
@@ -144,6 +241,25 @@ impl Github {
         out["body"] = json!(pull.get("body").and_then(Value::as_str).unwrap_or_default());
         out["files"] = json!(slim_list(&files, slim_file));
         out["review_comments"] = json!(slim_list(&reviews, slim_review_comment));
+        // **What CI says, on the request itself.** Reading a pull request to decide what to do
+        // next and then having to ask separately whether it is even green is a round trip for
+        // something GitHub was going to be asked about anyway.
+        if let Some(head) = pull.get("head").and_then(|h| h.get("sha")).and_then(Value::as_str) {
+            let checks = self
+                .get(
+                    &format!("/repos/{}/{}/commits/{head}/check-runs", repo.owner, repo.name),
+                    &[("per_page", "100".into())],
+                )
+                .await
+                .map(|body| fold_checks(&body))
+                .unwrap_or_default();
+            out["checks"] = json!(match checks {
+                crate::repo::Checks::Quiet => "none",
+                crate::repo::Checks::Running => "running",
+                crate::repo::Checks::Passed => "passed",
+                crate::repo::Checks::Failed => "failed",
+            });
+        }
         Ok(out)
     }
 
@@ -267,6 +383,95 @@ async fn read(response: reqwest::Response) -> Result<Value> {
     Ok(serde_json::from_str(&text).unwrap_or(Value::Null))
 }
 
+/// Which of a branch's pull requests the strip should be about.
+///
+/// **Anything still open beats the highest number.** A long-lived branch has a row of closed pull
+/// requests behind it — `develop` here has eight — and picking by number alone would put a
+/// release that landed weeks ago on the row instead of the one waiting for review right now.
+/// Among equals it is the newest, because that is the one being worked on.
+///
+/// Pure: the choice is the whole of what a person sees, and it should not need a network to check.
+pub fn pick_pull(listed: &Value) -> Option<u64> {
+    let rank = |p: &Value| -> (u8, u64) {
+        let number = p.get("number").and_then(Value::as_u64).unwrap_or_default();
+        let open = text_at(p, "state") == "open";
+        (open as u8, number)
+    };
+    listed
+        .as_array()?
+        .iter()
+        .filter(|p| p.get("number").and_then(Value::as_u64).is_some())
+        .max_by_key(|p| rank(p))
+        .and_then(|p| p.get("number").and_then(Value::as_u64))
+}
+
+/// What a pile of check runs adds up to.
+///
+/// **Anything still going wins, then anything failed.** A run that is half green and half still
+/// working is not passing yet, and saying so early is how a person comes to stop reading the mark.
+///
+/// Pure, so every combination can be checked without a network.
+pub fn fold_checks(body: &Value) -> crate::repo::Checks {
+    use crate::repo::Checks;
+    let runs = body.get("check_runs").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]);
+    if runs.is_empty() {
+        return Checks::Quiet;
+    }
+    let mut failed = false;
+    let mut counted = 0usize;
+    for run in runs {
+        let status = text_at(run, "status");
+        if status != "completed" {
+            return Checks::Running;
+        }
+        counted += 1;
+        match text_at(run, "conclusion").as_str() {
+            "failure" | "timed_out" | "cancelled" | "action_required" | "startup_failure" => {
+                failed = true
+            }
+            // `neutral`, `skipped` and `success` are all "not in the way".
+            _ => {}
+        }
+    }
+    match (counted, failed) {
+        (0, _) => Checks::Quiet,
+        (_, true) => Checks::Failed,
+        (_, false) => Checks::Passed,
+    }
+}
+
+/// Whether a failure is GitHub saying it already has this.
+///
+/// **Not an error to us.** Setting signing up again after a reinstall finds the same key already
+/// on the account, and failing there would leave the person with no way forward that is not
+/// "delete the key on github.com first".
+fn already_there(e: &anyhow::Error) -> bool {
+    let said = e.to_string().to_ascii_lowercase();
+    said.contains("already been taken") || said.contains("key_id already exists")
+}
+
+/// The `x-oauth-scopes` header, as a list.
+///
+/// Pure, because the whole decision about whether to send somebody through the browser again
+/// hangs off it.
+pub fn split_scopes(header: &str) -> Vec<String> {
+    header.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect()
+}
+
+/// An account and what this token may do with it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Account {
+    pub id: u64,
+    pub login: String,
+    pub scopes: Vec<String>,
+}
+
+impl Account {
+    pub fn may(&self, scope: &str) -> bool {
+        self.scopes.iter().any(|s| s == scope)
+    }
+}
+
 fn first_line(text: &str) -> String {
     let line = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
     line.chars().take(200).collect()
@@ -344,7 +549,7 @@ pub fn slim_pull(v: &Value) -> Value {
             .unwrap_or_default()
             .to_string()
     };
-    json!({
+    let mut out = json!({
         "number": v.get("number").and_then(Value::as_u64).unwrap_or_default(),
         "title": text_at(v, "title"),
         // **Merged is not a state GitHub reports.** It answers `state: "closed"` and a separate
@@ -359,7 +564,15 @@ pub fn slim_pull(v: &Value) -> Value {
         "base": branch("base"),
         "updated_at": text_at(v, "updated_at"),
         "url": text_at(v, "html_url"),
-    })
+    });
+    // **Only when GitHub sent them.** The list endpoint leaves these out entirely, and writing
+    // `+0 -0` there would say a pull request changed nothing rather than that nobody asked.
+    for (ours, theirs) in [("added", "additions"), ("removed", "deletions")] {
+        if let Some(n) = v.get(theirs).and_then(Value::as_u64) {
+            out[ours] = json!(n);
+        }
+    }
+    out
 }
 
 fn slim_comment(v: &Value) -> Value {
@@ -391,6 +604,110 @@ fn slim_file(v: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The sizes appear only when GitHub sent them.** The list endpoint leaves `additions` and
+    /// `deletions` out entirely, and answering `+0 -0` there would tell an agent a pull request
+    /// changed nothing rather than that nobody asked.
+    #[test]
+    fn a_pull_request_carries_its_size_only_when_there_is_one_to_carry() {
+        let listed = slim_pull(&json!({"number": 53, "title": "t", "state": "open"}));
+        assert!(listed.get("added").is_none(), "{listed}");
+        assert!(listed.get("removed").is_none(), "{listed}");
+
+        let one = slim_pull(&json!({
+            "number": 53, "title": "t", "state": "open", "additions": 118, "deletions": 30,
+        }));
+        assert_eq!(one["added"], 118);
+        assert_eq!(one["removed"], 30);
+
+        // **Merged is still not a state GitHub reports.** It answers closed and a separate
+        // merged_at, and an agent reading only the state calls a merged branch abandoned.
+        let merged = slim_pull(&json!({
+            "number": 53, "state": "closed", "merged_at": "2026-08-18T00:00:00Z",
+        }));
+        assert_eq!(merged["state"], "merged");
+    }
+
+    /// **Anything open beats the highest number.** A long-lived branch trails a row of closed
+    /// pull requests — `develop` in this repository had eight behind it — and picking by number
+    /// alone puts a release that landed weeks ago on the strip instead of the one waiting for
+    /// review right now.
+    #[test]
+    fn the_pull_request_on_the_strip_is_the_one_still_open() {
+        let closed = |n: u64| json!({"number": n, "state": "closed"});
+        let open = |n: u64| json!({"number": n, "state": "open"});
+
+        assert_eq!(pick_pull(&json!([closed(5), closed(12), closed(8)])), Some(12));
+        assert_eq!(
+            pick_pull(&json!([closed(12), open(9)])),
+            Some(9),
+            "an open request is the one being worked on, however old its number",
+        );
+        // Among equals, the newest.
+        assert_eq!(pick_pull(&json!([open(9), open(13)])), Some(13));
+        // A branch nobody has opened anything for, and an answer that is not a list.
+        assert_eq!(pick_pull(&json!([])), None);
+        assert_eq!(pick_pull(&json!({"message": "Not Found"})), None);
+    }
+
+    /// **Still running beats failed beats passed.** A pull request whose checks are half green
+    /// and half still working is not passing, and a mark that says it is gets stopped being read.
+    #[test]
+    fn checks_add_up_to_the_least_settled_thing_among_them() {
+        use crate::repo::Checks;
+        let runs = |v: Value| json!({ "check_runs": v });
+        assert_eq!(fold_checks(&runs(json!([]))), Checks::Quiet, "no CI draws nothing");
+        assert_eq!(fold_checks(&json!({})), Checks::Quiet, "and neither does an unreadable answer");
+        assert_eq!(
+            fold_checks(&runs(json!([
+                {"status": "completed", "conclusion": "success"},
+                {"status": "in_progress", "conclusion": null},
+            ]))),
+            Checks::Running,
+        );
+        assert_eq!(
+            fold_checks(&runs(json!([
+                {"status": "completed", "conclusion": "success"},
+                {"status": "completed", "conclusion": "failure"},
+            ]))),
+            Checks::Failed,
+        );
+        assert_eq!(
+            fold_checks(&runs(json!([
+                {"status": "completed", "conclusion": "success"},
+                {"status": "completed", "conclusion": "skipped"},
+                {"status": "completed", "conclusion": "neutral"},
+            ]))),
+            Checks::Passed,
+            "skipped and neutral are not in the way",
+        );
+        // A queued run has not started, which is still "not settled".
+        assert_eq!(
+            fold_checks(&runs(json!([{"status": "queued", "conclusion": null}]))),
+            Checks::Running,
+        );
+    }
+
+    /// **Scopes are read off the header, because a saved token carries what it was granted then.**
+    /// A token from before signing existed cannot add a key, and the only way to tell it from one
+    /// granted today is to ask — guessing produces a 404 that reads like a broken endpoint.
+    #[test]
+    fn what_a_token_may_do_is_read_from_what_github_answered() {
+        let account = Account {
+            id: 7,
+            login: "ruma".into(),
+            scopes: split_scopes("repo, read:user, write:gpg_key"),
+        };
+        assert!(account.may("write:gpg_key"));
+        assert!(account.may("repo"));
+        assert!(!account.may("workflow"));
+
+        // An older token, and the header a token with nothing at all comes back with.
+        let older = Account { scopes: split_scopes("repo,read:user"), ..Account::default() };
+        assert!(!older.may("write:gpg_key"));
+        assert!(Account { scopes: split_scopes(""), ..Account::default() }.scopes.is_empty());
+        assert!(Account { scopes: split_scopes("  ,  "), ..Account::default() }.scopes.is_empty());
+    }
 
     #[test]
     fn a_repo_is_read_from_either_a_name_or_a_remote() {
