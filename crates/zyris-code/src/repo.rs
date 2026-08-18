@@ -19,6 +19,20 @@ pub struct Repo {
     pub conflicts: usize,
     pub ahead: usize,
     pub behind: usize,
+    /// How much code this branch changed against the branch it came off.
+    ///
+    /// **`None` means there is nothing to compare against**, not "no change" — the default branch
+    /// itself, a checkout with no remote, or a git that could not answer. Zero is a real answer
+    /// and reads as `+0 -0`; absence has to stay distinguishable from it or a branch that failed
+    /// to measure would claim it changed nothing.
+    pub diverged: Option<Diff>,
+}
+
+/// Lines added and removed, as `git diff --shortstat` counts them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Diff {
+    pub added: usize,
+    pub removed: usize,
 }
 
 impl Repo {
@@ -114,12 +128,19 @@ enum Level {
     Full,
     NoUntracked,
     NoAhead,
+    NoDiverged,
     NoCounts,
     NoGit,
 }
 
-const LEVELS: [Level; 5] =
-    [Level::Full, Level::NoUntracked, Level::NoAhead, Level::NoCounts, Level::NoGit];
+const LEVELS: [Level; 6] = [
+    Level::Full,
+    Level::NoUntracked,
+    Level::NoAhead,
+    Level::NoDiverged,
+    Level::NoCounts,
+    Level::NoGit,
+];
 
 /// The whole divider row: `─ ~/zyris-code · * main +2 ~1 ────────`.
 ///
@@ -198,7 +219,25 @@ fn pieces(path: &str, repo: Option<&Repo>, level: Level) -> Vec<Vec<Span<'static
             }
         }
     }
-    vec![vec![Span::styled(path.to_string(), muted)], git]
+    // **Its own piece, not more marks on the git one.** `+` already means "staged" two columns
+    // to the left, so `* main +2 ~1 +120 -34` asks the reader to know that the third number
+    // changed units. A separator says they are different things without a word of explanation.
+    let mut diverged: Vec<Span<'static>> = Vec::new();
+    if let (Some(r), true) =
+        (repo, matches!(level, Level::Full | Level::NoUntracked | Level::NoAhead))
+    {
+        if let Some(d) = r.diverged {
+            diverged.push(Span::styled(
+                format!("+{}", d.added),
+                Style::default().fg(theme::diff_add()),
+            ));
+            diverged.push(Span::styled(
+                format!(" -{}", d.removed),
+                Style::default().fg(theme::diff_del()),
+            ));
+        }
+    }
+    vec![vec![Span::styled(path.to_string(), muted)], git, diverged]
 }
 
 /// Joins the non-empty pieces and pads out to exactly `width`. `None` when the body is over
@@ -291,7 +330,91 @@ pub async fn read(cwd: &Path) -> Option<Repo> {
     if !out.status.success() {
         return None;
     }
-    parse(&String::from_utf8_lossy(&out.stdout))
+    let mut repo = parse(&String::from_utf8_lossy(&out.stdout))?;
+    repo.diverged = measure_against_base(cwd, &repo.branch).await;
+    Some(repo)
+}
+
+/// How far this branch has moved from the one it came off, or `None` when that question has no
+/// answer here.
+///
+/// **Nothing to say on the base branch itself.** Sitting on `main`, `main...HEAD` is empty by
+/// definition, and `+0 -0` on every checkout that never made a branch is a column of noise.
+///
+/// `A...HEAD` (three dots) is deliberate: it measures from where the two last agreed, so pulling
+/// the base does not suddenly credit this branch with everyone else's work.
+async fn measure_against_base(cwd: &Path, branch: &str) -> Option<Diff> {
+    let base = base_ref(cwd).await?;
+    // `origin/main` and `main` both describe the branch named `main`.
+    if base.rsplit('/').next() == Some(branch) {
+        return None;
+    }
+    let out = git(cwd, &["diff", "--shortstat", &format!("{base}...HEAD")]).await?;
+    Some(parse_shortstat(&out))
+}
+
+/// What `git diff --shortstat` said, in lines.
+///
+/// ```text
+///  3 files changed, 120 insertions(+), 34 deletions(-)
+///  1 file changed, 2 insertions(+)
+/// ```
+///
+/// **Pure, and it never fails** — a clause that is absent is zero, which is exactly what git means
+/// by leaving it out. Anything unparseable also reads as zero rather than as an error, because the
+/// caller has already decided there is a branch worth measuring and a strip that silently loses
+/// its numbers is better than one that loses the whole row.
+pub fn parse_shortstat(text: &str) -> Diff {
+    let mut out = Diff::default();
+    for part in text.split(',') {
+        let part = part.trim();
+        let Some((n, rest)) = part.split_once(' ') else { continue };
+        let Ok(n) = n.parse::<usize>() else { continue };
+        // `insertion`/`insertions` and `deletion`/`deletions` — match the stem, not the plural.
+        if rest.starts_with("insertion") {
+            out.added = n;
+        } else if rest.starts_with("deletion") {
+            out.removed = n;
+        }
+    }
+    out
+}
+
+/// The branch this checkout's work is measured against.
+///
+/// **Asked once per process.** It is a property of the remote, not of the moment, and the strip
+/// polls every few seconds — re-resolving it each tick would double the git calls to learn
+/// something that does not change. The cost of caching is that a repository which gains an
+/// `origin/HEAD` mid-session keeps saying nothing until the app restarts, which is the cheaper
+/// mistake.
+///
+/// `origin/HEAD` is the honest answer but is very often unset on a fresh clone, so the usual two
+/// names are tried after it. `None` means there is nothing to compare against, and the strip then
+/// shows no counts at all rather than comparing against something invented.
+async fn base_ref(cwd: &Path) -> Option<&'static str> {
+    static BASE: tokio::sync::OnceCell<Option<&'static str>> = tokio::sync::OnceCell::const_new();
+    *BASE
+        .get_or_init(|| async {
+            for name in ["origin/HEAD", "origin/main", "origin/master", "main", "master"] {
+                if git(cwd, &["rev-parse", "--verify", "--quiet", name]).await.is_some() {
+                    return Some(name);
+                }
+            }
+            None
+        })
+        .await
+}
+
+/// Runs a git command in `cwd` and hands back its stdout, or `None` for any failure at all.
+async fn git(cwd: &Path, args: &[&str]) -> Option<String> {
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.args(["--no-optional-locks", "-C"])
+        .arg(cwd)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let out = tokio::time::timeout(READ_TIMEOUT, cmd.output()).await.ok()?.ok()?;
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// How often to ask. `ZYRIS_CODE_GIT_MS`, 0 turns git off.
@@ -381,6 +504,7 @@ mod tests {
             conflicts: 0,
             ahead: 1,
             behind: 0,
+            diverged: None,
         }
     }
 
@@ -397,6 +521,7 @@ mod tests {
             conflicts: 0,
             ahead: 2,
             behind: 1,
+            diverged: None,
         };
         let spans = super::spans(
             80,
@@ -411,6 +536,56 @@ mod tests {
         assert_eq!(colour_of('↓'), Some(theme::behind()), "behind came from elsewhere");
         assert_ne!(colour_of('↑'), colour_of('↓'), "the two directions must not look alike");
         assert_ne!(colour_of('?'), colour_of('↑'), "litter must not look like work to send");
+    }
+
+    /// **A clause git left out is zero, not a failure.** `--shortstat` prints only the counts
+    /// that happened, so a commit that adds and never deletes has no deletion clause at all.
+    #[test]
+    fn a_shortstat_says_zero_for_the_clause_it_leaves_out() {
+        let both = parse_shortstat(" 3 files changed, 120 insertions(+), 34 deletions(-)");
+        assert_eq!(both, Diff { added: 120, removed: 34 });
+        let added_only = parse_shortstat(" 1 file changed, 2 insertions(+)");
+        assert_eq!(added_only, Diff { added: 2, removed: 0 });
+        let removed_only = parse_shortstat(" 1 file changed, 7 deletions(-)");
+        assert_eq!(removed_only, Diff { added: 0, removed: 7 });
+        // Nothing changed, and anything unreadable, both land on zero rather than on a panic.
+        assert_eq!(parse_shortstat(""), Diff::default());
+        assert_eq!(parse_shortstat("what?"), Diff::default());
+    }
+
+    /// **`+120 -34` must not be read as staged files.** `+` two columns to the left already means
+    /// "staged", so the diverged counts stand as their own piece behind a separator.
+    #[test]
+    fn the_lines_a_branch_changed_stand_apart_from_the_files_it_staged() {
+        let mut repo = dirty();
+        repo.diverged = Some(Diff { added: 120, removed: 34 });
+        let out = strip(90, "/home/ruma/zyris-code", Some("/home/ruma"), Some(&repo));
+        assert!(out.contains("+120 -34"), "the branch's size is missing: {out:?}");
+        assert_eq!(out.matches('∙').count(), 2, "path ∙ git ∙ diverged: {out:?}");
+    }
+
+    /// **Absent is not zero.** A branch that could not be measured — no remote, no `origin/HEAD`,
+    /// a git that failed — must show nothing, or it claims it changed no code at all.
+    #[test]
+    fn a_branch_with_nothing_to_compare_against_shows_no_counts() {
+        let repo = dirty();
+        assert_eq!(repo.diverged, None, "the fixture is the unmeasured case");
+        let out = strip(90, "/home/ruma/zyris-code", Some("/home/ruma"), Some(&repo));
+        assert!(!out.contains("+0 -0"), "absence was drawn as zero: {out:?}");
+        assert_eq!(out.matches('∙').count(), 1, "no empty piece and no stray join: {out:?}");
+    }
+
+    /// The counts go before the ahead/behind arrows do — how much the branch changed is the thing
+    /// asked for, and the arrows are a smaller errand.
+    #[test]
+    fn the_branch_size_outlives_the_arrows_when_the_row_gets_tight() {
+        let mut repo = dirty();
+        repo.diverged = Some(Diff { added: 120, removed: 34 });
+        let wide = strip(90, "/home/ruma/zyris-code", Some("/home/ruma"), Some(&repo));
+        assert!(wide.contains('↑') && wide.contains("+120"), "both fit at 90: {wide:?}");
+        let tight = strip(46, "/home/ruma/zyris-code", Some("/home/ruma"), Some(&repo));
+        assert!(!tight.contains('↑'), "the arrow should have gone first: {tight:?}");
+        assert!(tight.contains("+120"), "the size should outlive it: {tight:?}");
     }
 
     #[test]
