@@ -251,6 +251,25 @@ impl Github {
         out["body"] = json!(pull.get("body").and_then(Value::as_str).unwrap_or_default());
         out["files"] = json!(slim_list(&files, slim_file));
         out["review_comments"] = json!(slim_list(&reviews, slim_review_comment));
+        // **What CI says, on the request itself.** Reading a pull request to decide what to do
+        // next and then having to ask separately whether it is even green is a round trip for
+        // something GitHub was going to be asked about anyway.
+        if let Some(head) = pull.get("head").and_then(|h| h.get("sha")).and_then(Value::as_str) {
+            let checks = self
+                .get(
+                    &format!("/repos/{}/{}/commits/{head}/check-runs", repo.owner, repo.name),
+                    &[("per_page", "100".into())],
+                )
+                .await
+                .map(|body| fold_checks(&body))
+                .unwrap_or_default();
+            out["checks"] = json!(match checks {
+                crate::repo::Checks::Quiet => "none",
+                crate::repo::Checks::Running => "running",
+                crate::repo::Checks::Passed => "passed",
+                crate::repo::Checks::Failed => "failed",
+            });
+        }
         Ok(out)
     }
 
@@ -518,7 +537,7 @@ pub fn slim_pull(v: &Value) -> Value {
             .unwrap_or_default()
             .to_string()
     };
-    json!({
+    let mut out = json!({
         "number": v.get("number").and_then(Value::as_u64).unwrap_or_default(),
         "title": text_at(v, "title"),
         // **Merged is not a state GitHub reports.** It answers `state: "closed"` and a separate
@@ -533,7 +552,15 @@ pub fn slim_pull(v: &Value) -> Value {
         "base": branch("base"),
         "updated_at": text_at(v, "updated_at"),
         "url": text_at(v, "html_url"),
-    })
+    });
+    // **Only when GitHub sent them.** The list endpoint leaves these out entirely, and writing
+    // `+0 -0` there would say a pull request changed nothing rather than that nobody asked.
+    for (ours, theirs) in [("added", "additions"), ("removed", "deletions")] {
+        if let Some(n) = v.get(theirs).and_then(Value::as_u64) {
+            out[ours] = json!(n);
+        }
+    }
+    out
 }
 
 fn slim_comment(v: &Value) -> Value {
@@ -565,6 +592,29 @@ fn slim_file(v: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The sizes appear only when GitHub sent them.** The list endpoint leaves `additions` and
+    /// `deletions` out entirely, and answering `+0 -0` there would tell an agent a pull request
+    /// changed nothing rather than that nobody asked.
+    #[test]
+    fn a_pull_request_carries_its_size_only_when_there_is_one_to_carry() {
+        let listed = slim_pull(&json!({"number": 53, "title": "t", "state": "open"}));
+        assert!(listed.get("added").is_none(), "{listed}");
+        assert!(listed.get("removed").is_none(), "{listed}");
+
+        let one = slim_pull(&json!({
+            "number": 53, "title": "t", "state": "open", "additions": 118, "deletions": 30,
+        }));
+        assert_eq!(one["added"], 118);
+        assert_eq!(one["removed"], 30);
+
+        // **Merged is still not a state GitHub reports.** It answers closed and a separate
+        // merged_at, and an agent reading only the state calls a merged branch abandoned.
+        let merged = slim_pull(&json!({
+            "number": 53, "state": "closed", "merged_at": "2026-08-18T00:00:00Z",
+        }));
+        assert_eq!(merged["state"], "merged");
+    }
 
     /// **Still running beats failed beats passed.** A pull request whose checks are half green
     /// and half still working is not passing, and a mark that says it is gets stopped being read.
