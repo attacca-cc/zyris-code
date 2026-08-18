@@ -23,6 +23,7 @@ use std::path::PathBuf;
 use serde_json::{json, Value};
 
 use crate::github::signing::Signing;
+use crate::github::ReviewNote;
 
 /// The env var the credential helper reads the token out of.
 ///
@@ -271,23 +272,80 @@ mod tests {
 }
 
 // ── The capability ───────────────────────────────────────────────────────────────────────────
+//
+// **One capability, not two.** git and GitHub were announced separately, which put eighteen tools
+// in front of the agent and three pairs among them that did the same job from different sides:
+// `pull_diff` next to `diff`, `me` next to `status`, and `issue`/`issues` and `pull`/`pulls`
+// differing by a single letter. A model reaching for one and getting the other is not a mistake it
+// can see it made. They are one subject — the repository you are in and the place it is hosted —
+// so they are one capability, and where two tools overlapped an argument now says which is wanted.
 
 fn oops(text: impl Into<String>) -> zyris::WireError {
     zyris::WireError::invalid_params(text)
 }
 
-#[zyris::capability(name = "git", version = 1)]
+impl Git {
+    /// The GitHub client, or a refusal that says what to do about it.
+    ///
+    /// **Read at call time, not held.** Signing in with `/github login` has to take effect without
+    /// restarting, and a client built at startup would have captured "not signed in" for good.
+    pub(crate) fn github_client(
+        &self,
+        role: crate::github::auth::Role,
+    ) -> zyris::Result<crate::github::api::Github> {
+        let accounts = crate::github::auth::Accounts::load();
+        let Some(account) = accounts.for_role(role) else {
+            return Err(oops(
+                "not signed in to GitHub ‒ the person running this node needs to run `/github login`",
+            ));
+        };
+        crate::github::api::Github::new(account.token.clone())
+            .map_err(|e| zyris::WireError::internal(e.to_string()))
+    }
+
+    /// Which repository a call is about.
+    ///
+    /// **An empty argument means "the one we are in".** The agent usually has no idea what the
+    /// remote is called, and making it find out first would cost a round trip to learn something
+    /// this process can read out of `.git/config`.
+    fn github_repo(&self, given: &str) -> zyris::Result<crate::github::api::Repo> {
+        if !given.trim().is_empty() {
+            return crate::github::api::Repo::parse(given).ok_or_else(|| {
+                oops(format!("`{given}` is not an owner/repo, and not a GitHub remote either"))
+            });
+        }
+        crate::github::repo_of(&self.cwd).ok_or_else(|| {
+            oops("no repository given, and this working directory has no GitHub remote")
+        })
+    }
+}
+
+#[zyris::capability(name = "git", version = 2)]
 pub trait GitCap {
-    /// What has changed here: the branch, how far it is from its upstream, and which files are
-    /// staged, changed but not staged, or not tracked at all.
+    /// Where this is and who it is: the branch, how far it is from its upstream, which files are
+    /// staged, changed but not staged, or untracked — and the GitHub account and repository the
+    /// calls below would act as and on.
+    ///
+    /// **Nothing here goes over the network.** The account is read from where signing in put it,
+    /// so this stays the cheap call it looks like.
     async fn status(&self) -> zyris::Result<Value>;
 
     /// Recent commits, newest first.
     async fn log(&self, limit: u32) -> zyris::Result<Value>;
 
-    /// The unified diff. `staged` shows what a commit would take; leave `path` empty for
-    /// everything. **Give `against` a branch** to see how far this one has come from it.
-    async fn diff(&self, staged: bool, path: String, against: String) -> zyris::Result<String>;
+    /// A unified diff. **Three sources, one tool** — give `number` for a pull request's diff as
+    /// GitHub has it, `against` for how far this branch has come from another, or neither for
+    /// what is uncommitted here. `staged` shows what a commit would take; leave `path` empty for
+    /// everything. A pull request's diff can be large — read `pulls` first to see whether it is
+    /// worth it.
+    async fn diff(
+        &self,
+        staged: bool,
+        path: String,
+        against: String,
+        number: u32,
+        repo: String,
+    ) -> zyris::Result<String>;
 
     /// The branches here, and which one is checked out.
     async fn branches(&self) -> zyris::Result<Value>;
@@ -308,6 +366,81 @@ pub trait GitCap {
     /// `force_with_lease` overwrites the remote branch **only if it is where we last saw it** —
     /// a plain force would throw away work that arrived in between.
     async fn push(&self, force_with_lease: bool) -> zyris::Result<Value>;
+
+    /// Issues. **One tool for the list and for one of them**: give `number` for that issue with
+    /// its body and comments, or leave it at 0 for the newest. `repo` is `owner/name`; leave it
+    /// empty for the repository this working directory pushes to. `state` is `open`, `closed` or
+    /// `all`, and is ignored when a number is given.
+    async fn issues(
+        &self,
+        repo: String,
+        number: u32,
+        state: String,
+        limit: u32,
+    ) -> zyris::Result<Value>;
+
+    /// Pull requests, the same way. With `number`, that one in full: its body, which files
+    /// changed and by how much, what the checks say, and the review comments — **but not the
+    /// patch**, which is `diff`.
+    async fn pulls(
+        &self,
+        repo: String,
+        number: u32,
+        state: String,
+        limit: u32,
+    ) -> zyris::Result<Value>;
+
+    /// Adds a comment to an issue or a pull request — they share a numbering.
+    async fn comment(&self, repo: String, number: u32, body: String) -> zyris::Result<Value>;
+
+    /// Opens an issue.
+    async fn create_issue(
+        &self,
+        repo: String,
+        title: String,
+        body: String,
+        labels: Vec<String>,
+    ) -> zyris::Result<Value>;
+
+    /// Opens a pull request. `head` is the branch with the changes, `base` the branch to merge
+    /// into. **The branch must already be pushed** — use `push` first.
+    async fn create_pull(
+        &self,
+        repo: String,
+        title: String,
+        body: String,
+        head: String,
+        base: String,
+        draft: bool,
+    ) -> zyris::Result<Value>;
+
+    /// Submits a review on a pull request. **Not the same as a comment** — a review carries a
+    /// verdict and can hang remarks off particular lines.
+    ///
+    /// `event` is `comment`, `approve` or `request_changes`. Each entry in `comments` needs a file
+    /// path and a line number **as the diff numbers it**, which is what `diff` shows.
+    ///
+    /// **You cannot approve your own pull request.** GitHub refuses, and this node acts as the
+    /// person who signed in — use `comment` there.
+    async fn review(
+        &self,
+        repo: String,
+        number: u32,
+        event: String,
+        body: String,
+        comments: Vec<ReviewNote>,
+    ) -> zyris::Result<Value>;
+
+    /// Asks people to review a pull request. `reviewers` are GitHub logins.
+    ///
+    /// **Accounts and teams only.** There is no way to name an app: an OAuth app is not an
+    /// identity of its own, it acts as whoever signed in.
+    async fn request_review(
+        &self,
+        repo: String,
+        number: u32,
+        reviewers: Vec<String>,
+    ) -> zyris::Result<Value>;
 }
 
 #[async_trait::async_trait]
@@ -334,6 +467,12 @@ impl GitCap for Git {
                 ahead = parts.next().and_then(|n| n.parse().ok()).unwrap_or(0);
             }
         }
+        // **Who, from disk.** This used to be a tool of its own that asked GitHub for a login it
+        // had already written down when the token was saved — a round trip to repeat itself.
+        let accounts = crate::github::auth::Accounts::load();
+        let login = accounts.exactly(crate::github::auth::Role::User).map(|a| a.login.clone());
+        let reviewer =
+            accounts.exactly(crate::github::auth::Role::Reviewer).map(|a| a.login.clone());
         Ok(json!({
             "branch": branch,
             "upstream": upstream,
@@ -344,6 +483,13 @@ impl GitCap for Git {
             "untracked": untracked,
             "clean": text.trim().is_empty(),
             "signing": Signing::load().map(|s| json!({"email": s.email, "key": s.fingerprint})),
+            "github": json!({
+                "login": login.clone(),
+                "reviews_as": reviewer.clone().or(login),
+                "separate_reviewer": reviewer.is_some(),
+                "repository": crate::github::repo_of(&self.cwd)
+                    .map(|r| format!("{}/{}", r.owner, r.name)),
+            }),
         }))
     }
 
@@ -364,7 +510,23 @@ impl GitCap for Git {
         Ok(json!(parse_log(&text)))
     }
 
-    async fn diff(&self, staged: bool, path: String, against: String) -> zyris::Result<String> {
+    async fn diff(
+        &self,
+        staged: bool,
+        path: String,
+        against: String,
+        number: u32,
+        repo: String,
+    ) -> zyris::Result<String> {
+        // A number means the diff lives on GitHub, and the branch may not even be checked out.
+        if number > 0 {
+            let repo = self.github_repo(&repo)?;
+            return self
+                .github_client(crate::github::auth::Role::User)?
+                .pull_diff(&repo, number as u64)
+                .await
+                .map_err(crate::github::err);
+        }
         let mut args: Vec<String> =
             ["--no-optional-locks", "diff"].iter().map(|a| a.to_string()).collect();
         if staged {
@@ -496,6 +658,208 @@ impl GitCap for Git {
         }
         Ok(json!({"remote": remote, "branch": branch, "said": ran.err.trim()}))
     }
+
+    async fn issues(
+        &self,
+        repo: String,
+        number: u32,
+        state: String,
+        limit: u32,
+    ) -> zyris::Result<Value> {
+        let repo = self.github_repo(&repo)?;
+        let client = self.github_client(crate::github::auth::Role::User)?;
+        match number {
+            0 => client
+                .issues(
+                    &repo,
+                    &crate::github::normalise_state(&state),
+                    crate::github::limit_of(limit),
+                )
+                .await
+                .map_err(crate::github::err),
+            n => client.issue(&repo, n as u64).await.map_err(crate::github::err),
+        }
+    }
+
+    async fn pulls(
+        &self,
+        repo: String,
+        number: u32,
+        state: String,
+        limit: u32,
+    ) -> zyris::Result<Value> {
+        let repo = self.github_repo(&repo)?;
+        let client = self.github_client(crate::github::auth::Role::User)?;
+        match number {
+            0 => client
+                .pulls(
+                    &repo,
+                    &crate::github::normalise_state(&state),
+                    crate::github::limit_of(limit),
+                )
+                .await
+                .map_err(crate::github::err),
+            n => client.pull(&repo, n as u64).await.map_err(crate::github::err),
+        }
+    }
+
+    async fn comment(&self, repo: String, number: u32, body: String) -> zyris::Result<Value> {
+        if body.trim().is_empty() {
+            return Err(oops("a comment with no words in it"));
+        }
+        let repo = self.github_repo(&repo)?;
+        self.github_client(crate::github::auth::Role::User)?
+            .comment(&repo, number as u64, &body)
+            .await
+            .map_err(crate::github::err)
+    }
+
+    async fn create_issue(
+        &self,
+        repo: String,
+        title: String,
+        body: String,
+        labels: Vec<String>,
+    ) -> zyris::Result<Value> {
+        if title.trim().is_empty() {
+            return Err(oops("an issue needs a title"));
+        }
+        let repo = self.github_repo(&repo)?;
+        self.github_client(crate::github::auth::Role::User)?
+            .create_issue(&repo, &title, &body, &labels)
+            .await
+            .map_err(crate::github::err)
+    }
+
+    async fn create_pull(
+        &self,
+        repo: String,
+        title: String,
+        body: String,
+        head: String,
+        base: String,
+        draft: bool,
+    ) -> zyris::Result<Value> {
+        if title.trim().is_empty() || head.trim().is_empty() || base.trim().is_empty() {
+            return Err(oops("a pull request needs a title, a head branch and a base branch"));
+        }
+        let repo = self.github_repo(&repo)?;
+        self.github_client(crate::github::auth::Role::User)?
+            .create_pull(&repo, &title, &body, &head, &base, draft)
+            .await
+            .map_err(crate::github::err)
+    }
+
+    async fn review(
+        &self,
+        repo: String,
+        number: u32,
+        event: String,
+        body: String,
+        comments: Vec<ReviewNote>,
+    ) -> zyris::Result<Value> {
+        let event = crate::github::review_event(&event).ok_or_else(|| {
+            oops(format!(
+                "`{event}` is not a review verdict ‒ use comment, approve or request_changes"
+            ))
+        })?;
+        // **A verdict with nothing to say is fine; a comment with nothing at all is not.** GitHub
+        // rejects an empty COMMENT review, and the message it gives back says nothing useful.
+        if event == "COMMENT" && body.trim().is_empty() && comments.is_empty() {
+            return Err(oops("a review with no words and no line remarks says nothing"));
+        }
+        let repo = self.github_repo(&repo)?;
+        self.github_client(crate::github::auth::Role::Reviewer)?
+            .review(&repo, number as u64, event, &body, &comments)
+            .await
+            .map_err(crate::github::err)
+    }
+
+    async fn request_review(
+        &self,
+        repo: String,
+        number: u32,
+        reviewers: Vec<String>,
+    ) -> zyris::Result<Value> {
+        if reviewers.is_empty() {
+            return Err(oops("no one to ask"));
+        }
+        let repo = self.github_repo(&repo)?;
+        self.github_client(crate::github::auth::Role::Reviewer)?
+            .request_review(&repo, number as u64, &reviewers)
+            .await
+            .map_err(crate::github::err)
+    }
+}
+
+#[cfg(test)]
+mod what_is_announced {
+    use super::*;
+
+    fn tools() -> Vec<String> {
+        let server = GitCapServer(Git::new(std::path::PathBuf::from("/")));
+        zyris::ServeCapability::descriptor(&server).tools.into_iter().map(|t| t.name).collect()
+    }
+
+    /// **One capability, and one tool per job.** git and GitHub were announced separately until
+    /// 0.3.1, which put eighteen tools in front of the agent with three pairs among them doing the
+    /// same job from different sides. The pairs are what this holds shut: a model reaching for
+    /// `issue` when it meant `issues` is not a mistake it can see it made.
+    #[test]
+    fn the_tools_that_did_the_same_job_are_one_tool() {
+        let tools = tools();
+        for gone in ["me", "pull_diff", "issue", "pull"] {
+            assert!(
+                !tools.iter().any(|t| t == gone),
+                "`{gone}` is back, and `{}` already does it: {tools:?}",
+                match gone {
+                    "me" => "status",
+                    "pull_diff" => "diff",
+                    _ => "the plural",
+                },
+            );
+        }
+        let mut want = [
+            "status",
+            "log",
+            "diff",
+            "branches",
+            "switch",
+            "commit",
+            "push",
+            "issues",
+            "pulls",
+            "comment",
+            "create_issue",
+            "create_pull",
+            "review",
+            "request_review",
+        ]
+        .map(str::to_string)
+        .to_vec();
+        want.sort();
+        let mut got = tools;
+        got.sort();
+        assert_eq!(got, want);
+    }
+
+    /// **The wire name has to split into exactly four.** attacca builds
+    /// `zyris__{node}__{capability}__{tool}` and reads it back by splitting on `__`, so a name
+    /// carrying `__` inside it, or ending in `_`, breaks apart somewhere else. This repository has
+    /// shipped that mistake twice, both times green locally and only visible live — and a new
+    /// capability name is exactly when it happens again.
+    #[test]
+    fn every_wire_name_splits_into_four() {
+        let server = GitCapServer(Git::new(std::path::PathBuf::from("/")));
+        let descriptor = zyris::ServeCapability::descriptor(&server);
+        assert_eq!(descriptor.name, "git");
+        for tool in &descriptor.tools {
+            let wire = format!("zyris__arch-zyris-code__{}__{}", descriptor.name, tool.name);
+            let parts: Vec<&str> = wire.split("__").collect();
+            assert_eq!(parts.len(), 4, "`{wire}` split into {parts:?}");
+            assert_eq!(parts[3], tool.name);
+        }
+    }
 }
 
 /// Against a real repository, because the whole of this module is what git does when it is run.
@@ -620,10 +984,12 @@ mod against_a_real_repository {
         std::fs::write(dir.path().join("first.txt"), "one\ntwo\n").expect("write");
         git.commit("more".into(), vec!["first.txt".into()], false).await.expect("commit");
 
-        let patch = git.diff(false, String::new(), "main".into()).await.expect("diff");
+        let patch =
+            git.diff(false, String::new(), "main".into(), 0, String::new()).await.expect("diff");
         assert!(patch.contains("+two"), "{patch}");
         // Nothing uncommitted, so the plain diff is empty while the one against main is not.
-        assert!(git.diff(false, String::new(), String::new()).await.expect("diff").is_empty());
+        let here = git.diff(false, String::new(), String::new(), 0, String::new());
+        assert!(here.await.expect("diff").is_empty());
     }
 
     /// **Nowhere to push is said before anything is attempted.** A push that fails inside git

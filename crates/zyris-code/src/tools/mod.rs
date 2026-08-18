@@ -55,10 +55,8 @@ pub fn announce(
     api: tokio::sync::watch::Receiver<Option<std::sync::Arc<zyris_attacca::AttaccaApiClient>>>,
 ) -> Runner {
     let edit = LocalEdit::new(cwd.clone());
-    // The GitHub tools read the repository out of this, so they need their own copy — `search`
-    // takes `cwd` by value further down.
-    let cwd2 = cwd.clone();
-    // And git runs in it too.
+    // The git tools run in it and read the GitHub remote out of it, so they need their own copy —
+    // `search` takes `cwd` by value further down.
     let cwd3 = cwd.clone();
     // `/undo` must see the **same history** as the edit tool. Built separately, their locks would drift apart.
     bridge.set_undo(edit.undo());
@@ -106,17 +104,14 @@ pub fn announce(
             wait::WaitServer(wait::Waits::new(jobs, api.clone(), bridge.clone())),
             bridge.clone(),
         ))
-        // **Git as tools, not as shell text.** Reading a repository has to work in plan mode,
-        // a commit has to pick up the signing key by itself, and a push has to authenticate
-        // without the token ever reaching a command line ‒ none of which `terminal.exec` can do.
+        // **The repository you are in and the place it is hosted, as one capability.** Git as
+        // tools rather than shell text, because reading has to work in plan mode, a commit has to
+        // pick up the signing key by itself, and a push has to authenticate without the token
+        // ever reaching a command line ‒ none of which `terminal.exec` can do. And GitHub without
+        // needing `gh` on the machine, announced whether or not anybody has signed in: the tools
+        // say "not signed in" plainly, which beats a tool that is simply absent and leaves the
+        // agent shelling out to a `gh` that is not there.
         .capability(Gate::new(crate::git::GitCapServer(crate::git::Git::new(cwd3)), bridge.clone()))
-        // **GitHub, without needing `gh` on the machine.** Announced whether or not anybody has
-        // signed in — the tools say "not signed in" plainly, which is a far better answer than a
-        // tool that is simply absent and leaves the agent shelling out to a `gh` that is not there.
-        .capability(Gate::new(
-            crate::github::GithubCapServer(crate::github::GithubTools::new(cwd2)),
-            bridge.clone(),
-        ))
         // **Only this one reaches outside this computer.** Big jobs are handed to attacca so a
         // subagent runs them (`work.rs`). The handle arrives after we attach, so we receive it via `watch`.
         .capability(Gate::new(work::WorkServer(work::Works::new(api)), bridge))
