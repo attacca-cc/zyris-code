@@ -133,7 +133,14 @@ chmod 755 "$install_tmp"
 mv -f "$install_tmp" "$INSTALL_DIR/$BIN"
 
 # The short name. A symlink rather than a second copy, so upgrades only have to replace one file.
-ln -sf "$BIN" "$INSTALL_DIR/$ALIAS" 2>/dev/null || cp -f "$INSTALL_DIR/$BIN" "$INSTALL_DIR/$ALIAS"
+# **The fallback writes beside and renames too.** Overwriting a real copy that is being executed
+# fails with ETXTBSY, which is the same self-update trap the line above avoids.
+if ! ln -sf "$BIN" "$INSTALL_DIR/$ALIAS" 2>/dev/null; then
+  alias_tmp="$INSTALL_DIR/.$ALIAS.new.$$"
+  cp "$tmp/$BIN" "$alias_tmp"
+  chmod 755 "$alias_tmp"
+  mv -f "$alias_tmp" "$INSTALL_DIR/$ALIAS"
+fi
 
 # **Do not run it to ask its version.** It is a TUI that starts on launch and takes no
 # arguments, so that would open the app in the middle of an install.
