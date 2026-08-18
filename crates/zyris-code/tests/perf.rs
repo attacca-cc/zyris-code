@@ -240,7 +240,12 @@ fn measure_bytes_on_the_wire() {
         let entry = Entry { seq, kind: EntryKind::User(format!("{i}번째 질문입니다")) };
         apply(
             &mut state,
-            &Action::Frame(AppFrame::Event { cursor: seq, entry: Some(entry), todo: None }),
+            &Action::Frame(AppFrame::Event {
+                cursor: seq,
+                entry: Some(entry),
+                todo: None,
+                plan: None,
+            }),
         );
         seq += 1;
         let entry = Entry {
@@ -249,7 +254,12 @@ fn measure_bytes_on_the_wire() {
         };
         apply(
             &mut state,
-            &Action::Frame(AppFrame::Event { cursor: seq, entry: Some(entry), todo: None }),
+            &Action::Frame(AppFrame::Event {
+                cursor: seq,
+                entry: Some(entry),
+                todo: None,
+                plan: None,
+            }),
         );
     }
 

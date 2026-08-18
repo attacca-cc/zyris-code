@@ -390,6 +390,7 @@ mod tests {
                 dir_access: crate::config::DirAccess::Allow,
                 ..Default::default()
             },
+            false,
         );
         let gate = Gate::new(fake, bridge);
 
@@ -402,7 +403,7 @@ mod tests {
     async fn the_normal_mode_runs_without_asking() {
         let (fake, ran) = Fake::new("code_edit");
         let bridge = Bridge::new();
-        bridge.sync(Mode::Job, &crate::config::Config::default());
+        bridge.sync(Mode::Job, &crate::config::Config::default(), false);
         let gate = Gate::new(fake, bridge);
 
         assert!(gate.dispatch(incoming("edit", json!({"path": "a"}))).await.is_ok());
@@ -414,7 +415,7 @@ mod tests {
     async fn a_refusal_says_what_to_do_instead() {
         let (fake, ran) = Fake::new("code_edit");
         let bridge = Bridge::new();
-        bridge.sync(Mode::Plan, &crate::config::Config::default());
+        bridge.sync(Mode::Plan, &crate::config::Config::default(), false);
         let gate = Gate::new(fake, bridge);
 
         let Err(e) = gate.dispatch(incoming("edit", json!({"path": "a"}))).await else {
@@ -429,7 +430,7 @@ mod tests {
     async fn reading_is_never_gated() {
         let (fake, ran) = Fake::new("file_io");
         let bridge = Bridge::new();
-        bridge.sync(Mode::Job, &crate::config::Config::default());
+        bridge.sync(Mode::Job, &crate::config::Config::default(), false);
         let gate = Gate::new(fake, bridge);
 
         assert!(gate.dispatch(incoming("read", json!({"path": "a"}))).await.is_ok());
@@ -442,7 +443,7 @@ mod tests {
         let (mut fake, _) = Fake::new("terminal");
         fake.reply = Some(json!({"pty": "p1"}));
         let bridge = Bridge::new();
-        bridge.sync(Mode::Job, &crate::config::Config::default());
+        bridge.sync(Mode::Job, &crate::config::Config::default(), false);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         bridge.attach(tx);
         let gate = Gate::new(fake, bridge.clone());
@@ -462,7 +463,7 @@ mod tests {
     async fn a_long_exec_is_cut_to_fit_the_wire_deadline() {
         let (fake, _) = Fake::new("terminal");
         let bridge = Bridge::new();
-        bridge.sync(Mode::Job, &crate::config::Config::default());
+        bridge.sync(Mode::Job, &crate::config::Config::default(), false);
         let gate = Gate::new(fake, bridge);
 
         let args = json!({"command": "cargo build", "timeout_ms": 600_000u64});

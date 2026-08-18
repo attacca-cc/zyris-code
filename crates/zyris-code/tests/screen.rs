@@ -126,6 +126,7 @@ fn a_user_message_appears_above_the_input() {
             cursor: 1,
             entry: Some(Entry { seq: 1, kind: EntryKind::User("안녕하세요".into()) }),
             todo: None,
+            plan: None,
         }),
     );
     let screen = dump(&mut s, 40, 10);
@@ -159,6 +160,7 @@ fn the_servers_copy_of_a_submitted_message_does_not_double_it() {
             cursor: 1,
             entry: Some(Entry { seq: 1, kind: EntryKind::User("안녕하세요".into()) }),
             todo: None,
+            plan: None,
         }),
     );
     let screen = dump(&mut s, 40, 12);
@@ -195,7 +197,7 @@ fn cell_bg(state: &mut State, w: u16, h: u16, x: u16, y: u16) -> Option<ratatui:
 
 fn said(state: &mut State, seq: i64, kind: EntryKind) {
     let entry = Some(Entry { seq, kind });
-    apply(state, &Action::Frame(AppFrame::Event { cursor: seq, entry, todo: None }));
+    apply(state, &Action::Frame(AppFrame::Event { cursor: seq, entry, todo: None, plan: None }));
 }
 
 /// **A scrolled-up view keeps looking at the same words when the width changes.**
@@ -453,6 +455,7 @@ fn there_is_no_header_taking_up_the_top_line() {
             cursor: 1,
             entry: Some(Entry { seq: 1, kind: EntryKind::User("첫 줄".into()) }),
             todo: None,
+            plan: None,
         }),
     );
     let screen = dump(&mut s, 40, 10);
@@ -473,6 +476,7 @@ fn drawing_at_a_very_narrow_width_does_not_panic() {
                 seq: 1, kind: EntryKind::Agent("한글 **강조** `코드`".into())
             }),
             todo: None,
+            plan: None,
         }),
     );
     let _ = dump(&mut s, 12, 6);
@@ -548,6 +552,7 @@ fn planned(state: &mut State, seq: i64, content: &str, status: &str) {
             cursor: seq,
             entry: zyris_code::event::entry_from(&event),
             todo: zyris_code::todos::change_from(&event),
+            plan: None,
         }),
     );
 }
@@ -744,6 +749,7 @@ fn a_form_being_open_does_not_swallow_what_the_server_says() {
                 cursor: 42,
                 entry: Some(Entry { seq: 42, kind: EntryKind::Agent("들어온 말".into()) }),
                 todo: None,
+                plan: None,
             }),
         );
         assert_eq!(s.last_cursor, Some(42), "the resume position was lost (form {open_a_form})");
@@ -890,6 +896,7 @@ fn clicking_a_work_card_toggles_it() {
             cursor: 1,
             entry: Some(Entry { seq: 1, kind: EntryKind::WorkStart("작업".into()) }),
             todo: None,
+            plan: None,
         }),
     );
     // Streaming reasoning gives the card a chip, so there are two targets to tell apart.
@@ -944,6 +951,7 @@ fn dragging_selects_text_and_the_selection_survives_the_release() {
                 seq: 1, kind: EntryKind::Agent("안녕하세요 반갑습니다".into())
             }),
             todo: None,
+            plan: None,
         }),
     );
     let _ = dump(&mut s, 60, 12);
@@ -970,6 +978,7 @@ fn a_click_without_moving_does_not_select() {
             cursor: 1,
             entry: Some(Entry { seq: 1, kind: EntryKind::Agent("본문".into()) }),
             todo: None,
+            plan: None,
         }),
     );
     let _ = dump(&mut s, 60, 12);
@@ -992,6 +1001,7 @@ fn the_selection_survives_releasing_the_mouse() {
                 seq: 1, kind: EntryKind::Agent("안녕하세요 반갑습니다".into())
             }),
             todo: None,
+            plan: None,
         }),
     );
     let _ = dump(&mut s, 60, 12);
@@ -1018,6 +1028,7 @@ fn moving_after_release_does_not_grow_the_selection() {
                 seq: 1, kind: EntryKind::Agent("안녕하세요 반갑습니다".into())
             }),
             todo: None,
+            plan: None,
         }),
     );
     let _ = dump(&mut s, 60, 12);
@@ -1044,6 +1055,7 @@ fn scrolling_keeps_the_selection() {
                     seq: i, kind: EntryKind::Agent(format!("줄 {i} 내용입니다"))
                 }),
                 todo: None,
+                plan: None,
             }),
         );
     }
@@ -1077,6 +1089,7 @@ fn the_highlight_covers_only_the_selected_columns() {
             cursor: 1,
             entry: Some(Entry { seq: 1, kind: EntryKind::Agent("abcdefghij".into()) }),
             todo: None,
+            plan: None,
         }),
     );
     let _ = dump(&mut s, 60, 12);
@@ -1117,6 +1130,7 @@ fn typing_drops_the_selection() {
                 seq: 1, kind: EntryKind::Agent("안녕하세요 반갑습니다".into())
             }),
             todo: None,
+            plan: None,
         }),
     );
     let _ = dump(&mut s, 60, 12);
@@ -1151,6 +1165,7 @@ fn question_event(seq: i64, result: serde_json::Value) -> AppFrame {
             created_at: None,
         }),
         todo: None,
+        plan: None,
     }
 }
 
@@ -1194,6 +1209,7 @@ fn an_open_ended_question_whose_wait_ran_out_is_still_answerable() {
             created_at: None,
         }),
         todo: None,
+        plan: None,
     };
 
     let mut s = State::new();
@@ -1326,6 +1342,7 @@ fn the_picker_overlays_the_conversation_and_takes_the_keys() {
             cursor: 1,
             entry: Some(Entry { seq: 1, kind: EntryKind::Agent("뒤에 있는 대화".into()) }),
             todo: None,
+            plan: None,
         }),
     );
     s.picker = Some(Picker::projects(
@@ -1539,6 +1556,7 @@ fn the_picker_box_stays_inside_the_screen_with_wide_text_behind() {
                     ),
                 }),
                 todo: None,
+                plan: None,
             }),
         );
     }
@@ -1570,6 +1588,7 @@ fn typed_answers_look_different_from_chosen_ones_in_history() {
                 kind: EntryKind::User("질문?\n  - A안 (설명)\n  - 직접 입력: 내가 쓴 답".into()),
             }),
             todo: None,
+            plan: None,
         }),
     );
     let screen = dump(&mut s, 70, 12);
@@ -1817,6 +1836,7 @@ fn state_with_edit_tool() -> State {
                 seq: 1, kind: EntryKind::WorkStart("파일을 고치는 중".into())
             }),
             todo: None,
+            plan: None,
         }),
     );
     apply(
@@ -1842,6 +1862,7 @@ fn state_with_edit_tool() -> State {
                 },
             }),
             todo: None,
+            plan: None,
         }),
     );
     s.folds.insert(1, Fold { open: true, user_touched: true, ..Fold::default() });
@@ -2087,6 +2108,7 @@ fn the_enroll_window_overlays_the_conversation() {
             cursor: 1,
             entry: Some(Entry { seq: 1, kind: EntryKind::Agent("뒤에 있는 대화".into()) }),
             todo: None,
+            plan: None,
         }),
     );
     apply(&mut s, &Action::Frame(AppFrame::Enroll(enroll_view())));

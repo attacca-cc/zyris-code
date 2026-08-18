@@ -28,6 +28,7 @@ pub mod newproject;
 pub mod notice;
 pub mod panel;
 pub mod picker;
+pub mod plan;
 pub mod plugin;
 pub mod print;
 pub mod question;

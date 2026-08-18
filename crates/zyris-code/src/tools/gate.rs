@@ -100,9 +100,17 @@ fn only_reads(call: &Call) -> bool {
     }
 }
 
-pub fn decide(mode: Mode, config: &Config, call: &Call) -> Decision {
+/// `plan_decided` is whether the person has decided the plan this session handed back. It only
+/// means anything in plan mode.
+///
+/// **Plan mode's fence comes down when the plan is agreed** (2026-08-18 user decision). Investigating
+/// and waiting on a decision are both times when nothing should be written; once the person has
+/// said go ahead, the agent is carrying out something they agreed to and refusing it would leave
+/// an approved plan with no way to happen. Submitting a revised plan closes the fence again, which
+/// is what makes the loop work.
+pub fn decide(mode: Mode, config: &Config, call: &Call, plan_decided: bool) -> Decision {
     // Plan mode comes first. Refusing over something immutable is wasted effort.
-    if mode == Mode::Plan && !only_reads(call) {
+    if mode == Mode::Plan && !plan_decided && !only_reads(call) {
         return Decision::Refuse(
             "계획 모드입니다. 지금은 파일을 바꾸거나 명령을 돌릴 수 없습니다. \
              무엇을 할지 먼저 말해 주세요."
@@ -399,7 +407,7 @@ mod tests {
             let asked = reaching("file_io", "read", json!({ "path": path }));
             for config in [&allow, &deny] {
                 assert!(
-                    matches!(decide(Mode::Normal, config, &asked), Decision::Refuse(_)),
+                    matches!(decide(Mode::Normal, config, &asked, false), Decision::Refuse(_)),
                     "{file} was handed over with dir_access {:?}",
                     config.dir_access
                 );
@@ -420,14 +428,37 @@ mod tests {
         ] {
             let asked = reaching("file_io", "read", json!({ "path": path }));
             assert!(
-                matches!(decide(Mode::Normal, &allow, &asked), Decision::Refuse(_)),
+                matches!(decide(Mode::Normal, &allow, &asked, false), Decision::Refuse(_)),
                 "{path} was handed over",
             );
         }
         // And the fence is around that directory, not the whole config directory ‒ skills and
         // plugins live beside it and are ordinary files somebody may well be editing.
         let ordinary = reaching("file_io", "read", json!({ "path": format!("{APP}/skills/a.md") }));
-        assert!(!matches!(decide(Mode::Normal, &allow, &ordinary), Decision::Refuse(_)));
+        assert!(!matches!(decide(Mode::Normal, &allow, &ordinary, false), Decision::Refuse(_)));
+    }
+
+    /// **Plan mode's fence comes down when the plan is agreed.** Investigating and waiting on a
+    /// decision are both times when nothing should be written; once the person has said go ahead,
+    /// refusing would leave an approved plan with no way to happen.
+    #[test]
+    fn an_agreed_plan_is_allowed_to_be_carried_out() {
+        let config = Config::default();
+        let write = call("code_edit", "write", "src/app.rs");
+        assert!(
+            matches!(decide(Mode::Plan, &config, &write, false), Decision::Refuse(_)),
+            "a write went through before anything had been agreed",
+        );
+        assert!(
+            matches!(decide(Mode::Plan, &config, &write, true), Decision::Run),
+            "an approved plan could not be carried out",
+        );
+        // The other modes never looked at it.
+        for mode in [Mode::Normal, Mode::Job, Mode::Work] {
+            for decided in [false, true] {
+                assert!(matches!(decide(mode, &config, &write, decided), Decision::Run));
+            }
+        }
     }
 
     /// **Plan mode is "look before you touch", so looking has to work.** A plan for a change is
@@ -439,14 +470,14 @@ mod tests {
         for tool in ["status", "log", "diff", "branches"] {
             let asked = call("git", tool, "");
             assert!(
-                !matches!(decide(Mode::Plan, &config, &asked), Decision::Refuse(_)),
+                !matches!(decide(Mode::Plan, &config, &asked, false), Decision::Refuse(_)),
                 "git.{tool} was refused while planning",
             );
         }
         for tool in ["commit", "push", "switch"] {
             let asked = call("git", tool, "");
             assert!(
-                matches!(decide(Mode::Plan, &config, &asked), Decision::Refuse(_)),
+                matches!(decide(Mode::Plan, &config, &asked, false), Decision::Refuse(_)),
                 "git.{tool} changed the checkout while planning",
             );
         }
@@ -454,13 +485,19 @@ mod tests {
         // and pull requests are where the reason for a change usually is.
         for tool in ["issues", "pulls"] {
             assert!(
-                !matches!(decide(Mode::Plan, &config, &call("git", tool, "")), Decision::Refuse(_)),
+                !matches!(
+                    decide(Mode::Plan, &config, &call("git", tool, ""), false),
+                    Decision::Refuse(_)
+                ),
                 "git.{tool} was refused while planning",
             );
         }
         for tool in ["comment", "create_pull", "review", "request_review", "create_issue"] {
             assert!(
-                matches!(decide(Mode::Plan, &config, &call("git", tool, "")), Decision::Refuse(_)),
+                matches!(
+                    decide(Mode::Plan, &config, &call("git", tool, ""), false),
+                    Decision::Refuse(_)
+                ),
                 "git.{tool} spoke to the world while planning",
             );
         }
@@ -494,7 +531,7 @@ mod tests {
                 .leaving(escaping_path(root(), "terminal", "exec", &args))
                 .reaching_for(secret_path(&app_dir, root(), "terminal", "exec", &args));
             assert!(
-                matches!(decide(Mode::Normal, &allow, &asked), Decision::Refuse(_)),
+                matches!(decide(Mode::Normal, &allow, &asked, false), Decision::Refuse(_)),
                 "`{command}` went through"
             );
         }
@@ -523,11 +560,11 @@ mod tests {
     fn planning_mode_may_look_at_works_but_not_start_one() {
         let config = Config::default();
         for read in ["status", "list"] {
-            let seen = decide(Mode::Plan, &config, &call("work", read, ""));
+            let seen = decide(Mode::Plan, &config, &call("work", read, ""), false);
             assert_eq!(seen, Decision::Run, "looking is allowed in plan mode too: {read}");
         }
         for write in ["start", "say", "stop", "resume"] {
-            let seen = decide(Mode::Plan, &config, &call("work", write, ""));
+            let seen = decide(Mode::Plan, &config, &call("work", write, ""), false);
             assert!(matches!(seen, Decision::Refuse(_)), "it passed in plan mode: {write}");
         }
     }
@@ -559,7 +596,7 @@ mod tests {
     fn planning_mode_refuses_start_but_answers_list() {
         let config = Config::default();
         let seen = |tool: &str, args: Value| {
-            decide(Mode::Plan, &config, &call("wait", tool, &target_of("wait", tool, &args)))
+            decide(Mode::Plan, &config, &call("wait", tool, &target_of("wait", tool, &args)), false)
         };
         assert_eq!(seen("list", json!({})), Decision::Run);
         assert_eq!(seen("logs", json!({ "job": "b1" })), Decision::Run);
@@ -597,12 +634,16 @@ mod tests {
         ];
         for mode in [Mode::Job, Mode::Work, Mode::Job] {
             for c in &calls {
-                assert_eq!(decide(mode, &config, c), Decision::Run, "{mode:?} blocked it: {c:?}");
+                assert_eq!(
+                    decide(mode, &config, c, false),
+                    Decision::Run,
+                    "{mode:?} blocked it: {c:?}"
+                );
             }
         }
         // The comparison spot — plan mode blocks the same call.
         assert!(matches!(
-            decide(Mode::Plan, &config, &call("code_edit", "write", "a.rs")),
+            decide(Mode::Plan, &config, &call("code_edit", "write", "a.rs"), false),
             Decision::Refuse(_)
         ));
     }
@@ -613,7 +654,7 @@ mod tests {
     fn every_mode_refuses_outside_when_denied() {
         let outside = out("file_io", "read", "/etc/passwd");
         for mode in Mode::ALL {
-            let seen = decide(mode, &Config::default(), &outside);
+            let seen = decide(mode, &Config::default(), &outside, false);
             // Plan mode already refuses before that (writes) or here (reads). Not passing is enough.
             assert_ne!(seen, Decision::Run, "{mode:?} just walked outside");
         }
@@ -623,7 +664,7 @@ mod tests {
     /// this capability has only one decision: the mode.
     #[test]
     fn a_work_call_has_no_path_to_escape_from() {
-        let seen = decide(Mode::Job, &Config::default(), &call("work", "start", ""));
+        let seen = decide(Mode::Job, &Config::default(), &call("work", "start", ""), false);
         assert_eq!(seen, Decision::Run);
     }
 
@@ -637,7 +678,7 @@ mod tests {
             out("file_io", "read", "Cargo.toml"),
             out("terminal", "exec", "."),
         ] {
-            assert_eq!(decide(Mode::Job, &c, &call), Decision::Run, "{call:?}");
+            assert_eq!(decide(Mode::Job, &c, &call, false), Decision::Run, "{call:?}");
         }
     }
 
@@ -649,7 +690,7 @@ mod tests {
         for path in ["/home/ruma/attacca/Cargo.toml", "../attacca/x.rs", "/etc/passwd"] {
             let call = out("code_edit", "edit", path);
             assert!(call.outside.is_some(), "{path} was not caught as leaving");
-            assert!(matches!(decide(Mode::Job, &c, &call), Decision::Refuse(_)), "{path}");
+            assert!(matches!(decide(Mode::Job, &c, &call, false), Decision::Refuse(_)), "{path}");
         }
     }
 
@@ -657,7 +698,7 @@ mod tests {
     #[test]
     fn even_reading_outside_refuses_when_denied() {
         let call = out("file_io", "read", "/home/ruma/attacca/.env");
-        assert!(matches!(decide(Mode::Job, &Config::default(), &call), Decision::Refuse(_)));
+        assert!(matches!(decide(Mode::Job, &Config::default(), &call, false), Decision::Refuse(_)));
     }
 
     /// **`allow` runs it** — no per-directory grants, no approval window. That is the whole
@@ -668,7 +709,7 @@ mod tests {
         for path in ["/home/ruma/attacca/Cargo.toml", "/etc/passwd"] {
             let call = out("file_io", "read", path);
             assert!(call.outside.is_some(), "{path} was not caught as leaving");
-            assert_eq!(decide(Mode::Job, &c, &call), Decision::Run, "{path}");
+            assert_eq!(decide(Mode::Job, &c, &call, false), Decision::Run, "{path}");
         }
     }
 
@@ -676,7 +717,7 @@ mod tests {
     #[test]
     fn planning_refuses_before_the_directory_policy() {
         let call = out("code_edit", "edit", "/home/ruma/attacca/x.rs");
-        let Decision::Refuse(why) = decide(Mode::Plan, &Config::default(), &call) else {
+        let Decision::Refuse(why) = decide(Mode::Plan, &Config::default(), &call, false) else {
             panic!("it passed in plan mode");
         };
         assert!(why.contains("계획"), "{why}");
@@ -686,14 +727,14 @@ mod tests {
     #[test]
     fn reading_works_while_planning_but_still_respects_the_policy() {
         let c = Config::default();
-        assert_eq!(decide(Mode::Plan, &c, &out("search", "grep", ".")), Decision::Run);
+        assert_eq!(decide(Mode::Plan, &c, &out("search", "grep", "."), false), Decision::Run);
         assert!(matches!(
-            decide(Mode::Plan, &c, &out("file_io", "read", "/etc/passwd")),
+            decide(Mode::Plan, &c, &out("file_io", "read", "/etc/passwd"), false),
             Decision::Refuse(_)
         ));
         let allow = Config { dir_access: DirAccess::Allow, ..Config::default() };
         assert_eq!(
-            decide(Mode::Plan, &allow, &out("file_io", "read", "/etc/passwd")),
+            decide(Mode::Plan, &allow, &out("file_io", "read", "/etc/passwd"), false),
             Decision::Run
         );
     }

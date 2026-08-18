@@ -343,6 +343,37 @@ impl Lang {
         }
     }
 
+    // ── The plan waiting to be approved
+    pub fn plan_title(self) -> &'static str {
+        self.pick("계획", "Plan")
+    }
+    /// **Says both keys, because nothing else on screen does.** Approving is Enter on an empty
+    /// draft, which is not a thing anybody guesses.
+    pub fn plan_keys(self, open: bool) -> String {
+        let fold = match (self, open) {
+            (Lang::Ko, true) => "Ctrl+P 접기",
+            (Lang::Ko, false) => "Ctrl+P 펼치기",
+            (Lang::En, true) => "Ctrl+P to fold",
+            (Lang::En, false) => "Ctrl+P to open",
+        };
+        match self {
+            Lang::Ko => format!("Enter 승인 · 고칠 점은 그냥 적으세요 · {fold}"),
+            Lang::En => format!("Enter approves · type to ask for changes · {fold}"),
+        }
+    }
+    pub fn plan_more(self, n: usize) -> String {
+        match self {
+            Lang::Ko => format!("↓ {n}줄 더 — 위 대화에서 전체를 볼 수 있습니다"),
+            Lang::En => format!("↓ {n} more lines — the whole plan is in the conversation above"),
+        }
+    }
+    /// What Enter on an empty draft sends. **The agent reads this as the decision**, so it has to
+    /// say approval and nothing else — attacca tells it the message is the decision, and anything
+    /// hedged reads as changes.
+    pub fn plan_approved(self) -> &'static str {
+        self.pick("승인합니다. 계획대로 진행해 주세요.", "Approved — go ahead with the plan.")
+    }
+
     pub fn connecting(self) -> &'static str {
         self.pick("연결 중…", "Connecting…")
     }

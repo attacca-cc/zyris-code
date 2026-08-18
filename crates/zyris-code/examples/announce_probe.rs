@@ -90,7 +90,7 @@ async fn main() -> ExitCode {
     // The probe has no screen. With nowhere for the gate to ask, **it's set to auto mode** —
     // this probe's job is to measure the tool path, not the approval path.
     let bridge = zyris_code::tools::bridge::Bridge::new();
-    bridge.sync(zyris_code::mode::Mode::Job, &Default::default());
+    bridge.sync(zyris_code::mode::Mode::Job, &Default::default(), false);
 
     // The probe doesn't use the attacca handle — the `work` tool just needs to appear in the list.
     let (_api_tx, api_rx) = tokio::sync::watch::channel(None);

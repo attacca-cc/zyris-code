@@ -25,6 +25,14 @@ pub enum Frame {
         /// entry rather than arriving on its own so that **one place feeds the list** — history
         /// replay goes back through here, so it is fed exactly like the live stream.
         todo: Option<crate::todos::Change>,
+        /// The plan this event handed back for approval, if it did. **Rides along for the same
+        /// reason the todo change does**: a plan submitted while nobody was watching has to be
+        /// approvable when the thread is opened again, and history replays through here.
+        ///
+        /// **Boxed.** A plan is pages of markdown and almost every event carries none; unboxed it
+        /// widens every `Action` that goes down the channel by the size of the largest plan-shaped
+        /// hole, which is what clippy's `large_enum_variant` is about.
+        plan: Option<Box<crate::plan::Submitted>>,
     },
     Delta {
         kind: ZDeltaKind,
@@ -120,9 +128,8 @@ pub enum Frame {
     /// switching threads never blocks the loop. Tagged with the session id, so a switch made
     /// while an older one was still loading drops the loser (`frame_is_current`).
     History {
-        /// `(cursor, what to draw, what it did to the todo list)` — the three `Frame::Event`
-        /// carries, converted off the loop and replayed back through it.
-        entries: Vec<(i64, Option<crate::event::Entry>, Option<crate::todos::Change>)>,
+        /// What `Frame::Event` carries, converted off the loop and replayed back through it.
+        entries: Vec<Past>,
     },
     /// **Every file under the working directory**, walked off the loop for the `@` list.
     Files(Vec<String>),
@@ -237,6 +244,8 @@ pub enum Action {
     ToggleFold,
     /// Unfold or fold the todo list under the activity line (Ctrl+T, or a click on that line).
     ToggleTodos,
+    /// Unfolds the plan waiting to be approved, or folds it again.
+    TogglePlan,
     /// Where the mouse was pressed. Screen coordinates.
     Press(u16, u16),
     /// A Ctrl+click landed on a link. The URL is opened by the OS (I/O side).
@@ -463,6 +472,16 @@ pub struct State {
     /// A question lands here on its own when it arrives — the turn is blocked waiting for
     /// the answer, so the user should not have to open it separately.
     pub asking: Option<(i64, crate::question::Answering)>,
+    /// The plan waiting to be approved, if one is. **Not in `asking`** — a question replaces the
+    /// input because answering it *is* the message, while a plan is decided by an ordinary message
+    /// and the draft has to stay reachable to say what to change.
+    pub plan: Option<crate::plan::Plan>,
+    /// Whether the plan this session is working to has been decided.
+    ///
+    /// **What the gate reads in plan mode.** Investigating and waiting on a decision are both times
+    /// when nothing should be written; once the person has decided, the agent is carrying out
+    /// something they agreed to and the fence would only be in the way (2026-08-18 user decision).
+    pub plan_decided: bool,
     /// The area the question screen occupies. Used to map a click to a row.
     pub ask_area: Option<ratatui::layout::Rect>,
     /// Which screen row the activity line was drawn on. Clicking it opens the todo list, and
@@ -651,6 +670,8 @@ impl Default for State {
             dragging: false,
             screen: Vec::new(),
             asking: None,
+            plan: None,
+            plan_decided: false,
             ask_area: None,
             activity_row: None,
             submit_now: false,
@@ -1060,6 +1081,18 @@ pub enum GithubNews {
     Step(String),
 }
 
+/// One event out of a thread's history, in the shape the live stream delivers.
+///
+/// **Named rather than a tuple.** It is everything `Frame::Event` carries, and every field added to
+/// one has to be added to the other — a positional list of four makes that a diff nobody can read.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Past {
+    pub cursor: i64,
+    pub entry: Option<Entry>,
+    pub todo: Option<crate::todos::Change>,
+    pub plan: Option<Box<crate::plan::Submitted>>,
+}
+
 /// A clickable URL somewhere on the screen, in absolute cells.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScreenLink {
@@ -1287,6 +1320,9 @@ pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
         // **t for tasks.** Nothing else claims Ctrl+T here, and the terminal sends it through
         // untouched — it is not one of the bytes a tty reserves.
         KeyCode::Char('t') if ctrl => vec![Action::ToggleTodos],
+        // **p for plan.** Nothing else claims Ctrl+P here — `Ctrl+P` is history-back only while
+        // there is something to recall, and this arm sits after that one.
+        KeyCode::Char('p') if ctrl && state.plan.is_some() => vec![Action::TogglePlan],
         KeyCode::BackTab => vec![Action::CycleMode],
         // **The line-editing keys every terminal already teaches.** People arrive here with
         // twenty years of `readline` in their fingers; a text field that ignores them feels
@@ -1348,6 +1384,12 @@ pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
         // Enter+SHIFT. Alt+Enter (ESC+\r) is the fallback for terminals without the
         // protocol — it has to come before the submit arm.
         KeyCode::Enter if alt || shift => vec![Action::Insert('\n')],
+        // **Enter on an empty draft approves the plan.** With a plan up, Enter with nothing typed
+        // had no meaning at all, and approval is the one thing that must be a single key — typing
+        // is how changes are asked for, so the two cannot both be "press Enter with words".
+        KeyCode::Enter if state.plan.is_some() && state.input.text.trim().is_empty() => {
+            vec![Action::Submit(state.lang.plan_approved().to_string())]
+        }
         KeyCode::Enter if !state.input.text.is_empty() => {
             vec![Action::Submit(state.input.text.clone())]
         }
@@ -1693,6 +1735,14 @@ pub fn apply(state: &mut State, action: &Action) {
                 state.queued.push(text.clone());
                 return;
             }
+            // **Sending is deciding.** There is no approve call in the protocol and there does not
+            // need to be one: attacca reads the message that follows an open `submit_plan` as the
+            // decision. So the panel closes here, and the gate's fence comes down with it — the
+            // agent is now carrying out something the person agreed to. A revised plan arriving
+            // puts both back up (`apply_frame`).
+            if state.plan.take().is_some() {
+                state.plan_decided = true;
+            }
             // **The words go up the moment they are submitted.** The only other source of
             // `Item::User` is the server's `chat_user`, so without this a person's own line is
             // missing for the whole round trip — and in 일/작업 mode the first message never
@@ -1746,6 +1796,11 @@ pub fn apply(state: &mut State, action: &Action) {
             }
         }
         Action::ToggleTodos => state.todos_open = !state.todos_open,
+        Action::TogglePlan => {
+            if let Some(plan) = &mut state.plan {
+                plan.open = !plan.open;
+            }
+        }
         Action::Press(x, y) => {
             // Pressing on the question screen picks that row.
             if let (Some(area), Some((_, a))) = (state.ask_area, state.asking.as_ref()) {
@@ -2091,7 +2146,7 @@ pub fn apply(state: &mut State, action: &Action) {
 
 fn apply_frame(state: &mut State, frame: &Frame) {
     match frame {
-        Frame::Event { cursor, entry, todo } => {
+        Frame::Event { cursor, entry, todo, plan } => {
             // The cursor advances even for an event we do not render — the resume position
             // must not be lost.
             state.last_cursor = Some(*cursor);
@@ -2100,6 +2155,24 @@ fn apply_frame(state: &mut State, frame: &Frame) {
             // `tool_call`, and those always draw.
             if let (Some(change), Some(entry)) = (todo, entry) {
                 state.todos.note(entry.seq, change.clone());
+            }
+            // **The plan panel opens the same way the question panel does, and closes the same way.**
+            // History comes through here too, so opening a thread reopens the plan it is waiting on —
+            // a plan submitted while nobody was watching is otherwise unapprovable, there being no
+            // other way to reach it. Where several are open the **last** holds the screen, judged by
+            // `seq` rather than arrival: a `submit_plan` event is updated in place when its wait runs
+            // out, so an older one's frame can land after a newer one's.
+            if let Some(plan) = plan {
+                if plan.decided {
+                    if state.plan.as_ref().is_some_and(|p| p.seq == plan.seq) {
+                        state.plan = None;
+                    }
+                } else if state.plan.as_ref().is_none_or(|p| p.seq < plan.seq) {
+                    // **A fresh plan is undecided again.** The agent revising and submitting anew is
+                    // how a plan mode loop goes round, and the gate has to close behind it.
+                    state.plan_decided = false;
+                    state.plan = Some(crate::plan::Plan::new(plan));
+                }
             }
             let Some(entry) = entry else { return };
             if let EntryKind::WorkStart(_) = entry.kind {
@@ -2306,9 +2379,13 @@ fn apply_frame(state: &mut State, frame: &Frame) {
         // still what is on screen and still what the person can read.
         Frame::History { entries } => {
             clear_conversation(state);
-            for (cursor, entry, todo) in entries {
-                let frame =
-                    Frame::Event { cursor: *cursor, entry: entry.clone(), todo: todo.clone() };
+            for past in entries {
+                let frame = Frame::Event {
+                    cursor: past.cursor,
+                    entry: past.entry.clone(),
+                    todo: past.todo.clone(),
+                    plan: past.plan.clone(),
+                };
                 apply(state, &Action::Frame(frame));
             }
             state.loading_history = false;
@@ -3448,7 +3525,7 @@ async fn run_inner(
     let (tx, mut rx) = mpsc::unbounded_channel::<AppMsg>();
 
     bridge.attach(tx.clone());
-    bridge.sync(state.mode, &state.config);
+    bridge.sync(state.mode, &state.config, state.plan_decided);
 
     // Off means the branch is simply never polled — the strip then shows the path alone.
     let git_every = crate::repo::poll_interval();
@@ -3564,7 +3641,7 @@ async fn run_inner(
                     crate::lang::save(state.lang);
                     crate::theme::set(state.config.theme.resolve());
                 }
-                bridge.sync(state.mode, &state.config);
+                bridge.sync(state.mode, &state.config, state.plan_decided);
                 dirty = true;
             }
             _ = ticker.tick() => {
@@ -3919,7 +3996,7 @@ async fn run_inner(
                         // The palette applies to the very next frame — the same promise the
                         // directory policy makes to the gate.
                         crate::theme::set(state.config.theme.resolve());
-                        bridge.sync(state.mode, &state.config);
+                        bridge.sync(state.mode, &state.config, state.plan_decided);
                     }
 
                     // **The `@` list asked for a walk.** `apply` set the flag and put the
@@ -3975,7 +4052,7 @@ async fn run_inner(
                     // answer a follow-up question.
                     if state.mode != last_mode {
                         last_mode = state.mode;
-                        bridge.sync(state.mode, &state.config);
+                        bridge.sync(state.mode, &state.config, state.plan_decided);
                         restage(&state, &mut session);
                     }
 
@@ -4488,7 +4565,12 @@ fn spawn_history(api: &Arc<AttaccaApiClient>, tx: &mpsc::UnboundedSender<AppMsg>
             Ok(events) => Frame::History {
                 entries: events
                     .iter()
-                    .map(|e| (e.cursor, crate::event::entry_from(e), crate::todos::change_from(e)))
+                    .map(|e| Past {
+                        cursor: e.cursor,
+                        entry: crate::event::entry_from(e),
+                        todo: crate::todos::change_from(e),
+                        plan: crate::plan::submitted_from(e).map(Box::new),
+                    })
                     .collect(),
             },
             Err(e) => Frame::PickerFailed(e.to_string()),
@@ -4815,7 +4897,7 @@ async fn finish_command(
             // policy makes to the gate. Missing it is how a setting changes on screen and
             // nowhere else.
             crate::theme::set(state.config.theme.resolve());
-            bridge.sync(state.mode, &state.config);
+            bridge.sync(state.mode, &state.config, state.plan_decided);
             if let crate::command::ConfigAction::Lang(lang) = action {
                 crate::lang::set(lang);
                 crate::lang::save(lang);
@@ -4836,7 +4918,7 @@ async fn finish_command(
                 state.lang = l;
             }
             crate::theme::set(state.config.theme.resolve());
-            bridge.sync(state.mode, &state.config);
+            bridge.sync(state.mode, &state.config, state.plan_decided);
             state.panel = Some(crate::panel::config(state.lang, state.config));
         }
         Command::Changes => {
@@ -5617,7 +5699,7 @@ mod tests {
     fn a_mode_picked_before_connecting_still_reaches_the_gate() {
         let mut s = state();
         let bridge = crate::tools::bridge::Bridge::new();
-        bridge.sync(s.mode, &s.config);
+        bridge.sync(s.mode, &s.config, s.plan_decided);
         let write = crate::tools::gate::Call::new("code_edit", "edit", "a.rs".into());
         assert_eq!(bridge.decide(&write), crate::tools::gate::Decision::Run, "normal runs");
 
@@ -5627,7 +5709,7 @@ mod tests {
                 apply(&mut s, &action);
             }
         }
-        bridge.sync(s.mode, &s.config);
+        bridge.sync(s.mode, &s.config, s.plan_decided);
         assert!(
             matches!(bridge.decide(&write), crate::tools::gate::Decision::Refuse(_)),
             "the gate is still on the old mode"
@@ -6703,6 +6785,7 @@ mod tests {
             cursor: seq,
             entry: Some(Entry { seq, kind: EntryKind::WorkStart(String::new()) }),
             todo: None,
+            plan: None,
         })
     }
 
@@ -6870,6 +6953,7 @@ mod tests {
                     },
                 }),
                 todo: None,
+                plan: None,
             }),
         );
 
@@ -7170,6 +7254,7 @@ mod tests {
             cursor: seq,
             entry: crate::event::entry_from(&event),
             todo: crate::todos::change_from(&event),
+            plan: None,
         })
     }
 
@@ -7236,7 +7321,10 @@ mod tests {
     #[test]
     fn the_last_cursor_is_remembered_for_resume() {
         let mut s = state();
-        apply(&mut s, &Action::Frame(Frame::Event { cursor: 42, entry: None, todo: None }));
+        apply(
+            &mut s,
+            &Action::Frame(Frame::Event { cursor: 42, entry: None, todo: None, plan: None }),
+        );
         assert_eq!(s.last_cursor, Some(42));
     }
 
@@ -7326,6 +7414,119 @@ mod tests {
         assert!(s.folds[&7].open && !s.folds[&7].closing);
         let amount = s.fading_in().get(&7).copied().expect("it is fading");
         assert!(amount > 0.5, "a reveal just begun should still be near the background: {amount}");
+    }
+
+    /// **A plan opens the panel, and deciding it closes the panel and the fence together.** There
+    /// is no approve call in the protocol: attacca reads the message following an open
+    /// `submit_plan` as the decision, so sending is approving.
+    #[test]
+    fn a_submitted_plan_can_be_approved_and_the_fence_comes_down_with_it() {
+        let mut s = state();
+        s.mode = crate::mode::Mode::Plan;
+        assert!(!s.plan_decided, "nothing has been agreed yet");
+
+        let plan = crate::plan::Submitted {
+            seq: 5,
+            markdown: "# Plan
+
+- step one"
+                .into(),
+            decided: false,
+        };
+        apply(
+            &mut s,
+            &Action::Frame(Frame::Event {
+                cursor: 5,
+                entry: None,
+                todo: None,
+                plan: Some(Box::new(plan)),
+            }),
+        );
+        assert_eq!(s.plan.as_ref().map(|p| p.seq), Some(5), "the plan never reached the screen");
+        assert!(!s.plan_decided);
+
+        // Enter on an empty draft is what sends the approval.
+        let keys = on_key(&s, key(KeyCode::Enter, KeyModifiers::NONE));
+        let Some(Action::Submit(said)) = keys.first() else {
+            panic!("Enter did not approve: {keys:?}")
+        };
+        assert_eq!(said, s.lang.plan_approved());
+
+        apply(&mut s, &Action::Submit(said.clone()));
+        assert!(s.plan.is_none(), "the panel stayed up after it was decided");
+        assert!(s.plan_decided, "the fence stayed up after the plan was agreed");
+    }
+
+    /// **A revised plan puts the fence back up.** The agent submitting again is how the loop goes
+    /// round, and writes must wait on the new decision rather than riding the old one.
+    #[test]
+    fn a_revised_plan_has_to_be_agreed_all_over_again() {
+        let mut s = state();
+        s.mode = crate::mode::Mode::Plan;
+        s.plan_decided = true;
+
+        let plan = crate::plan::Submitted { seq: 9, markdown: "# v2".into(), decided: false };
+        apply(
+            &mut s,
+            &Action::Frame(Frame::Event {
+                cursor: 9,
+                entry: None,
+                todo: None,
+                plan: Some(Box::new(plan)),
+            }),
+        );
+        assert!(!s.plan_decided, "a new plan rode in on the last one's approval");
+        assert_eq!(s.plan.as_ref().map(|p| p.seq), Some(9));
+
+        // Ctrl+P is what reads the whole of it.
+        assert_eq!(
+            on_key(&s, key(KeyCode::Char('p'), KeyModifiers::CONTROL)),
+            vec![Action::TogglePlan],
+        );
+        apply(&mut s, &Action::TogglePlan);
+        assert!(s.plan.as_ref().is_some_and(|p| p.open));
+    }
+
+    /// **A decided plan takes the panel away rather than leaving it to be approved twice.** The
+    /// event is updated in place when the wait ends, so this is how a decision made elsewhere —
+    /// or in an earlier run of this app — reaches the screen.
+    #[test]
+    fn a_plan_already_decided_never_opens_the_panel() {
+        let mut s = state();
+        let settled = crate::plan::Submitted { seq: 5, markdown: "# Plan".into(), decided: true };
+        apply(
+            &mut s,
+            &Action::Frame(Frame::Event {
+                cursor: 5,
+                entry: None,
+                todo: None,
+                plan: Some(Box::new(settled.clone())),
+            }),
+        );
+        assert!(s.plan.is_none());
+
+        // And one that opened closes when its own decision lands.
+        let open = crate::plan::Submitted { decided: false, ..settled.clone() };
+        apply(
+            &mut s,
+            &Action::Frame(Frame::Event {
+                cursor: 5,
+                entry: None,
+                todo: None,
+                plan: Some(Box::new(open)),
+            }),
+        );
+        assert!(s.plan.is_some());
+        apply(
+            &mut s,
+            &Action::Frame(Frame::Event {
+                cursor: 6,
+                entry: None,
+                todo: None,
+                plan: Some(Box::new(settled)),
+            }),
+        );
+        assert!(s.plan.is_none(), "the panel stayed up on a plan that was already decided");
     }
 
     /// **A frame from a stale session must not reach the screen.** Leave work running and
@@ -7747,6 +7948,7 @@ mod tests {
                 cursor: 2,
                 entry: Some(Entry { seq: 2, kind: EntryKind::Agent("먼저 볼게요".into()) }),
                 todo: None,
+                plan: None,
             }),
         );
         apply(
@@ -7910,6 +8112,7 @@ mod tests {
                     },
                 }),
                 todo: None,
+                plan: None,
             })
         };
         // Aimed at another thread: dropped at the door, so nothing is applied here.
@@ -7945,6 +8148,7 @@ mod tests {
                     },
                 }),
                 todo: None,
+                plan: None,
             })
         };
         let showing = |s: &State| s.asking.as_ref().unwrap().1.current().question.clone();

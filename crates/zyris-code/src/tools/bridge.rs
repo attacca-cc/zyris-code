@@ -25,6 +25,9 @@ pub struct Bridge(Arc<Inner>);
 struct Inner {
     /// The current mode. When the screen changes it, the I/O site carries it over.
     mode: Mutex<Mode>,
+    /// Whether the plan this session is working to has been decided. **Only plan mode reads it**,
+    /// and only to know whether the fence is still up.
+    plan_decided: std::sync::atomic::AtomicBool,
     /// The current settings. Same — the screen is the only place they change.
     config: Mutex<Config>,
     /// The working directory. **It's the yardstick for whether something leaves it.**
@@ -105,9 +108,10 @@ impl Bridge {
 
     /// Copies over the screen-side decision material (mode + settings). Called whenever the
     /// I/O site touches state.
-    pub fn sync(&self, mode: Mode, config: &Config) {
+    pub fn sync(&self, mode: Mode, config: &Config, plan_decided: bool) {
         *self.0.mode.lock().unwrap() = mode;
         *self.0.config.lock().unwrap() = *config;
+        self.0.plan_decided.store(plan_decided, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Records what the plugins want run around a tool call. `tools::announce` calls it once,
@@ -145,7 +149,8 @@ impl Bridge {
     pub fn decide(&self, call: &Call) -> Decision {
         let mode = *self.0.mode.lock().unwrap();
         let config = *self.0.config.lock().unwrap();
-        decide(mode, &config, call)
+        let decided = self.0.plan_decided.load(std::sync::atomic::Ordering::SeqCst);
+        decide(mode, &config, call, decided)
     }
 
     /// Whether the screen is attached.
@@ -256,9 +261,9 @@ mod tests {
     fn the_gate_sees_the_mode_the_screen_is_in() {
         let b = Bridge::new();
         assert_eq!(b.decide(&edit_call()), Decision::Run, "the default just runs");
-        b.sync(Mode::Plan, &Config::default());
+        b.sync(Mode::Plan, &Config::default(), false);
         assert!(matches!(b.decide(&edit_call()), Decision::Refuse(_)));
-        b.sync(Mode::Job, &Config::default());
+        b.sync(Mode::Job, &Config::default(), false);
         assert_eq!(b.decide(&edit_call()), Decision::Run);
     }
 
@@ -275,6 +280,7 @@ mod tests {
                 dir_access: crate::config::DirAccess::Allow,
                 ..Config::default()
             },
+            false,
         );
         assert_eq!(b.decide(&leaving), Decision::Run, "allow must run it");
     }

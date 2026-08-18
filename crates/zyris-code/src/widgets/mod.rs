@@ -33,6 +33,8 @@ mod input;
 mod newproject;
 mod panel;
 mod picker;
+/// Public for the same reason as `todos` — `lines` is the pure seam the plan panel is read through.
+pub mod plan;
 /// Public for the same reason as `activity` — `left_spans` is the pure seam tests read the
 /// bottom bar through.
 pub mod status;
@@ -66,12 +68,16 @@ pub fn draw(frame: &mut Frame, state: &mut State) {
     // under the line whose count it explains, and is capped at a third of the screen — a plan of
     // twenty tasks must not push what is being read off the top.
     let todo_h = todos::height(state, (area.height / 3).max(1));
+    // **The plan takes from the conversation too, and no more than half of it.** It is pages long
+    // and the reply to it is typed, so it must never eat the input's rows — see `plan::height`.
+    let plan_h = plan::height(state, (area.height / 2).saturating_sub(todo_h));
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(1),              // conversation
             Constraint::Length(1),           // what's happening now
-            Constraint::Length(todo_h),      // the plan, when it is unfolded
+            Constraint::Length(todo_h),      // the todo list, when it is unfolded
+            Constraint::Length(plan_h),      // a plan waiting to be approved
             Constraint::Length(input_h + 1), // divider + input box
             Constraint::Length(1),           // divider
             Constraint::Length(1),           // bottom bar
@@ -87,19 +93,20 @@ pub fn draw(frame: &mut Frame, state: &mut State) {
     state.activity_row = Some(chunks[1].y);
     activity::draw(frame, chunks[1], state);
     todos::draw(frame, chunks[2], state);
+    plan::draw(frame, chunks[3], state);
     match &state.asking {
         Some((_, a)) => {
             // Moving a click to a row requires knowing this area.
-            state.ask_area = Some(chunks[3]);
-            ask::draw(frame, chunks[3], a, state.lang);
+            state.ask_area = Some(chunks[4]);
+            ask::draw(frame, chunks[4], a, state.lang);
         }
         None => {
             state.ask_area = None;
-            input::draw(frame, chunks[3], state);
+            input::draw(frame, chunks[4], state);
         }
     }
-    input::rule(frame, chunks[4]);
-    status::draw(frame, chunks[5], state);
+    input::rule(frame, chunks[5]);
+    status::draw(frame, chunks[6], state);
 
     // The picker overlaps at the very top — while it is open, that is the current task.
     if let Some(p) = &mut state.picker {

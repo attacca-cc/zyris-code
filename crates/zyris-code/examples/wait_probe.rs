@@ -77,7 +77,7 @@ async fn main() -> ExitCode {
     // The probe has no screen. With nowhere for the gate to ask, **it's set to auto mode** —
     // this probe's job is to measure the waiting path, not the approval path.
     let bridge = zyris_code::tools::bridge::Bridge::new();
-    bridge.sync(zyris_code::mode::Mode::Job, &Default::default());
+    bridge.sync(zyris_code::mode::Mode::Job, &Default::default(), false);
 
     let (_api_tx, api_rx) = tokio::sync::watch::channel(None);
     zyris_code::tools::announce(Runner::from_env(), dir, bridge, api_rx)
