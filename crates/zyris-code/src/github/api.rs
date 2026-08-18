@@ -117,6 +117,70 @@ impl Github {
         })
     }
 
+    /// The pull request `branch` is on, with the counts and what CI says about its head.
+    ///
+    /// **Three calls, because no one of them answers all of it.** The list endpoint finds the
+    /// number but leaves out `additions`/`deletions`; the single pull request has those and the
+    /// head sha; the checks hang off that sha. This is why it is polled slowly and not with git.
+    ///
+    /// `Ok(None)` is the ordinary answer for a branch nobody has opened anything for.
+    pub async fn branch_pull(
+        &self,
+        repo: &Repo,
+        branch: &str,
+    ) -> Result<Option<crate::repo::Pull>> {
+        let listed = self
+            .get(
+                &format!("/repos/{}/{}/pulls", repo.owner, repo.name),
+                &[
+                    ("head", format!("{}:{branch}", repo.owner)),
+                    ("state", "all".into()),
+                    ("per_page", "10".into()),
+                ],
+            )
+            .await?;
+        // **The highest number, not the first.** A branch reused after its pull request landed
+        // has two, and the old one is the one that is over.
+        let Some(number) = listed
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|p| p.get("number").and_then(Value::as_u64))
+            .max()
+        else {
+            return Ok(None);
+        };
+
+        let pull =
+            self.get(&format!("/repos/{}/{}/pulls/{number}", repo.owner, repo.name), &[]).await?;
+        let head = pull
+            .get("head")
+            .and_then(|h| h.get("sha"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        // **Checks failing to answer is `Quiet`, not an error.** A repository with no CI, or a
+        // token that cannot see it, must not take the pull request off the strip with it.
+        let checks = match head.is_empty() {
+            true => crate::repo::Checks::Quiet,
+            false => self
+                .get(
+                    &format!("/repos/{}/{}/commits/{head}/check-runs", repo.owner, repo.name),
+                    &[("per_page", "100".into())],
+                )
+                .await
+                .map(|body| fold_checks(&body))
+                .unwrap_or_default(),
+        };
+        Ok(Some(crate::repo::Pull {
+            number,
+            added: pull.get("additions").and_then(Value::as_u64).unwrap_or_default() as usize,
+            removed: pull.get("deletions").and_then(Value::as_u64).unwrap_or_default() as usize,
+            checks,
+            merged: pull.get("merged_at").is_some_and(|m| !m.is_null()),
+        }))
+    }
+
     /// Puts a public key on the account. **Answers what is already there as success** — turning
     /// signing on twice must not fail on the second try.
     pub async fn add_gpg_key(&self, armored: &str, name: &str) -> Result<Value> {
@@ -310,6 +374,41 @@ async fn read(response: reqwest::Response) -> Result<Value> {
     Ok(serde_json::from_str(&text).unwrap_or(Value::Null))
 }
 
+/// What a pile of check runs adds up to.
+///
+/// **Anything still going wins, then anything failed.** A run that is half green and half still
+/// working is not passing yet, and saying so early is how a person comes to stop reading the mark.
+///
+/// Pure, so every combination can be checked without a network.
+pub fn fold_checks(body: &Value) -> crate::repo::Checks {
+    use crate::repo::Checks;
+    let runs = body.get("check_runs").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]);
+    if runs.is_empty() {
+        return Checks::Quiet;
+    }
+    let mut failed = false;
+    let mut counted = 0usize;
+    for run in runs {
+        let status = text_at(run, "status");
+        if status != "completed" {
+            return Checks::Running;
+        }
+        counted += 1;
+        match text_at(run, "conclusion").as_str() {
+            "failure" | "timed_out" | "cancelled" | "action_required" | "startup_failure" => {
+                failed = true
+            }
+            // `neutral`, `skipped` and `success` are all "not in the way".
+            _ => {}
+        }
+    }
+    match (counted, failed) {
+        (0, _) => Checks::Quiet,
+        (_, true) => Checks::Failed,
+        (_, false) => Checks::Passed,
+    }
+}
+
 /// Whether a failure is GitHub saying it already has this.
 ///
 /// **Not an error to us.** Setting signing up again after a reinstall finds the same key already
@@ -466,6 +565,44 @@ fn slim_file(v: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **Still running beats failed beats passed.** A pull request whose checks are half green
+    /// and half still working is not passing, and a mark that says it is gets stopped being read.
+    #[test]
+    fn checks_add_up_to_the_least_settled_thing_among_them() {
+        use crate::repo::Checks;
+        let runs = |v: Value| json!({ "check_runs": v });
+        assert_eq!(fold_checks(&runs(json!([]))), Checks::Quiet, "no CI draws nothing");
+        assert_eq!(fold_checks(&json!({})), Checks::Quiet, "and neither does an unreadable answer");
+        assert_eq!(
+            fold_checks(&runs(json!([
+                {"status": "completed", "conclusion": "success"},
+                {"status": "in_progress", "conclusion": null},
+            ]))),
+            Checks::Running,
+        );
+        assert_eq!(
+            fold_checks(&runs(json!([
+                {"status": "completed", "conclusion": "success"},
+                {"status": "completed", "conclusion": "failure"},
+            ]))),
+            Checks::Failed,
+        );
+        assert_eq!(
+            fold_checks(&runs(json!([
+                {"status": "completed", "conclusion": "success"},
+                {"status": "completed", "conclusion": "skipped"},
+                {"status": "completed", "conclusion": "neutral"},
+            ]))),
+            Checks::Passed,
+            "skipped and neutral are not in the way",
+        );
+        // A queued run has not started, which is still "not settled".
+        assert_eq!(
+            fold_checks(&runs(json!([{"status": "queued", "conclusion": null}]))),
+            Checks::Running,
+        );
+    }
 
     /// **Scopes are read off the header, because a saved token carries what it was granted then.**
     /// A token from before signing existed cannot add a key, and the only way to tell it from one

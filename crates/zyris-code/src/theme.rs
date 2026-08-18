@@ -344,6 +344,15 @@ pub fn link() -> Color {
 ///
 /// `success()`/`danger()` are not reused. Those two say "the tool worked / did not", so a deleted
 /// line inside a *successful* edit painted the same red as a failed tool would be misread.
+/// A pull request that has landed.
+///
+/// **Purple because it is the one state that is finished.** Yellow says "waiting on somebody",
+/// which is what an open pull request is; green and red are already spoken for by what CI said,
+/// and a merged pull request is neither of those — it is over.
+pub fn merged() -> Color {
+    pick((0xa3, 0x71, 0xf7), (0x82, 0x50, 0xdf))
+}
+
 pub fn diff_add() -> Color {
     pick((0x7e, 0xc0, 0x50), (0x2f, 0x7a, 0x1f))
 }
@@ -405,6 +414,9 @@ mod tests {
                     ("ahead", ahead()),
                     ("behind", behind()),
                     ("the path itself", text_muted()),
+                    // A landed pull request sits on this row too, and it must not read as any of
+                    // the states above it — least of all as the green that means CI passed.
+                    ("merged", merged()),
                 ];
                 for (i, (an, a)) in marks.iter().enumerate() {
                     for (bn, b) in marks.iter().skip(i + 1) {

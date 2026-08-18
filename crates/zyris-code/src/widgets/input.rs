@@ -57,6 +57,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &State) {
         &state.cwd,
         state.home.as_deref(),
         state.repo.as_ref(),
+        state.pull.as_ref(),
     ))];
     for (i, text) in wrapped[start..].iter().take(rows).enumerate() {
         // The prompt is only on the first line. Continuation lines start at the same column so the text stays tidy.

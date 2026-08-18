@@ -28,6 +28,51 @@ pub struct Repo {
     pub diverged: Option<Diff>,
 }
 
+/// The pull request this branch is on, as GitHub describes it.
+///
+/// **Kept apart from [`Repo`].** One is read from git every few seconds and never leaves this
+/// machine; the other costs three network calls and is polled far more slowly. Folding them into
+/// one struct would mean the git poll wiped the pull request every three seconds.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Pull {
+    pub number: u64,
+    /// GitHub's own counts for the whole pull request. **Not the same as [`Repo::diverged`]** —
+    /// that is measured here and includes commits that have not been pushed yet.
+    pub added: usize,
+    pub removed: usize,
+    pub checks: Checks,
+    pub merged: bool,
+}
+
+/// What the checks on the head commit add up to.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Checks {
+    /// Nothing is configured, or nothing has reported yet. **Drawn as nothing** — a repository
+    /// with no CI must not grow a mark saying so on every frame.
+    #[default]
+    Quiet,
+    Running,
+    Passed,
+    Failed,
+}
+
+impl Checks {
+    /// The word on the strip, and the colour it wears.
+    ///
+    /// **Letters, not symbols.** `●`, `✓` and `✗` are East Asian Ambiguous: `unicode-width` calls
+    /// them one column and a terminal set to the wide reading draws them as two, which pushes
+    /// everything after them one column right and makes the next positioned write eat a
+    /// character. That is exactly how `main` once came out as `mai`.
+    pub fn mark(self) -> Option<(&'static str, ratatui::style::Color)> {
+        match self {
+            Checks::Quiet => None,
+            Checks::Running => Some(("ci..", theme::warning())),
+            Checks::Passed => Some(("ci ok", theme::diff_add())),
+            Checks::Failed => Some(("ci x", theme::danger())),
+        }
+    }
+}
+
 /// Lines added and removed, as `git diff --shortstat` counts them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Diff {
@@ -128,16 +173,20 @@ enum Level {
     Full,
     NoUntracked,
     NoAhead,
+    NoChecks,
     NoDiverged,
+    NoPullSize,
     NoCounts,
     NoGit,
 }
 
-const LEVELS: [Level; 6] = [
+const LEVELS: [Level; 8] = [
     Level::Full,
     Level::NoUntracked,
     Level::NoAhead,
+    Level::NoChecks,
     Level::NoDiverged,
+    Level::NoPullSize,
     Level::NoCounts,
     Level::NoGit,
 ];
@@ -157,6 +206,7 @@ pub fn spans(
     cwd: &Path,
     home: Option<&Path>,
     repo: Option<&Repo>,
+    pull: Option<&Pull>,
 ) -> Vec<Span<'static>> {
     let width = width as usize;
     let bare = || vec![Span::styled("─".repeat(width), Style::default().fg(theme::border()))];
@@ -168,14 +218,14 @@ pub fn spans(
     let budget = width - overhead;
     let path = path_text(cwd, home);
     for level in LEVELS {
-        if let Some(out) = assemble(width, &pieces(&path, repo, level), budget) {
+        if let Some(out) = assemble(width, &pieces(&path, repo, pull, level), budget) {
             return out;
         }
     }
     // Even the path alone did not fit — take it from the head, never the tail.
     match shorten(&path, budget) {
         Some(short) => {
-            assemble(width, &pieces(&short, None, Level::NoGit), budget).unwrap_or_else(bare)
+            assemble(width, &pieces(&short, None, None, Level::NoGit), budget).unwrap_or_else(bare)
         }
         None => bare(),
     }
@@ -183,7 +233,12 @@ pub fn spans(
 
 /// The pieces, in order, at this level of detail. **Empty inner vectors are the whole point** —
 /// `assemble` drops them, and with them their separator.
-fn pieces(path: &str, repo: Option<&Repo>, level: Level) -> Vec<Vec<Span<'static>>> {
+fn pieces(
+    path: &str,
+    repo: Option<&Repo>,
+    pull: Option<&Pull>,
+    level: Level,
+) -> Vec<Vec<Span<'static>>> {
     let muted = Style::default().fg(theme::text_muted());
     let mut git: Vec<Span<'static>> = Vec::new();
     if let (Some(r), false) = (repo, level == Level::NoGit) {
@@ -224,7 +279,7 @@ fn pieces(path: &str, repo: Option<&Repo>, level: Level) -> Vec<Vec<Span<'static
     // changed units. A separator says they are different things without a word of explanation.
     let mut diverged: Vec<Span<'static>> = Vec::new();
     if let (Some(r), true) =
-        (repo, matches!(level, Level::Full | Level::NoUntracked | Level::NoAhead))
+        (repo, matches!(level, Level::Full | Level::NoUntracked | Level::NoAhead | Level::NoChecks))
     {
         if let Some(d) = r.diverged {
             diverged.push(Span::styled(
@@ -237,7 +292,32 @@ fn pieces(path: &str, repo: Option<&Repo>, level: Level) -> Vec<Vec<Span<'static
             ));
         }
     }
-    vec![vec![Span::styled(path.to_string(), muted)], git, diverged]
+    // The pull request this branch is on. **Its own piece as well**, and for the same reason the
+    // branch's counts are: `#53` is an identity, `+118 -30` are GitHub's numbers for the whole
+    // request, and neither belongs among marks that describe the working tree.
+    let mut pr: Vec<Span<'static>> = Vec::new();
+    if let (Some(p), false) = (pull, level == Level::NoGit) {
+        // **Yellow while it is somebody else's turn, purple once it has landed.** The number
+        // carries the colour because the number is the thing being talked about.
+        let state = match p.merged {
+            true => Style::default().fg(theme::merged()),
+            false => Style::default().fg(theme::warning()),
+        };
+        pr.push(Span::styled(format!("#{}", p.number), state));
+        if !matches!(level, Level::NoPullSize | Level::NoCounts) {
+            pr.push(Span::styled(format!(" +{}", p.added), Style::default().fg(theme::diff_add())));
+            pr.push(Span::styled(
+                format!(" -{}", p.removed),
+                Style::default().fg(theme::diff_del()),
+            ));
+        }
+        if matches!(level, Level::Full | Level::NoUntracked | Level::NoAhead) {
+            if let Some((word, colour)) = p.checks.mark() {
+                pr.push(Span::styled(format!(" {word}"), Style::default().fg(colour)));
+            }
+        }
+    }
+    vec![vec![Span::styled(path.to_string(), muted)], git, diverged, pr]
 }
 
 /// Joins the non-empty pieces and pads out to exactly `width`. `None` when the body is over
@@ -422,6 +502,31 @@ pub fn poll_interval() -> Option<std::time::Duration> {
     interval_from(std::env::var("ZYRIS_CODE_GIT_MS").ok().as_deref())
 }
 
+/// How often the pull request on the strip is refreshed.
+///
+/// **Far slower than git, because it costs three network calls.** Nothing on this row changes in
+/// three seconds that a person needs to see in three seconds: a review lands, or CI turns over,
+/// and thirty is soon enough for both. `0` turns it off.
+pub fn pull_interval() -> Option<std::time::Duration> {
+    pull_interval_from(std::env::var("ZYRIS_CODE_PULL_MS").ok().as_deref())
+}
+
+/// The decision on its own, for the same reason [`interval_from`] is split out.
+pub fn pull_interval_from(given: Option<&str>) -> Option<std::time::Duration> {
+    const DEFAULT_MS: u64 = 30_000;
+    /// GitHub's own rate limit is per hour; anything under this spends it on nobody's behalf.
+    const FLOOR_MS: u64 = 5_000;
+    let ms = match given.map(str::trim).filter(|v| !v.is_empty()) {
+        None => DEFAULT_MS,
+        Some(text) => match text.parse::<u64>() {
+            Ok(0) => return None,
+            Ok(ms) => ms.max(FLOOR_MS),
+            Err(_) => DEFAULT_MS,
+        },
+    };
+    Some(std::time::Duration::from_millis(ms))
+}
+
 /// The decision, kept **pure** so tests do not have to shake the environment — the same reason
 /// `theme::page_bg_from` is split out.
 ///
@@ -487,12 +592,110 @@ mod tests {
         assert!(!got.branch.is_empty());
     }
 
+    // ── The pull request on the strip ─────────────────────────────────────────────────────
+
+    /// **Its own piece, not more marks on the branch's.** `+` two columns to the left already
+    /// means "staged", and `#53` is an identity while `+118 -30` are GitHub's numbers for the
+    /// whole request — a separator says they are different things without a word of explanation.
+    #[test]
+    fn a_pull_request_stands_apart_from_what_the_branch_staged() {
+        let text = strip_with(100, "/w", None, Some(&dirty()), Some(&open_pull()));
+        assert!(text.contains("#53"), "{text}");
+        assert!(text.contains("+118 -30"), "{text}");
+        // The branch's own marks are still there, and something sits between them.
+        assert!(text.contains("+2"), "{text}");
+        let (before, after) = text.split_once("#53").expect("the number is on the row");
+        assert!(before.trim_end().ends_with(SEP.trim_end()), "no separator before it: {text}");
+        assert!(after.contains("+118"), "{text}");
+    }
+
+    /// **A branch with nothing open on it draws nothing.** Most branches never have a pull
+    /// request, and a placeholder on every one of them is a row that stops being read.
+    #[test]
+    fn a_branch_with_no_pull_request_shows_nothing_about_one() {
+        let text = strip_with(100, "/w", None, Some(&dirty()), None);
+        assert!(!text.contains('#'), "{text}");
+    }
+
+    /// **Running, passed and failed each say a different word.** "if CI is going, show it" is the
+    /// ask, and a mark that cannot tell the three apart answers none of them.
+    #[test]
+    fn the_state_of_the_checks_is_written_out() {
+        let mut pull = open_pull();
+        for (checks, word) in
+            [(Checks::Running, "ci.."), (Checks::Passed, "ci ok"), (Checks::Failed, "ci x")]
+        {
+            pull.checks = checks;
+            let text = strip_with(100, "/w", None, Some(&dirty()), Some(&pull));
+            assert!(text.contains(word), "{checks:?} did not say {word}: {text}");
+        }
+        // **Nothing configured draws nothing.** A repository without CI must not grow a mark
+        // that says so on every frame.
+        pull.checks = Checks::Quiet;
+        let text = strip_with(100, "/w", None, Some(&dirty()), Some(&pull));
+        assert!(!text.contains("ci"), "{text}");
+    }
+
+    /// **The colours say the state, and they are not the ones the row already uses.** Yellow
+    /// while it is somebody else's turn, purple once it has landed.
+    #[test]
+    fn a_merged_pull_request_is_a_different_colour_from_an_open_one() {
+        let colour_of = |pull: &Pull| {
+            super::spans(100, Path::new("/w"), None, Some(&dirty()), Some(pull))
+                .into_iter()
+                .find(|s| s.content.contains("#53"))
+                .and_then(|s| s.style.fg)
+                .expect("the number is drawn")
+        };
+        let mut pull = open_pull();
+        let open = colour_of(&pull);
+        pull.merged = true;
+        let merged = colour_of(&pull);
+        assert_ne!(open, merged, "open and merged look the same");
+        assert_eq!(open, theme::warning(), "an open request waits on somebody");
+        assert_eq!(merged, theme::merged(), "a landed one is over");
+    }
+
+    /// **The number outlives its own counts.** When the row gets tight, what is dropped is the
+    /// size of the pull request; which pull request it is stays, because that is the part a
+    /// person cannot work out from anything else on the row.
+    #[test]
+    fn the_pull_request_keeps_its_number_longest_when_the_row_gets_tight() {
+        let mut last_with_number = 0;
+        for width in (30u16..=100).rev() {
+            let text = strip_with(width, "/w", None, Some(&dirty()), Some(&open_pull()));
+            if text.contains("#53") {
+                last_with_number = width;
+            }
+            if text.contains("+118") {
+                assert!(text.contains("#53"), "the size outlived the number at {width}: {text}");
+            }
+        }
+        assert!(last_with_number < 60, "the number never survived a narrow row");
+    }
+
     /// The strip as plain text, the way a terminal would show it.
     fn strip(width: u16, cwd: &str, home: Option<&str>, repo: Option<&Repo>) -> String {
-        super::spans(width, Path::new(cwd), home.map(Path::new), repo)
+        strip_with(width, cwd, home, repo, None)
+    }
+
+    /// The same, with a pull request on it.
+    fn strip_with(
+        width: u16,
+        cwd: &str,
+        home: Option<&str>,
+        repo: Option<&Repo>,
+        pull: Option<&Pull>,
+    ) -> String {
+        super::spans(width, Path::new(cwd), home.map(Path::new), repo, pull)
             .iter()
             .map(|s| s.content.as_ref())
             .collect()
+    }
+
+    /// A branch with an open pull request on it, checks still going.
+    fn open_pull() -> Pull {
+        Pull { number: 53, added: 118, removed: 30, checks: Checks::Running, merged: false }
     }
 
     fn dirty() -> Repo {
@@ -528,6 +731,7 @@ mod tests {
             Path::new("/home/ruma/zyris-code"),
             Some(Path::new("/home/ruma")),
             Some(&repo),
+            None,
         );
         let colour_of =
             |mark: char| spans.iter().find(|s| s.content.contains(mark)).and_then(|s| s.style.fg);
@@ -686,7 +890,7 @@ mod tests {
     #[test]
     fn every_span_carries_a_colour() {
         // An unstyled span leaks the terminal's own default foreground (`theme` header rule).
-        for s in super::spans(60, Path::new("/home/ruma/zyris-code"), None, Some(&dirty())) {
+        for s in super::spans(60, Path::new("/home/ruma/zyris-code"), None, Some(&dirty()), None) {
             assert!(s.style.fg.is_some(), "uncoloured span: {:?}", s.content);
         }
     }
