@@ -80,9 +80,7 @@ impl Notice {
                 plain(&lang.previous_error(before));
             }
         }
-        plain(&lang.log_location(
-            &std::env::var("ZYRIS_CODE_LOG").unwrap_or_else(|_| "/tmp/zyris-code.log".into()),
-        ));
+        plain(&lang.log_location(&log_path().to_string_lossy()));
     }
 
     /// A spot that ends things but is **not an error**. Red is used sparingly — if everything is red, the real error
@@ -152,6 +150,18 @@ impl Notice {
             }
         });
     }
+}
+
+/// Where the log is written.
+///
+/// **One place, because two of them drifted.** This said `/tmp/zyris-code.log` outright while the
+/// side that opens the file asked the platform — so on Windows the app pointed somebody at a path
+/// that does not exist there, in the one message whose whole job is saying where to look (reported
+/// 2026-08-18). `std::env::temp_dir` reads `%TEMP%` on Windows and `/tmp` here.
+pub fn log_path() -> std::path::PathBuf {
+    std::env::var("ZYRIS_CODE_LOG")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir().join("zyris-code.log"))
 }
 
 /// A single red line. **No color unless it's a terminal** — for something receiving through a pipe,
@@ -234,6 +244,25 @@ impl Visit for Grab {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The path it names has to be the path it writes.** These were worked out in two places and
+    /// one of them said `/tmp/zyris-code.log` outright, so on Windows the app pointed somebody at a
+    /// directory that does not exist there — in the one line whose whole job is saying where to
+    /// look (reported 2026-08-18).
+    #[test]
+    fn the_log_it_names_is_the_log_it_writes() {
+        let named = log_path();
+        assert!(named.ends_with("zyris-code.log"), "{named:?}");
+        assert_eq!(
+            named.parent(),
+            Some(std::env::temp_dir().as_path()),
+            "the log was named somewhere other than where this platform puts temporary files",
+        );
+        // On Windows that is `%TEMP%`, never `/tmp` — which is what the old literal said.
+        if cfg!(windows) {
+            assert!(!named.starts_with("/tmp"), "a unix path was named on Windows: {named:?}");
+        }
+    }
 
     /// Once connected, the watcher falls silent. Otherwise text gets printed over the screen.
     #[test]
