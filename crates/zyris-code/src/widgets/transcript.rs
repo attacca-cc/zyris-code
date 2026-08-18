@@ -33,20 +33,35 @@ pub fn pulse_at(ms: u64) -> u8 {
     ((travelled as u32 * DEEPEST) / half as u32) as u8
 }
 
-/// The lines a node's body occupies, given where every node's head sits.
+/// How many cells the crest of the head's wave has travelled by `ms`.
 ///
-/// **A body runs from just under its own head to just above the next one.** `heads` is the map the
-/// row cache already keeps for click-to-fold — absolute line index to the seq of the node that
-/// starts there — so nothing new has to be tracked to know what a fold revealed.
+/// **One cell at a time, always forward.** The pulse goes out and comes back, and a crest driven by
+/// it would slide along the line and then reverse; a wave runs. Whole cells because that is what
+/// the screen has, and because a crest that has not moved a cell leaves the line byte for byte
+/// identical — which is what keeps this off the wire on the frames between.
+pub fn wave_at(ms: u64) -> u32 {
+    const MS_PER_CELL: u64 = 55;
+    (ms / MS_PER_CELL) as u32
+}
+
+/// Which line a node's head sits on, if it is on screen at all.
+pub fn head_of(heads: &HashMap<usize, i64>, seq: i64) -> Option<usize> {
+    heads.iter().find(|(_, s)| **s == seq).map(|(line, _)| *line)
+}
+
+/// The lines a node's body occupies: from just under its head to whichever comes first — the next
+/// node's head, or `stop`, the end of the item the node belongs to.
+///
+/// **`stop` is what keeps the fade to what actually opened.** The head map only knows about things
+/// that fold, so a tool or a chip that is the last one inside its card has no head after it, and
+/// reaching for "the next head" ran past the end of the card and washed the agent's answer — and
+/// everything under it — along with the body that had just been revealed (reported 2026-08-18).
 ///
 /// Pure, and the reason the fade can be applied to lines that are already built and cached: only
 /// their colour changes over those few frames, so the cache never has to be told about it.
-pub fn body_of(heads: &HashMap<usize, i64>, seq: i64, total: usize) -> std::ops::Range<usize> {
-    let Some(&head) = heads.iter().find(|(_, s)| **s == seq).map(|(line, _)| line) else {
-        return 0..0;
-    };
-    let next = heads.keys().copied().filter(|line| *line > head).min().unwrap_or(total);
-    (head + 1).min(total)..next.min(total)
+pub fn body_of(heads: &HashMap<usize, i64>, head: usize, stop: usize) -> std::ops::Range<usize> {
+    let next = heads.keys().copied().filter(|line| *line > head).min().unwrap_or(stop);
+    (head + 1).min(stop)..next.min(stop)
 }
 
 /// Moves every span on `line` `amount` of the way to the background.
@@ -74,12 +89,12 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut State) {
 
     // How far a waiting tool's dot has receded right now. Wall-clock based, so it moves without
     // anything having to be stored between frames.
-    let pulse = pulse_at(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0),
-    );
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let pulse = pulse_at(now_ms);
+    let crest = wave_at(now_ms);
 
     // **What the viewport was looking at, taken before the relayout.** `Scroll.top` is an
     // absolute line index and `layout` rebuilds the line list from scratch, so a width change or
@@ -93,7 +108,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut State) {
     {
         // Borrow the fields separately — `timeline` and `rows_cache` must be held at the same time.
         let State { timeline, rows_cache, folds, running, lang, .. } = &mut *state;
-        let turn = crate::rows::Turn { running: *running, pulse };
+        let turn = crate::rows::Turn { running: *running, pulse, wave: crest };
         rows_cache.layout(timeline.items(), area.width, folds, skip, turn, *lang);
     }
 
@@ -125,7 +140,8 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut State) {
     // of the screen changing under it in one step. Applied to the copies handed back here, so the
     // cache is untouched — see `body_of`.
     for (seq, amount) in state.fading_in() {
-        let body = body_of(state.rows_cache.cards(), seq, total);
+        let Some(head) = head_of(state.rows_cache.cards(), seq) else { continue };
+        let body = body_of(state.rows_cache.cards(), head, state.rows_cache.item_end(head));
         for line in body.start.max(start)..body.end.min(end) {
             if let Some(row) = shown.get_mut(line - start) {
                 *row = faded(std::mem::take(row), amount);
@@ -197,16 +213,22 @@ mod tests {
         }
     }
 
-    /// **A body is the lines between its own head and the next one.** This is what lets a fold's
-    /// reveal be faded without the row cache knowing anything about it — the heads are already
-    /// mapped for click-to-fold, so the extent comes out of arithmetic rather than new state.
+    /// **A body is the lines between its own head and the next one — and never past its item.**
+    /// The head map only knows about things that fold, so the last tool inside a card has no head
+    /// after it; reaching for "the next head" ran off the end of the card and washed the agent's
+    /// answer and everything below it along with the reveal.
     #[test]
-    fn a_nodes_body_runs_from_under_its_head_to_the_next_one() {
+    fn a_body_stops_at_the_next_head_or_at_the_end_of_its_item() {
+        // A card at 0 holding tools at 4 and 9; the card itself ends at 12, and lines 12..20 are
+        // the answer that followed it and whatever came after that.
         let heads = HashMap::from([(0usize, 1i64), (4, 2), (9, 3)]);
-        assert_eq!(body_of(&heads, 1, 12), 1..4, "the card's body stops at the next head");
-        assert_eq!(body_of(&heads, 2, 12), 5..9);
-        assert_eq!(body_of(&heads, 3, 12), 10..12, "the last body runs to the end");
-        assert_eq!(body_of(&heads, 99, 12), 0..0, "a node that is not there has no body");
+        assert_eq!(body_of(&heads, 0, 12), 1..4, "the card's body stops at the first tool");
+        assert_eq!(body_of(&heads, 4, 12), 5..9);
+        assert_eq!(
+            body_of(&heads, 9, 12),
+            10..12,
+            "the last tool's body must stop where its card does, not run on into the answer",
+        );
     }
 
     /// **A head with nothing under it has an empty body, not a backwards one.** A folded node sits
@@ -214,8 +236,16 @@ mod tests {
     #[test]
     fn a_node_with_nothing_under_it_has_an_empty_body() {
         let heads = HashMap::from([(0usize, 1i64), (1, 2)]);
-        let body = body_of(&heads, 1, 2);
+        let body = body_of(&heads, 0, 2);
         assert!(body.start >= body.end, "an empty body came back as {body:?}");
-        assert!(body_of(&heads, 2, 2).end <= 2);
+        assert!(body_of(&heads, 1, 2).end <= 2);
+    }
+
+    /// The head map is how a seq is found at all; a node that is not on screen has no head.
+    #[test]
+    fn a_node_that_is_not_on_screen_has_no_head() {
+        let heads = HashMap::from([(0usize, 1i64), (4, 2)]);
+        assert_eq!(head_of(&heads, 2), Some(4));
+        assert_eq!(head_of(&heads, 99), None);
     }
 }

@@ -89,9 +89,71 @@ Environment variables are listed in the README.
     )
 }
 
+/// `text` with the line endings a console on `windows` needs, and exactly one at the end.
+///
+/// **A Windows console in virtual-terminal mode takes a bare `\n` literally.** The cursor drops a
+/// row and stays in the column it was already in, so `zyris --version` left the shell's next prompt
+/// indented under the end of the version and the whole thing read as taking two lines (reported
+/// 2026-08-18). Measured on a Windows 11 machine: what reached stdout was `zyris 0.2.7\n`, twelve
+/// bytes with no carriage return.
+///
+/// Rust does no line-ending translation of its own, and the old console's LF-to-CRLF fixup stops
+/// once VT processing is switched on — which is the default in Windows Terminal. `--help` is worse
+/// than `--version` there, since every one of its lines starts further right than the last.
+///
+/// **Pure, and told which platform it is for**, so both answers can be checked from either.
+pub fn ended(text: &str, windows: bool) -> String {
+    // **Brought to bare newlines first.** Trimming the end before that leaves the carriage return
+    // of a text that already ended in CRLF stranded, and the ending put back after it reads as two.
+    let unified = text.replace("\r\n", "\n");
+    let body = unified.strip_suffix('\n').unwrap_or(&unified);
+    if windows {
+        format!("{}\r\n", body.replace('\n', "\r\n"))
+    } else {
+        format!("{body}\n")
+    }
+}
+
+/// Writes a line to stdout the way this console needs it, and flushes.
+///
+/// **Flushed because stdout to a pipe is block-buffered.** A script reading one answer would
+/// otherwise wait for the process to end to see it.
+pub fn say(text: &str) {
+    use std::io::Write;
+    let mut out = std::io::stdout();
+    let _ = out.write_all(ended(text, cfg!(windows)).as_bytes());
+    let _ = out.flush();
+}
+
+/// The same, to stderr — where what went wrong goes, so a script's own output stays clean.
+pub fn warn(text: &str) {
+    use std::io::Write;
+    let _ = std::io::stderr().write_all(ended(text, cfg!(windows)).as_bytes());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A bare newline is not a newline on a Windows console in VT mode.** The cursor drops a row
+    /// and stays in its column, so `--version` left the next shell prompt indented under it and the
+    /// output read as two lines. Measured there: `zyris 0.2.7\n`, no carriage return.
+    #[test]
+    fn a_line_is_ended_the_way_the_console_it_goes_to_needs() {
+        assert_eq!(ended("zyris 0.2.7", true), "zyris 0.2.7\r\n");
+        assert_eq!(ended("zyris 0.2.7", false), "zyris 0.2.7\n");
+
+        // Every line of a block, not just the last — `--help` is where getting this wrong walks
+        // each line further to the right than the one before it.
+        assert_eq!(ended("one\ntwo", true), "one\r\ntwo\r\n");
+
+        // **Exactly one ending, however the text arrived.** These strings come from `lang` and from
+        // `help`, and one of them ends in a newline already.
+        assert_eq!(ended("done\n", true), "done\r\n");
+        assert_eq!(ended("done\n", false), "done\n");
+        // And a text that is already CRLF is not doubled into CRCRLF.
+        assert_eq!(ended("a\r\nb\r\n", true), "a\r\nb\r\n");
+    }
 
     fn parse_of(line: &str) -> Run {
         parse(line.split_whitespace().map(str::to_string))
