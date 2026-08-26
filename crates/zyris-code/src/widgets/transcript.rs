@@ -33,34 +33,6 @@ pub fn pulse_at(ms: u64) -> u8 {
     ((travelled as u32 * DEEPEST) / half as u32) as u8
 }
 
-/// About how long the crest should take to cross one cell.
-const MS_PER_CELL: u64 = 55;
-
-/// How many frames the crest spends on each cell, at a frame every `frame_ms`.
-///
-/// **A whole number, and never zero.** This is the whole of why the wave was uneven: it moved on a
-/// wall clock at one cell every 55ms while frames land every 50ms, so drawn frames took it one
-/// cell, then one, then two, then one — a limp rather than a run. Tying it to the frame instead
-/// means every drawn frame moves it the same distance, and rounding keeps the speed about what it
-/// was whatever `$ZYRIS_CODE_FPS` is set to.
-pub fn frames_per_cell(frame_ms: u64) -> u64 {
-    let frame_ms = frame_ms.max(1);
-    ((MS_PER_CELL + frame_ms / 2) / frame_ms).max(1)
-}
-
-/// How many cells the crest of the head's wave has travelled by frame `tick`.
-///
-/// **One cell at a time, always forward.** The pulse goes out and comes back, and a crest driven by
-/// it would slide along the line and then reverse; a wave runs. Whole cells because that is what
-/// the screen has, and because a crest that has not moved a cell leaves the line byte for byte
-/// identical — which is what keeps this off the wire on the frames between.
-///
-/// **Counted in frames, not milliseconds.** The rest of this app's animation already works that
-/// way (`State.tick`), and it is the only way the step is the same size every time.
-pub fn wave_at(tick: u64, frame_ms: u64) -> u32 {
-    (tick / frames_per_cell(frame_ms)) as u32
-}
-
 /// Which line a node's head sits on, if it is on screen at all.
 pub fn head_of(heads: &HashMap<usize, i64>, seq: i64) -> Option<usize> {
     heads.iter().find(|(_, s)| **s == seq).map(|(line, _)| *line)
@@ -126,11 +98,10 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut State) {
 
     // **Driven by the frame counter, not by the clock.** Wall time and the frame rate do not
     // divide into each other, so a wall-clock animation lands a different distance on each drawn
-    // frame — which is what the wave was doing. `State.tick` is what everything else that moves
-    // here already uses, and it also keeps this side free of a clock read per frame.
+    // frame. `State.tick` is what everything else that moves here already uses, and it also keeps
+    // this side free of a clock read per frame.
     let now_ms = state.tick.saturating_mul(state.frame_ms);
     let pulse = pulse_at(now_ms);
-    let crest = wave_at(state.tick, state.frame_ms);
 
     // **What the viewport was looking at, taken before the relayout.** `Scroll.top` is an
     // absolute line index and `layout` rebuilds the line list from scratch, so a width change or
@@ -144,7 +115,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut State) {
     {
         // Borrow the fields separately — `timeline` and `rows_cache` must be held at the same time.
         let State { timeline, rows_cache, folds, running, lang, .. } = &mut *state;
-        let turn = crate::rows::Turn { running: *running, pulse, wave: crest };
+        let turn = crate::rows::Turn { running: *running, pulse };
         rows_cache.layout(timeline.items(), area.width, folds, skip, turn, *lang);
     }
 
@@ -273,33 +244,6 @@ mod tests {
         assert_eq!(revealed(&heads, 6, 10, false), 7..10);
         // And an empty card is an empty range, not a backwards one.
         assert!(revealed(&HashMap::from([(4usize, 1i64)]), 4, 4, true).is_empty());
-    }
-
-    /// **The frames a cell gets are a whole number of them.** The wave used to move on a wall
-    /// clock at one cell every 55ms while frames land every 50ms, so a drawn frame took it one
-    /// cell, then one, then two — a limp rather than a run, and the reason it was reported as
-    /// stuttering. Tied to the frame, every step is the same size.
-    #[test]
-    fn the_crest_moves_the_same_distance_on_every_frame() {
-        for frame_ms in [50u64, 16, 100, 1] {
-            let per_cell = frames_per_cell(frame_ms);
-            assert!(per_cell >= 1, "a cell cannot take no frames at {frame_ms}ms");
-            let steps: Vec<u32> =
-                (0..40).map(|t| wave_at(t + 1, frame_ms) - wave_at(t, frame_ms)).collect();
-            let moved: Vec<u32> = steps.iter().copied().filter(|s| *s > 0).collect();
-            assert!(moved.iter().all(|s| *s == 1), "uneven steps at {frame_ms}ms: {steps:?}");
-        }
-    }
-
-    /// And the speed stays about what it was however fast frames come, so turning the frame rate
-    /// up makes it smoother rather than faster.
-    #[test]
-    fn the_crest_travels_at_about_the_same_speed_whatever_the_frame_rate() {
-        for frame_ms in [50u64, 33, 16] {
-            let a_second = 1000 / frame_ms;
-            let cells = wave_at(a_second, frame_ms);
-            assert!((14..=24).contains(&cells), "{cells} cells a second at {frame_ms}ms");
-        }
     }
 
     /// **A body is the lines between its own head and the next one — and never past its item.**

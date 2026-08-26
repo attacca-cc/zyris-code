@@ -46,15 +46,6 @@ pub struct Fold {
     pub open: bool,
     /// Set when the person explicitly opened/closed this node. Auto-open/auto-fold then leaves it alone.
     pub user_touched: bool,
-    /// Closed, but still laid out while its body fades away.
-    ///
-    /// **This is the whole of the closing animation, and it is deliberately the only part of it.**
-    /// Fading something out means drawing lines that are on their way to not existing; splicing
-    /// them back into a layout that has already dropped them is what once left the fade smeared
-    /// across the whole screen. So nothing is spliced: the node simply goes on laying out as open
-    /// for [`crate::app::FADE_IN`], its body washes toward the background, and then it collapses
-    /// in one step with nothing left to see. `app::State::settle_folds` is what ends it.
-    pub closing: bool,
 }
 
 /// The kind of a foldable node.
@@ -72,11 +63,6 @@ enum NodeKind {
 /// the cache's change detection and the renderer must agree, or the cache would think nothing
 /// changed when the run ends and the screen would keep the run's shape forever.
 fn effective_open(kind: NodeKind, f: &Fold, running: bool) -> bool {
-    // **On its way out is still on screen.** The body has to be there to be drawn fading, and
-    // this is the one place the open state is decided, so it is the one place that can say so.
-    if f.closing {
-        return true;
-    }
     match kind {
         // **A card is open while it is being worked on and folds itself when it is done.** The
         // answer is no longer inside it — the agent speaking is what ends the card — so what is
@@ -95,27 +81,6 @@ fn effective_open(kind: NodeKind, f: &Fold, running: bool) -> bool {
         // screen with second thoughts while saying nothing about what is being done.
         NodeKind::Chip => f.open,
         NodeKind::Tool => f.open,
-    }
-}
-
-#[cfg(test)]
-mod closing_is_still_drawn {
-    use super::*;
-
-    /// **A node on its way out is still laid out.** The whole of the closing animation is that its
-    /// body goes on existing while it fades; without this there is nothing on screen to fade, and
-    /// the alternative — splicing dropped lines back into a layout — is what once smeared a fade
-    /// across the entire screen.
-    #[test]
-    fn a_fold_that_is_closing_draws_open() {
-        let shut = Fold { open: false, user_touched: true, closing: false };
-        let leaving = Fold { closing: true, ..shut };
-        for kind in [NodeKind::Card, NodeKind::Chip, NodeKind::Tool] {
-            assert!(!effective_open(kind, &shut, false), "{kind:?} was drawn open while shut");
-            assert!(effective_open(kind, &leaving, false), "{kind:?} vanished before it faded");
-            // And not because a turn is running ‒ nobody is clicking folds mid-run.
-            assert!(effective_open(kind, &leaving, true), "{kind:?} vanished mid-run");
-        }
     }
 }
 
@@ -190,72 +155,7 @@ pub struct Turn {
     /// colour instead. Held in whole steps so it can be compared, which is what the row cache needs
     /// to decide whether a card has to be built again.
     pub pulse: u8,
-    /// How many cells the crest of the head's wave has travelled. **Its own count, not the pulse**:
-    /// the pulse goes out and comes back, and a crest driven by it would slide forward and then
-    /// reverse rather than run along the line.
-    pub wave: u32,
 }
-
-/// `text` with a bright crest travelling along it, as spans ready to draw.
-///
-/// **What a wave is, on a terminal.** There is nothing to move but the colour, so the letters stay
-/// where they are and brightness travels through them: each is drawn a little further toward the
-/// background the further it sits from the crest, and the crest advances a cell at a time.
-///
-/// **Runs of equal brightness become one span.** Colouring every character separately would put a
-/// colour escape on the wire per cell per frame, which on a remote terminal is the most expensive
-/// thing on screen for the least — quantising to `WAVE_LEVELS` and merging neighbours that landed
-/// on the same one keeps a short title down to a handful of spans, and holds it steady on the
-/// frames where the crest has not moved a whole cell.
-///
-/// Pure, and given its own phase, so a test walks it rather than waiting on a clock.
-pub fn wave(text: &str, colour: ratatui::style::Color, phase: usize) -> Vec<Span<'static>> {
-    let chars: Vec<char> = text.chars().collect();
-    if chars.is_empty() {
-        return Vec::new();
-    }
-    // The crest travels a little past the end and comes back round, so the wave keeps moving on a
-    // title short enough that it would otherwise sit still.
-    let span_len = chars.len() + WAVE_TAIL;
-    let crest = phase % span_len;
-    let level = |i: usize| -> u8 {
-        let away = i.abs_diff(crest);
-        // Beyond the crest's reach everything sits at the dimmest step, so the wave is a moving
-        // brightening rather than a band of colour sliding over grey.
-        let steps = u32::from(WAVE_LEVELS - 1);
-        (away.min(WAVE_REACH) as u32 * steps / WAVE_REACH as u32) as u8
-    };
-    let mut out: Vec<Span<'static>> = Vec::new();
-    let mut run = String::new();
-    let mut at: Option<u8> = None;
-    for (i, ch) in chars.iter().enumerate() {
-        let here = level(i);
-        if at != Some(here) && !run.is_empty() {
-            let amount = f64::from(at.unwrap_or(0)) / f64::from(WAVE_LEVELS - 1) * WAVE_DEPTH;
-            out.push(Span::styled(
-                std::mem::take(&mut run),
-                Style::default().fg(theme::fade(colour, amount)),
-            ));
-        }
-        at = Some(here);
-        run.push(*ch);
-    }
-    if !run.is_empty() {
-        let amount = f64::from(at.unwrap_or(0)) / f64::from(WAVE_LEVELS - 1) * WAVE_DEPTH;
-        out.push(Span::styled(run, Style::default().fg(theme::fade(colour, amount))));
-    }
-    out
-}
-
-/// How many brightnesses the wave is drawn in. Few, so neighbours merge into one span.
-const WAVE_LEVELS: u8 = 4;
-/// How far from the crest the brightening reaches, in cells.
-const WAVE_REACH: usize = 6;
-/// How far the dimmest part of the wave sits toward the background. **Not all the way**: this is a
-/// line somebody is reading, and text that goes out is worse than text that does not move.
-const WAVE_DEPTH: f64 = 0.55;
-/// Extra travel past the end of the text, so a short title still has the crest leave and return.
-const WAVE_TAIL: usize = 8;
 
 /// The steps a pulse is quantised to. **Not smoother than this on purpose**: every distinct value
 /// is a rebuild of the card being worked on, and past a certain point the eye cannot tell anyway.
@@ -520,7 +420,7 @@ impl Cache {
             if skip == Some(seq) {
                 continue;
             }
-            let turn = Turn { running: live == Some(seq), pulse: turn.pulse, wave: turn.wave };
+            let turn = Turn { running: live == Some(seq), pulse: turn.pulse };
             // `affecting` is already exactly "(node, effective open)" for every node in this
             // item, so the click handler reads it from here rather than recomputing the rule.
             let now = affecting(item, folds, turn.running);
@@ -628,7 +528,7 @@ fn blank() -> Line<'static> {
 /// lockstep with `out`: **every** line pushed must push a link entry, empty unless the line's
 /// text came from a link.
 fn make(item: &Item, width: u16, folds: &Folds, turn: Turn, lang: crate::lang::Lang) -> Made {
-    let Turn { running, pulse, wave: crest } = turn;
+    let Turn { running, pulse } = turn;
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut links: Vec<Vec<crate::markdown::Link>> = Vec::new();
     let mut heads: Vec<(usize, i64)> = Vec::new();
@@ -761,11 +661,20 @@ fn make(item: &Item, width: u16, folds: &Folds, turn: Turn, lang: crate::lang::L
             // the thing they hang from. The fold marker goes on the end, where the tool rows put
             // theirs.
             let mut card = vec![Span::styled("✻ ", Style::default().fg(theme::topic()))];
-            // **The head waves only while the run is going.** It is the one line that says work is
-            // happening at all, and a finished card holding a moving title would say it still is —
-            // besides keeping the screen redrawing for a turn that ended.
+            // **The head pulses, it does not wave.** A wave moving a bright crest through the
+            // letters cost a handful of spans rebuilt on the frames the crest moved, and on a
+            // remote terminal that is exactly where the frame budget goes when tools are on
+            // screen. The web page this is modelled on fades the whole "Thinking…" as one thing
+            // (`zyris-pulse`), so this fades the whole head uniformly toward the background and
+            // back, driven by the same breath the waiting dots take. Only while the run is going:
+            // a finished card holding a moving title would say it still is, besides keeping the
+            // screen redrawing for a turn that ended.
             if running {
-                card.extend(wave(head, theme::text_heading(), crest as usize));
+                let amount = f64::from(pulse.min(PULSE_STEPS)) / f64::from(PULSE_STEPS);
+                card.push(Span::styled(
+                    head.to_string(),
+                    Style::default().fg(theme::fade(theme::text_heading(), amount)),
+                ));
             } else {
                 card.push(Span::styled(
                     head.to_string(),
@@ -1298,10 +1207,10 @@ mod tests {
             return Folds::new();
         };
         let mut f = Folds::new();
-        f.insert(*seq, Fold { open: true, user_touched: true, ..Fold::default() });
+        f.insert(*seq, Fold { open: true, user_touched: true });
         for p in parts {
             if let Part::Think(t) = p {
-                f.insert(t.seq, Fold { open: true, user_touched: true, ..Fold::default() });
+                f.insert(t.seq, Fold { open: true, user_touched: true });
             }
         }
         f
@@ -1310,7 +1219,7 @@ mod tests {
     /// Draws with the last card being worked on right now — the state most of these assertions are
     /// about, since a finished stretch folds itself away.
     fn live(items: &[Item], width: u16, folds: &Folds, lang: crate::lang::Lang) -> Rendered {
-        rows_with(items, width, folds, None, lang, Turn { running: true, pulse: 0, wave: 0 })
+        rows_with(items, width, folds, None, lang, Turn { running: true, pulse: 0 })
     }
 
     /// The first chip's fold key, so a test can open a single chip.
@@ -1327,64 +1236,48 @@ mod tests {
             .expect("the work item has no chip")
     }
 
+    /// **The head pulses as one thing, not as a wave.** The web page this is modelled on fades the
+    /// whole "Thinking…" (`zyris-pulse`); a crest travelling through the letters was a handful of
+    /// spans rebuilt whenever it moved, which is exactly where the frame budget went while tools
+    /// were on screen. So the running head's title is a single span whose whole colour drifts
+    /// toward the background and back with `pulse`, and every letter moves together.
+    #[test]
+    fn the_running_head_fades_whole_and_together() {
+        let items = [Item::Work { seq: 1, title: "생각하는 중".into(), parts: vec![] }];
+        let head = |pulse: u8| {
+            let out = rows_with(
+                &items,
+                40,
+                &Folds::new(),
+                None,
+                crate::lang::Lang::Ko,
+                Turn { running: true, pulse },
+            );
+            let line = &out.lines[0];
+            // The title span is the one that says the title; the ✻ and ▾ either side are not the
+            // head being animated.
+            let title = line
+                .spans
+                .iter()
+                .find(|s| s.content.contains("생각"))
+                .expect("the head carries its title");
+            assert!(
+                line.spans.iter().filter(|s| s.content.contains("생각")).count() == 1,
+                "the title must be one span, not a wave: {line:?}",
+            );
+            title.style.fg.expect("the head has a colour")
+        };
+        assert_eq!(head(0), crate::theme::text_heading(), "at full colour it is the heading");
+        let faded = head(crate::rows::PULSE_STEPS / 2);
+        assert_ne!(faded, crate::theme::text_heading(), "mid-breath it must have receded");
+        assert_eq!(faded, crate::theme::fade(crate::theme::text_heading(), 0.5), "{faded:?}");
+    }
+
     /// **A folded chip hides thinking, not what was done.** Tool use is part of the flow; buried
-    /// **A wave is brightness travelling through letters that stay put.** There is nothing else to
-    /// move on a terminal. What has to hold is that it says the same text, that the crest is
-    /// somewhere different a moment later, and that it costs few enough spans to send.
-    #[test]
-    fn the_head_waves_without_moving_its_letters() {
-        let text = "생각하는 중…";
-        let at = |phase| {
-            wave(text, crate::theme::text_heading(), phase)
-                .iter()
-                .map(|s| s.content.to_string())
-                .collect::<String>()
-        };
-        assert_eq!(at(0), text, "the wave changed the words");
-        assert_eq!(at(7), text, "and it still has to, further along");
-
-        // The colours have to differ somewhere, or nothing is moving.
-        let colours = |phase| {
-            wave(text, crate::theme::text_heading(), phase)
-                .iter()
-                .map(|s| (s.content.chars().count(), s.style.fg))
-                .collect::<Vec<_>>()
-        };
-        assert_ne!(colours(0), colours(4), "the crest did not travel");
-
-        // **And it comes back round.** A title shorter than the wave's reach would otherwise sit
-        // at one brightness forever once the crest ran off the end.
-        let span = text.chars().count() + WAVE_TAIL;
-        assert_eq!(colours(3), colours(3 + span), "the wave does not repeat");
-    }
-
-    /// **Runs of one brightness are merged.** A colour escape per cell per frame is the most
-    /// expensive thing that could be on screen for the least, and this line is redrawn constantly
-    /// while a turn runs — on a remote terminal that is what the frame budget is spent on.
-    #[test]
-    fn a_wave_costs_a_handful_of_spans_not_one_per_letter() {
-        let text = "노드 재시도 및 커밋 시도";
-        let letters = text.chars().count();
-        for phase in 0..24 {
-            let spans = wave(text, crate::theme::text_heading(), phase).len();
-            assert!(spans <= WAVE_LEVELS as usize * 2 + 1, "{spans} spans at phase {phase}");
-            assert!(spans < letters, "one span per letter at phase {phase}");
-        }
-    }
-
-    /// Nothing to wave is not a panic.
-    #[test]
-    fn an_empty_head_waves_nothing() {
-        assert!(wave("", crate::theme::text_heading(), 3).is_empty());
-    }
-
     /// under a fold the person can't tell what the agent is doing.
     #[test]
     fn a_folded_chip_hides_thinking_but_shows_tools() {
-        let shut = Folds::from([(
-            chip_key(&work()),
-            Fold { open: false, user_touched: true, ..Fold::default() },
-        )]);
+        let shut = Folds::from([(chip_key(&work()), Fold { open: false, user_touched: true })]);
         let out = plain(&live(&[work()], 40, &shut, crate::lang::Lang::Ko));
         assert!(out[0].contains("스크롤 계산 위치를 찾는 중"), "no card head: {out:?}");
         assert!(out.iter().any(|l| l.contains("먼저 구조를 본다")), "no chip title: {out:?}");
@@ -1652,10 +1545,7 @@ mod tests {
     #[test]
     fn the_cache_draws_exactly_what_the_plain_path_draws() {
         let items = mixed();
-        for folds in [
-            Folds::new(),
-            Folds::from([(2, Fold { open: true, user_touched: true, ..Fold::default() })]),
-        ] {
+        for folds in [Folds::new(), Folds::from([(2, Fold { open: true, user_touched: true })])] {
             let want = rows(&items, 40, &folds, crate::lang::Lang::Ko);
             let mut cache = Cache::new();
             cache.layout(
@@ -1663,7 +1553,7 @@ mod tests {
                 40,
                 &folds,
                 None,
-                Turn { running: false, pulse: 0, wave: 0 },
+                Turn { running: false, pulse: 0 },
                 crate::lang::Lang::Ko,
             );
 
@@ -1686,7 +1576,7 @@ mod tests {
             40,
             &folds,
             None,
-            Turn { running: false, pulse: 0, wave: 0 },
+            Turn { running: false, pulse: 0 },
             crate::lang::Lang::Ko,
         );
         for (from, to) in [(0usize, 3usize), (2, 5), (1, cache.total()), (0, cache.total())] {
@@ -1713,7 +1603,7 @@ mod tests {
             40,
             &folds,
             None,
-            Turn { running: false, pulse: 0, wave: 0 },
+            Turn { running: false, pulse: 0 },
             crate::lang::Lang::Ko,
         );
         let first = cache.renders();
@@ -1724,7 +1614,7 @@ mod tests {
             40,
             &folds,
             None,
-            Turn { running: false, pulse: 0, wave: 0 },
+            Turn { running: false, pulse: 0 },
             crate::lang::Lang::Ko,
         );
         assert_eq!(cache.renders(), first, "unchanged, not a single row is drawn again");
@@ -1738,7 +1628,7 @@ mod tests {
             40,
             &folds,
             None,
-            Turn { running: false, pulse: 0, wave: 0 },
+            Turn { running: false, pulse: 0 },
             crate::lang::Lang::Ko,
         );
         assert_eq!(cache.renders(), first + 1, "only the changed one is drawn again");
@@ -1757,20 +1647,20 @@ mod tests {
             40,
             &Folds::new(),
             None,
-            Turn { running: false, pulse: 0, wave: 0 },
+            Turn { running: false, pulse: 0 },
             crate::lang::Lang::Ko,
         );
         let before = cache.renders();
 
         let chip = chip_key(&items[1]);
-        let open = Fold { open: true, user_touched: true, ..Fold::default() };
+        let open = Fold { open: true, user_touched: true };
         let opened = Folds::from([(chip, open), (items[1].seq(), open)]);
         cache.layout(
             &items,
             40,
             &opened,
             None,
-            Turn { running: false, pulse: 0, wave: 0 },
+            Turn { running: false, pulse: 0 },
             crate::lang::Lang::Ko,
         );
         assert_eq!(cache.renders(), before + 1, "only the card holding that chip is drawn again");
@@ -1791,7 +1681,7 @@ mod tests {
             40,
             &folds,
             None,
-            Turn { running: false, pulse: 0, wave: 0 },
+            Turn { running: false, pulse: 0 },
             crate::lang::Lang::Ko,
         );
         let before = cache.renders();
@@ -1801,7 +1691,7 @@ mod tests {
             80,
             &folds,
             None,
-            Turn { running: false, pulse: 0, wave: 0 },
+            Turn { running: false, pulse: 0 },
             crate::lang::Lang::Ko,
         );
         assert_eq!(cache.renders(), before + items.len() as u64);
@@ -1827,7 +1717,7 @@ mod tests {
             40,
             &Folds::new(),
             Some(2),
-            Turn { running: false, pulse: 0, wave: 0 },
+            Turn { running: false, pulse: 0 },
             crate::lang::Lang::Ko,
         );
         assert!(
@@ -1841,7 +1731,7 @@ mod tests {
             40,
             &Folds::new(),
             None,
-            Turn { running: false, pulse: 0, wave: 0 },
+            Turn { running: false, pulse: 0 },
             crate::lang::Lang::Ko,
         );
         assert!(
@@ -1868,7 +1758,7 @@ mod tests {
         );
 
         let mut both = card_open.clone();
-        both.insert(100, Fold { open: true, user_touched: true, ..Fold::default() });
+        both.insert(100, Fold { open: true, user_touched: true });
         let open = plain(&rows(&items, 60, &both, crate::lang::Lang::Ko));
         assert!(open.iter().any(|l| l.contains("인자")), "the detail is not shown: {open:?}");
         assert!(open.iter().any(|l| l.contains("viewport")), "{open:?}");
@@ -1899,7 +1789,7 @@ mod tests {
     #[test]
     fn a_folded_card_has_nothing_clickable_inside_it() {
         let items = [work_at(1)];
-        let folds = Folds::from([(1, Fold { open: false, user_touched: true, ..Fold::default() })]);
+        let folds = Folds::from([(1, Fold { open: false, user_touched: true })]);
         let r = rows(&items, 60, &folds, crate::lang::Lang::Ko);
         let by_seq: Vec<i64> = r.cards.values().copied().collect();
         assert_eq!(by_seq, vec![1], "only the card head is clickable when it is folded");
@@ -1911,8 +1801,8 @@ mod tests {
     fn a_folded_card_hides_open_tool_details() {
         let items = [work_at(1)];
         let folds = Folds::from([
-            (1, Fold { open: false, user_touched: true, ..Fold::default() }),
-            (100, Fold { open: true, user_touched: true, ..Fold::default() }),
+            (1, Fold { open: false, user_touched: true }),
+            (100, Fold { open: true, user_touched: true }),
         ]);
         let out = plain(&rows(&items, 60, &folds, crate::lang::Lang::Ko));
         assert!(!out.iter().any(|l| l.contains("grep")), "a folded card hides its rows: {out:?}");
@@ -2117,19 +2007,19 @@ mod tests {
             60,
             &card_open,
             None,
-            Turn { running: false, pulse: 0, wave: 0 },
+            Turn { running: false, pulse: 0 },
             crate::lang::Lang::Ko,
         );
         let before = cache.renders();
 
         let mut both = card_open.clone();
-        both.insert(100, Fold { open: true, user_touched: true, ..Fold::default() });
+        both.insert(100, Fold { open: true, user_touched: true });
         cache.layout(
             &items,
             60,
             &both,
             None,
-            Turn { running: false, pulse: 0, wave: 0 },
+            Turn { running: false, pulse: 0 },
             crate::lang::Lang::Ko,
         );
         assert_eq!(cache.renders(), before + 1, "a tool was unfolded but nothing was redrawn");
@@ -2243,9 +2133,9 @@ mod tests {
     #[test]
     fn the_card_head_still_says_whether_it_is_folded() {
         let items = [work_at(1)];
-        let open = Folds::from([(1, Fold { open: true, user_touched: true, ..Fold::default() })]);
+        let open = Folds::from([(1, Fold { open: true, user_touched: true })]);
         assert!(plain(&rows(&items, 78, &open, crate::lang::Lang::Ko))[0].ends_with('▾'));
-        let shut = Folds::from([(1, Fold { open: false, user_touched: true, ..Fold::default() })]);
+        let shut = Folds::from([(1, Fold { open: false, user_touched: true })]);
         assert!(plain(&rows(&items, 78, &shut, crate::lang::Lang::Ko))[0].ends_with('▸'));
     }
 
@@ -2264,7 +2154,7 @@ mod tests {
             &Folds::new(),
             None,
             crate::lang::Lang::Ko,
-            Turn { running: true, pulse: 0, wave: 0 },
+            Turn { running: true, pulse: 0 },
         ))
         .remove(0);
         assert!(running.contains("보고서 작성 중"), "{running:?}");
@@ -2288,7 +2178,7 @@ mod tests {
             &Folds::new(),
             None,
             crate::lang::Lang::Ko,
-            Turn { running: true, pulse: 0, wave: 0 },
+            Turn { running: true, pulse: 0 },
         ));
         assert_eq!(out[0].trim_end_matches([' ', '▾']), "✻ 결과를 보고 중", "{out:?}");
     }
@@ -2307,7 +2197,7 @@ mod tests {
                 60,
                 &Folds::new(),
                 None,
-                Turn { running, pulse: 0, wave: 0 },
+                Turn { running, pulse: 0 },
                 crate::lang::Lang::Ko,
             );
             cache.plain()
@@ -2337,12 +2227,8 @@ mod tests {
     #[test]
     fn a_user_opened_chip_stays_open() {
         let items = [work_at(1)];
-        let mut folds =
-            Folds::from([(1, Fold { open: true, user_touched: true, ..Fold::default() })]);
-        folds.insert(
-            chip_key(&items[0]),
-            Fold { open: true, user_touched: true, ..Fold::default() },
-        );
+        let mut folds = Folds::from([(1, Fold { open: true, user_touched: true })]);
+        folds.insert(chip_key(&items[0]), Fold { open: true, user_touched: true });
         let mut cache = Cache::new();
         cache.layout(&items, 60, &folds, None, Turn::default(), crate::lang::Lang::Ko);
         assert!(cache.plain().iter().any(|l| l.contains('┊')), "{:?}", cache.plain());

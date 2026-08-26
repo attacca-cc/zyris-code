@@ -927,14 +927,11 @@ fn clicking_a_work_card_toggles_it() {
         apply(s, &Action::Release);
     };
 
-    // **A running card draws open**, so the first click folds it — and `closing` is set, because
-    // a fold on its way out goes on being laid out while its body fades away.
+    // **A running card draws open**, so the first click folds it — and folding snaps shut now
+    // (the fade-out was what smeared a fade across the whole screen), so there is no `closing`
+    // state to wait on.
     click(&mut s, row);
-    assert_eq!(
-        s.folds[&seq],
-        Fold { open: false, user_touched: true, closing: true },
-        "a click must fold it"
-    );
+    assert_eq!(s.folds[&seq], Fold { open: false, user_touched: true }, "a click must fold it");
     click(&mut s, row);
     assert!(s.folds[&seq].open, "clicking again must unfold it");
 }
@@ -1866,13 +1863,13 @@ fn state_with_edit_tool() -> State {
             plan: None,
         }),
     );
-    s.folds.insert(1, Fold { open: true, user_touched: true, ..Fold::default() });
+    s.folds.insert(1, Fold { open: true, user_touched: true });
     s
 }
 
 fn expand_the_tool_row(state: &mut State) {
     use zyris_code::rows::Fold;
-    state.folds.insert(2, Fold { open: true, user_touched: true, ..Fold::default() });
+    state.folds.insert(2, Fold { open: true, user_touched: true });
 }
 
 /// Even folded, how much changed must be visible.
@@ -2394,7 +2391,7 @@ fn show_a_work_card() {
     }
     let items = t.items().to_vec();
 
-    let open = Fold { open: true, user_touched: true, ..Fold::default() };
+    let open = Fold { open: true, user_touched: true };
     for keys in [vec![12], vec![10, 11, 12, 13, 14, 15]] {
         println!("─── 펼친 것: {keys:?} ───");
         let folds: Folds = keys.into_iter().map(|k| (k, open)).collect();
