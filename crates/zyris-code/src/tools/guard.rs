@@ -581,6 +581,25 @@ mod tests {
         assert_eq!(call.params.to_json().unwrap().get("timeout_ms"), None);
     }
 
+    /// **And the gate is what says it.** `declare_limits` being right is half of it — the
+    /// descriptor that goes out is the one `Gate` builds, and a limit computed but never attached
+    /// leaves every caller on its own sixty seconds with nothing to show that anything was meant.
+    /// This is the half that a change to `Gate::descriptor` breaks, and the other test cannot see.
+    #[test]
+    fn the_gate_announces_the_limit_it_declares() {
+        let gate = Gate::new(
+            zyris_caps::TerminalServer(zyris_capkit::PtyTerminal::default()),
+            Bridge::new(),
+        );
+        let announced = gate.descriptor();
+        let exec = announced.tools.iter().find(|t| t.name == "exec").expect("exec is announced");
+        // Which limit is the environment's business; that there is one is this one's.
+        assert!(
+            exec.call_limit.is_some(),
+            "the gate announced exec with nothing said about its clock",
+        );
+    }
+
     /// **What is declared is what is enforced.** A caller is asked to wait for exactly as long as
     /// this node will let the command run, plus the time to send an answer back. Drift either way
     /// is a bug with a face: declared short, the caller gives up on an answer that is coming;
