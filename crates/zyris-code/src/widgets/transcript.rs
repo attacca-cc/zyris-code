@@ -11,8 +11,8 @@ use crate::app::State;
 use crate::markdown::display_width;
 use std::collections::HashMap;
 
-/// Where in the breath a waiting dot is at `ms`, in the whole steps [`crate::rows::Turn::pulse`]
-/// takes — 0 at full colour, [`crate::rows::PULSE_STEPS`] at the background.
+/// How far toward the background the breath has gone at `ms` — `0.0` at full colour, [`DEEPEST`]
+/// at its faintest.
 ///
 /// **A triangle, not a square.** The dot used to be on for half a second and off for the next,
 /// which reads as flicker and pulls the eye away from the words being read; going out and coming
@@ -22,16 +22,25 @@ use std::collections::HashMap;
 /// **It never goes all the way out.** A dot that disappears reads as one that finished, and half of
 /// what this is for is saying that something is still waiting.
 ///
+/// **Not quantised.** It used to come back in sixteenths, because the value was baked into a
+/// cached line and every distinct one cost a rebuild. Eleven steps over the sixteen frames of a
+/// half-period is 0.6875 of a step per frame, so the increments ran `0,1,1,1,0,1,0,1,1,…` — a limp
+/// that no frame rate could smooth, since raising it only added frames that repeated the value.
+/// The fade is applied to the drawn copy now and costs nothing, so it can simply be continuous.
+///
 /// Pure and taking its own clock, so a test can walk it rather than sleep through it.
-pub fn pulse_at(ms: u64) -> u8 {
+pub fn breath_at(ms: u64) -> f64 {
     const PERIOD_MS: u64 = 1600;
-    const DEEPEST: u32 = 11; // of PULSE_STEPS — far enough to read as receding, not as gone.
     let half = PERIOD_MS / 2;
     let into = ms % PERIOD_MS;
     // Out for the first half of the period, back for the second.
     let travelled = if into < half { into } else { PERIOD_MS - into };
-    ((travelled as u32 * DEEPEST) / half as u32) as u8
+    travelled as f64 / half as f64 * DEEPEST
 }
+
+/// How far toward the background the faintest part of the breath sits. **Not all the way**: this
+/// is a line somebody is reading, and text that goes out is worse than text that does not move.
+pub const DEEPEST: f64 = 0.6875;
 
 /// Which line a node's head sits on, if it is on screen at all.
 pub fn head_of(heads: &HashMap<usize, i64>, seq: i64) -> Option<usize> {
@@ -96,12 +105,13 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut State) {
     // The question being answered in the panel below is not drawn again inside the conversation.
     let skip = state.asking.as_ref().map(|(seq, _)| *seq);
 
-    // **Driven by the frame counter, not by the clock.** Wall time and the frame rate do not
-    // divide into each other, so a wall-clock animation lands a different distance on each drawn
-    // frame. `State.tick` is what everything else that moves here already uses, and it also keeps
-    // this side free of a clock read per frame.
-    let now_ms = state.tick.saturating_mul(state.frame_ms);
-    let pulse = pulse_at(now_ms);
+    // **Driven by the clock, not by the frame counter.** `State.tick` counts timer fires, and a
+    // fire is not a draw: the streaming gate drops some, a keystroke and the healing repaint draw
+    // extra ones at the same tick, and a stalled loop fires several back to back. Multiplying that
+    // count by the nominal frame length is fictional time, and the eye reads the difference as the
+    // breath speeding up and stalling. Where the breath actually is depends on nothing but how
+    // long the turn has been going.
+    let breath = if state.running { breath_at(state.breath_ms()) } else { 0.0 };
 
     // **What the viewport was looking at, taken before the relayout.** `Scroll.top` is an
     // absolute line index and `layout` rebuilds the line list from scratch, so a width change or
@@ -115,7 +125,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut State) {
     {
         // Borrow the fields separately — `timeline` and `rows_cache` must be held at the same time.
         let State { timeline, rows_cache, folds, running, lang, .. } = &mut *state;
-        let turn = crate::rows::Turn { running: *running, pulse };
+        let turn = crate::rows::Turn { running: *running };
         rows_cache.layout(timeline.items(), area.width, folds, skip, turn, *lang);
     }
 
@@ -159,6 +169,23 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut State) {
         for line in body.start.max(start)..body.end.min(end) {
             if let Some(row) = shown.get_mut(line - start) {
                 *row = faded(std::mem::take(row), amount);
+            }
+        }
+    }
+    // **The breath, applied to the copies rather than baked into the cache.** This is the whole
+    // reason it moves: a card is rebuilt only when its content changes, so a head coloured at
+    // build time stood perfectly still through a silent tool call and then lurched the moment
+    // output arrived. Here it costs one span rewrite per breathing thing per frame, and it lands
+    // wherever the clock says regardless of what was rebuilt.
+    if breath > 0.0 {
+        for (row, span) in state.rows_cache.breathing() {
+            if *row < start || *row >= end {
+                continue;
+            }
+            let Some(line) = shown.get_mut(row - start) else { continue };
+            let Some(target) = line.spans.get_mut(*span) else { continue };
+            if let Some(colour) = target.style.fg {
+                target.style = target.style.fg(crate::theme::fade(colour, breath));
             }
         }
     }
@@ -207,23 +234,34 @@ mod tests {
     /// values, and that hard on/off is what pulled the eye off the words being read.
     #[test]
     fn a_waiting_dot_fades_out_and_back_rather_than_switching() {
-        let seen: Vec<u8> = (0..1600).step_by(50).map(pulse_at).collect();
-        let deepest = *seen.iter().max().expect("a period has samples");
-        assert!(seen.iter().collect::<std::collections::HashSet<_>>().len() > 4, "{seen:?}");
-        assert_eq!(pulse_at(0), 0, "the period starts at full colour");
-        assert_eq!(pulse_at(800), deepest, "the middle of the period is the deepest");
-        assert_eq!(pulse_at(1600), 0, "and it comes back to where it started");
+        assert_eq!(breath_at(0), 0.0, "the period starts at full colour");
+        assert_eq!(breath_at(800), DEEPEST, "the middle of the period is the deepest");
+        assert_eq!(breath_at(1600), 0.0, "and it comes back to where it started");
 
         // **Never all the way to the background.** A dot that vanishes reads as one that finished,
         // and saying something is still waiting is the whole job.
-        assert!(deepest < crate::rows::PULSE_STEPS, "the dot goes out entirely: {deepest}");
+        assert!(breath_at(800) < 1.0, "the dot goes out entirely: {DEEPEST}");
+    }
+
+    /// **Every frame moves it, at any frame rate.** The value used to come back in sixteenths, so
+    /// eleven steps had to cover the sixteen frames of a half-period — 0.6875 of a step each,
+    /// which is an irregular run of holds and moves that reads as a limp however fast frames come.
+    /// Raising the rate made it worse: at 60fps, four frames in five repeated the one before.
+    #[test]
+    fn no_two_frames_in_a_row_land_on_the_same_breath() {
+        for frame_ms in [50u64, 33, 16] {
+            let seen: Vec<f64> = (0..1600).step_by(frame_ms as usize).map(breath_at).collect();
+            for pair in seen.windows(2) {
+                assert_ne!(pair[0], pair[1], "the breath stood still at {frame_ms}ms: {seen:?}");
+            }
+        }
     }
 
     /// It repeats, so a long wait looks the same at the end as at the start.
     #[test]
     fn the_breath_repeats() {
         for ms in [0u64, 137, 799, 1200] {
-            assert_eq!(pulse_at(ms), pulse_at(ms + 1600), "the period does not close at {ms}");
+            assert_eq!(breath_at(ms), breath_at(ms + 1600), "the period does not close at {ms}");
         }
     }
 

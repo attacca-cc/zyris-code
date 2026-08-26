@@ -883,6 +883,50 @@ fn the_status_bar_names_the_mode_it_is_in() {
     }
 }
 
+/// **The breath moves on a frame that rebuilt nothing.** This is the whole of the reported freeze.
+/// The fade used to be written into the cached line, and a card is rebuilt only when its own
+/// content changes — so through a silent tool call, with no output to change anything, the head
+/// kept exactly the colour it was built with and then jumped the moment the tool answered. Here
+/// the clock moves and nothing else does, and the head has to have moved with it.
+#[test]
+fn the_head_keeps_breathing_while_nothing_else_changes() {
+    let mut s = State::new();
+    apply(
+        &mut s,
+        &Action::Frame(AppFrame::Event {
+            cursor: 1,
+            entry: Some(Entry { seq: 1, kind: EntryKind::WorkStart("빌드하는 중".into()) }),
+            todo: None,
+            plan: None,
+        }),
+    );
+    apply(&mut s, &Action::Frame(AppFrame::Status { running: true }));
+
+    // Where the head's title starts. Drawn once so the widget has recorded its coordinates.
+    let screen = dump(&mut s, 60, 12);
+    let row = screen
+        .lines()
+        .position(|l| l.contains("빌드하는 중"))
+        .expect("the card head must be on screen") as u16;
+    let col = screen.lines().nth(row as usize).unwrap().find('빌').expect("the title") as u16;
+
+    let at = |s: &mut State, ms: u64| {
+        // Only the clock moves. The timeline, the folds and the running flag are untouched, so
+        // the cache has nothing to rebuild — which is exactly the case that used to stand still.
+        s.breath_origin = std::time::Instant::now() - std::time::Duration::from_millis(ms);
+        let mut term = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        term.draw(|f| widgets::draw(f, s)).unwrap();
+        term.backend().buffer()[(col, row)].style().fg
+    };
+
+    let full = at(&mut s, 0);
+    let deep = at(&mut s, 800);
+    assert!(full.is_some(), "the head must be coloured at all");
+    assert_ne!(full, deep, "the head stood still through a frame that rebuilt nothing");
+    // And it comes back, so a long wait does not end up at a colour it never leaves.
+    assert_eq!(full, at(&mut s, 1600), "the breath does not return to where it started");
+}
+
 /// Clicking a work card's head must fold and unfold it, and its reasoning chip must be a separate
 /// target. If the coordinate transform is off, the wrong line gets hit.
 #[test]

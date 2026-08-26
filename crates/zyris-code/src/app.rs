@@ -535,7 +535,20 @@ pub struct State {
     ///
     /// It is a frame count rather than a clock so that **tests do not have to wait on
     /// time.** It keeps the drawing side pure.
+    ///
+    /// **The breath does not use it** — see [`State::breath_ms`]. A tick is a timer fire, not a
+    /// drawn frame, and the two are not the same count in either direction.
     pub tick: u64,
+    /// Where the breath is measured from.
+    ///
+    /// **A clock, because a frame count is not one.** `tick` counts timer fires: the streaming
+    /// gate drops some of them without drawing, a keystroke and the healing repaint draw extra
+    /// frames at an unchanged tick, and a stalled loop fires several back to back. An animation
+    /// stepped by that count runs at a tempo that has nothing to do with time, which is what a
+    /// person sees as it stalling and then rushing.
+    ///
+    /// A test picks a phase by moving this back rather than by sleeping.
+    pub breath_origin: Instant,
     /// What the tools resolve relative paths against. The screen has to show it, or there is
     /// no telling which repo the `src/app.rs` on a tool line belongs to.
     pub cwd: std::path::PathBuf,
@@ -690,6 +703,7 @@ impl Default for State {
             usage: crate::usage::Usage::default(),
             title: "Zyris Code".into(),
             tick: 0,
+            breath_origin: Instant::now(),
             // Must be **the same place** the tools use. `tools::working_dir` is the one
             // definition.
             cwd: crate::tools::working_dir(),
@@ -921,6 +935,15 @@ impl State {
                 self.opened_at.remove(&child);
             }
         }
+    }
+
+    /// How far into the breath the drawing side is, in milliseconds.
+    ///
+    /// **Read at draw time, from a clock.** Where the breath is depends on nothing but how long it
+    /// has been going; which frames were drawn along the way is the drawing side's business and
+    /// must not change the tempo.
+    pub fn breath_ms(&self) -> u64 {
+        self.breath_origin.elapsed().as_millis() as u64
     }
 
     /// Ends the fades that have run their course, and collapses what was waiting on one.
@@ -3543,6 +3566,11 @@ async fn run_inner(
     let frame = frame_interval();
     state.frame_ms = frame.as_millis().max(1) as u64;
     let mut ticker = tokio::time::interval(frame);
+    // **A missed frame is missed, not owed.** The default is to fire the skipped ticks back to
+    // back, so any stall — a send over the wire, a slow draw over SSH, the healing repaint — is
+    // followed by a burst of frames a millisecond apart. They draw the same picture as each other
+    // and nobody sees them; what a person does see is the pause that came before.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_size: Option<(u16, u16)> = None;
     let mut dirty = true;
 
@@ -3745,6 +3773,11 @@ async fn run_inner(
     let frame = frame_interval();
     state.frame_ms = frame.as_millis().max(1) as u64;
     let mut ticker = tokio::time::interval(frame);
+    // **A missed frame is missed, not owed.** The default is to fire the skipped ticks back to
+    // back, so any stall — a send over the wire, a slow draw over SSH, the healing repaint — is
+    // followed by a burst of frames a millisecond apart. They draw the same picture as each other
+    // and nobody sees them; what a person does see is the pause that came before.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut poll = tokio::time::interval(POLL_INTERVAL);
     let mut git = tokio::time::interval(git_every.unwrap_or(Duration::from_secs(86400)));
     let mut pull = tokio::time::interval(pull_every.unwrap_or(Duration::from_secs(86400)));
@@ -4261,10 +4294,11 @@ async fn run_inner(
                 // chunk is 3.4KB, so twenty a second is the heaviest thing for a remote terminal —
                 // ten or twenty looks the same to the eye but halves the volume out.
                 //
-                // **The animation is not that, and must not be held with it.** A frame where only
-                // the crest moved is the few cells it moved across; holding those back cut the
-                // wave to ten frames a second, on top of it stepping unevenly, and it looked
-                // exactly as bad as that sounds (reported 2026-08-18).
+                // **Only a frame that carries content is held.** While the agent is thinking
+                // with nothing to send, `content` is false and the breath gets every frame; while
+                // it is streaming, the breath rides along at whatever rate the content is drawn.
+                // Coarser, but even — and it is the drawing that costs, not the breath, which is
+                // one span rewritten on a copy that was about to be drawn anyway.
                 let held = content && state.running && last_draw.elapsed() < STREAM_MIN_GAP;
                 if dirty && !held {
                     terminal.draw(|f| widgets::draw(f, &mut state))?;

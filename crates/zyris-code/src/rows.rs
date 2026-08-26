@@ -141,25 +141,22 @@ const CHIP_TITLE_FLOOR: usize = 20;
 
 pub type Folds = HashMap<i64, Fold>;
 
+/// Which span of a tool row carries the status dot: the indent comes first, the dot second.
+const DOT_SPAN: usize = 1;
+
 /// What the turn is doing right now, as far as drawing is concerned.
 ///
-/// **Two values that always travel together.** `running` decides whether cards and chips are open
-/// (see [`effective_open`]) and `pulse` is how far a waiting tool's dot has receded; splitting them
-/// across signatures only made every layer carry two more parameters.
+/// **The breath is not in here, and that is the point.** It used to carry a quantised `pulse` that
+/// `make` baked into the head's colour — which meant the animation only moved when a card was
+/// rebuilt, and a card is rebuilt only when its *content* changes. A silent wait on a tool
+/// therefore froze the head completely, and a streaming answer sampled the breath at whatever
+/// phase each delta happened to land on. What breathes is now marked here and coloured at draw
+/// time (`Made::breathing`, `widgets::transcript`), so it costs no rebuild at all and lands on
+/// real time whenever the frame is drawn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Turn {
     pub running: bool,
-    /// How far toward the background a waiting dot is drawn, in sixteenths — 0 is full colour and
-    /// 16 is invisible. **A number rather than the flag it replaced**: on and off is a hard flicker
-    /// that pulls the eye off what is being read, and the page this app is modelled on breathes the
-    /// colour instead. Held in whole steps so it can be compared, which is what the row cache needs
-    /// to decide whether a card has to be built again.
-    pub pulse: u8,
 }
-
-/// The steps a pulse is quantised to. **Not smoother than this on purpose**: every distinct value
-/// is a rebuild of the card being worked on, and past a certain point the eye cannot tell anyway.
-pub const PULSE_STEPS: u8 = 16;
 
 /// The rendered result. Along with the lines it gives **which line is the head of which work card**.
 ///
@@ -172,6 +169,8 @@ pub struct Rendered {
     pub cards: HashMap<usize, i64>,
     /// The links on each line, in that line's display columns.
     pub links: Vec<Vec<crate::markdown::Link>>,
+    /// `(row, span)` of everything drawn breathing — see [`Made::breathing`].
+    pub breathing: Vec<(usize, usize)>,
 }
 
 impl Rendered {
@@ -210,6 +209,7 @@ pub fn rows_with(
         lines: cache.window(0, total),
         cards: cache.cards().clone(),
         links: cache.window_links(0, total),
+        breathing: cache.breathing().to_vec(),
     }
 }
 
@@ -224,6 +224,13 @@ struct Made {
     /// There's one work-card head, plus one per tool row inside it —
     /// **each tool unfolds separately.**
     heads: Vec<(usize, i64)>,
+    /// `(which line within this item, which span within that line)` for every span whose colour
+    /// breathes — the head of the card being worked on, and the dot of a tool still waiting.
+    ///
+    /// **Marked rather than coloured.** The colour is applied to the copies the window hands out
+    /// (`widgets::transcript`), so the cached line keeps its full colour and the breath needs no
+    /// rebuild — which is what makes it move while nothing else does.
+    breathing: Vec<(usize, usize)>,
 }
 
 /// Every fold state that affects how this item is drawn. The cache comparison looks at this.
@@ -320,6 +327,8 @@ pub struct Cache {
     slots: Vec<Slot>,
     total: usize,
     cards: HashMap<usize, i64>,
+    /// `(row, span)` of every span drawn breathing, in absolute line numbers.
+    breathing: Vec<(usize, usize)>,
     /// The **effective** open state of every node that has a head, as it was last drawn.
     ///
     /// A click toggles from what is on screen, not from what is stored. A card with no fold state
@@ -346,6 +355,15 @@ impl Cache {
 
     pub fn cards(&self) -> &HashMap<usize, i64> {
         &self.cards
+    }
+
+    /// Every span whose colour breathes, in absolute `(row, span)`.
+    ///
+    /// **The one thing about the drawing that is not in the cached line.** The fade is applied to
+    /// the copies `window` hands out, so a frame where only the breath moved rebuilds nothing —
+    /// and, more to the point, the breath keeps moving on frames where nothing was rebuilt.
+    pub fn breathing(&self) -> &[(usize, usize)] {
+        &self.breathing
     }
 
     /// Where the item holding `line` stops — the line after its last.
@@ -408,6 +426,7 @@ impl Cache {
         }
         self.slots.clear();
         self.cards.clear();
+        self.breathing.clear();
         self.open.clear();
 
         // **Only one card is running: the one at the end.** Passing the turn's flag to every card
@@ -420,7 +439,7 @@ impl Cache {
             if skip == Some(seq) {
                 continue;
             }
-            let turn = Turn { running: live == Some(seq), pulse: turn.pulse };
+            let turn = Turn { running: live == Some(seq) };
             // `affecting` is already exactly "(node, effective open)" for every node in this
             // item, so the click handler reads it from here rather than recomputing the rule.
             let now = affecting(item, folds, turn.running);
@@ -440,6 +459,9 @@ impl Cache {
             pos = slot.end();
             for (rel, at) in &made.heads {
                 self.cards.insert(slot.first_line() + rel, *at);
+            }
+            for (rel, span) in &made.breathing {
+                self.breathing.push((slot.first_line() + rel, *span));
             }
             self.slots.push(slot);
         }
@@ -528,10 +550,11 @@ fn blank() -> Line<'static> {
 /// lockstep with `out`: **every** line pushed must push a link entry, empty unless the line's
 /// text came from a link.
 fn make(item: &Item, width: u16, folds: &Folds, turn: Turn, lang: crate::lang::Lang) -> Made {
-    let Turn { running, pulse } = turn;
+    let Turn { running } = turn;
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut links: Vec<Vec<crate::markdown::Link>> = Vec::new();
     let mut heads: Vec<(usize, i64)> = Vec::new();
+    let mut breathing: Vec<(usize, usize)> = Vec::new();
     match item {
         Item::User { text, .. } => {
             for (i, raw) in text.lines().enumerate() {
@@ -661,20 +684,19 @@ fn make(item: &Item, width: u16, folds: &Folds, turn: Turn, lang: crate::lang::L
             // the thing they hang from. The fold marker goes on the end, where the tool rows put
             // theirs.
             let mut card = vec![Span::styled("✻ ", Style::default().fg(theme::topic()))];
-            // **The head pulses, it does not wave.** A wave moving a bright crest through the
-            // letters cost a handful of spans rebuilt on the frames the crest moved, and on a
-            // remote terminal that is exactly where the frame budget goes when tools are on
-            // screen. The web page this is modelled on fades the whole "Thinking…" as one thing
-            // (`zyris-pulse`), so this fades the whole head uniformly toward the background and
-            // back, driven by the same breath the waiting dots take. Only while the run is going:
-            // a finished card holding a moving title would say it still is, besides keeping the
-            // screen redrawing for a turn that ended.
+            // **The head breathes as one thing, and it is coloured elsewhere.** The whole title
+            // fades toward the background and back — the page this is modelled on does the same
+            // to its "Thinking…" (`zyris-pulse`), and a bright crest travelling through the
+            // letters was rebuilt spans on every frame it moved. It is written here at full
+            // colour and marked: the fade lands on the drawn copy, so it moves on a frame where
+            // nothing else did. Only while the run goes — a finished card whose title kept
+            // moving would say it still is.
             if running {
-                let amount = f64::from(pulse.min(PULSE_STEPS)) / f64::from(PULSE_STEPS);
                 card.push(Span::styled(
                     head.to_string(),
-                    Style::default().fg(theme::fade(theme::text_heading(), amount)),
+                    Style::default().fg(theme::text_heading()),
                 ));
+                breathing.push((out.len(), card.len() - 1));
             } else {
                 card.push(Span::styled(
                     head.to_string(),
@@ -698,7 +720,7 @@ fn make(item: &Item, width: u16, folds: &Folds, turn: Turn, lang: crate::lang::L
             out.push(Line::from(card));
             links.push(Vec::new());
             if !card_open {
-                return Made { lines: out, links, heads };
+                return Made { lines: out, links, heads, breathing };
             }
 
             // ── Children, in arrival order ───────────────────────────────────────────────────
@@ -754,7 +776,11 @@ fn make(item: &Item, width: u16, folds: &Folds, turn: Turn, lang: crate::lang::L
                     }
                     Part::Step(step) => {
                         let open = effective_open(NodeKind::Tool, &fold_of(folds, step.seq), false);
-                        let (rows, clickable) = tool_row(step, open, pulse, width, lang);
+                        let (rows, clickable, waiting) = tool_row(step, open, width, lang);
+                        // The dot sits on the row's first line, right after the indent.
+                        if waiting {
+                            breathing.push((out.len(), DOT_SPAN));
+                        }
                         if clickable {
                             heads.push((out.len(), step.seq));
                         }
@@ -765,7 +791,7 @@ fn make(item: &Item, width: u16, folds: &Folds, turn: Turn, lang: crate::lang::L
             }
         }
     }
-    Made { lines: out, links, heads }
+    Made { lines: out, links, heads, breathing }
 }
 
 /// One tool row: the status dot, the short name, what it was run against, how much it changed,
@@ -775,10 +801,9 @@ fn make(item: &Item, width: u16, folds: &Folds, turn: Turn, lang: crate::lang::L
 fn tool_row(
     step: &Step,
     open: bool,
-    pulse: u8,
     width: u16,
     lang: crate::lang::Lang,
-) -> (Vec<Line<'static>>, bool) {
+) -> (Vec<Line<'static>>, bool, bool) {
     use crate::tool_view::{Detail, ToolState};
     let mut out: Vec<Line<'static>> = Vec::new();
     let can_open = !matches!(step.detail, Detail::None);
@@ -788,11 +813,10 @@ fn tool_row(
     let dot = match step.state {
         ToolState::Failed => Span::styled("● ", Style::default().fg(theme::danger())),
         ToolState::Ok => Span::styled("● ", Style::default().fg(theme::success())),
-        ToolState::Pending => {
-            let amount = f64::from(pulse.min(PULSE_STEPS)) / f64::from(PULSE_STEPS);
-            Span::styled("● ", Style::default().fg(theme::fade(theme::warning(), amount)))
-        }
+        // Written at full colour and reported as breathing; the fade is applied to the drawn copy.
+        ToolState::Pending => Span::styled("● ", Style::default().fg(theme::warning())),
     };
+    let waiting = matches!(step.state, ToolState::Pending);
     let mut head = vec![
         pad(),
         dot,
@@ -823,7 +847,7 @@ fn tool_row(
     if open {
         out.extend(detail_lines(&step.detail, width, step.state, lang));
     }
-    (out, can_open)
+    (out, can_open, waiting)
 }
 
 /// The indent a tool's detail sits at. Deep enough to read as belonging to the row above,
@@ -1219,7 +1243,7 @@ mod tests {
     /// Draws with the last card being worked on right now — the state most of these assertions are
     /// about, since a finished stretch folds itself away.
     fn live(items: &[Item], width: u16, folds: &Folds, lang: crate::lang::Lang) -> Rendered {
-        rows_with(items, width, folds, None, lang, Turn { running: true, pulse: 0 })
+        rows_with(items, width, folds, None, lang, Turn { running: true })
     }
 
     /// The first chip's fold key, so a test can open a single chip.
@@ -1236,41 +1260,56 @@ mod tests {
             .expect("the work item has no chip")
     }
 
-    /// **The head pulses as one thing, not as a wave.** The web page this is modelled on fades the
-    /// whole "Thinking…" (`zyris-pulse`); a crest travelling through the letters was a handful of
-    /// spans rebuilt whenever it moved, which is exactly where the frame budget went while tools
-    /// were on screen. So the running head's title is a single span whose whole colour drifts
-    /// toward the background and back with `pulse`, and every letter moves together.
+    /// **The head breathes as one thing, and it is written at full colour.** The whole title
+    /// fades together — a crest travelling through the letters was a handful of spans rebuilt
+    /// every time it moved. What the layout does is name the span; the colour is applied to the
+    /// drawn copy, which is what lets it move on a frame that rebuilt nothing.
     #[test]
-    fn the_running_head_fades_whole_and_together() {
+    fn the_running_head_is_one_span_and_is_named_as_breathing() {
         let items = [Item::Work { seq: 1, title: "생각하는 중".into(), parts: vec![] }];
-        let head = |pulse: u8| {
-            let out = rows_with(
-                &items,
-                40,
-                &Folds::new(),
-                None,
-                crate::lang::Lang::Ko,
-                Turn { running: true, pulse },
-            );
-            let line = &out.lines[0];
-            // The title span is the one that says the title; the ✻ and ▾ either side are not the
-            // head being animated.
-            let title = line
-                .spans
-                .iter()
-                .find(|s| s.content.contains("생각"))
-                .expect("the head carries its title");
-            assert!(
-                line.spans.iter().filter(|s| s.content.contains("생각")).count() == 1,
-                "the title must be one span, not a wave: {line:?}",
-            );
-            title.style.fg.expect("the head has a colour")
+        let out = live(&items, 40, &Folds::new(), crate::lang::Lang::Ko);
+        let line = &out.lines[0];
+        assert_eq!(
+            line.spans.iter().filter(|s| s.content.contains("생각")).count(),
+            1,
+            "the title must be one span, not a wave: {line:?}",
+        );
+        let title = line.spans.iter().position(|s| s.content.contains("생각")).expect("the title");
+        assert_eq!(
+            line.spans[title].style.fg,
+            Some(crate::theme::text_heading()),
+            "the cached line keeps its full colour ‒ the fade belongs to the drawn copy",
+        );
+        assert!(
+            out.breathing.contains(&(0, title)),
+            "the head is not named as breathing, so nothing will ever fade it: {:?}",
+            out.breathing,
+        );
+    }
+
+    /// **A tool still waiting breathes; one that has answered does not.** The dot is the only
+    /// thing on that row saying whether the call has come back, and a dot that sat still through
+    /// a four-second wait was the whole of the reported "it freezes" — the row had nothing new to
+    /// say, so nothing redrew it, so the colour it was built with is the colour it kept.
+    #[test]
+    fn only_a_waiting_tool_has_a_dot_that_breathes() {
+        let waiting = |state| {
+            let mut step = step_at(100, "exec");
+            step.state = state;
+            let item =
+                Item::Work { seq: 1, title: "빌드 중".into(), parts: vec![Part::Step(step)] };
+            let out = live(&[item], 60, &Folds::new(), crate::lang::Lang::Ko);
+            // Which row the tool landed on, so the assertion does not depend on the layout.
+            let row = plain(&out).iter().position(|l| l.contains("exec")).expect("the tool row");
+            (out.breathing.contains(&(row, DOT_SPAN)), out.breathing.clone())
         };
-        assert_eq!(head(0), crate::theme::text_heading(), "at full colour it is the heading");
-        let faded = head(crate::rows::PULSE_STEPS / 2);
-        assert_ne!(faded, crate::theme::text_heading(), "mid-breath it must have receded");
-        assert_eq!(faded, crate::theme::fade(crate::theme::text_heading(), 0.5), "{faded:?}");
+        use crate::tool_view::ToolState;
+        let (breathes, all) = waiting(ToolState::Pending);
+        assert!(breathes, "a waiting dot must breathe: {all:?}");
+        for state in [ToolState::Ok, ToolState::Failed] {
+            let (breathes, all) = waiting(state);
+            assert!(!breathes, "{state:?} has come back and must sit still: {all:?}");
+        }
     }
 
     /// **A folded chip hides thinking, not what was done.** Tool use is part of the flow; buried
@@ -1548,14 +1587,7 @@ mod tests {
         for folds in [Folds::new(), Folds::from([(2, Fold { open: true, user_touched: true })])] {
             let want = rows(&items, 40, &folds, crate::lang::Lang::Ko);
             let mut cache = Cache::new();
-            cache.layout(
-                &items,
-                40,
-                &folds,
-                None,
-                Turn { running: false, pulse: 0 },
-                crate::lang::Lang::Ko,
-            );
+            cache.layout(&items, 40, &folds, None, Turn { running: false }, crate::lang::Lang::Ko);
 
             assert_eq!(cache.total(), want.lines.len(), "the row counts must match");
             assert_eq!(cache.plain(), want.plain(), "the contents must match");
@@ -1571,14 +1603,7 @@ mod tests {
         let all = rows(&items, 40, &folds, crate::lang::Lang::Ko).plain();
 
         let mut cache = Cache::new();
-        cache.layout(
-            &items,
-            40,
-            &folds,
-            None,
-            Turn { running: false, pulse: 0 },
-            crate::lang::Lang::Ko,
-        );
+        cache.layout(&items, 40, &folds, None, Turn { running: false }, crate::lang::Lang::Ko);
         for (from, to) in [(0usize, 3usize), (2, 5), (1, cache.total()), (0, cache.total())] {
             let got: Vec<String> = cache
                 .window(from, to)
@@ -1598,39 +1623,18 @@ mod tests {
         let folds = Folds::new();
         let mut cache = Cache::new();
 
-        cache.layout(
-            &items,
-            40,
-            &folds,
-            None,
-            Turn { running: false, pulse: 0 },
-            crate::lang::Lang::Ko,
-        );
+        cache.layout(&items, 40, &folds, None, Turn { running: false }, crate::lang::Lang::Ko);
         let first = cache.renders();
         assert_eq!(first, items.len() as u64, "everything is drawn the first time");
 
-        cache.layout(
-            &items,
-            40,
-            &folds,
-            None,
-            Turn { running: false, pulse: 0 },
-            crate::lang::Lang::Ko,
-        );
+        cache.layout(&items, 40, &folds, None, Turn { running: false }, crate::lang::Lang::Ko);
         assert_eq!(cache.renders(), first, "unchanged, not a single row is drawn again");
 
         // A delta was appended to the answer — only that item should be redrawn.
         if let Item::Agent { text, .. } = &mut items[2] {
             text.push_str("| c | 3 |\n");
         }
-        cache.layout(
-            &items,
-            40,
-            &folds,
-            None,
-            Turn { running: false, pulse: 0 },
-            crate::lang::Lang::Ko,
-        );
+        cache.layout(&items, 40, &folds, None, Turn { running: false }, crate::lang::Lang::Ko);
         assert_eq!(cache.renders(), first + 1, "only the changed one is drawn again");
     }
 
@@ -1647,7 +1651,7 @@ mod tests {
             40,
             &Folds::new(),
             None,
-            Turn { running: false, pulse: 0 },
+            Turn { running: false },
             crate::lang::Lang::Ko,
         );
         let before = cache.renders();
@@ -1655,14 +1659,7 @@ mod tests {
         let chip = chip_key(&items[1]);
         let open = Fold { open: true, user_touched: true };
         let opened = Folds::from([(chip, open), (items[1].seq(), open)]);
-        cache.layout(
-            &items,
-            40,
-            &opened,
-            None,
-            Turn { running: false, pulse: 0 },
-            crate::lang::Lang::Ko,
-        );
+        cache.layout(&items, 40, &opened, None, Turn { running: false }, crate::lang::Lang::Ko);
         assert_eq!(cache.renders(), before + 1, "only the card holding that chip is drawn again");
         assert!(
             cache.plain().iter().any(|l| l.contains("rows.rs가 정본")),
@@ -1676,24 +1673,10 @@ mod tests {
         let items = mixed();
         let folds = Folds::new();
         let mut cache = Cache::new();
-        cache.layout(
-            &items,
-            40,
-            &folds,
-            None,
-            Turn { running: false, pulse: 0 },
-            crate::lang::Lang::Ko,
-        );
+        cache.layout(&items, 40, &folds, None, Turn { running: false }, crate::lang::Lang::Ko);
         let before = cache.renders();
 
-        cache.layout(
-            &items,
-            80,
-            &folds,
-            None,
-            Turn { running: false, pulse: 0 },
-            crate::lang::Lang::Ko,
-        );
+        cache.layout(&items, 80, &folds, None, Turn { running: false }, crate::lang::Lang::Ko);
         assert_eq!(cache.renders(), before + items.len() as u64);
         assert_eq!(cache.plain(), rows(&items, 80, &folds, crate::lang::Lang::Ko).plain());
     }
@@ -1717,7 +1700,7 @@ mod tests {
             40,
             &Folds::new(),
             Some(2),
-            Turn { running: false, pulse: 0 },
+            Turn { running: false },
             crate::lang::Lang::Ko,
         );
         assert!(
@@ -1731,7 +1714,7 @@ mod tests {
             40,
             &Folds::new(),
             None,
-            Turn { running: false, pulse: 0 },
+            Turn { running: false },
             crate::lang::Lang::Ko,
         );
         assert!(
@@ -2002,26 +1985,12 @@ mod tests {
         let items = [work_at(1)];
         let card_open = open_all(&items[0]);
         let mut cache = Cache::new();
-        cache.layout(
-            &items,
-            60,
-            &card_open,
-            None,
-            Turn { running: false, pulse: 0 },
-            crate::lang::Lang::Ko,
-        );
+        cache.layout(&items, 60, &card_open, None, Turn { running: false }, crate::lang::Lang::Ko);
         let before = cache.renders();
 
         let mut both = card_open.clone();
         both.insert(100, Fold { open: true, user_touched: true });
-        cache.layout(
-            &items,
-            60,
-            &both,
-            None,
-            Turn { running: false, pulse: 0 },
-            crate::lang::Lang::Ko,
-        );
+        cache.layout(&items, 60, &both, None, Turn { running: false }, crate::lang::Lang::Ko);
         assert_eq!(cache.renders(), before + 1, "a tool was unfolded but nothing was redrawn");
         assert!(cache.plain().iter().any(|l| l.contains("인자")), "{:?}", cache.plain());
     }
@@ -2154,7 +2123,7 @@ mod tests {
             &Folds::new(),
             None,
             crate::lang::Lang::Ko,
-            Turn { running: true, pulse: 0 },
+            Turn { running: true },
         ))
         .remove(0);
         assert!(running.contains("보고서 작성 중"), "{running:?}");
@@ -2178,7 +2147,7 @@ mod tests {
             &Folds::new(),
             None,
             crate::lang::Lang::Ko,
-            Turn { running: true, pulse: 0 },
+            Turn { running: true },
         ));
         assert_eq!(out[0].trim_end_matches([' ', '▾']), "✻ 결과를 보고 중", "{out:?}");
     }
@@ -2192,14 +2161,7 @@ mod tests {
         let items = [work_at(1)];
         let mut cache = Cache::new();
         let draw = |cache: &mut Cache, running: bool| {
-            cache.layout(
-                &items,
-                60,
-                &Folds::new(),
-                None,
-                Turn { running, pulse: 0 },
-                crate::lang::Lang::Ko,
-            );
+            cache.layout(&items, 60, &Folds::new(), None, Turn { running }, crate::lang::Lang::Ko);
             cache.plain()
         };
         let running = draw(&mut cache, true);
