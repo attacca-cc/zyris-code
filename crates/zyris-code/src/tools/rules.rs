@@ -26,23 +26,34 @@ impl Rules {
     pub fn load(&self) -> Option<String> {
         crate::instructions::preamble(&self.cwd)
     }
+
+    /// What the session preamble says, read now rather than when the session was made.
+    ///
+    /// **Which node this is comes first, and it is always there.** A session opened as a job or a
+    /// work has no preamble at all — `ZNewJob` and `ZNewWork` have no such field — so for those
+    /// this tool is the only way the agent can find out whose machine it is holding.
+    pub fn whole(&self) -> String {
+        let here = crate::conn::node_preamble(&self.cwd);
+        match self.load() {
+            Some(rules) => format!("{here}\n\n{rules}"),
+            None => format!("{here}\n\n(이 작업 디렉터리에는 CLAUDE.md∙AGENTS.md 지침이 없습니다)"),
+        }
+    }
 }
 
 #[zyris::capability(name = "rules", version = 1)]
 pub trait RulesCap {
-    /// The `CLAUDE.md`·`AGENTS.md` conventions that apply to the working directory. Read it at
-    /// the start of a task and again whenever the repo's conventions might have changed — the
-    /// session preamble is fixed at creation and can go stale.
+    /// Which node this conversation is coming from, and the `CLAUDE.md`·`AGENTS.md` conventions
+    /// of its working directory. Read it at the start of a task, and again whenever the repo's
+    /// conventions might have changed — the session preamble is fixed at creation and can go
+    /// stale, and a job or work session never had one.
     async fn load(&self) -> zyris::Result<String>;
 }
 
 #[async_trait::async_trait]
 impl RulesCap for Rules {
     async fn load(&self) -> zyris::Result<String> {
-        Ok(match Rules::load(self) {
-            Some(p) => p,
-            None => "(이 작업 디렉터리에는 CLAUDE.md∙AGENTS.md 지침이 없습니다)".to_string(),
-        })
+        Ok(self.whole())
     }
 }
 
@@ -73,5 +84,19 @@ mod tests {
         let r = Rules::new(d.path().to_path_buf());
         let out = RulesCap::load(&r).await.unwrap();
         assert!(out.contains("없습니다"), "{out}");
+    }
+
+    /// **Which node this is comes back even from a directory with no conventions.** A job or a
+    /// work session gets no preamble at all, so this tool is the only place its agent can learn
+    /// whose files it is about to open — and with several nodes on one account, "this repo" means
+    /// nothing until it knows which of them is the person's.
+    #[tokio::test]
+    async fn load_says_which_node_it_is_speaking_from() {
+        let d = tempfile::tempdir().unwrap();
+        let r = Rules::new(d.path().to_path_buf());
+        let out = RulesCap::load(&r).await.unwrap();
+        assert!(out.contains(&crate::conn::node_name()), "the node is not named: {out}");
+        assert!(out.contains(&d.path().display().to_string()), "the directory is missing: {out}");
+        assert!(out.contains(std::env::consts::OS), "the platform is missing: {out}");
     }
 }
