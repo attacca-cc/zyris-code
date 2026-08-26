@@ -39,13 +39,32 @@ pub fn height(state: &State, avail: u16) -> u16 {
 ///
 /// `rows` is how many lines there is room for. When the tasks do not fit, the last row says how
 /// many are hidden instead of showing one more task: a list that just stops looks complete.
+///
+/// **Done tasks sink to the bottom only when the list is too long.** A list that fits keeps the
+/// order tasks were added in — a task changing state must not jump the line under the reader's
+/// eyes. But when some of the plan has to be hidden behind "+N more", what belongs in that hidden
+/// space is the finished work: the person is looking at what is left to do, and a task already
+/// struck through at the top of a screenful pushes the one actually in hand off the edge.
+/// Reordering happens only then, and even then done tasks keep their relative order, so a finished
+/// list reads the same way it was written.
 pub fn lines(items: &[Todo], lang: Lang, width: usize, rows: usize) -> Vec<Line<'static>> {
     if rows == 0 || items.is_empty() {
         return vec![];
     }
-    let shown = if items.len() <= rows { items.len() } else { rows.saturating_sub(1) };
+    let overflow = items.len() > rows;
+    // What to draw, in drawing order. When it overflows, the done ones go last, each group keeping
+    // the order they arrived in.
+    let ordered: Vec<&Todo> = if overflow {
+        let mut ordered = Vec::with_capacity(items.len());
+        ordered.extend(items.iter().filter(|t| t.status != Status::Done));
+        ordered.extend(items.iter().filter(|t| t.status == Status::Done));
+        ordered
+    } else {
+        items.iter().collect()
+    };
+    let shown = if overflow { rows.saturating_sub(1) } else { items.len() };
     let mut out: Vec<Line<'static>> =
-        items.iter().take(shown).enumerate().map(|(i, todo)| row(todo, i + 1, width)).collect();
+        ordered.iter().take(shown).enumerate().map(|(i, todo)| row(todo, i + 1, width)).collect();
     if shown < items.len() {
         let muted = Style::default().fg(theme::text_muted());
         out.push(Line::from(vec![
@@ -184,6 +203,61 @@ mod tests {
         assert_eq!(out.len(), 4, "it must not exceed the rows it was given");
         assert_eq!(plain(&out[3]), "  ↓ 7개 더");
         assert!(plain(&out[2]).contains("할 일 3"), "{:?}", plain(&out[2]));
+    }
+
+    /// **When the list overflows, finished tasks sink to the bottom.** The visible rows are what
+    /// the person is looking at — what is left to do — so a struck-through task at the top of a
+    /// screenful must not push the one actually in hand off the edge. Done tasks still keep their
+    /// relative order, so the finished stretch reads the way it was written.
+    #[test]
+    fn done_tasks_sink_to_the_bottom_only_when_the_list_overflows() {
+        // Fits: order is exactly the order tasks were added in, done or not.
+        let items = [
+            todo("첫째", Status::Done),
+            todo("둘째", Status::Doing),
+            todo("셋째", Status::Pending),
+        ];
+        let fits = lines(&items, Lang::Ko, 40, 3);
+        assert_eq!(plain(&fits[0]), "  ● 1. 첫째");
+        assert_eq!(plain(&fits[1]), "  ● 2. 둘째");
+        assert_eq!(plain(&fits[2]), "  ● 3. 셋째");
+
+        // Overflow: the done one goes below the not-done ones, which keep their relative order.
+        let many = [
+            todo("완료된 일", Status::Done),
+            todo("진행 중", Status::Doing),
+            todo("대기 중", Status::Pending),
+            todo("또 하나", Status::Pending),
+            todo("마지막", Status::Pending),
+        ];
+        let out = lines(&many, Lang::Ko, 40, 3);
+        assert_eq!(out.len(), 3);
+        assert!(plain(&out[0]).contains("진행 중"), "{:?}", plain(&out[0]));
+        assert!(plain(&out[1]).contains("대기 중"), "{:?}", plain(&out[1]));
+        assert_eq!(plain(&out[2]), "  ↓ 3개 더", "{:?}", plain(&out[2]));
+        // The finished task is hidden (counted in "더"), not shown ahead of active work.
+        assert!(!out.iter().any(|l| plain(l).contains("완료된 일")));
+    }
+
+    /// **Sinking is about where, never about dropping.** A list that overflows shows the active
+    /// tasks first; the done ones come after them, and keep their own relative order — the same
+    /// one the finished stretch had when it was written. One doing task followed by three done
+    /// ones shows the doing task, then the first done one (the earliest finished) on the next
+    /// visible row, and the rest counted as hidden.
+    #[test]
+    fn done_tasks_keep_their_relative_order_when_sunk() {
+        let items = [
+            todo("둘", Status::Done),
+            todo("하나", Status::Doing),
+            todo("셋", Status::Done),
+            todo("넷", Status::Done),
+        ];
+        let out = lines(&items, Lang::Ko, 40, 3);
+        let texts: Vec<String> = out.iter().map(plain).collect();
+        // One doing task, then the earliest-finished of the done ones, then the overflow count.
+        assert!(texts[0].contains("하나"), "{:?}", texts);
+        assert!(texts[1].contains("둘"), "{:?}", texts);
+        assert_eq!(texts[2], "  ↓ 2개 더", "{:?}", texts);
     }
 
     #[test]
