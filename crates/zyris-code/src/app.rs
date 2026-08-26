@@ -4562,21 +4562,48 @@ fn spawn_history(api: &Arc<AttaccaApiClient>, tx: &mpsc::UnboundedSender<AppMsg>
     let (api, tx) = (Arc::clone(api), tx.clone());
     tokio::spawn(async move {
         let frame = match crate::conn::history(&api, &id).await {
-            Ok(events) => Frame::History {
-                entries: events
-                    .iter()
-                    .map(|e| Past {
-                        cursor: e.cursor,
-                        entry: crate::event::entry_from(e),
-                        todo: crate::todos::change_from(e),
-                        plan: crate::plan::submitted_from(e).map(Box::new),
-                    })
-                    .collect(),
-            },
+            Ok(events) => Frame::History { entries: history_past(&events) },
             Err(e) => Frame::PickerFailed(e.to_string()),
         };
         let _ = tx.send((Some(Origin::asked(id)), Action::Frame(frame)));
     });
+}
+
+/// Turns a thread's history into the `Past` entries `apply_frame` replays.
+///
+/// **A question the person already moved past is treated as answered.** A `question` left
+/// `answered: false` reopens its screen when the thread is entered again — which is right for one
+/// the person never touched, and wrong for one they dealt with by sending a message that moved the
+/// conversation on. The answer itself is sent as an ordinary message too, but then the event's
+/// result says `answered` and the flag is already true; a *later* user message under a still-false
+/// flag is the sign that the question was skipped rather than answered, so it is marked answered
+/// and does not reopen. That is the exception the thread reopen otherwise lacks (2026-08-18).
+fn history_past(events: &[zyris_attacca::ZSessionEvent]) -> Vec<Past> {
+    let mut past: Vec<Past> = events
+        .iter()
+        .map(|e| Past {
+            cursor: e.cursor,
+            entry: crate::event::entry_from(e),
+            todo: crate::todos::change_from(e),
+            plan: crate::plan::submitted_from(e).map(Box::new),
+        })
+        .collect();
+
+    // Walk back to front, remembering whether a user message appeared after this point. A
+    // Question still marked unanswered that has such a message after it was skipped, not
+    // awaiting — so it reads as answered and does not take the screen when the thread reopens.
+    let mut user_message_after = false;
+    for p in past.iter_mut().rev() {
+        if let Some(Entry { kind: EntryKind::Question { answered, .. }, .. }) = &mut p.entry {
+            if !*answered && user_message_after {
+                *answered = true;
+            }
+        }
+        if matches!(p.entry, Some(Entry { kind: EntryKind::User(_), .. })) {
+            user_message_after = true;
+        }
+    }
+    past
 }
 
 /// Actually acts on what was chosen from the list.
@@ -8167,6 +8194,72 @@ mod tests {
         assert_eq!(showing(&s), "second", "answering an older one leaves this one alone");
         apply(&mut s, &asked(9, "second", true));
         assert!(s.asking.is_none(), "answering the open one closes it");
+    }
+
+    fn event(seq: i64, kind: &str, payload: serde_json::Value) -> zyris_attacca::ZSessionEvent {
+        zyris_attacca::ZSessionEvent {
+            seq,
+            cursor: seq,
+            kind: kind.into(),
+            payload,
+            created_at: None,
+        }
+    }
+
+    /// **A question the person already moved past does not reopen.** Entering a thread replays its
+    /// history; a `question` left `answered: false` would otherwise take the screen again — right
+    /// for one the person never touched, wrong for one they got past by sending a message. The
+    /// answer itself is sent as an ordinary message too, but then the event's result says
+    /// `answered` and the flag is already true; a later user message under a still-false flag is
+    /// the sign that it was skipped, so it reads as answered.
+    #[test]
+    fn a_question_followed_by_a_user_message_is_treated_as_answered_on_reopen() {
+        let events = [
+            event(1, "chat_user", serde_json::json!({ "content": "할 일 정리해줘" })),
+            event(
+                2,
+                "tool_call",
+                serde_json::json!({
+                    "name": "question",
+                    "arguments": { "questions": [{ "question": "어느 쪽으로?" }] },
+                    "result": { "status": "timeout" },
+                }),
+            ),
+            // The person moved on instead of answering the question.
+            event(3, "chat_user", serde_json::json!({ "content": "아무 쪽이나" })),
+        ];
+        let past = history_past(&events);
+        let questions: Vec<&Past> = past
+            .iter()
+            .filter(|p| matches!(p.entry, Some(Entry { kind: EntryKind::Question { .. }, .. })))
+            .collect();
+        assert_eq!(questions.len(), 1, "there must be one question: {past:?}");
+        match questions[0].entry.as_ref().map(|e| &e.kind) {
+            Some(EntryKind::Question { answered, .. }) => {
+                assert!(*answered, "a skipped question must not reopen");
+            }
+            other => panic!("not a question: {other:?}"),
+        }
+    }
+
+    /// **A question with nothing after it still opens.** The exception is about a question the
+    /// person moved past; one that is genuinely last in the thread — still awaiting an answer —
+    /// keeps `answered: false` and reopens.
+    #[test]
+    fn a_question_that_is_still_last_reopens() {
+        let events = [event(
+            1,
+            "tool_call",
+            serde_json::json!({
+                "name": "question",
+                "arguments": { "questions": [{ "question": "어느 쪽으로?" }] },
+            }),
+        )];
+        let past = history_past(&events);
+        match past[0].entry.as_ref().map(|e| &e.kind) {
+            Some(EntryKind::Question { answered, .. }) => assert!(!*answered),
+            other => panic!("not a question: {other:?}"),
+        }
     }
 
     /// **What a conversation had to say goes with it.** "could not send" from the thread just
