@@ -145,6 +145,11 @@ impl ServeCapability for McpCapability {
                     // MCP doesn't give a result schema. Keep it loosely open.
                     response_schema: Some(json!({"type": "object"})),
                     item_schema: None,
+                    // **Nothing is declared, because nothing here knows.** MCP gives a server no way to
+                    // say how long one of its tools takes, and answering on its behalf would either cut a
+                    // slow one short or leave a caller waiting on a dead one. Saying nothing asks for the
+                    // caller's own default, which is what these tools have always had.
+                    call_limit: None,
                 })
                 .collect(),
         };

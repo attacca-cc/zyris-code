@@ -11,7 +11,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::Value;
 use zyris::{
-    CapabilityDescriptor, IncomingCall, Outgoing, Payload, Result, ServeCapability, WireError,
+    CallLimit, CapabilityDescriptor, IncomingCall, Outgoing, Payload, Result, ServeCapability,
+    WireError,
 };
 
 use crate::app::Frame;
@@ -41,6 +42,10 @@ impl<C: ServeCapability> ServeCapability for Gate<C> {
         // the description, so trimming here only touches what gets announced.
         let mut descriptor = self.inner.descriptor();
         crate::tools::trim::trim_descriptor(&mut descriptor);
+        // **And says how long a caller should be willing to wait.** Every announced capability
+        // passes here, upstream's and this crate's alike, so this is the one place that can say it
+        // for tools whose descriptor is generated somewhere else (`terminal.exec` is exactly that).
+        declare_limits(&mut descriptor, exec_ceiling());
         descriptor
     }
 
@@ -75,10 +80,9 @@ impl<C: ServeCapability> ServeCapability for Gate<C> {
             return Err(WireError::invalid_params(why));
         }
 
-        let (call, cut) = self.clamp_exec(call, &args, wire_deadline());
+        let (call, cut) = self.clamp_exec(call, &args, exec_ceiling());
         // **Shows what's running while it runs.** `exec` gives its result only once at completion
-        // (protocol §terminal), so without this a human waits up to 55 seconds
-        // knowing nothing.
+        // (protocol §terminal), so without this a human waits out the whole command knowing nothing.
         // **Which window took this call.** With several windows up, it only goes to the one the server picked, and
         // looking at the screen alone can't tell whether a window missed it or wasn't asked.
         tracing::info!(capability = %gated.capability, tool = %gated.tool, "took a tool call");
@@ -122,34 +126,44 @@ impl<C: ServeCapability> Gate<C> {
         Some(id)
     }
 
-    /// **When the wire deadline is on, `exec`'s `timeout_ms` is clamped inside it.**
+    /// **`exec`'s `timeout_ms` is held inside the ceiling this node enforces.**
     ///
-    /// This isn't the tool's deadline but the other side's situation. attacca cuts node calls at 60
-    /// seconds (`ZYRIS_CALL_TIMEOUT_SECS`), and a command running longer becomes a Timeout
-    /// **error** over there, leaving the agent not knowing what happened. We finish first and
-    /// note that it was cut, so the agent can switch to `wait.start`.
+    /// Two reasons, and the second is the one that is easy to miss.
+    ///
+    /// Left out, `timeout_ms` means *no* clock at all in capkit — `child.wait()` with nothing
+    /// bounding it — so a command that never returns never returns, and neither end has a way to
+    /// take it back. Something has to fill that in, and this is the only place every call passes.
+    ///
+    /// And **what this node waits for is what it asked the caller to wait for**
+    /// (`declare_limits`). A run allowed past the ceiling would outlive the declaration, and the
+    /// caller would give up on an answer that was still coming — the failure this whole thing
+    /// exists to stop, arrived at from the other direction.
+    ///
+    /// This used to clamp to the *wire* deadline instead, because attacca cut every node call at
+    /// 60 seconds no matter what the tool was. It does not any more: the limit declared above is
+    /// what it waits for (attacca#122).
     fn clamp_exec(
         &self,
         call: IncomingCall,
         args: &Value,
-        deadline: Option<Duration>,
+        ceiling: Option<Duration>,
     ) -> (IncomingCall, Option<Duration>) {
-        let Some(deadline) = deadline else { return (call, None) };
+        let Some(ceiling) = ceiling else { return (call, None) };
         if self.capability != "terminal" || call.tool != "exec" {
             return (call, None);
         }
-        let room = deadline.saturating_sub(EXEC_HEADROOM).as_millis() as u64;
+        let room = u64::try_from(ceiling.as_millis()).unwrap_or(u64::MAX);
         if room == 0 {
             return (call, None);
         }
-        // If the agent already set it shorter, that side wins. The deadline is a cap, not a default.
+        // If the agent already set it shorter, that side wins. The ceiling is a cap, not a default.
         if args.get("timeout_ms").and_then(Value::as_u64).is_some_and(|ms| ms <= room) {
             return (call, None);
         }
         let mut patched = args.clone();
         let Some(obj) = patched.as_object_mut() else { return (call, None) };
         obj.insert("timeout_ms".into(), Value::from(room));
-        (IncomingCall { params: Payload::from_json(patched), ..call }, Some(deadline))
+        (IncomingCall { params: Payload::from_json(patched), ..call }, Some(ceiling))
     }
 
     /// Tells the screen about shells opening and closing.
@@ -204,7 +218,7 @@ fn pty_id_of(out: &Outgoing) -> Option<String> {
 
 /// When time ran out and it was cut, **say so in the result.** Cut silently, the agent
 /// thinks the command failed and retries the same thing.
-fn note_the_cut(out: Outgoing, deadline: Duration) -> Outgoing {
+fn note_the_cut(out: Outgoing, ceiling: Duration) -> Outgoing {
     let Outgoing::Response(payload) = out else { return out };
     let Ok(mut v) = payload.to_json() else { return Outgoing::Response(payload) };
     if v.get("timed_out").and_then(Value::as_bool) != Some(true) {
@@ -215,25 +229,74 @@ fn note_the_cut(out: Outgoing, deadline: Duration) -> Outgoing {
     // **Says where to go instead.** It used to point at `terminal.open`+`read`, but that path has
     // no signal for "did the command finish", so the agent had to read the prompt by guesswork.
     stderr.push_str(&format!(
-        "\n\n이 배포는 노드 호출을 {}초에 끊습니다. **명령은 실패한 것이 아니라 시간에 \
-         잘린 것입니다.** 오래 걸리는 것은 wait.start로 배경에 걸고 wait.until로 \
+        "\n\n이 노드는 명령을 {}초에 끊습니다. **명령은 실패한 것이 아니라 시간에 \
+         잘린 것입니다.** 더 오래 걸리는 것은 wait.start로 배경에 걸고 wait.until로 \
          기다리세요 ‒ 그쪽은 끝날 때까지 나눠서 기다릴 수 있습니다.",
-        deadline.as_secs()
+        ceiling.as_secs()
     ));
     obj.insert("stderr".into(), Value::from(stderr));
     Outgoing::Response(Payload::from_json(v))
 }
 
-/// Headroom given to `exec`. Time for us to build and send back the result.
-const EXEC_HEADROOM: Duration = Duration::from_secs(5);
+/// Added to the ceiling when it is declared, never when it is enforced. A run stopped exactly at
+/// the ceiling still has to have its output gathered and sent, and a caller that gave up one
+/// instant before that answer arrived would be the very failure this is here to prevent.
+const REPLY_HEADROOM: Duration = Duration::from_secs(10);
+
+/// The longest `terminal.exec` may run on this node before the process tree is killed.
+///
+/// **This is the node's number, not the wire's.** It used to be neither — `exec` was cut to fit
+/// inside whatever attacca would wait, which was 60 seconds for every tool alike, and so a build
+/// could not be run at all. Now the wait is what the tool asks for (`declare_limits`), and this is
+/// what it asks for.
+///
+/// `ZYRIS_CODE_EXEC_MAX_SECS`, default half an hour. **`0` lifts the ceiling**, and then the
+/// declaration says `Unlimited` — the agent's own `timeout_ms` is the only bound left, and a call
+/// that omits it can hang until the connection dies. That is the point of it being off by default.
+pub(crate) fn exec_ceiling() -> Option<Duration> {
+    let secs: u64 =
+        std::env::var("ZYRIS_CODE_EXEC_MAX_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(1800);
+    (secs > 0).then(|| Duration::from_secs(secs))
+}
+
+/// **What this node asks of a caller's clock, tool by tool.**
+///
+/// A caller cannot tell from a schema whether a tool answers in a millisecond or builds a
+/// workspace, so the node holding the tool says which (`zyris::CallLimit`, attacca#122). Saying
+/// nothing asks for the caller's own default, and that is right for everything here but one:
+/// every other tool answers well inside a minute, and `terminal.exec` is the one that cannot.
+///
+/// **What is declared is what is enforced.** The number is `clamp_exec`'s ceiling and the time to
+/// send an answer back, so the two cannot drift: declare longer and a caller waits for something
+/// this node already killed, declare shorter and it gives up on an answer that is on its way.
+pub(crate) fn declare_limits(descriptor: &mut CapabilityDescriptor, ceiling: Option<Duration>) {
+    if descriptor.name != "terminal" {
+        return;
+    }
+    let limit = match ceiling {
+        // Saturating rather than adding: `Duration + Duration` panics on overflow, and the number
+        // comes from the environment, where anything at all can be written.
+        Some(ceiling) => {
+            let secs = ceiling.as_secs().saturating_add(REPLY_HEADROOM.as_secs());
+            CallLimit::Secs(secs.min(u64::from(u32::MAX)) as u32)
+        }
+        None => CallLimit::Unlimited,
+    };
+    for tool in &mut descriptor.tools {
+        if tool.name == "exec" {
+            tool.call_limit = Some(limit);
+        }
+    }
+}
 
 /// A deadline that only applies to the wire. **Not the tool's deadline.**
 ///
-/// attacca cuts node calls at `ZYRIS_CALL_TIMEOUT_SECS` (default 60) and we can't read that value.
-/// So we answer in time within it.
+/// A tool that declares nothing gets the caller's default, which on attacca is
+/// `ZYRIS_CALL_TIMEOUT_SECS` (60) and cannot be read from here. So `wait.until` answers in time
+/// within it — with success, saying to call again — rather than being cut off mid-wait.
 ///
-/// `wait.until` reads the same value. **Only one place may know the deadline** — with two, fixing
-/// one of them leaves one tool answering while the other gets cut off.
+/// **`terminal.exec` no longer reads this.** It declares a limit of its own (`declare_limits`)
+/// and is held to that instead; this is what is left for the tools that declare nothing.
 pub(crate) fn wire_deadline() -> Option<Duration> {
     let secs: u64 = std::env::var("ZYRIS_CODE_WIRE_DEADLINE_SECS")
         .ok()
@@ -279,6 +342,7 @@ mod tests {
                     request_schema: json!({}),
                     response_schema: None,
                     item_schema: None,
+                    call_limit: None,
                 }],
             }
         }
@@ -309,6 +373,7 @@ mod tests {
                         request_schema: json!({}),
                         response_schema: None,
                         item_schema: None,
+                        call_limit: None,
                     }],
                 }
             }
@@ -457,25 +522,40 @@ mod tests {
         }
     }
 
-    /// **A long command is clamped inside the wire deadline.** Unclamped, the other side cuts first and
-    /// the agent is left not knowing what happened.
+    /// **A long command is held to the ceiling this node enforces**, and no further. It used to be
+    /// cut to fit inside what attacca would wait for — 60 seconds for every tool alike — which is
+    /// why a build could not be run at all.
     #[tokio::test]
-    async fn a_long_exec_is_cut_to_fit_the_wire_deadline() {
+    async fn a_long_exec_is_cut_to_the_ceiling_this_node_enforces() {
         let (fake, _) = Fake::new("terminal");
         let bridge = Bridge::new();
         bridge.sync(Mode::Job, &crate::config::Config::default(), false);
         let gate = Gate::new(fake, bridge);
 
-        let args = json!({"command": "cargo build", "timeout_ms": 600_000u64});
-        let (call, cut) =
-            gate.clamp_exec(incoming("exec", args.clone()), &args, Some(Duration::from_secs(55)));
-        assert_eq!(cut, Some(Duration::from_secs(55)), "it must mark that it was cut");
+        let ceiling = Duration::from_secs(1800);
+        let args = json!({"command": "cargo build", "timeout_ms": 7_200_000u64});
+        let (call, cut) = gate.clamp_exec(incoming("exec", args.clone()), &args, Some(ceiling));
+        assert_eq!(cut, Some(ceiling), "it must mark that it was cut");
         let sent = call.params.to_json().unwrap();
-        assert_eq!(sent["timeout_ms"], json!(50_000u64), "it must come inside the deadline");
+        assert_eq!(sent["timeout_ms"], json!(1_800_000u64), "it must come inside the ceiling");
         assert_eq!(sent["command"], json!("cargo build"), "no other argument may be touched");
     }
 
-    /// If the agent already set it shorter, that side wins. The deadline is a cap, not a default.
+    /// **Naming no timeout is not asking for no timeout.** Left out, `timeout_ms` means capkit
+    /// waits on the child with no clock at all, and neither end can take that call back — so the
+    /// ceiling is written in rather than left absent.
+    #[tokio::test]
+    async fn an_exec_that_named_no_timeout_is_given_the_ceiling() {
+        let (fake, _) = Fake::new("terminal");
+        let gate = Gate::new(fake, Bridge::new());
+        let args = json!({"command": "cargo build"});
+        let (call, cut) =
+            gate.clamp_exec(incoming("exec", args.clone()), &args, Some(Duration::from_secs(1800)));
+        assert_eq!(cut, Some(Duration::from_secs(1800)));
+        assert_eq!(call.params.to_json().unwrap()["timeout_ms"], json!(1_800_000u64));
+    }
+
+    /// If the agent already set it shorter, that side wins. The ceiling is a cap, not a default.
     #[tokio::test]
     async fn a_short_exec_is_left_alone() {
         let (fake, _) = Fake::new("terminal");
@@ -484,20 +564,59 @@ mod tests {
 
         let args = json!({"command": "ls", "timeout_ms": 1_000u64});
         let (call, cut) =
-            gate.clamp_exec(incoming("exec", args.clone()), &args, Some(Duration::from_secs(55)));
+            gate.clamp_exec(incoming("exec", args.clone()), &args, Some(Duration::from_secs(1800)));
         assert_eq!(cut, None);
         assert_eq!(call.params.to_json().unwrap()["timeout_ms"], json!(1_000u64));
     }
 
-    /// Deadline off means nothing is cut — once attacca is fixed, this is the way.
+    /// Ceiling lifted means nothing is cut, and the declaration says as much — the agent's own
+    /// `timeout_ms` becomes the only bound there is.
     #[tokio::test]
-    async fn turning_the_deadline_off_stops_the_cutting() {
+    async fn lifting_the_ceiling_leaves_the_agents_own_clock_alone() {
         let (fake, _) = Fake::new("terminal");
         let gate = Gate::new(fake, Bridge::new());
         let args = json!({"command": "cargo build"});
         let (call, cut) = gate.clamp_exec(incoming("exec", args.clone()), &args, None);
         assert_eq!(cut, None);
         assert_eq!(call.params.to_json().unwrap().get("timeout_ms"), None);
+    }
+
+    /// **What is declared is what is enforced.** A caller is asked to wait for exactly as long as
+    /// this node will let the command run, plus the time to send an answer back. Drift either way
+    /// is a bug with a face: declared short, the caller gives up on an answer that is coming;
+    /// declared long, it waits on one this node already killed.
+    #[test]
+    fn what_exec_declares_is_what_this_node_enforces() {
+        let terminal = |ceiling| {
+            let mut d = zyris::ServeCapability::descriptor(&zyris_caps::TerminalServer(
+                zyris_capkit::PtyTerminal::default(),
+            ));
+            declare_limits(&mut d, ceiling);
+            d
+        };
+        let limit = |d: &CapabilityDescriptor, tool: &str| {
+            d.tools.iter().find(|t| t.name == tool).expect("the tool is announced").call_limit
+        };
+
+        let d = terminal(Some(Duration::from_secs(1800)));
+        assert_eq!(
+            limit(&d, "exec"),
+            Some(CallLimit::Secs(1810)),
+            "the declaration must cover the ceiling and the answer",
+        );
+        // **Only `exec`.** Everything else here answers well inside a caller's own default, and
+        // saying so for them would be asking a caller to wait on tools that never need it.
+        assert_eq!(limit(&d, "read"), None, "only exec has anything to declare");
+
+        // Lifted, it says so rather than naming a number nothing holds it to.
+        let lifted = terminal(None);
+        assert_eq!(limit(&lifted, "exec"), Some(CallLimit::Unlimited));
+
+        // And nothing outside `terminal` is touched.
+        let (fake, _) = Fake::new("file_io");
+        let mut other = zyris::ServeCapability::descriptor(&fake);
+        declare_limits(&mut other, Some(Duration::from_secs(1800)));
+        assert_eq!(other.tools[0].call_limit, None, "another capability is not exec's business");
     }
 
     /// Cut because time ran out, **the result says so.** Cut silently, the agent
@@ -507,7 +626,7 @@ mod tests {
         let out = Outgoing::Response(Payload::from_json(
             json!({"exit_code": -1, "stdout": "", "stderr": "앞선 오류", "timed_out": true}),
         ));
-        let Outgoing::Response(p) = note_the_cut(out, Duration::from_secs(55)) else {
+        let Outgoing::Response(p) = note_the_cut(out, Duration::from_secs(1800)) else {
             panic!("it must be a unary response")
         };
         let v = p.to_json().unwrap();
@@ -525,7 +644,7 @@ mod tests {
         let out = Outgoing::Response(Payload::from_json(
             json!({"exit_code": 0, "stdout": "됐다", "stderr": "", "timed_out": false}),
         ));
-        let Outgoing::Response(p) = note_the_cut(out, Duration::from_secs(55)) else {
+        let Outgoing::Response(p) = note_the_cut(out, Duration::from_secs(1800)) else {
             panic!("it must be a unary response")
         };
         assert_eq!(p.to_json().unwrap()["stderr"], json!(""));

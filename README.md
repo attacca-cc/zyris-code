@@ -367,7 +367,8 @@ Messages typed while a turn is running are queued and sent in order when it ends
 | `ZYRIS_CODE_BG` | — | Paint a page background (`zyris`, or `#rrggbb`). Off by default so the terminal's own background shows; turn it on if wide characters leave smears over SSH |
 | `ZYRIS_NODE_TOKEN` | — | Dial with a fixed node token instead of enrolling |
 | `ZYRIS_CODE_LOG` | `/tmp/zyris-code.log` | Log file. Logs never go to the terminal — they would land in the middle of the UI |
-| `ZYRIS_CODE_WIRE_DEADLINE_SECS` | `55` | Answer the wire before the server gives up on a call; `0` disables it |
+| `ZYRIS_CODE_EXEC_MAX_SECS` | `1800` | Longest a `terminal.exec` command may run before this node kills it — and, because the two must agree, the wait it asks callers for. `0` lifts the ceiling, and then only the agent's own `timeout_ms` bounds a command |
+| `ZYRIS_CODE_WIRE_DEADLINE_SECS` | `55` | Answer the wire before the server gives up on a call, for the tools that declare no limit of their own (`wait.until`); `0` disables it |
 | `ZYRIS_CODE_MOUSE` | on | `0` hands the mouse back to the terminal, so copy-on-select and the scrollback drag work as they do everywhere else. Click-to-fold, drag-to-copy and Ctrl+click go with it |
 | `ZYRIS_CODE_HYPERLINKS` | detected | Force OSC 8 link markup on or off. Only terminals known to read it are sent any, because one that does not prints the escape bytes across the screen. Links stay Ctrl+clickable either way — the app opens them itself |
 | `ZYRIS_CODE_OSC52` | detected | Force system-clipboard writes on or off. Terminals differ, and several that draw links keep clipboard writes switched off until told otherwise |

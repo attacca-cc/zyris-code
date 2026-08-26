@@ -53,11 +53,17 @@ pub fn clip_schema(value: &mut Value) {
 /// The one line appended to `terminal.exec`'s description. **It sits outside the budget** — it is
 /// added after trimming.
 ///
-/// As it stands the agent only learns there is another way **after** being cut at 50 seconds. It
-/// needs to know **while choosing** the tool to take the right path first time. `exec`'s description
-/// is upstream's and we can't edit it, and trimming is the only place that touches that description,
-/// so this is where it gets attached.
-pub const LONG_HINT: &str = " For anything that may take over a minute, use wait.start instead.";
+/// **It used to send long commands away**, because a run over a minute came back to the agent as
+/// a transport error and there was nothing to be done about it here. `exec` now declares how long
+/// it may take and is waited for (`guard::declare_limits`), so the thing worth saying while the
+/// tool is being chosen is the one that is still true: `wait.start` is for leaving something
+/// running while you get on with something else, not for anything that merely takes a while.
+///
+/// `exec`'s description is upstream's and we can't edit it, and trimming is the only place that
+/// touches that description, so this is where it gets attached.
+pub const LONG_HINT: &str =
+    " A long run is fine; this node waits for it. Use wait.start to leave one running in the \
+      background while you do something else.";
 
 /// Fits one capability descriptor to the budget.
 pub fn trim_descriptor(descriptor: &mut CapabilityDescriptor) {
@@ -119,7 +125,9 @@ mod tests {
         assert_eq!(schema["properties"]["path"]["type"], "string");
     }
 
-    /// **Learning about it after being cut is too late. The agent must know while choosing.**
+    /// **The line has to be there while the tool is being chosen**, not learned afterwards. What
+    /// it says changed when `exec` stopped being cut at a minute; that it rides on `exec` and on
+    /// nothing else did not.
     #[test]
     fn the_exec_description_points_at_wait_for_long_commands() {
         let mut d = zyris::ServeCapability::descriptor(&zyris_caps::TerminalServer(

@@ -60,8 +60,9 @@ pub enum Frame {
     ShellClosed {
         id: String,
     },
-    /// A command started running. **`exec` only reports once, on completion** — saying
-    /// nothing in the meantime leaves the user waiting blind for up to 55 seconds.
+    /// A command started running. **`exec` only reports once, on completion** — saying nothing
+    /// in the meantime leaves the user waiting blind for however long the command takes, which
+    /// since it stopped being cut at a minute (`guard::exec_ceiling`) can be a long while.
     ExecStart {
         id: u64,
         command: String,

@@ -55,7 +55,8 @@ pub fn parts_at(
         return (theme::notice(), lang.connecting().to_string(), "");
     }
     // **More specific than "working…".** A command gives its result once, when done, so unless
-    // we say here what is running, people wait up to 55 seconds blind.
+    // we say here what is running, people wait it out blind — and a command is no longer cut at a
+    // minute, so that wait is as long as the command is.
     // **Saying you asked to stop comes first.** Until the server answers, "working" stays up,
     // and while it keeps showing, people think Ctrl+C did not work and press again.
     // **Fetching a thread's history is something happening**, and on a long one it takes a

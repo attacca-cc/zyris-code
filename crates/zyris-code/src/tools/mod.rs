@@ -96,10 +96,11 @@ pub fn announce(
         .capability(Gate::new(search::SearchServer(search::LocalSearch::new(cwd)), bridge.clone()))
         .capability(Gate::new(TerminalServer(PtyTerminal::default()), bridge.clone()))
         .capability(Gate::new(CodeEditServer(edit), bridge.clone()))
-        // **This is where the long-running work goes.** `exec` gets cut at the wire deadline and
-        // the process dies with it, whereas `until` answers **with success** even when it hasn't
-        // finished, so the agent doesn't read it as a failure. It lives here rather than upstream
-        // because one of its branches waits on a work.
+        // **This is where work you want left running goes.** `exec` runs to this node's ceiling
+        // now rather than being cut at the wire (`guard::declare_limits`), so length alone is no
+        // longer the reason to come here — holding the turn open is. `until` answers **with
+        // success** even when it hasn't finished, so the agent doesn't read waiting as failing.
+        // It lives here rather than upstream because one of its branches waits on a work.
         .capability(Gate::new(
             wait::WaitServer(wait::Waits::new(jobs, api.clone(), bridge.clone())),
             bridge.clone(),

@@ -558,10 +558,11 @@ mod tests {
         Waits::new(Jobs::new(std::env::temp_dir()), rx, Bridge::new())
     }
 
-    /// The budget is **not read from the environment.** `guard`'s tests set and clear
-    /// `ZYRIS_CODE_WIRE_DEADLINE_SECS` while these run, so measuring the budget through the
-    /// public path gives a different value every run. The calculation itself is locked purely
-    /// by `the_budget_never_outlives_the_wire_deadline`.
+    /// The budget is **not read from the environment.** `ZYRIS_CODE_WIRE_DEADLINE_SECS` is
+    /// process-wide and the whole suite runs in one process, so a test that reached for it
+    /// through the public path would answer differently depending on what ran beside it — which
+    /// is how this was found, passing alone and failing in the suite. The calculation itself is
+    /// locked purely by `the_budget_never_outlives_the_wire_deadline`.
     fn ms(n: u64) -> std::time::Duration {
         std::time::Duration::from_millis(n)
     }
