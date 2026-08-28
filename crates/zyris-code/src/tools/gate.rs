@@ -212,7 +212,7 @@ fn candidates(root: &Path, capability: &str, tool: &str, args: &Value) -> Vec<Pa
     let mut out = Vec::new();
     for key in PATH_KEYS {
         if let Some(p) = args.get(*key).and_then(Value::as_str).filter(|s| !s.is_empty()) {
-            out.push(zyris_capkit::resolve_under(root, p));
+            out.push(zyris_caps::resolve_under(root, p));
         }
     }
     // Visible paths inside a shell command. Looks after stripping quotes and common separators.
@@ -240,7 +240,7 @@ fn candidates(root: &Path, capability: &str, tool: &str, args: &Value) -> Vec<Pa
             Some(rest) => home().join(rest).to_string_lossy().into_owned(),
             None => bare.to_string(),
         };
-        out.push(zyris_capkit::resolve_under(root, &bare));
+        out.push(zyris_caps::resolve_under(root, &bare));
     }
     out
 }

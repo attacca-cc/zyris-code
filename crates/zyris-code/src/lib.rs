@@ -34,6 +34,7 @@ pub mod print;
 pub mod question;
 pub mod repo;
 pub mod rows;
+pub mod runtime;
 pub mod scroll;
 pub mod selection;
 pub mod term;

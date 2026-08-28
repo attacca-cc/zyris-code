@@ -17,11 +17,8 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-use zyris::runtime::{
-    credentials::{Credentials, StaticToken},
-    RunConfig, Runner,
-};
 use zyris::NodeKind;
+use zyris_code::runtime::{Credentials, RunConfig, Runner, StaticToken};
 
 /// To see whether the second connection displaces the first, it must connect while the first is alive.
 const OVERLAP: Duration = Duration::from_secs(12);
@@ -100,41 +97,39 @@ async fn register_a_child(creds: Arc<dyn Credentials>) -> Option<String> {
     use zyris_attacca::{AttaccaApi, AttaccaApiClient};
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let task = tokio::spawn(async move {
-        let runner = Runner::new(RunConfig::from_env(), creds).kind(NodeKind::Service).on_connect(
-            move |conn| {
-                let tx = tx.clone();
-                async move {
-                    let Ok(api) = conn.wait_capability::<AttaccaApiClient>(WAIT).await else {
-                        let _ = tx.send(None);
-                        return;
-                    };
-                    let asked = zyris_attacca::ZNewNode {
-                        name: "zyris-code probe child".into(),
-                        platform: Some("linux".into()),
-                        scopes: zyris_code::conn::REQUIRED_SCOPES
-                            .iter()
-                            .map(|s| s.to_string())
-                            .collect(),
-                    };
-                    let _ = tx.send(match api.register_node(asked).await {
-                        Ok(node) => {
-                            println!(
-                                "registered a child: slug={} node_id={} scopes={} token={}",
-                                node.slug,
-                                node.node_id,
-                                node.scopes.len(),
-                                if node.token.is_some() { "yes" } else { "NONE" }
-                            );
-                            node.token
-                        }
-                        Err(e) => {
-                            println!("register_node refused: {e}");
-                            None
-                        }
-                    });
-                }
-            },
-        );
+        let runner = runner_for(creds).on_connect(move |conn| {
+            let tx = tx.clone();
+            async move {
+                let Ok(api) = conn.wait_capability::<AttaccaApiClient>(WAIT).await else {
+                    let _ = tx.send(None);
+                    return;
+                };
+                let asked = zyris_attacca::ZNewNode {
+                    name: "zyris-code probe child".into(),
+                    platform: Some("linux".into()),
+                    scopes: zyris_code::conn::REQUIRED_SCOPES
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
+                };
+                let _ = tx.send(match api.register_node(asked).await {
+                    Ok(node) => {
+                        println!(
+                            "registered a child: slug={} node_id={} scopes={} token={}",
+                            node.slug,
+                            node.node_id,
+                            node.scopes.len(),
+                            if node.token.is_some() { "yes" } else { "NONE" }
+                        );
+                        node.token
+                    }
+                    Err(e) => {
+                        println!("register_node refused: {e}");
+                        None
+                    }
+                });
+            }
+        });
         let _ = runner.try_run().await;
     });
     let out =
@@ -148,36 +143,34 @@ async fn ask_about_the_methods(creds: Arc<dyn Credentials>) {
     use zyris_attacca::{AttaccaApi, AttaccaApiClient};
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let task = tokio::spawn(async move {
-        let runner = Runner::new(RunConfig::from_env(), creds).kind(NodeKind::Service).on_connect(
-            move |conn| {
-                let tx = tx.clone();
-                async move {
-                    let Ok(api) = conn.wait_capability::<AttaccaApiClient>(WAIT).await else {
-                        let _ = tx.send(vec![("attacca_api".into(), "never announced".into())]);
-                        return;
-                    };
-                    let mut out = Vec::new();
-                    match api.list_nodes().await {
-                        Ok(nodes) => {
-                            out.push(("list_nodes".into(), format!("{} node(s)", nodes.len())));
-                            for n in &nodes {
-                                out.push((
-                                    format!("  {}", n.slug),
-                                    format!(
-                                        "{} · {}connected · scopes {}",
-                                        n.node_id,
-                                        if n.connected { "" } else { "not " },
-                                        n.scopes.len()
-                                    ),
-                                ));
-                            }
+        let runner = runner_for(creds).on_connect(move |conn| {
+            let tx = tx.clone();
+            async move {
+                let Ok(api) = conn.wait_capability::<AttaccaApiClient>(WAIT).await else {
+                    let _ = tx.send(vec![("attacca_api".into(), "never announced".into())]);
+                    return;
+                };
+                let mut out = Vec::new();
+                match api.list_nodes().await {
+                    Ok(nodes) => {
+                        out.push(("list_nodes".into(), format!("{} node(s)", nodes.len())));
+                        for n in &nodes {
+                            out.push((
+                                format!("  {}", n.slug),
+                                format!(
+                                    "{} · {}connected · scopes {}",
+                                    n.node_id,
+                                    if n.connected { "" } else { "not " },
+                                    n.scopes.len()
+                                ),
+                            ));
                         }
-                        Err(e) => out.push(("list_nodes".into(), say(Some(e)))),
                     }
-                    let _ = tx.send(out);
+                    Err(e) => out.push(("list_nodes".into(), say(Some(e)))),
                 }
-            },
-        );
+                let _ = tx.send(out);
+            }
+        });
         let _ = runner.try_run().await;
     });
     match tokio::time::timeout(Duration::from_secs(30), rx.recv()).await {
@@ -208,6 +201,22 @@ fn say(err: Option<zyris::WireError>) -> String {
     }
 }
 
+/// A runner with a node of its own.
+///
+/// **The node is built here rather than by the runner.** Upstream's `Runner` owned a private
+/// capability set and grew `kind`/`capability` methods of its own; the library-only one takes a
+/// `zyris::Node` the caller built through `NodeBuilder`, which is the sync half of the same thing
+/// and the only half that can hand out a live `Capabilities` before the loop starts.
+fn runner_for(creds: Arc<dyn Credentials>) -> Runner {
+    let config = RunConfig::from_env();
+    let node = zyris::Node::builder()
+        .name(&config.node_name)
+        .kind(NodeKind::Service)
+        .build()
+        .expect("a node that announces nothing cannot fail to build");
+    Runner::new(config, node, creds)
+}
+
 /// How long to wait for the server to announce `attacca_api`.
 const WAIT: Duration = Duration::from_secs(5);
 
@@ -217,15 +226,13 @@ fn dial(label: &'static str, creds: Arc<dyn Credentials>) -> tokio::task::JoinHa
 
 fn dial_with(label: &'static str, creds: Arc<dyn Credentials>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let runner = Runner::new(RunConfig::from_env(), creds).kind(NodeKind::Service).on_connect(
-            move |conn| async move {
-                let info = conn.info();
-                println!("{label}: node_id={} conn_id={}", info.node_id, info.conn_id);
-                // Must stay connected for the overlap. If it drops, there's no way to see displacement.
-                conn.closed().await;
-                println!("{label}: connection dropped");
-            },
-        );
+        let runner = runner_for(creds).on_connect(move |conn| async move {
+            let info = conn.info();
+            println!("{label}: node_id={} conn_id={}", info.node_id, info.conn_id);
+            // Must stay connected for the overlap. If it drops, there's no way to see displacement.
+            conn.closed().await;
+            println!("{label}: connection dropped");
+        });
         let _ = runner.try_run().await;
     })
 }

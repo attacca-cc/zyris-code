@@ -191,8 +191,11 @@ fn given_config_dir() -> Option<std::ffi::OsString> {
 
 /// `$ZYRIS_CONFIG_DIR` → `app` under the platform's user-config location.
 ///
-/// Follows **the same branch** as zyris's `enroll::config_dir()`. If they diverge, the variable we fill
-/// and the location upstream reads fall out of sync, scattering credentials across two places.
+/// Follows **the same branch** as `runtime::store::config_dir`, which is what actually opens the
+/// file. This one decides what `$ZYRIS_CONFIG_DIR` is set to and that one reads the variable, so
+/// while they agree the branch is only ever taken once — and when they diverge, credentials are
+/// scattered across two places. **Both copies now live in this repo**: the branch was zyris's until
+/// it became a library and stopped owning where a program may write a secret.
 fn config_home_for(app: &str) -> Option<std::path::PathBuf> {
     if let Some(given) = given_config_dir() {
         // The person meant exactly that location. Don't append the app name.
@@ -280,9 +283,13 @@ pub fn migrate_credentials(from: &std::path::Path, into: &std::path::Path, profi
 
 /// The profile fragment that goes into credential file names.
 ///
-/// **This is a verbatim copy of zyris's `file_store::slugify`.** Upstream names the files and we only
-/// recognize them, so if the rules diverge we fail to recognize the files to migrate and quietly pass
-/// them by — the person only sees a "please re-enroll" screen. When upstream changes, this changes too.
+/// **The same rule as `runtime::store::slugify`, which is what names the files.** This one only
+/// recognizes them — for the migration out of the old shared directory, and for the window lock —
+/// so if the two diverge we fail to recognize the files to move and quietly pass them by, and the
+/// person sees a "please re-enroll" screen with their credential still sitting on disk.
+///
+/// It used to be a copy of *upstream's* rule, back when upstream named the files. Both copies are
+/// in this repo now, which makes them easier to keep in step and no less necessary to.
 fn slugify_profile(profile: &str) -> String {
     let mut out = String::with_capacity(profile.len());
     let mut prev_dash = false;

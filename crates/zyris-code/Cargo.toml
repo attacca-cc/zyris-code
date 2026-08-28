@@ -17,7 +17,12 @@ path = "src/main.rs"
 zyris.workspace = true
 zyris-attacca.workspace = true
 zyris-caps.workspace = true
-zyris-capkit.workspace = true
+# The two reference implementations this node serves. They used to arrive together as
+# `zyris-capkit`; that crate is now a re-export shell in front of one crate per implementation, and
+# naming the two we serve is what keeps `zyris-screen`'s X11/Wayland/D-Bus/PipeWire stack out of
+# this build entirely rather than one feature flag away.
+zyris-fs.workspace = true
+zyris-terminal.workspace = true
 
 # Used by the code `#[zyris::capability]` generates. **Match the version to upstream** — if
 # different, the macro's generated types differ from upstream's and the traits don't line up.

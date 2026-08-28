@@ -1,33 +1,43 @@
-//! Notices when re-enrollment happens and **draws the code on screen.**
+//! Where this node's credential comes from, and **the enrollment code drawn on screen.**
 //!
-//! The upstream (zyris) provides an `EnrollmentUi` hook (`Enroller::with_ui`, PR #6). Plugging our
-//! screen into it means the enrollment code arrives on screen as `Frame::Enroll` instead of going
-//! out through the stdout box — the old "code leaking into the terminal" problem structurally
-//! disappears. Without a screen (the extreme where first run precedes the screen), it prints the box as before.
+//! Upstream used to drive the whole device grant: an `Enroller` held the store, ran the polling
+//! loop, and called back into an `EnrollmentUi` we implemented so the code arrived as
+//! `Frame::Enroll` instead of going out through a stdout box. **That layer is gone** — the
+//! library-only `zyris` hands back the code as a value and refuses to write the loop, on the
+//! grounds that a loop the caller cannot end is a program rather than a library.
+//!
+//! So the loop is here now, and the property it existed for is unchanged: with a screen up, the
+//! code goes to the screen and nothing is written to stdout, so the old "code leaking into the
+//! terminal behind the alternate screen" problem stays structurally impossible. Without a screen
+//! (the extreme where the app could not start at all) it prints the box, exactly as before.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
-
-use zyris::enroll::{AuthorizeResponse, CredentialStore, EnrollmentUi, TokenResponse};
-use zyris::runtime::credentials::Credentials;
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::app::{EnrollPhase, EnrollView, Frame};
+use crate::runtime::{
+    CredentialStore, CredentialStoreError, Credentials, CredentialsError, FileCredentialStore,
+    RunConfig,
+};
 use crate::tools::bridge::Bridge;
 
 /// The credentials this node will use.
 ///
-/// The order must **match** the upstream `credentials::from_env` — what a person explicitly gives
-/// always wins, and enrollment that must ask a person comes last. The only difference is wiring
-/// the enrollment path to the screen; since we hold the store ourselves, no path guessing is needed.
+/// The order is upstream's old `credentials::from_env` and must stay it — what a person explicitly
+/// gives always wins, and the path that has to ask a person comes last. The only difference is
+/// that the enrollment path is wired to the screen; since we hold the store ourselves, no path
+/// guessing is needed.
 ///
-/// **Scopes must be settled before getting here.** `Enroller` copies `config.scopes` at this point,
-/// so scopes given later via `Runner::request_scopes` don't ride on the enrollment request.
+/// **Scopes must be settled before getting here.** The `EnrollRequest` built below is what the
+/// authorize call carries, and the grant is approved once against exactly that list. `main.rs`
+/// writes `$ZYRIS_SCOPES` before `RunConfig::from_env` reads it for that reason: settle them later
+/// and the approval screen asks for nothing, which is a browser round trip that grants nothing.
 pub fn source(
-    config: &zyris::runtime::RunConfig,
+    config: &RunConfig,
     bridge: &Bridge,
 ) -> Result<(Arc<dyn Credentials>, Option<Reauth>), String> {
-    use zyris::runtime::credentials::{StaticToken, TokenFile};
+    use crate::runtime::{StaticToken, TokenFile};
 
     // Where a person gave a token directly, there is nothing to discard and no one to ask again.
     if let Some(token) = StaticToken::from_env().map_err(|e| e.to_string())? {
@@ -40,64 +50,266 @@ pub fn source(
     // The credential file lands under `$ZYRIS_CONFIG_DIR`. `main.rs` has filled that variable with
     // this app's directory (`conn::credential_dir`).
     let store = Arc::new(
-        zyris::enroll::FileCredentialStore::for_server(&config.url, &config.profile)
-            .map_err(|e| e.to_string())?,
-    );
-    let store = store as Arc<dyn CredentialStore>;
+        FileCredentialStore::for_server(&config.url, &config.profile).map_err(|e| e.to_string())?,
+    ) as Arc<dyn CredentialStore>;
 
-    // This screen draws the enrollment code. Without a screen it falls to the box (`ScreenEnroll::show`).
-    let enroller = zyris::enroll::Enroller::new(
-        &config.url,
-        config.node_name.clone(),
-        config.platform().to_string(),
-        config.scopes.clone(),
+    // **Not `Account` on its own** — see `AccountGrant`. The rotation behaviour is the library's;
+    // what is added here is a screen to draw the code on and a way for logging out to reach the
+    // copy this process is holding.
+    let grant = Arc::new(AccountGrant::new(
         store.clone(),
-    )
-    .map_err(|e| e.to_string())?
-    .with_ui(Arc::new(ScreenEnroll { bridge: bridge.clone() }));
-    // **Not upstream's `DeviceGrant`** — see `Held`. The behaviour is the same; the difference is
-    // that logging out can reach the copy it keeps in memory.
-    let held = Arc::new(Held::new(enroller));
-    let creds: Arc<dyn Credentials> = held.clone();
+        config.url.clone(),
+        zyris::EnrollRequest {
+            name: config.node_name.clone(),
+            platform: config.platform().to_string(),
+            scopes: config.scopes.clone(),
+        },
+        ScreenEnroll { bridge: bridge.clone() },
+    ));
+    let creds: Arc<dyn Credentials> = grant.clone();
 
-    let reauth = Reauth { store, held, spent: Arc::new(AtomicBool::new(false)) };
+    let reauth = Reauth { store, grant, spent: Arc::new(AtomicBool::new(false)) };
     Ok((creds, Some(reauth)))
 }
 
 /// The credential this node presents, **with a way to let go of it.**
 ///
-/// Upstream's `DeviceGrant` does exactly this and nothing here differs from it — the token is
-/// fetched once and reused until it expires, because `bearer` is called before *every* dial and
-/// going back to the store each time would be pointless work.
+/// It is the device grant end to end: load what is stored, or enroll and show a code; wrap the
+/// result in a [`zyris::Account`], which rotates the refresh token and hands each rotation back
+/// for storing; and answer `bearer` from it before every dial.
 ///
-/// The copy it keeps is private, though, and that made `/account logout` a lie: it cleared the
-/// credential file, dropped the socket so the runner would redial, and the redial presented the
-/// token this process was **still holding** and attached. Logged out on disk, connected on the
-/// wire, and no enrollment code — which is exactly what was reported (2026-08-14). Clearing the
-/// file cannot be the whole of logging out while a live process holds a working token.
+/// **The account is kept in memory, and that is what made `/account logout` a lie.** Logging out
+/// cleared the credential file and dropped the socket so the runner would redial — and the redial
+/// presented the token this process was **still holding** and attached. Logged out on disk,
+/// connected on the wire, and no enrollment code, which is exactly what was reported
+/// (2026-08-14). Clearing the file cannot be the whole of logging out while a live process holds a
+/// working token.
 ///
-/// So this type exists for one method: [`forget`](Self::forget).
-pub struct Held {
-    enroller: zyris::enroll::Enroller,
-    held: tokio::sync::Mutex<Option<zyris::enroll::StoredCredential>>,
+/// So this type exists for one method beyond the trait: [`forget`](Self::forget).
+struct AccountGrant {
+    store: Arc<dyn CredentialStore>,
+    /// The websocket URL. `Account` and `zyris::enroll` both derive the HTTP base from it, so this
+    /// node cannot end up enrolling against one deployment while connecting to another.
+    url: String,
+    /// What to ask to be enrolled as. Settled before this value is built — see [`source`].
+    request: zyris::EnrollRequest,
+    ui: ScreenEnroll,
+    held: tokio::sync::Mutex<Option<Arc<zyris::Account>>>,
+    /// Held for the length of one enrollment, so two dials cannot put two codes on the screen.
+    ///
+    /// **Separate from `held` on purpose.** The loop below has no bound — it renews a lapsed code
+    /// for as long as somebody might still walk over to a browser — and `Reauth::discard` reaches
+    /// for `held` to let go of the token this process is carrying. Parking the enrollment on that
+    /// same lock made `/account logout` wait for the enrollment to finish, which is a frozen screen
+    /// with no keys and no redraw. Two locks, so the one a person can reach is never the one a
+    /// stranger's browser is holding.
+    enrolling: tokio::sync::Mutex<()>,
+    /// Why a rotation could not be stored, once one could not be.
+    ///
+    /// **This is the difference between stopping and being revoked.** `zyris::Account` does not
+    /// adopt a rotation its hook refused, and it reports the refusal as `Unreachable` — the same
+    /// shade a server that blipped produces, which the run loop answers by backing off and dialling
+    /// again. Here that answer is wrong and dangerous: the server has *already* spent the old
+    /// refresh token, so every later attempt re-presents a spent one, and attacca reads a replay
+    /// past its 30-second grace as a leaked chain — `revoke_all_for_node`, which kills every node
+    /// under this credential rather than only this one.
+    ///
+    /// Upstream could not reach that state: its `Enroller` persisted with `?`, so a store failure
+    /// was `NeedsOperator` and the process exited 2 on the first one. Recording it here is how that
+    /// answer survives the move — the hook is our code, so it is the one place that can still tell
+    /// a full disk from a slow server.
+    store_broke: Arc<tokio::sync::Mutex<Option<String>>>,
 }
 
-impl Held {
-    /// Clock-skew allowance when deciding whether a stored access token is still worth presenting.
-    /// The same figure upstream uses — a token this close to expiry will be refused mid-handshake.
-    const SKEW_SECS: i64 = 30;
-
-    fn new(enroller: zyris::enroll::Enroller) -> Held {
-        Held { enroller, held: tokio::sync::Mutex::new(None) }
+impl AccountGrant {
+    fn new(
+        store: Arc<dyn CredentialStore>,
+        url: String,
+        request: zyris::EnrollRequest,
+        ui: ScreenEnroll,
+    ) -> AccountGrant {
+        AccountGrant {
+            store,
+            url,
+            request,
+            ui,
+            held: tokio::sync::Mutex::new(None),
+            enrolling: tokio::sync::Mutex::new(()),
+            store_broke: Arc::new(tokio::sync::Mutex::new(None)),
+        }
     }
 
-    /// Lets go of the token held in memory. The next dial goes back through `obtain`, which finds
-    /// whatever the store now holds — nothing, once logging out has cleared it — and enrolls.
+    /// The account to ask for a bearer: the one being held, the one on disk, or a fresh enrollment.
+    ///
+    /// This is the whole startup decision tree, and going through it whenever nothing usable is
+    /// held means there is no timer task and no second code path.
+    ///
+    /// **An account whose credential is due for rotation is dropped and the file read again**, and
+    /// that re-read is the whole reason two windows in one directory are survivable. Upstream's
+    /// `Held` went back through `Enroller::obtain()` whenever the access token was spent, and
+    /// `obtain` opened by reading the file — so the second window found the pair the first had just
+    /// written and simply used it. Holding an `Account` for the life of the process instead means
+    /// both windows carry the same credential, reach 80% of the *same* `access_expires_at` at the
+    /// same instant, and rotate from the same single-use refresh token. That is not a race to lose
+    /// occasionally, it is an appointment — and attacca answers a replay past its 30-second grace
+    /// with `revoke_all_for_node`. CLAUDE.md has a section on this — "nothing locks credential
+    /// rotation", spelled `### 자격 회전을 잠그는 것은 아무것도 없다` there, and quoted so it can be
+    /// searched for. Nothing here is a lock either; re-reading is only what keeps the odds where
+    /// that note says they are.
+    async fn account(&self) -> Result<Arc<zyris::Account>, CredentialsError> {
+        if let Some(account) = self.usable().await {
+            return Ok(account);
+        }
+        // One enrollment at a time, so a second dial arriving mid-grant cannot put a second code on
+        // the screen. **`held` is deliberately not what is locked here** — see the field.
+        let _enrolling = self.enrolling.lock().await;
+        // Whoever was ahead of us may have finished while we waited for that.
+        if let Some(account) = self.usable().await {
+            return Ok(account);
+        }
+
+        let credential = match self.stored().await? {
+            Some(credential) => credential,
+            None => self.enroll().await?,
+        };
+        let account = Arc::new(self.restore(credential));
+        *self.held.lock().await = Some(account.clone());
+        Ok(account)
+    }
+
+    /// The held account, if there is one and it is not already due to rotate.
+    ///
+    /// Dropping a due one here rather than in [`account`](Self::account) keeps the two places that
+    /// ask the same question answering it the same way.
+    async fn usable(&self) -> Option<Arc<zyris::Account>> {
+        let mut held = self.held.lock().await;
+        let account = held.as_ref()?.clone();
+        if account.credential().await.should_refresh(now_unix(), ACCESS_LIFETIME_SECS) {
+            *held = None;
+            return None;
+        }
+        Some(account)
+    }
+
+    /// A corrupt or unreadable credential is a reason to enroll again, not to die. A *refused* one
+    /// is different — a world-readable key file, a machine with nowhere to keep a secret — and
+    /// refusing loudly is the whole point of that distinction, so it propagates rather than
+    /// answering an exposed secret with a quiet re-enrollment.
+    async fn stored(&self) -> Result<Option<zyris::AccountCredential>, CredentialsError> {
+        match self.store.load().await {
+            Ok(credential) => Ok(credential),
+            Err(e) if !e.is_discardable() => Err(store_trouble(e)),
+            Err(e) => {
+                tracing::warn!(error = %e, "discarding unusable stored credential");
+                self.store.clear().await.map_err(store_trouble)?;
+                Ok(None)
+            }
+        }
+    }
+
+    /// Wrap a credential in an account that writes every rotation back to the store.
+    ///
+    /// **The hook runs before the rotation is adopted, and that ordering is the load-bearing part.**
+    /// A refresh token is single-use: a process that started presenting a pair which never reached
+    /// disk would present the spent one on its next start, and attacca reads a replay past its
+    /// 30-second grace as a leaked chain — `revoke_all_for_node`, which kills every node under this
+    /// credential rather than only this one. `zyris::Account` enforces the order; all we owe it is
+    /// a hook that fails when the write failed.
+    fn restore(&self, credential: zyris::AccountCredential) -> zyris::Account {
+        let store = self.store.clone();
+        let broke = self.store_broke.clone();
+        zyris::Account::restore(&self.url, credential)
+            .on_rotate(move |rotated| {
+                let store = store.clone();
+                let broke = broke.clone();
+                async move {
+                    match store.save(&rotated).await {
+                        Ok(()) => Ok(()),
+                        // Remembered as well as refused. The refusal alone reaches the run loop as
+                        // `Unreachable`, which it answers by dialling again — and by now the server
+                        // has spent the refresh token that produced `rotated`, so dialling again is
+                        // a replay. See `store_broke`.
+                        Err(e) => {
+                            *broke.lock().await = Some(e.to_string());
+                            Err(zyris::RotateError(e.to_string()))
+                        }
+                    }
+                }
+            })
+            .build()
+    }
+
+    /// The reason this node must stop, if a rotation could not be stored.
+    ///
+    /// **Asked whether or not the dial would have worked.** A hook that failed means the server
+    /// rotated and the pair on disk is spent, which is true no matter what the call it happened
+    /// inside went on to return. `NeedsOperator` is the shade that ends the process (exit 2)
+    /// instead of backing off into a replay — the same answer upstream gave, from the same fact.
+    async fn cannot_go_on(&self) -> Option<CredentialsError> {
+        let why = self.store_broke.lock().await.clone()?;
+        Some(CredentialsError::NeedsOperator(format!(
+            "a rotated credential could not be stored ({why}), so the one on disk is spent and \
+             dialling again would replay it. Fix that path and start this again."
+        )))
+    }
+
+    /// Ask for a code, put it in front of a person, and wait.
+    ///
+    /// **The renewal loop is ours because the library refuses to write it.** `Enrollment::renew`
+    /// exists and nothing calls it on its own. It is also the reason the window says "that code
+    /// expired" and draws the next one over it instead of the app dying at the ten-minute mark.
+    ///
+    /// Unbounded on purpose. Upstream stopped after three rounds because it was printing into a
+    /// terminal somebody had walked away from; here the window is on screen, Ctrl+C is always
+    /// live, and giving up on the node's behalf would take away the one thing it can still do.
+    /// The cost is known: attacca rate-limits repeated grants from one address (`too many pending
+    /// enrollments from this address`), so a code left unapproved long enough eventually renews
+    /// into that refusal — which arrives as `Unavailable`, and the run loop backs off on it.
+    async fn enroll(&self) -> Result<zyris::AccountCredential, CredentialsError> {
+        let mut enrollment =
+            zyris::enroll(&self.url, self.request.clone()).await.map_err(enrollment_trouble)?;
+        self.ui.show(enrollment.code());
+        loop {
+            // Hoisted out of the `match` so nothing borrows `enrollment` while the arm that has
+            // to renew it runs.
+            let progress = enrollment.poll().await.map_err(enrollment_trouble)?;
+            match progress {
+                // `poll` sleeps to the server's own cadence, `slow_down` included. A sleep here
+                // would be a second clock, disagreeing with the one the server asked for.
+                zyris::Progress::Waiting { .. } => {}
+                zyris::Progress::Granted(credential) => {
+                    // Stored **before** it is used, and before the window is told. A credential
+                    // this process began dialling on but never wrote down would enroll again on
+                    // the next start and leave a dead node row behind each time; and a window that
+                    // closed on `EnrollDone` while the save was still to fail would have said the
+                    // approval took when the next thing on screen is that it did not.
+                    self.store.save(&credential).await.map_err(store_trouble)?;
+                    self.ui.authorized();
+                    return Ok(credential);
+                }
+                zyris::Progress::Lapsed => {
+                    self.ui.lapsed();
+                    enrollment.renew().await.map_err(enrollment_trouble)?;
+                    self.ui.show(enrollment.code());
+                }
+                zyris::Progress::Denied => {
+                    self.ui.denied();
+                    return Err(CredentialsError::NeedsOperator(
+                        "the request was declined in the browser".to_string(),
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Lets go of the account held in memory. The next `bearer` goes back through
+    /// [`account`](Self::account), which finds whatever the store now holds — nothing, once logging
+    /// out has cleared it — and enrolls.
     pub async fn forget(&self) {
         *self.held.lock().await = None;
     }
 
-    /// Whether a token is being held right now. For the test that logging out lets go of it —
+    /// Whether an account is being held right now. For the test that logging out lets go of it —
     /// there is no other way to see the thing that made logging out a lie.
     #[cfg(test)]
     pub(crate) async fn is_holding(&self) -> bool {
@@ -105,88 +317,223 @@ impl Held {
     }
 
     #[cfg(test)]
-    pub(crate) async fn hold(&self, credential: zyris::enroll::StoredCredential) {
-        *self.held.lock().await = Some(credential);
-    }
-
-    fn now_unix() -> i64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0)
+    pub(crate) async fn hold(&self, credential: zyris::AccountCredential) {
+        *self.held.lock().await = Some(Arc::new(self.restore(credential)));
     }
 }
 
 #[async_trait::async_trait]
-impl Credentials for Held {
-    async fn bearer(&self) -> Result<String, zyris::runtime::credentials::CredentialsError> {
-        let mut held = self.held.lock().await;
-        // `obtain` is the whole startup decision tree: reuse, refresh, or enroll. Going there
-        // whenever the access token is spent means there is no timer task and no second code path.
-        if held.as_ref().and_then(|c| c.bearer(Self::now_unix(), Self::SKEW_SECS)).is_none() {
-            *held = Some(self.enroller.obtain().await?);
+impl Credentials for AccountGrant {
+    async fn bearer(&self) -> Result<String, CredentialsError> {
+        let account = self.account().await?;
+        let asked = account.bearer().await;
+        // Before the answer is read, because a rotation that could not be stored is fatal whatever
+        // this call returned — it may well have returned a perfectly good token, held over from
+        // before the rotation the disk refused.
+        if let Some(stop) = self.cannot_go_on().await {
+            return Err(stop);
         }
-        held.as_ref()
-            .and_then(|c| c.bearer(Self::now_unix(), Self::SKEW_SECS))
-            .map(str::to_string)
-            .ok_or_else(|| {
-                zyris::runtime::credentials::CredentialsError::NeedsOperator(
-                    "the credential just issued is already expired; check this machine's clock"
-                        .to_string(),
-                )
-            })
+        match asked {
+            Ok(bearer) => Ok(bearer),
+            // The server disowned this credential while we were holding it. Clearing the store and
+            // letting go of the account sends the next dial back through `account`, which finds
+            // nothing stored and enrolls — so a node whose grant chain was revoked shows a fresh
+            // code instead of presenting a dead token until somebody deletes the file by hand.
+            // `Unavailable` rather than `Fatal` is what buys that next dial: the run loop backs off
+            // and comes round again, where `Fatal` would end the process.
+            Err(zyris::EnrollError::Revoked) => {
+                tracing::warn!("this credential was revoked; enrolling again");
+                if let Err(e) = self.store.clear().await {
+                    tracing::warn!(error = %e, "could not discard the revoked credential");
+                }
+                self.forget().await;
+                Err(CredentialsError::Unavailable(
+                    "this credential was revoked; asking for a new one".to_string(),
+                ))
+            }
+            Err(e) => Err(enrollment_trouble(e)),
+        }
     }
 
-    async fn refresh(&self) -> Result<bool, zyris::runtime::credentials::CredentialsError> {
+    async fn refresh(&self) -> Result<bool, CredentialsError> {
         let mut held = self.held.lock().await;
-        let Some(current) = held.as_ref() else { return Ok(false) };
-        // `None` means the server disowned this credential and the store has already been cleared.
-        // Dropping what is held sends the next `bearer` back through `obtain`, which finds nothing
-        // stored and enrolls — so a revoked node shows a fresh code instead of dying.
-        *held = self.enroller.force_refresh(current).await?;
-        Ok(true)
+        // Nothing held means nothing was presented, so the refusal was not about a token of ours.
+        let Some(account) = held.take() else { return Ok(false) };
+
+        let forced = self.restore(due_now(account.credential().await));
+        let asked = forced.bearer().await;
+        if let Some(stop) = self.cannot_go_on().await {
+            return Err(stop);
+        }
+        match asked {
+            Ok(_) => {
+                *held = Some(Arc::new(forced));
+                Ok(true)
+            }
+            // The same conclusion the startup path reaches, and for the same reason: a node whose
+            // grant chain was revoked while it was connected must not be left presenting the dead
+            // token until a human deletes the file. The store is cleared here and nothing is put
+            // back in `held`, so the next `bearer` enrolls and a fresh code appears.
+            Err(zyris::EnrollError::Revoked) => {
+                tracing::warn!("this credential was rejected on rotation; enrolling again");
+                if let Err(e) = self.store.clear().await {
+                    tracing::warn!(error = %e, "could not discard the revoked credential");
+                }
+                Ok(true)
+            }
+            Err(e) => Err(enrollment_trouble(e)),
+        }
     }
 
     fn describe(&self) -> String {
-        format!("device enrollment ({})", self.enroller.store_description())
+        format!("device enrollment ({})", self.store.describe())
     }
 }
 
-/// The hook that moves the enrollment code to the screen. The upstream polling loop calls this method.
+/// The same credential, stamped as already due for rotation.
 ///
-/// Once `show` reaches the screen, the screen owns the display from that moment — nothing goes
-/// to stdout. If it doesn't (screen not up yet or already dead), it prints the box as before.
+/// **[`zyris::Account`] has no "rotate now"**: it decides from the credential's own expiry, at 80%
+/// of a one-hour life. Upstream's `Enroller::force_refresh` could call the refresh endpoint
+/// outright, and that is what answered the 401 a slept laptop or a drifted clock produces —
+/// without it a node exits permanently on a condition it could have fixed itself, because the
+/// transport marks 401 non-retriable and the run loop would spend its one rotation on a no-op.
+///
+/// So the copy handed to a throwaway account is aged instead. **Nothing false reaches disk**: the
+/// stored credential is untouched and the only thing `on_rotate` ever writes is what came back
+/// rotated. An expiry of *now* also means a rotation that fails leaves nothing presentable, so the
+/// failure is reported rather than papered over with the token that was just refused.
+/// The access-token lifetime attacca issues, used only to ask when a rotation is due.
+///
+/// **A copy of a constant `zyris::Account` keeps private** (`ACCESS_LIFETIME_SECS` in
+/// `zyris-core/src/account.rs`). It has to be the same number: this is what decides when to drop a
+/// held account and read the file again, and `Account` uses it to decide when to rotate. Read it
+/// too large and the re-read never happens before the rotation it exists to get ahead of; read it
+/// too small and every dial re-reads the file for nothing. If upstream changes it, change this.
+const ACCESS_LIFETIME_SECS: i64 = 3600;
+
+fn due_now(credential: zyris::AccountCredential) -> zyris::AccountCredential {
+    zyris::AccountCredential::new(
+        credential.access_token,
+        credential.refresh_token,
+        credential.node_id,
+        credential.node_name,
+        credential.owner_email,
+        now_unix(),
+    )
+}
+
+fn now_unix() -> i64 {
+    SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+/// How the run loop should read a failure that came from the enrollment or account layer.
+///
+/// Matched exhaustively on purpose: a shade added upstream must stop the build here rather than be
+/// folded into "back off and try again", which is the answer that never surfaces anything.
+fn enrollment_trouble(error: zyris::EnrollError) -> CredentialsError {
+    match error {
+        // **The 2026-08-03 incident, and this message is the only thing that explains it.** One
+        // scope the deployment does not know refuses the *whole* authorize request: attacca's axum
+        // `Json` extractor cannot read an enum variant it has never heard of and answers 422, so
+        // nobody ever reaches the approval screen. Naming the scope is the difference between
+        // "enrollment is broken" and one line to delete from `conn::REQUIRED_SCOPES`.
+        zyris::EnrollError::ScopeUnknown { scope } => CredentialsError::NeedsOperator(format!(
+            "this server does not know the scope {scope}; it must be removed from the list this \
+             build asks for before enrollment can even show a code"
+        )),
+        // Somebody said no in the browser. Asking again is pestering them.
+        e @ zyris::EnrollError::Denied => CredentialsError::NeedsOperator(e.to_string()),
+        // All three are worth another dial rather than an exit. `Lapsed` and `Revoked` reaching
+        // here mean the caller has already cleared what it had, so the next attempt enrolls; and a
+        // server that is merely unreachable is usually a startup race, not a dead node.
+        e @ (zyris::EnrollError::Lapsed
+        | zyris::EnrollError::Revoked
+        | zyris::EnrollError::Unreachable(_)) => CredentialsError::Unavailable(e.to_string()),
+    }
+}
+
+/// A store failure that reached the caller needs a person.
+///
+/// [`AccountGrant::stored`] already swallows the discardable ones on the read path, so what is left
+/// is either a refusal — an exposed secret, a machine with nowhere to keep one — or a *write* that
+/// could not be kept. Retrying the second would mean a fresh code on every restart and a dead node
+/// row in the account behind each one, so neither is a reason to loop.
+fn store_trouble(error: CredentialStoreError) -> CredentialsError {
+    CredentialsError::NeedsOperator(error.to_string())
+}
+
+/// What moves the enrollment code to the screen. The polling loop above calls these.
+///
+/// Once `show` reaches the screen, the screen owns the display from that moment — nothing goes to
+/// stdout. If it doesn't (screen not up yet, or already dead), it prints the box as before.
 pub struct ScreenEnroll {
     bridge: Bridge,
 }
 
-impl EnrollmentUi for ScreenEnroll {
-    fn show(&self, response: &AuthorizeResponse) {
+impl ScreenEnroll {
+    /// A fresh code is ready. Called for the first one and again after every renewal, so the
+    /// window redraws over whatever phase it was showing.
+    pub fn show(&self, code: &zyris::Code) {
         let view = EnrollView {
-            code: response.user_code.clone(),
-            uri: response.verification_uri.clone(),
-            expires_at: std::time::Instant::now()
-                + Duration::from_secs(response.expires_in.max(0) as u64),
+            code: code.user_code.clone(),
+            uri: code.verification_uri.clone(),
+            // `Code` carries a wall-clock instant and the screen counts down on the monotonic one.
+            // A code that already lapsed converts to no time left rather than panicking — renewal
+            // and this conversion race, and losing that race must not take the app down.
+            expires_at: Instant::now() + time_left(code),
             phase: EnrollPhase::Waiting,
         };
         if !self.bridge.reaches_screen(Frame::Enroll(view)) {
-            // Without a screen, print the box — the same path as before. Even with the hook,
-            // this is all the first run (before the screen is up) does.
-            println!("{}", zyris::enroll::authorization_notice(response));
+            // Without a screen, print the box — the same path as before. Even with the screen
+            // wired up, this is all the first run does when the app could not start at all.
+            println!("{}", notice(code));
         }
     }
 
-    fn lapsed(&self) {
+    /// The code lapsed. **The window is not closed** — a new one is on its way and will be drawn
+    /// over this phase.
+    pub fn lapsed(&self) {
         self.bridge.frame(Frame::EnrollPhase(EnrollPhase::Lapsed));
     }
 
-    fn denied(&self) {
+    pub fn denied(&self) {
         self.bridge.frame(Frame::EnrollPhase(EnrollPhase::Denied));
     }
 
-    fn authorized(&self, _response: &TokenResponse) {
+    /// Approved. This is what closes the window, including one a person dismissed with Esc while
+    /// the grant kept polling in the background.
+    pub fn authorized(&self) {
         self.bridge.frame(Frame::EnrollDone);
     }
+}
+
+/// How much of a code's life is left, on the wall clock it was issued against.
+fn time_left(code: &zyris::Code) -> Duration {
+    code.expires_at.duration_since(SystemTime::now()).unwrap_or_default()
+}
+
+/// The block printed when there is no screen to draw on.
+///
+/// Built here rather than fetched from the library: upstream's `authorization_notice` went with
+/// the program layer, and it was three facts and a border. **Nothing here goes through `lang.rs`**
+/// — that is the screen's vocabulary, and this is the one path where there is no screen.
+///
+/// `println!` rather than `tracing` at the call site: somebody running with `RUST_LOG=error` must
+/// still see the code. It is the primary UX of the whole feature when the box is all there is.
+fn notice(code: &zyris::Code) -> String {
+    let minutes = time_left(code).as_secs().div_ceil(60);
+    format!(
+        "\n\
+         --------------------------------------------------------------\n  \
+         Authorize this node\n\n  \
+         1. Open        {uri}\n  \
+         2. Enter code  {user_code}\n\n  \
+         Waiting for approval. This code expires in {minutes} minutes.\n  \
+         Press Ctrl-C to cancel.\n\
+         --------------------------------------------------------------\n",
+        uri = code.verification_uri,
+        user_code = code.user_code,
+    )
 }
 
 /// A handle to discard credentials and get authorized again. **Used at most once per process.**
@@ -197,31 +544,31 @@ impl EnrollmentUi for ScreenEnroll {
 #[derive(Clone)]
 pub struct Reauth {
     store: Arc<dyn CredentialStore>,
-    /// The token this process is holding. **Clearing the file is only half of it** — see `Held`.
-    held: Arc<Held>,
+    /// The account this process is holding. **Clearing the file is only half of it** — see
+    /// `AccountGrant`.
+    grant: Arc<AccountGrant>,
     /// Whether this process has already discarded once. **A person can approve narrowly again** —
     /// discarding every time would demand the browser on every attach, not every launch.
     spent: Arc<AtomicBool>,
 }
 
 impl Reauth {
-    /// A `Reauth` over whatever store the test hands it. The enroller is never called — nothing in
-    /// these tests reaches the network — but `Held` needs one to exist.
+    /// A `Reauth` over whatever store the test hands it. Nothing in these tests reaches the
+    /// network — the URL never resolves — but the grant has to exist, because discarding has two
+    /// halves and one of them is the account this process is holding.
     #[cfg(test)]
     pub(crate) fn for_test(store: Arc<dyn CredentialStore>) -> Reauth {
-        let enroller = zyris::enroll::Enroller::new(
-            "wss://example.invalid",
-            "arch zyris-code".into(),
-            "linux".into(),
-            Vec::new(),
+        let grant = Arc::new(AccountGrant::new(
             store.clone(),
-        )
-        .expect("the enroller is only built, never called");
-        Reauth {
-            store,
-            held: Arc::new(Held::new(enroller)),
-            spent: Arc::new(AtomicBool::new(false)),
-        }
+            "wss://example.invalid/zyris/v1/ws".to_string(),
+            zyris::EnrollRequest {
+                name: "arch zyris-code".to_string(),
+                platform: "linux".to_string(),
+                scopes: Vec::new(),
+            },
+            ScreenEnroll { bridge: Bridge::new() },
+        ));
+        Reauth { store, grant, spent: Arc::new(AtomicBool::new(false)) }
     }
 
     /// Whether it has already been done. The value fed into the decision (`conn::needs_reenrollment`).
@@ -265,7 +612,7 @@ impl Reauth {
                 false
             }
         };
-        self.held.forget().await;
+        self.grant.forget().await;
         cleared
     }
 }
@@ -273,10 +620,10 @@ impl Reauth {
 #[cfg(test)]
 mod tests_discard {
     use super::*;
-    use zyris::enroll::{CredentialStore, MemoryCredentialStore};
+    use crate::runtime::MemoryCredentialStore;
 
-    fn stored() -> zyris::enroll::StoredCredential {
-        zyris::enroll::StoredCredential::new(
+    fn stored() -> zyris::AccountCredential {
+        zyris::AccountCredential::new(
             "a".into(),
             "r".into(),
             "n".into(),
@@ -284,6 +631,67 @@ mod tests_discard {
             "e@example.com".into(),
             i64::MAX,
         )
+    }
+
+    /// A credential due to rotate at a chosen moment. `access_expires_at` is what
+    /// `should_refresh` reads, so this is the only knob a test needs to say "due" or "not yet".
+    fn expiring_at(at: i64) -> zyris::AccountCredential {
+        zyris::AccountCredential::new(
+            "a".into(),
+            "r".into(),
+            "n".into(),
+            "arch zyris-code".into(),
+            "e@example.com".into(),
+            at,
+        )
+    }
+
+    /// **A rotation that could not be stored stops this node instead of dialling again.**
+    ///
+    /// `zyris::Account` reports a hook refusal as `Unreachable`, which the run loop answers with
+    /// backoff and another dial — but the server has already spent the refresh token by then, so
+    /// every retry is a replay, and attacca answers a replay past its 30-second grace with
+    /// `revoke_all_for_node`: every node under the credential, not just this one. `NeedsOperator`
+    /// is what ends the process instead, which is the answer upstream's `Enroller` gave by
+    /// persisting with `?`.
+    #[tokio::test]
+    async fn a_rotation_that_could_not_be_stored_stops_the_node() {
+        let store = std::sync::Arc::new(MemoryCredentialStore::default());
+        store.save(&stored()).await.unwrap();
+        let reauth = Reauth::for_test(store.clone());
+        *reauth.grant.store_broke.lock().await = Some("no space left on device".to_string());
+
+        // The credential is nowhere near expiry, so this asks nothing of the network: the token it
+        // would have handed back is perfectly good, and that is exactly the case being locked.
+        match reauth.grant.bearer().await {
+            Err(CredentialsError::NeedsOperator(why)) => {
+                assert!(why.contains("no space left on device"), "the reason is lost: {why}");
+            }
+            other => panic!("a spent credential must not be dialled with again: {other:?}"),
+        }
+    }
+
+    /// **A credential due to rotate is dropped and the file is read again.**
+    ///
+    /// Two windows in one directory share one credential file. Upstream went back to disk whenever
+    /// its token was spent, so the second window found the pair the first had just written and used
+    /// it. Holding an account for the life of the process instead puts both windows on the same
+    /// `access_expires_at`, so both rotate from the same single-use refresh token at the same
+    /// instant — an appointment rather than a race, and the answer to it is `revoke_all_for_node`.
+    #[tokio::test]
+    async fn a_credential_due_to_rotate_is_not_handed_back_from_memory() {
+        let store = std::sync::Arc::new(MemoryCredentialStore::default());
+        let reauth = Reauth::for_test(store.clone());
+
+        // Well inside its life: nothing to re-read, so what is held is what is used.
+        reauth.grant.hold(expiring_at(now_unix() + ACCESS_LIFETIME_SECS)).await;
+        assert!(reauth.grant.usable().await.is_some(), "a fresh credential is still good");
+
+        // Past the 80% mark, which is where `Account` would rotate. The held one goes, and with it
+        // the guarantee that this window rotates from a pair another window has already spent.
+        reauth.grant.hold(expiring_at(now_unix() + 60)).await;
+        assert!(reauth.grant.usable().await.is_none(), "a due credential was handed back");
+        assert!(!reauth.grant.is_holding().await, "the due account is still held");
     }
 
     /// **Clearing the file is only half of logging out.**
@@ -296,11 +704,11 @@ mod tests_discard {
         let store = std::sync::Arc::new(MemoryCredentialStore::default());
         store.save(&stored()).await.unwrap();
         let reauth = Reauth::for_test(store.clone());
-        reauth.held.hold(stored()).await;
+        reauth.grant.hold(stored()).await;
 
         assert!(reauth.discard().await);
         assert!(store.load().await.unwrap().is_none(), "the file was not cleared");
-        assert!(!reauth.held.is_holding().await, "the token in memory would still attach");
+        assert!(!reauth.grant.is_holding().await, "the token in memory would still attach");
     }
 
     /// **A person asking to log out means it every time.**
@@ -329,12 +737,12 @@ mod tests_discard {
 mod tests {
     use super::*;
     use tokio::sync::mpsc;
-    use zyris::enroll::MemoryCredentialStore;
 
     use crate::app::Action;
+    use crate::runtime::MemoryCredentialStore;
 
-    fn stored() -> zyris::enroll::StoredCredential {
-        zyris::enroll::StoredCredential::new(
+    fn stored() -> zyris::AccountCredential {
+        zyris::AccountCredential::new(
             "a".into(),
             "r".into(),
             "n".into(),
@@ -344,13 +752,11 @@ mod tests {
         )
     }
 
-    fn authorize() -> AuthorizeResponse {
-        AuthorizeResponse {
-            device_code: "zdc_secret".into(),
+    fn code() -> zyris::Code {
+        zyris::Code {
             user_code: "WXQR-7KBD".into(),
             verification_uri: "https://attacca.example/settings/zyris/device".into(),
-            expires_in: 600,
-            interval: 5,
+            expires_at: SystemTime::now() + Duration::from_secs(600),
         }
     }
 
@@ -366,7 +772,7 @@ mod tests {
     #[test]
     fn the_code_goes_to_the_screen_when_one_is_up() {
         let (bridge, mut screen) = with_screen();
-        ScreenEnroll { bridge }.show(&authorize());
+        ScreenEnroll { bridge }.show(&code());
 
         match screen.try_recv().expect("must reach the screen") {
             (_, Action::Frame(Frame::Enroll(view))) => {
@@ -383,7 +789,31 @@ mod tests {
     fn without_a_screen_the_code_is_printed() {
         let bridge = Bridge::new();
         // Called without a screen, the box goes to stdout — no panic, and that's all.
-        ScreenEnroll { bridge }.show(&authorize());
+        ScreenEnroll { bridge }.show(&code());
+    }
+
+    /// **The box has to carry both halves.** A code with nowhere to type it is not actionable, and
+    /// this string is all a machine without a screen ever gets. The device code — the secret half
+    /// of the grant — is not in `zyris::Code` at all, so it cannot be printed by accident.
+    #[test]
+    fn the_printed_box_names_the_code_and_where_to_type_it() {
+        let box_text = notice(&code());
+        assert!(box_text.contains("WXQR-7KBD"), "the code is missing: {box_text}");
+        assert!(box_text.contains("https://attacca.example/settings/zyris/device"));
+        assert!(box_text.contains("expires in 10 minutes"), "no idea how long it lasts");
+    }
+
+    /// **A code that already lapsed still draws.** Renewal and the wall-clock conversion race, and
+    /// `SystemTime::duration_since` answers a past instant with an error — taking the app down at
+    /// the moment it is showing somebody how to authorize it would be the worst place for one.
+    #[test]
+    fn a_code_that_already_expired_still_reaches_the_screen() {
+        let (bridge, mut screen) = with_screen();
+        let lapsed =
+            zyris::Code { expires_at: SystemTime::now() - Duration::from_secs(60), ..code() };
+        ScreenEnroll { bridge }.show(&lapsed);
+
+        assert!(matches!(screen.try_recv(), Ok((_, Action::Frame(Frame::Enroll(_))))));
     }
 
     /// **Expiry, denial, and approval reach the screen.** If they vanished silently, a person wouldn't know.
@@ -404,15 +834,7 @@ mod tests {
             other => panic!("must be a denial frame: {other:?}"),
         }
 
-        ui.authorized(&TokenResponse {
-            access_token: "zna_x".into(),
-            refresh_token: "znr_x".into(),
-            expires_in: 3600,
-            scope: String::new(),
-            node_id: "n".into(),
-            node_name: "hello node".into(),
-            owner_email: "allen@example.com".into(),
-        });
+        ui.authorized();
         assert!(matches!(screen.try_recv(), Ok((_, Action::Frame(Frame::EnrollDone)))));
     }
 

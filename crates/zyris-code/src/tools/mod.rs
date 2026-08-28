@@ -1,8 +1,9 @@
 //! What this node hands out to agents.
 //!
 //! **The moment we announce, every agent in every session of that account sees this node.** Sessions
-//! running in other windows can touch this computer too, and capkit's path resolution isn't a jail,
-//! so (`path.rs`: "the root is a default, not a jail") absolute paths escape the working directory.
+//! running in other windows can touch this computer too, and the shared path resolution isn't a
+//! jail, so (`zyris_caps::resolve_under`, `path.rs`: "the root is a default, not a jail") absolute
+//! paths escape the working directory.
 //! **Catching that escape is `Gate`'s job** — anything outside the working directory follows
 //! the `/config` directory-access setting (deny by default; `allow` runs it without asking).
 
@@ -22,9 +23,9 @@ pub mod work;
 
 use std::path::PathBuf;
 
-use zyris::runtime::Runner;
-use zyris_capkit::PtyTerminal;
+use zyris::NodeBuilder;
 use zyris_caps::TerminalServer;
+use zyris_terminal::PtyTerminal;
 
 use bridge::Bridge;
 use edit::{CodeEditServer, LocalEdit};
@@ -41,7 +42,14 @@ pub fn working_dir() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
-/// Attaches everything this node hands out to the Runner.
+/// Attaches everything this node hands out to the node being built.
+///
+/// **It takes the builder, not the runner.** `Runner` used to collect capabilities itself; the
+/// type it collected them into is not public any more, and its public replacement
+/// (`zyris::Capabilities::add`) is `async`, so there is nowhere synchronous left on that side to
+/// hang them. `zyris::NodeBuilder` is synchronous and is exactly that collector, so this function
+/// takes one and hands it back — the caller then names the node, builds it, and gives the `Node`
+/// to `Runner::new`.
 ///
 /// `cwd` is the process's working directory. Relative paths resolve against it, but **it is not a
 /// jail** — absolute paths go straight through. What stops them is `Gate`.
@@ -49,11 +57,11 @@ pub fn working_dir() -> PathBuf {
 /// **Every single one is wrapped in `Gate`.** If even one goes out bare, that capability
 /// becomes a back door around the fence.
 pub fn announce(
-    runner: Runner,
+    node: NodeBuilder,
     cwd: PathBuf,
     bridge: Bridge,
     api: tokio::sync::watch::Receiver<Option<std::sync::Arc<zyris_attacca::AttaccaApiClient>>>,
-) -> Runner {
+) -> NodeBuilder {
     let edit = LocalEdit::new(cwd.clone());
     // The git tools run in it and read the GitHub remote out of it, so they need their own copy —
     // `search` takes `cwd` by value further down.
@@ -95,8 +103,7 @@ pub fn announce(
     let joined: Vec<String> = parts.into_iter().flatten().collect();
     bridge.set_preamble((!joined.is_empty()).then(|| joined.join("\n\n")));
 
-    runner
-        .capability(Gate::new(skill::SkillServer(skills), bridge.clone()))
+    node.capability(Gate::new(skill::SkillServer(skills), bridge.clone()))
         .capability(Gate::new(rules::RulesCapServer(Rules::new(cwd.clone())), bridge.clone()))
         .capability(Gate::new(ReadOnlyFileIo::new(cwd.clone()), bridge.clone()))
         // Search is reading too. But **paths going outside are asked about even when read-only.**

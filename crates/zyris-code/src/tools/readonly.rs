@@ -1,6 +1,6 @@
 //! Exposes `file_io` **read-only**.
 //!
-//! Handing out capkit's `LocalFileIo` as-is drags `write`·`remove`·`mkdir` along too. If there are
+//! Handing out `zyris-fs`'s `LocalFileIo` as-is drags `write`·`remove`·`mkdir` along too. If there are
 //! two ways to change a file, the agent picks a full overwrite and the diff spreads over the whole
 //! file, and the approval gate has to be in two places. So the descriptor's tool list is filtered
 //! before announcing — legal, since protocol §5 pins down "consumers discover tools by descriptor".
@@ -12,18 +12,20 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 // The `serve` module itself is private. Its items are re-exported at the crate root, so use those.
 use zyris::{CapabilityDescriptor, IncomingCall, Outgoing, Result, ServeCapability};
-use zyris_capkit::LocalFileIo;
 use zyris_caps::FileIoServer;
+use zyris_fs::LocalFileIo;
 
 /// The four that are exposed. The rest are filtered out.
 const READ_ONLY: &[&str] = &["stat", "list", "read", "read_stream"];
 
 /// The ones deliberately withheld, written down so upstream cannot grow a writer unnoticed.
 ///
-/// **Every tool capkit offers has to appear in one of these two lists**, and the test below fails
-/// the moment that stops being true. Without it, a new upstream tool simply lands on the filtered
-/// side by default — silently, with nobody having decided anything. capkit v3 really did add
-/// `edit` this way, and the test that was supposed to guard this went on passing.
+/// **Every tool the implementation offers has to appear in one of these two lists**, and the test
+/// below fails the moment that stops being true. Without it, a new upstream tool simply lands on
+/// the filtered side by default — silently, with nobody having decided anything. capkit v3 really
+/// did add `edit` this way, and the test that was supposed to guard this went on passing. That
+/// implementation is `zyris-fs` now rather than `zyris-capkit`, which changes where the tools come
+/// from and nothing at all about how a new one gets classified.
 ///
 /// It is a test-only list because `READ_ONLY` alone decides what runs; this one exists to force a
 /// human to classify what upstream adds, not to gate anything at runtime.
@@ -62,7 +64,7 @@ mod tests {
 
     /// With two write paths, the agent picks a full overwrite and the diff spreads over the whole file.
     ///
-    /// **Every tool capkit offers must be classified here, by hand.**
+    /// **Every tool `zyris-fs` offers must be classified here, by hand.**
     ///
     /// This used to name `write`·`remove`·`mkdir` inline, and capkit v3 then added a fourth writer
     /// (`edit`). The allowlist did hold — a new name simply lands on the filtered side — but that
@@ -76,7 +78,7 @@ mod tests {
         for name in &offered {
             assert!(
                 READ_ONLY.contains(name) || WITHHELD.contains(name),
-                "capkit offers `{name}`, which this node has never decided about. Put it in \
+                "zyris-fs offers `{name}`, which this node has never decided about. Put it in \
                  READ_ONLY if it only reads, or in WITHHELD if it changes anything."
             );
         }
@@ -97,10 +99,10 @@ mod tests {
         assert_eq!(announced, want);
     }
 
-    /// **Every tool capkit offers that is not a read is refused when called**, not merely hidden.
-    /// Filtering the list alone leaves the name callable by anyone who knows it.
+    /// **Every tool `zyris-fs` offers that is not a read is refused when called**, not merely
+    /// hidden. Filtering the list alone leaves the name callable by anyone who knows it.
     #[tokio::test]
-    async fn no_writer_capkit_offers_can_be_called() {
+    async fn no_writer_the_implementation_offers_can_be_called() {
         let all = FileIoServer(LocalFileIo::rooted(PathBuf::from("/tmp"))).descriptor();
         let cap = ReadOnlyFileIo::new(PathBuf::from("/tmp"));
         for tool in all.tools.iter().filter(|t| !READ_ONLY.contains(&t.name.as_str())) {

@@ -1,11 +1,10 @@
 //! zyris-code — a terminal client that talks to an Attacca agent.
 //!
-//! This file is thin. `zyris::runtime::Runner` does the connecting, and `app::run` does the screen.
+//! This file is thin. `runtime::Runner` does the connecting, and `app::run` does the screen.
 
 use std::process::ExitCode;
 use std::time::Duration;
 
-use zyris::runtime::Runner;
 use zyris::NodeKind;
 // `AttaccaApi` is a trait. Calling its methods requires the trait to be in scope,
 // not just the client type — otherwise you get stuck with "method not found".
@@ -153,9 +152,12 @@ async fn main() -> ExitCode {
     // other's identity on the same file. Separating by profile leaned on a naming rule and was a
     // stopgap; splitting the directory is the fundamental fix.
     //
-    // **Upstream offers no way to set that** (`RunConfig::app` isn't in zyris `main`). Instead, since
-    // zyris's `config_dir()` checks `$ZYRIS_CONFIG_DIR` first, we fill that variable — **a value the
-    // person gave wins.**
+    // **Nothing in the library decides this, and nothing should.** Where on a machine a secret may
+    // be written is a property of the program, so `runtime::store::config_dir()` is ours and checks
+    // `$ZYRIS_CONFIG_DIR` first; we fill that variable here — **a value the person gave wins.**
+    // (The variable, rather than an argument, because the old `RunConfig::app` never existed
+    // upstream either and the store keeps reading the environment the same way it always did, so
+    // an old credential file is still found where it was left.)
     if std::env::var_os("ZYRIS_CONFIG_DIR").is_none_or(|v| v.is_empty()) {
         if let Some(dir) = zyris_code::conn::credential_dir() {
             std::env::set_var("ZYRIS_CONFIG_DIR", &dir);
@@ -199,11 +201,35 @@ async fn main() -> ExitCode {
         }
     }
 
-    // **The scopes to request must be decided before credentials are made.** Since `Enroller` copies
-    // `config.scopes` when it's built, values given later via `Runner::request_scopes` don't ride on
-    // the enrollment request — the approval screen would then appear without requesting any scope.
+    // **The scopes to request must be decided before credentials are made.** The device grant
+    // copies `config.scopes` when it is built, and it is built by `enroll::source` from the
+    // `RunConfig::from_env()` read further down — so anything set after that would not ride on the
+    // enrollment request, and the approval screen would appear asking for nothing. There is
+    // deliberately no setter to get this wrong with: the old `Runner::request_scopes` existed only
+    // because that `Runner` resolved its credential source lazily, and it went with it. **The
+    // environment variable is the only way in, and it is written here, above everything that reads
+    // it.**
     //
-    // Here too **the person's `$ZYRIS_SCOPES` wins** (same meaning as upstream `scopes_pinned`).
+    // Here too **the person's `$ZYRIS_SCOPES` wins** (that is `RunConfig::scopes_pinned`).
+    //
+    // Scope needed per call (attacca `zyris_gateway.rs`'s `require(ApiScope::…)`):
+    //
+    //   me                                          none
+    //   list_agents                                 agents:read
+    //   create_session_with · send_message
+    //     · cancel_turn                             sessions:write
+    //   turn_events · session_history               events:read     ← essential for v1
+    //   list_sessions · session_usage               sessions:read   ← v2 picker
+    //   list_projects                               projects:read   ← v2 picker
+    //
+    // **If `events:read` is missing, sending works but the answer never comes.** Only the stream is
+    // quietly blocked with ForbiddenScope and the screen looks like nothing happened — it caught us once.
+    //
+    // The rest (agents:write·projects:write·jobs:*·artifacts:*·kanban:*) has no caller,
+    // so it isn't requested. Unused permissions only widen the blast radius if a token leaks.
+    //
+    // **The list lives in one place** (`conn::REQUIRED_SCOPES`). If what's requested and what's
+    // checked after attaching diverge, you'd either deny something you never asked for or stay silent about something missing.
     if std::env::var_os("ZYRIS_SCOPES").is_none() {
         std::env::set_var("ZYRIS_SCOPES", zyris_code::conn::REQUIRED_SCOPES.join(","));
     }
@@ -218,8 +244,8 @@ async fn main() -> ExitCode {
 
     // **The app is raised before the runner.** That way the enrollment code window is on screen from
     // the first enrollment (before connecting) — no more stdout box leaking into the terminal like
-    // before. `Runner` calls `on_connect` again on every reconnect, but the app is started once here
-    // and only the handle is swapped (`api_rx`).
+    // before. The runner calls `on_connect` again on every reconnect, but the app is started once
+    // here and only the handle is swapped (`api_rx`).
     let (api_tx, api_rx) = watch::channel::<Option<Arc<AttaccaApiClient>>>(None);
     let api_tx = Arc::new(api_tx);
 
@@ -320,12 +346,15 @@ async fn main() -> ExitCode {
     if let Some(tag) = newer {
         bridge.frame(zyris_code::app::Frame::UpdateFound(tag));
     }
-    //
-    // **The enrollment code is sent to the screen by upstream's `EnrollmentUi` hook** (`enroll.rs`, upstream PR #6).
+
+    // **The enrollment code goes to the screen because `enroll.rs` runs the loop that produces it**
+    // (`AccountGrant` → `ScreenEnroll`). It used to arrive through an upstream `EnrollmentUi` hook
+    // (`Enroller::with_ui`, upstream PR #6); the library keeps no opinion about screens any more, so
+    // the polling loop — and with it the "expired, here is a new code" branch — is this app's.
     // Only when there's no screen (the extreme where the app couldn't start) does it fall to a stdout box. The old
-    // "leaking into the terminal behind the screen" problem is structurally gone.
-    let config = zyris::runtime::RunConfig::from_env();
-    let creds: Arc<dyn zyris::runtime::credentials::Credentials> =
+    // "leaking into the terminal behind the screen" problem is structurally gone either way.
+    let config = zyris_code::runtime::RunConfig::from_env();
+    let creds: Arc<dyn zyris_code::runtime::Credentials> =
         match zyris_code::enroll::source(&config, &bridge) {
             Ok((creds, reauth)) => {
                 // You only learn permissions are short after connecting (`me()`). To be able to drop
@@ -341,36 +370,58 @@ async fn main() -> ExitCode {
             }
         };
 
-    let runner = zyris_code::tools::announce(
-        Runner::new(config, creds),
+    // **The node is assembled here and handed over already built.** `announce` used to hang the
+    // capabilities on the runner; the collector it used is not public any more and its public
+    // replacement is `async`, so there is nowhere synchronous left on that side. `NodeBuilder` is
+    // synchronous and is exactly that collector, so the capabilities go on it, the name and kind go
+    // on it, and `Runner::new` receives the finished `Node`.
+    //
+    // **The name has to be said here now.** The runner used to take it out of `RunConfig`; a
+    // builder that is never told falls back to this machine's hostname, which is precisely the
+    // collision `$ZYRIS_NODE_NAME` was set above to avoid.
+    let node = match zyris_code::tools::announce(
+        zyris::Node::builder(),
         cwd.clone(),
         bridge.clone(),
         api_rx.clone(),
     )
+    .name(config.node_name.clone())
     .kind(NodeKind::Service)
-    // Scope needed per call (attacca `zyris_gateway.rs`'s `require(ApiScope::…)`):
-    //
-    //   me                                          none
-    //   list_agents                                 agents:read
-    //   create_session_with · send_message
-    //     · cancel_turn                             sessions:write
-    //   turn_events · session_history               events:read     ← essential for v1
-    //   list_sessions · session_usage               sessions:read   ← v2 picker
-    //   list_projects                               projects:read   ← v2 picker
-    //
-    // **If `events:read` is missing, sending works but the answer never comes.** Only the stream is
-    // quietly blocked with ForbiddenScope and the screen looks like nothing happened — it caught us once.
-    //
-    // The rest (agents:write·projects:write·jobs:*·artifacts:*·kanban:*) has no caller,
-    // so it isn't requested. Unused permissions only widen the blast radius if a token leaks.
-    //
-    // **The list lives in one place** (`conn::REQUIRED_SCOPES`). If what's requested and what's
-    // checked after attaching diverge, you'd either deny something you never asked for or stay silent about something missing.
-    .request_scopes(zyris_code::conn::REQUIRED_SCOPES)
+    .build()
+    {
+        Ok(node) => node,
+        // Building fails only on a capability this node declared wrongly — a duplicate name, a
+        // descriptor that will not serialise. It ends here rather than turning into a dial loop
+        // that never announces.
+        //
+        // **It is still reported through `RunError`.** That table is the whole difference between
+        // exit 2, which tells a supervisor that restarting changes nothing, and exit 1, which
+        // invites it to try again — and this is the case the 2 was written for. The node being
+        // built out here rather than inside the runner moved where the error is noticed; it is not
+        // a reason to grow a second answer to the same question.
+        Err(e) => {
+            let error = zyris_code::runtime::RunError::Build(e);
+            notice.fatal(&error.to_string());
+            return error.exit_code();
+        }
+    };
+
+    // **Taken before the node moves into the runner.** `Capabilities` is a handle onto the same set,
+    // so MCP servers that come up seconds later announce through it (`start_mcp`, below).
+    let capabilities = node.capabilities();
+
     // **Splitting windows is the server's job.** The node has nothing to offer — neither `.instance(…)`
     // nor registering siblings via `register_node` exists on the real server (measured 2026-08-03). So
     // here it just attaches, and the day the server starts splitting nodes, it happens by itself.
-    .on_connect({
+    //
+    // **`Node::connect` is not used, deliberately.** It takes one fixed token and redials with it
+    // for ever, which is right for a `znt_` that never expires and wrong for what this app holds:
+    // an account access token good for about an hour. `runtime::Runner` asks for a bearer
+    // immediately before every dial instead. `Account::register_node` would mint a `znt_` and let
+    // `Link` take this job over, and `nodes:write` is already in `conn::REQUIRED_SCOPES` — not
+    // taken, because it changes the one-credential-one-node story that was tried and reverted on
+    // 2026-08-12.
+    let runner = zyris_code::runtime::Runner::new(config, node, creds).on_connect({
         let bridge = bridge.clone();
         let notice = notice.clone();
         move |conn| {
@@ -415,7 +466,7 @@ async fn main() -> ExitCode {
 
     // **MCP attaches in the background.** Servers fetched with `npx` take seconds, and the screen
     // must not wait for that. Once they're up, `Capabilities::add` announces again.
-    zyris_code::tools::start_mcp(runner.capabilities(), cwd, bridge);
+    zyris_code::tools::start_mcp(capabilities, cwd, bridge);
 
     // **It doesn't die quietly.** `run()` sends the reason only to the log and leaves an exit code.
     //
@@ -477,7 +528,7 @@ async fn main() -> ExitCode {
 
 /// Which of runner and app ended first. The branch that decides the exit code.
 enum RunnerEnded {
-    Runner(Result<(), zyris::runtime::RunError>),
+    Runner(Result<(), zyris_code::runtime::RunError>),
     App(Result<Result<(), anyhow::Error>, tokio::task::JoinError>),
 }
 

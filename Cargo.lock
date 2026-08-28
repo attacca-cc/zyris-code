@@ -2119,6 +2119,7 @@ checksum = "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
 dependencies = [
  "aws-lc-rs",
  "once_cell",
+ "ring",
  "rustls-pki-types",
  "rustls-webpki",
  "subtle",
@@ -3610,62 +3611,32 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[package]]
 name = "zyris"
-version = "0.1.0"
-source = "git+https://github.com/attacca-cc/zyris-protocol?rev=28a341b6189610129386e06aaa0f9a9d1dc26f3e#28a341b6189610129386e06aaa0f9a9d1dc26f3e"
+version = "0.2.0"
+source = "git+https://github.com/attacca-cc/zyris-protocol?rev=43155d83419204b08cd93b95cd26515b594417f2#43155d83419204b08cd93b95cd26515b594417f2"
 dependencies = [
- "async-trait",
- "bytes",
- "futures-util",
- "gethostname",
- "reqwest",
- "schemars",
- "serde",
- "serde_json",
- "thiserror 2.0.19",
- "tokio",
- "tokio-tungstenite",
- "tracing",
- "uuid",
- "zyris-macros",
- "zyris-proto",
+ "zyris-core",
 ]
 
 [[package]]
 name = "zyris-attacca"
-version = "0.1.0"
-source = "git+https://github.com/attacca-cc/zyris-protocol?rev=28a341b6189610129386e06aaa0f9a9d1dc26f3e#28a341b6189610129386e06aaa0f9a9d1dc26f3e"
+version = "0.2.0"
+source = "git+https://github.com/attacca-cc/zyris-protocol?rev=43155d83419204b08cd93b95cd26515b594417f2#43155d83419204b08cd93b95cd26515b594417f2"
 dependencies = [
  "schemars",
  "serde",
  "serde_json",
- "zyris",
-]
-
-[[package]]
-name = "zyris-capkit"
-version = "0.1.0"
-source = "git+https://github.com/attacca-cc/zyris-protocol?rev=28a341b6189610129386e06aaa0f9a9d1dc26f3e#28a341b6189610129386e06aaa0f9a9d1dc26f3e"
-dependencies = [
- "bytes",
- "futures-util",
- "libc",
- "portable-pty",
- "tokio",
- "tracing",
- "vt100",
- "zyris",
- "zyris-caps",
+ "zyris-core",
 ]
 
 [[package]]
 name = "zyris-caps"
-version = "0.1.0"
-source = "git+https://github.com/attacca-cc/zyris-protocol?rev=28a341b6189610129386e06aaa0f9a9d1dc26f3e#28a341b6189610129386e06aaa0f9a9d1dc26f3e"
+version = "0.2.0"
+source = "git+https://github.com/attacca-cc/zyris-protocol?rev=43155d83419204b08cd93b95cd26515b594417f2#43155d83419204b08cd93b95cd26515b594417f2"
 dependencies = [
  "schemars",
  "serde",
  "serde_json",
- "zyris",
+ "zyris-core",
 ]
 
 [[package]]
@@ -3697,14 +3668,50 @@ dependencies = [
  "unicode-width",
  "zyris",
  "zyris-attacca",
- "zyris-capkit",
  "zyris-caps",
+ "zyris-fs",
+ "zyris-terminal",
+]
+
+[[package]]
+name = "zyris-core"
+version = "0.2.0"
+source = "git+https://github.com/attacca-cc/zyris-protocol?rev=43155d83419204b08cd93b95cd26515b594417f2#43155d83419204b08cd93b95cd26515b594417f2"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "futures-util",
+ "gethostname",
+ "reqwest",
+ "rustls",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+ "uuid",
+ "zyris-macros",
+ "zyris-proto",
+]
+
+[[package]]
+name = "zyris-fs"
+version = "0.2.0"
+source = "git+https://github.com/attacca-cc/zyris-protocol?rev=43155d83419204b08cd93b95cd26515b594417f2#43155d83419204b08cd93b95cd26515b594417f2"
+dependencies = [
+ "bytes",
+ "futures-util",
+ "tokio",
+ "zyris-caps",
+ "zyris-core",
 ]
 
 [[package]]
 name = "zyris-macros"
-version = "0.1.0"
-source = "git+https://github.com/attacca-cc/zyris-protocol?rev=28a341b6189610129386e06aaa0f9a9d1dc26f3e#28a341b6189610129386e06aaa0f9a9d1dc26f3e"
+version = "0.2.0"
+source = "git+https://github.com/attacca-cc/zyris-protocol?rev=43155d83419204b08cd93b95cd26515b594417f2#43155d83419204b08cd93b95cd26515b594417f2"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3713,8 +3720,8 @@ dependencies = [
 
 [[package]]
 name = "zyris-proto"
-version = "0.1.0"
-source = "git+https://github.com/attacca-cc/zyris-protocol?rev=28a341b6189610129386e06aaa0f9a9d1dc26f3e#28a341b6189610129386e06aaa0f9a9d1dc26f3e"
+version = "0.2.0"
+source = "git+https://github.com/attacca-cc/zyris-protocol?rev=43155d83419204b08cd93b95cd26515b594417f2#43155d83419204b08cd93b95cd26515b594417f2"
 dependencies = [
  "base64 0.23.0",
  "bytes",
@@ -3725,4 +3732,19 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "thiserror 2.0.19",
+]
+
+[[package]]
+name = "zyris-terminal"
+version = "0.2.0"
+source = "git+https://github.com/attacca-cc/zyris-protocol?rev=43155d83419204b08cd93b95cd26515b594417f2#43155d83419204b08cd93b95cd26515b594417f2"
+dependencies = [
+ "bytes",
+ "futures-util",
+ "libc",
+ "portable-pty",
+ "tokio",
+ "vt100",
+ "zyris-caps",
+ "zyris-core",
 ]

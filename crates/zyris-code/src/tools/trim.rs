@@ -131,7 +131,7 @@ mod tests {
     #[test]
     fn the_exec_description_points_at_wait_for_long_commands() {
         let mut d = zyris::ServeCapability::descriptor(&zyris_caps::TerminalServer(
-            zyris_capkit::PtyTerminal::default(),
+            zyris_terminal::PtyTerminal::default(),
         ));
         trim_descriptor(&mut d);
         let exec = d.tools.iter().find(|t| t.name == "exec").expect("exec must exist");

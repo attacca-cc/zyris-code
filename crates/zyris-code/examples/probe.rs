@@ -10,9 +10,9 @@
 use std::process::ExitCode;
 use std::time::Duration;
 
-use zyris::runtime::Runner;
 use zyris::{Connection, NodeKind};
 use zyris_attacca::{AttaccaApi, AttaccaApiClient, ZNewSession};
+use zyris_code::runtime::{RunConfig, Runner};
 
 const WAIT: Duration = Duration::from_secs(5);
 
@@ -20,9 +20,35 @@ const WAIT: Duration = Duration::from_secs(5);
 async fn main() -> ExitCode {
     tracing_subscriber::fmt().with_env_filter("probe=info,zyris=warn").init();
 
-    Runner::from_env()
-        .kind(NodeKind::Service)
-        .request_scopes(["agents:read", "sessions:read", "sessions:write"])
+    // **What this probe asks for has to be said before the credential is built.** `request_scopes`
+    // used to sit in the builder chain below; the grant is approved once against the list the
+    // authorize call carried, so the only place left to say it is ahead of `RunConfig::from_env`.
+    // A person who set the variable outranks the probe, same as everywhere else.
+    if std::env::var_os("ZYRIS_SCOPES").is_none() {
+        std::env::set_var("ZYRIS_SCOPES", "agents:read,sessions:read,sessions:write");
+    }
+
+    let config = RunConfig::from_env();
+    // The enrollment path wants somewhere to draw a code. This probe has no screen, so it falls to
+    // the stdout box — which is the right answer for a diagnostic run from a shell.
+    let bridge = zyris_code::tools::bridge::Bridge::new();
+    let creds = match zyris_code::enroll::source(&config, &bridge) {
+        Ok((creds, _)) => creds,
+        Err(e) => {
+            println!("could not build credentials: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let node = match zyris::Node::builder().name(&config.node_name).kind(NodeKind::Service).build()
+    {
+        Ok(node) => node,
+        Err(e) => {
+            println!("could not build the node: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    Runner::new(config, node, creds)
         .on_connect(|conn| async move {
             probe(&conn).await;
             std::process::exit(0);

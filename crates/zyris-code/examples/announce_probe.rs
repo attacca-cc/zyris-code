@@ -17,11 +17,11 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use zyris::runtime::Runner;
 use zyris::{Connection, NodeKind};
 use zyris_attacca::{
     AttaccaApi, AttaccaApiClient, ZDeltaKind, ZHistoryQuery, ZNewSession, ZTurnFrame,
 };
+use zyris_code::runtime::{RunConfig, Runner};
 
 const CONSUME_WAIT: Duration = Duration::from_secs(5);
 /// **Actually makes it happen.** Asking the model to list tools in prose is something it's bad at,
@@ -93,11 +93,37 @@ async fn main() -> ExitCode {
     bridge.sync(zyris_code::mode::Mode::Job, &Default::default(), false);
 
     // The probe doesn't use the attacca handle — the `work` tool just needs to appear in the list.
+    // **What this probe asks for has to be said before the credential is built.** `request_scopes`
+    // used to sit in the builder chain below; the grant is approved once against the list the
+    // authorize call carried, so the only place left to say it is ahead of `RunConfig::from_env`.
+    if std::env::var_os("ZYRIS_SCOPES").is_none() {
+        std::env::set_var("ZYRIS_SCOPES", "agents:read,sessions:write,events:read");
+    }
+    let config = RunConfig::from_env();
+    let creds = match zyris_code::enroll::source(&config, &bridge) {
+        Ok((creds, _)) => creds,
+        Err(e) => {
+            println!("could not build credentials: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     let (_api_tx, api_rx) = tokio::sync::watch::channel(None);
-    zyris_code::tools::announce(Runner::from_env(), dir, bridge, api_rx)
-        .capability(CodeProbeServer(Probe))
-        .kind(NodeKind::Service)
-        .request_scopes(["agents:read", "sessions:write", "events:read"])
+    let node =
+        match zyris_code::tools::announce(zyris::Node::builder(), dir, bridge.clone(), api_rx)
+            .capability(CodeProbeServer(Probe))
+            .name(&config.node_name)
+            .kind(NodeKind::Service)
+            .build()
+        {
+            Ok(node) => node,
+            Err(e) => {
+                println!("could not build the node: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+
+    Runner::new(config, node, creds)
         .on_connect(move |conn| {
             let note = note.clone();
             async move {

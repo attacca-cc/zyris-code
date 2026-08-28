@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use zyris::WireError;
-use zyris_capkit::resolve_under;
+use zyris_caps::resolve_under;
 
 use crate::tools::diff::diff;
 

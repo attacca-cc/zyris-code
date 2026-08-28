@@ -130,9 +130,10 @@ impl<C: ServeCapability> Gate<C> {
     ///
     /// Two reasons, and the second is the one that is easy to miss.
     ///
-    /// Left out, `timeout_ms` means *no* clock at all in capkit — `child.wait()` with nothing
-    /// bounding it — so a command that never returns never returns, and neither end has a way to
-    /// take it back. Something has to fill that in, and this is the only place every call passes.
+    /// Left out, `timeout_ms` means *no* clock at all in `zyris-terminal` — `child.wait()` with
+    /// nothing bounding it — so a command that never returns never returns, and neither end has a
+    /// way to take it back. Something has to fill that in, and this is the only place every call
+    /// passes.
     ///
     /// And **what this node waits for is what it asked the caller to wait for**
     /// (`declare_limits`). A run allowed past the ceiling would outlive the declaration, and the
@@ -541,9 +542,9 @@ mod tests {
         assert_eq!(sent["command"], json!("cargo build"), "no other argument may be touched");
     }
 
-    /// **Naming no timeout is not asking for no timeout.** Left out, `timeout_ms` means capkit
-    /// waits on the child with no clock at all, and neither end can take that call back — so the
-    /// ceiling is written in rather than left absent.
+    /// **Naming no timeout is not asking for no timeout.** Left out, `timeout_ms` means
+    /// `zyris-terminal` waits on the child with no clock at all, and neither end can take that
+    /// call back — so the ceiling is written in rather than left absent.
     #[tokio::test]
     async fn an_exec_that_named_no_timeout_is_given_the_ceiling() {
         let (fake, _) = Fake::new("terminal");
@@ -588,7 +589,7 @@ mod tests {
     #[test]
     fn the_gate_announces_the_limit_it_declares() {
         let gate = Gate::new(
-            zyris_caps::TerminalServer(zyris_capkit::PtyTerminal::default()),
+            zyris_caps::TerminalServer(zyris_terminal::PtyTerminal::default()),
             Bridge::new(),
         );
         let announced = gate.descriptor();
@@ -608,7 +609,7 @@ mod tests {
     fn what_exec_declares_is_what_this_node_enforces() {
         let terminal = |ceiling| {
             let mut d = zyris::ServeCapability::descriptor(&zyris_caps::TerminalServer(
-                zyris_capkit::PtyTerminal::default(),
+                zyris_terminal::PtyTerminal::default(),
             ));
             declare_limits(&mut d, ceiling);
             d
