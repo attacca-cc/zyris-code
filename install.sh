@@ -14,8 +14,12 @@ set -eu
 
 REPO="attacca-cc/zyris-code"
 BIN="zyris-code"
-# The short name people actually type. Both end up on PATH.
-ALIAS="zyris"
+# **`zyris` is not ours.** This installer used to drop a `zyris` symlink beside the binary as a
+# short name. On Linux the command that installs a Zyris node *is* `zyris`, so squatting it here
+# means whichever of the two was installed second silently wins — and the loser is a command
+# somebody has already learned. The name is left alone; a symlink an earlier version of this
+# script created is removed below.
+STALE_ALIAS="zyris"
 
 VERSION=""
 INSTALL_DIR="${ZYRIS_CODE_INSTALL_DIR:-$HOME/.local/bin}"
@@ -132,26 +136,31 @@ cp "$tmp/$BIN" "$install_tmp"
 chmod 755 "$install_tmp"
 mv -f "$install_tmp" "$INSTALL_DIR/$BIN"
 
-# The short name. A symlink rather than a second copy, so upgrades only have to replace one file.
-# **The fallback writes beside and renames too.** Overwriting a real copy that is being executed
-# fails with ETXTBSY, which is the same self-update trap the line above avoids.
-if ! ln -sf "$BIN" "$INSTALL_DIR/$ALIAS" 2>/dev/null; then
-  alias_tmp="$INSTALL_DIR/.$ALIAS.new.$$"
-  cp "$tmp/$BIN" "$alias_tmp"
-  chmod 755 "$alias_tmp"
-  mv -f "$alias_tmp" "$INSTALL_DIR/$ALIAS"
+# Take back the `zyris` name if an earlier version of this script left it here.
+#
+# **Only a symlink pointing at our own binary.** That is the shape this script made, so it is the
+# one we can be sure we own. Where `ln -s` failed the old fallback wrote a *copy*, which is
+# indistinguishable from a file somebody put there on purpose — that one is reported rather than
+# deleted, because guessing wrong deletes a stranger's program.
+stale="$INSTALL_DIR/$STALE_ALIAS"
+if [ -L "$stale" ] && [ "$(readlink "$stale")" = "$BIN" ]; then
+  rm -f "$stale"
+  say "removed the old $STALE_ALIAS link; the command is $BIN"
+elif [ -e "$stale" ] && [ ! -L "$stale" ] && cmp -s "$stale" "$INSTALL_DIR/$BIN"; then
+  say "note: $stale is a copy of $BIN left by an older installer — remove it if you want the"
+  say "      $STALE_ALIAS name free for a Zyris node"
 fi
 
 # **Do not run it to ask its version.** It is a TUI that starts on launch and takes no
 # arguments, so that would open the app in the middle of an install.
-say "installed $BIN and $ALIAS to $INSTALL_DIR"
+say "installed $BIN to $INSTALL_DIR"
 
 # ── shell integration ────────────────────────────────────────────────────────
 # Up to two lines get written, **each with its own marker**, so a later version adds whatever an
 # earlier one did not: the PATH export, and — zsh only — an alias that stops the shell from eating
 # a prompt before this program ever starts.
 #
-# **zsh refuses to run a command carrying a glob that matched nothing.** `zyris -p 이거 뭐야?`
+# **zsh refuses to run a command carrying a glob that matched nothing.** `zyris-code -p 이거 뭐야?`
 # dies as `no matches found: 뭐야?` and the binary is never started, so nothing inside it can
 # help — the fix has to live in the shell. `noglob` turns matching off for this one command.
 # bash needs none of it (an unmatched pattern is passed through as text), and fish has no
@@ -191,14 +200,16 @@ if [ "$MODIFY_PATH" = 0 ]; then
     say "    export PATH=\"$INSTALL_DIR:\$PATH\""
     say ""
   fi
-  say "Run it with:  $ALIAS"
+  say "Run it with:  $BIN"
   exit 0
 fi
 
 shell_name="$(basename "${SHELL:-sh}")"
 path_line="export PATH=\"$INSTALL_DIR:\$PATH\""
-# Both names, because either can be typed and the shell knows nothing of the symlink between them.
-glob_line="alias $ALIAS='noglob $ALIAS' $BIN='noglob $BIN'"
+# One name now. An install made by an earlier version carries both, and that line is left as it
+# is: `add_to` skips a file that already has the marker, and `noglob zyris` does no harm to a
+# `zyris` that turns out to be a node.
+glob_line="alias $BIN='noglob $BIN'"
 
 edited=""
 aliased=""
@@ -246,7 +257,7 @@ elif [ "$on_path" = 0 ]; then
 fi
 if [ -n "$aliased" ]; then
   say "Taught zsh to leave your prompts alone, in $aliased — so this works unquoted:"
-  say "    $ALIAS -p what is broken here?"
+  say "    $BIN -p what is broken here?"
   say ""
 fi
-say "Then run:  $ALIAS"
+say "Then run:  $BIN"
