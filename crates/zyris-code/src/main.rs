@@ -48,7 +48,10 @@ async fn main() -> ExitCode {
         .and_then(|p| {
             std::path::Path::new(&p).file_stem().map(|s| s.to_string_lossy().into_owned())
         })
-        .unwrap_or_else(|| "zyris".into());
+        // Only reached when argv[0] is absent, which a shell never does. `zyris-code` rather than
+        // `zyris`: that name belongs to the command that installs a node, and this program stopped
+        // answering to it when the installer stopped placing the link.
+        .unwrap_or_else(|| "zyris-code".into());
     let printing = match zyris_code::cli::parse(std::env::args().skip(1)) {
         zyris_code::cli::Run::Screen => None,
         zyris_code::cli::Run::Help => {

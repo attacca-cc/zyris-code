@@ -50,10 +50,13 @@ Windows — and put that directory on your PATH for bash, zsh, fish or PowerShel
 Open a new terminal and the command is:
 
 ```sh
-zyris
+zyris-code
 ```
 
-`zyris-code` is the same program under its full name. Set
+**There used to be a short `zyris` alias, and it is gone.** `zyris` is the command
+that installs a Zyris node, and two programs answering to one name means whichever
+was installed second silently wins. An installer that placed the old link removes it
+on the next run; a `zyris` it did not place is left alone and mentioned. Set
 `ZYRIS_CODE_INSTALL_DIR` to install elsewhere, `--no-modify-path`
 (`-NoModifyPath` on Windows) to leave your shell startup files alone, and
 `--version <tag>` to pin a release. Each archive is listed in the release's
@@ -386,7 +389,7 @@ release. What happens then is `/config`'s `update` setting:
 | `notify` | Says a newer release exists; `/update` installs it. |
 | `off` | Never looks. |
 
-`zyris --update` does the same thing without opening anything, whatever the setting says. Either
+`zyris-code --update` does the same thing without opening anything, whatever the setting says. Either
 way the download draws a progress bar, and the installer's own account of what it is doing goes to
 your terminal rather than being swallowed.
 
@@ -409,9 +412,9 @@ first — which is why an update needs no manual step on Windows either.
 ## Print mode
 
 ```bash
-zyris -p what does this repo do        # one turn, the answer on stdout, exit
-cat notes.md | zyris -p                # the prompt from stdin
-zyris -p "..." > answer.md             # only the answer is printed, so it pipes
+zyris-code -p what does this repo do   # one turn, the answer on stdout, exit
+cat notes.md | zyris-code -p           # the prompt from stdin
+zyris-code -p "..." > answer.md        # only the answer is printed, so it pipes
 ```
 
 **No quotes needed** — everything after the flag is the prompt.
@@ -419,12 +422,13 @@ zyris -p "..." > answer.md             # only the answer is printed, so it pipes
 The exception is zsh, and it is not this program's doing: a prompt containing `?` or `*` is read
 as a filename pattern, and when nothing matches, zsh refuses to run the command at all. The binary
 is never started, so it cannot help. `install.sh` therefore leaves an alias in `.zshrc` that runs
-these two names under `noglob`, after which `zyris -p what broke here?` works as typed. Without
+the command under `noglob`, after which `zyris-code -p what broke here?` works as typed. Without
 that alias, quote the prompt. bash needs none of this, and PowerShell passes arguments through
 untouched.
 
-`cargo install` puts the binary down as `zyris-code`; `install.sh` adds a `zyris` symlink beside
-it. They are the same file, so either name takes `-p`.
+An install made before the `zyris` name was given up carries that alias for both names. It is left
+as it is: the installer skips a startup file that already has its marker, and `noglob zyris` costs
+nothing if `zyris` later turns out to be a node.
 
 **Print mode still hands this computer over.** The node announces the same capabilities as the
 screen does, so the agent reads and changes files here and runs commands — `/config`'s `dir`

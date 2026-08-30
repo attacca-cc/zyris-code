@@ -39,8 +39,12 @@ if ($Dir) {
 
 $Repo  = 'attacca-cc/zyris-code'
 $Bin   = 'zyris-code'
-# The short name people actually type. Both end up on PATH.
-$Alias = 'zyris'
+# **`zyris` is not ours.** This installer used to place a second copy under that name. The command
+# that installs a Zyris node is `zyris`, so whichever of the two landed second silently won. The
+# name is left alone here, and a copy an earlier version placed is removed below. Kept the same as
+# the shell installer on purpose: a short name that exists on one platform and not the other is
+# worse than one that exists on neither.
+$StaleAlias = 'zyris'
 
 # ── Which build ──────────────────────────────────────────────────────────────
 $arch = switch ($env:PROCESSOR_ARCHITECTURE) {
@@ -187,8 +191,24 @@ try {
     }
 
     Install-Binary $exe (Join-Path $Dir "$Bin.exe")
-    # The short name. Windows has no usable symlink without elevation, so this is a second copy.
-    Install-Binary $exe (Join-Path $Dir "$Alias.exe")
+
+    # Take back the `zyris` name if an earlier version of this script left it here. Windows has no
+    # usable symlink without elevation, so what it left is a *copy* — remove it only when it is
+    # byte-identical to a build of ours, which is the only evidence available that we put it there.
+    $stale = Join-Path $Dir "$StaleAlias.exe"
+    if (Test-Path $stale) {
+        $sameAsNew = (Get-FileHash $stale).Hash -eq (Get-FileHash $exe).Hash
+        $sameAsOld = $false
+        try {
+            $sameAsOld = (Get-Item $stale).VersionInfo.ProductName -eq $Bin
+        } catch { }
+        if ($sameAsNew -or $sameAsOld) {
+            Remove-Item $stale -Force -ErrorAction SilentlyContinue
+            Write-Host "removed the old $StaleAlias.exe; the command is $Bin"
+        } else {
+            Write-Host "note: $stale was not placed by this installer and was left alone"
+        }
+    }
 
     Write-Host "installed to $Dir"
 
@@ -198,7 +218,7 @@ try {
 
     if ($onPath) {
         Write-Host ''
-        Write-Host "Run it with:  $Alias"
+        Write-Host "Run it with:  $Bin"
     } elseif ($NoModifyPath) {
         Write-Host ''
         Write-Host "$Dir is not on your PATH. Add it yourself:"
@@ -209,13 +229,13 @@ try {
         $updated = if ([string]::IsNullOrEmpty($userPath)) { $Dir } else { "$userPath;$Dir" }
         [Environment]::SetEnvironmentVariable('Path', $updated, 'User')
         # The line above only reaches processes started afterwards, so this session gets it too —
-        # otherwise `zyris` fails right after an install that said it succeeded.
+        # otherwise `zyris-code` fails right after an install that said it succeeded.
         $env:Path = "$env:Path;$Dir"
         Write-Host ''
         Write-Host "Added $Dir to your PATH."
         Write-Host 'Open a new terminal to pick it up everywhere.'
         Write-Host ''
-        Write-Host "Then run:  $Alias"
+        Write-Host "Then run:  $Bin"
     }
 } finally {
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
