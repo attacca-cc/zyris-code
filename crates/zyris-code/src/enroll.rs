@@ -121,6 +121,41 @@ struct AccountGrant {
     store_broke: Arc<tokio::sync::Mutex<Option<String>>>,
 }
 
+/// Persist a rotated credential, and **remember a refusal as well as returning it.**
+///
+/// Extracted from the hook so a test can drive it, which is the half that was missing. The
+/// rotation test below sets `store_broke` by hand and asserts the node then stops — which proves
+/// *"if the flag is set, we stop"* and says nothing about *"a store that refuses sets the flag"*.
+/// The second is the one that fires in the real incident: a full disk, a config directory that
+/// lost its write bit, a home on a mount that went away.
+///
+/// **Remembering is usually the only trace there is.** [`zyris::Account::bearer`] does not
+/// propagate a hook failure while it still holds a usable token — it logs "could not rotate;
+/// carrying on with the credential held" and answers `Ok`. Rotation falls due at 80% of the access
+/// token's life, so for the last fifth of every hour the refusal reaches this app through nothing
+/// but this flag. By then the server has already spent the refresh token that produced `rotated`,
+/// so every dial after this is a replay, and attacca answers a replay past its 30-second grace
+/// with `revoke_all_for_node`: every node under this credential, not only this one.
+///
+/// **A free function over the two `Arc`s, not a method.** The hook is `'static` and runs inside
+/// `Account::bearer`; [`AccountGrant::refresh`] holds the `held` lock across that call, so a hook
+/// reaching back into `self` would deadlock. Being free also keeps the flag shared across every
+/// account the grant builds — including the throwaway one `refresh` ages with `due_now`, which is
+/// the account most likely to rotate.
+async fn persist_rotation(
+    store: &Arc<dyn CredentialStore>,
+    broke: &Arc<tokio::sync::Mutex<Option<String>>>,
+    rotated: &zyris::AccountCredential,
+) -> Result<(), zyris::RotateError> {
+    match store.save(rotated).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            *broke.lock().await = Some(e.to_string());
+            Err(zyris::RotateError(e.to_string()))
+        }
+    }
+}
+
 impl AccountGrant {
     fn new(
         store: Arc<dyn CredentialStore>,
@@ -222,19 +257,13 @@ impl AccountGrant {
             .on_rotate(move |rotated| {
                 let store = store.clone();
                 let broke = broke.clone();
-                async move {
-                    match store.save(&rotated).await {
-                        Ok(()) => Ok(()),
-                        // Remembered as well as refused. The refusal alone reaches the run loop as
-                        // `Unreachable`, which it answers by dialling again — and by now the server
-                        // has spent the refresh token that produced `rotated`, so dialling again is
-                        // a replay. See `store_broke`.
-                        Err(e) => {
-                            *broke.lock().await = Some(e.to_string());
-                            Err(zyris::RotateError(e.to_string()))
-                        }
-                    }
-                }
+                // **Delegation only, and it has to stay that way.** No test reaches this line:
+                // firing it needs a server that actually rotates, so replacing the body with
+                // `Ok(())` leaves the whole suite green. What the tests below pin is
+                // `persist_rotation` itself and the two doors that read what it records — so the
+                // one thing they cannot see is this call going missing. Keep the closure a single
+                // delegation, and any logic that belongs here belongs in that function instead.
+                async move { persist_rotation(&store, &broke, &rotated).await }
             })
             .build()
     }
@@ -669,6 +698,88 @@ mod tests_discard {
             }
             other => panic!("a spent credential must not be dialled with again: {other:?}"),
         }
+    }
+
+    /// **`refresh` consults the same memory, and nothing used to check that it did.**
+    ///
+    /// `bearer` and `refresh` are two doors onto the same credential and both must refuse to open
+    /// once a rotation has gone unwritten. Only `bearer`'s guard was pinned: deleting `refresh`'s
+    /// outright left all 986 tests green, which is how a guard disappears in a refactor nobody
+    /// reviews twice.
+    ///
+    /// **`refresh` is the door that matters more here.** It runs after the server has already
+    /// refused a dial, so by definition something is wrong with the credential — and it *forces* a
+    /// rotation (`due_now`) rather than waiting for one. A refusal to store that rotation therefore
+    /// arrives on the path most likely to retry, and a retry is a replay.
+    #[tokio::test]
+    async fn a_refresh_after_a_refused_rotation_stops_the_node_too() {
+        let store = std::sync::Arc::new(MemoryCredentialStore::default());
+        store.save(&stored()).await.unwrap();
+        let reauth = Reauth::for_test(store.clone());
+        reauth.grant.hold(stored()).await;
+        *reauth.grant.store_broke.lock().await = Some("no space left on device".to_string());
+
+        match reauth.grant.refresh().await {
+            Err(CredentialsError::NeedsOperator(why)) => {
+                assert!(why.contains("no space left on device"), "the reason is lost: {why}");
+            }
+            other => panic!(
+                "refresh handed back a credential whose rotation was never written, so the run \
+                 loop will present a spent token: {other:?}"
+            ),
+        }
+    }
+
+    /// **A store that refuses a rotation is remembered, not only refused.**
+    ///
+    /// The test above starts from `store_broke` already set, so between them they lock the two
+    /// halves: this one that a refusal fills the flag, that one that a filled flag stops the node.
+    /// On its own either is comfortable and wrong — a hook that returned `Err` without recording it
+    /// passes the test above and still loses the account. `Account::bearer` keeps answering `Ok`
+    /// from the token it is holding for the last fifth of that token's life, so in the common case
+    /// the refusal reaches nobody at all, and the next rotation replays a refresh token the server
+    /// has already spent.
+    #[tokio::test]
+    async fn a_store_that_refuses_a_rotation_is_remembered_not_just_refused() {
+        /// Every write fails, the way a full disk or a config directory that lost its write bit
+        /// does.
+        #[derive(Debug)]
+        struct RefusingStore;
+
+        #[async_trait::async_trait]
+        impl CredentialStore for RefusingStore {
+            async fn load(&self) -> Result<Option<zyris::AccountCredential>, CredentialStoreError> {
+                Ok(None)
+            }
+            async fn save(
+                &self,
+                _credential: &zyris::AccountCredential,
+            ) -> Result<(), CredentialStoreError> {
+                Err(CredentialStoreError::Refused("no space left on device".to_string()))
+            }
+            async fn clear(&self) -> Result<(), CredentialStoreError> {
+                Ok(())
+            }
+            fn describe(&self) -> String {
+                "a store that refuses".to_string()
+            }
+        }
+
+        let store: Arc<dyn CredentialStore> = Arc::new(RefusingStore);
+        let broke = Arc::new(tokio::sync::Mutex::new(None));
+
+        let refused = persist_rotation(&store, &broke, &stored()).await;
+
+        assert!(
+            refused.is_err(),
+            "a rotation that was not written must not be reported as adopted"
+        );
+        let remembered = broke.lock().await.clone();
+        let why = remembered.expect(
+            "the refusal was returned but not remembered, so the run loop will read it as an \
+             outage and dial again with a spent credential",
+        );
+        assert!(why.contains("no space left on device"), "the reason is lost: {why}");
     }
 
     /// **A credential due to rotate is dropped and the file is read again.**
