@@ -24,6 +24,17 @@ async fn main() -> ExitCode {
     // used to sit in the builder chain below; the grant is approved once against the list the
     // authorize call carried, so the only place left to say it is ahead of `RunConfig::from_env`.
     // A person who set the variable outranks the probe, same as everywhere else.
+    // **The credential file, not just the profile.** The profile names the file; the directory
+    // says where to look for it, and `main.rs` is the only place that used to fill
+    // `$ZYRIS_CONFIG_DIR` from `conn::credential_dir()`. Without this, `zyris`'s own default
+    // applies — `~/.config/zyris/`, the directory this app deliberately moved out of — so the
+    // credential beside the TUI's is invisible and the probe asks for an enrollment code. Which
+    // makes "the only live verification that runs automatically" need a human, quietly.
+    if std::env::var_os("ZYRIS_CONFIG_DIR").is_none() {
+        if let Some(dir) = zyris_code::conn::credential_dir() {
+            std::env::set_var("ZYRIS_CONFIG_DIR", dir);
+        }
+    }
     if std::env::var_os("ZYRIS_SCOPES").is_none() {
         std::env::set_var("ZYRIS_SCOPES", "agents:read,sessions:read,sessions:write");
     }
