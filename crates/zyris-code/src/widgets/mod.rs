@@ -59,7 +59,9 @@ pub fn draw(frame: &mut Frame, state: &mut State) {
     //
     // **There is only one input slot.** When a question is open the question takes it.
     let input_h = match &state.asking {
-        Some((_, a)) => ask::height(a, area.height.saturating_sub(3)).saturating_sub(1),
+        Some((_, a)) => {
+            ask::height(a, area.width, area.height.saturating_sub(3), state.lang).saturating_sub(1)
+        }
         None => {
             state.input.height(area.width.saturating_sub(2)).min((area.height / 2).max(1)).max(1)
         }
@@ -343,10 +345,14 @@ pub fn activity_parts_at(
 }
 
 /// Which row this y coordinate is on in the question screen. Used by click handling.
+///
+/// The card has to be laid out at the same width and with the same language it was drawn with —
+/// a wrapped question changes how many lines each row takes.
 pub fn ask_row_at(
     a: &crate::question::Answering,
     area: ratatui::layout::Rect,
     y: u16,
+    lang: crate::lang::Lang,
 ) -> Option<usize> {
-    ask::row_at(a, area, y)
+    ask::row_at(a, area, y, lang)
 }

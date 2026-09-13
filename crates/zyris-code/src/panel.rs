@@ -238,7 +238,9 @@ pub enum PanelButton {
 }
 
 impl Panel {
-    fn new(title: String, lines: Vec<Line<'static>>) -> Self {
+    /// A panel holding pre-styled lines. `pub(crate)` because the widget's own tests build one
+    /// directly — every panel a person sees comes from a builder below.
+    pub(crate) fn new(title: String, lines: Vec<Line<'static>>) -> Self {
         Self { title, lines, scroll: 0, button: None, button_focused: false, form: None }
     }
 
@@ -253,12 +255,6 @@ impl Panel {
         }
     }
 
-    /// How far the body can scroll. `visible` is the number of body rows the box
-    /// shows; the widget clamps `scroll` to this so it never points past the end.
-    pub fn max_scroll(&self, visible: usize) -> usize {
-        self.lines.len().saturating_sub(visible)
-    }
-
     pub fn scroll_up(&mut self, by: usize) {
         self.scroll = self.scroll.saturating_sub(by);
     }
@@ -266,6 +262,14 @@ impl Panel {
     pub fn scroll_down(&mut self, by: usize) {
         self.scroll = self.scroll.saturating_add(by);
     }
+}
+
+/// How far the box may scroll.
+///
+/// **`drawn` counts the lines that were drawn, not the lines the panel holds**: one of them may
+/// have wrapped into several, and a scroll is measured in what is on screen.
+pub fn max_scroll(drawn: usize, visible: usize) -> usize {
+    drawn.saturating_sub(visible)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -910,6 +914,6 @@ mod tests {
         assert_eq!(p.scroll, 0);
         p.scroll_down(10);
         assert_eq!(p.scroll, 10);
-        assert_eq!(p.max_scroll(3), 2, "5 lines in a 3-row box scroll by 2");
+        assert_eq!(max_scroll(5, 3), 2, "5 lines in a 3-row box scroll by 2");
     }
 }

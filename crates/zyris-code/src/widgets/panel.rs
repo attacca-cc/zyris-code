@@ -13,14 +13,26 @@ use ratatui::Frame;
 use crate::markdown::display_width;
 use crate::panel::Panel;
 use crate::theme;
+use crate::wrap;
 
 pub fn draw(frame: &mut Frame, area: Rect, panel: &mut Panel, lang: crate::lang::Lang) {
+    let has_button = panel.button.is_some();
+    // **The width is settled first**, because the wrapping needs it and the height falls out of how
+    // many lines the wrapping produced — the order `widgets/enroll.rs` already uses. Sizing the box
+    // from the lines the panel was built with is how a long description came to end in an `…`
+    // against the right border, and how the rows past the bottom would have gone missing instead.
+    let w = 72.min(area.width.saturating_sub(4)).max(20);
+    // The borders take a column each side; `Block::inner` below agrees with this.
+    let body: Vec<Line<'static>> = panel
+        .lines
+        .iter()
+        .cloned()
+        .flat_map(|line| wrap::line(line, w.saturating_sub(2) as usize))
+        .collect();
     // The box grows with the content, never taller than four fifths of the screen.
     // A button adds its own row between the body and the hint.
-    let has_button = panel.button.is_some();
-    let want_h = (panel.lines.len() as u16).saturating_add(3 + u16::from(has_button)).max(5);
+    let want_h = (body.len() as u16).saturating_add(3 + u16::from(has_button)).max(5);
     let h = want_h.min(area.height.saturating_mul(4) / 5).max(3);
-    let w = 72.min(area.width.saturating_sub(4)).max(20);
     let box_area = Rect {
         x: area.x + (area.width.saturating_sub(w)) / 2,
         y: area.y + (area.height.saturating_sub(h)) / 2,
@@ -49,14 +61,16 @@ pub fn draw(frame: &mut Frame, area: Rect, panel: &mut Panel, lang: crate::lang:
     let fixed = 1 + u16::from(has_button);
     let body_rows = inner.height.saturating_sub(fixed) as usize;
 
-    // Clamp the scroll to what actually fits, then draw that window.
-    let max = panel.max_scroll(body_rows);
+    // Clamp the scroll to what actually fits, then draw that window. **The count is of drawn
+    // lines** — one of the panel's own lines may have wrapped into several — so it comes from
+    // `body`, not from `panel.lines`.
+    let max = crate::panel::max_scroll(body.len(), body_rows);
     if panel.scroll > max {
         panel.scroll = max;
     }
     let mut lines: Vec<Line<'static>> = Vec::new();
-    for i in panel.scroll..panel.scroll.saturating_add(body_rows).min(panel.lines.len()) {
-        lines.push(fit(panel.lines[i].clone(), width));
+    for i in panel.scroll..panel.scroll.saturating_add(body_rows).min(body.len()) {
+        lines.push(body[i].clone());
     }
     while lines.len() < body_rows {
         lines.push(Line::from(""));
@@ -103,76 +117,84 @@ fn button_line(
     Line::from(Span::styled(format!("{pad}{text}"), style))
 }
 
-/// Cuts a line to the box width, keeping each span's style. A wide character that
-/// would straddle the edge is dropped whole, and a cut line ends with `…`.
-fn fit(line: Line<'static>, width: usize) -> Line<'static> {
-    if width == 0 {
-        return Line::from("");
-    }
-    let mut out = Vec::new();
-    let mut used = 0usize;
-    for span in line.spans {
-        let text = span.content.to_string();
-        let w = display_width(&text);
-        if used + w <= width {
-            out.push(span);
-            used += w;
-            continue;
-        }
-        let room = width.saturating_sub(used);
-        if room > 0 {
-            out.push(Span::styled(truncate(&text, room), span.style));
-        }
-        break;
-    }
-    Line::from(out)
-}
-
-/// Truncates to the column count. When cut, appends `…` to show it was cut.
-fn truncate(s: &str, limit: usize) -> String {
-    if display_width(s) <= limit {
-        return s.to_string();
-    }
-    let mut out = String::new();
-    for ch in s.chars() {
-        if display_width(&out) + display_width(&ch.to_string()) > limit.saturating_sub(1) {
-            break;
-        }
-        out.push(ch);
-    }
-    out.push('…');
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
 
-    /// A line that fits is left untouched — no fake `…` on lines that fit.
+    /// Every body line, wrapped the way the widget wraps them.
+    fn body(panel: &Panel, w: u16) -> Vec<String> {
+        panel
+            .lines
+            .iter()
+            .cloned()
+            .flat_map(|line| wrap::line(line, w.saturating_sub(2) as usize))
+            .map(|line| line.to_string())
+            .collect()
+    }
+
+    /// Renders the box and gives back every row of the screen, wide characters not double-counted.
+    fn render(panel: &mut Panel, w: u16, h: u16) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).expect("terminal");
+        terminal.draw(|f| draw(f, f.area(), panel, crate::lang::Lang::Ko)).expect("draw");
+        let buf = terminal.backend().buffer().clone();
+        (0..h)
+            .map(|y| {
+                let mut row = String::new();
+                let mut x = 0u16;
+                while x < w {
+                    let symbol = buf[(x, y)].symbol();
+                    row.push_str(symbol);
+                    x += display_width(symbol).max(1) as u16;
+                }
+                row
+            })
+            .collect()
+    }
+
+    /// **A long line wraps; it does not end in `…`.** A mode's description is the box's whole
+    /// reason for being up, and it used to be cut at the right border.
+    #[test]
+    fn a_long_line_wraps_instead_of_ending_in_an_ellipsis() {
+        let long = "가".repeat(30);
+        let panel = Panel::new("t".into(), vec![Line::from(long.clone())]);
+        let rows = body(&panel, 40);
+        assert!(rows.len() > 1, "nothing wrapped: {rows:?}");
+        assert!(!rows.iter().any(|r| r.contains('…')), "{rows:?}");
+        assert_eq!(rows.concat(), long, "characters went missing: {rows:?}");
+        assert!(rows.iter().all(|r| display_width(r) <= 38), "{rows:?}");
+    }
+
+    /// A line that already fits is untouched — nothing reflows that had nothing wrong with it.
     #[test]
     fn a_line_that_fits_is_untouched() {
-        let line = Line::from(Span::styled("안녕", Style::default().fg(theme::text())));
-        let got = fit(line, 10);
-        assert_eq!(got.to_string(), "안녕");
+        let panel = Panel::new("t".into(), vec![Line::from("안녕")]);
+        assert_eq!(body(&panel, 40), vec!["안녕".to_string()]);
     }
 
-    /// A cut line ends with `…` and never exceeds the width.
+    /// **The box is sized from the wrapped lines, so the tail is on screen.** A box sized from the
+    /// lines the panel held would drop the wrapped rows past its bottom — the same loss as the
+    /// `…`, only harder to notice.
     #[test]
-    fn a_cut_line_ends_with_an_ellipsis_and_fits() {
-        let line = Line::from("가".repeat(20));
-        let got = fit(line, 8);
-        let text = got.to_string();
-        assert!(text.ends_with('…'), "{text}");
-        assert!(display_width(&text) <= 8, "{} wide: {text}", display_width(&text));
+    fn the_end_of_a_wrapped_line_reaches_the_screen() {
+        let mut panel = Panel::new("t".into(), vec![Line::from("가".repeat(30))]);
+        let screen = render(&mut panel, 80, 24).join("\n");
+        let drawn = screen.chars().filter(|c| *c == '가').count();
+        assert_eq!(drawn, 30, "the box dropped the end of the line:\n{screen}");
+        assert!(!screen.contains('…'), "{screen}");
     }
 
-    /// A wide character that would straddle the edge is dropped whole, not halved.
+    /// A very tall panel still stops at four fifths of the screen and scrolls the rest.
     #[test]
-    fn a_wide_character_is_never_halved() {
-        let line = Line::from("가나다라");
-        let got = fit(line, 5);
-        let text = got.to_string();
-        assert!(display_width(&text) <= 5, "{} wide: {text}", display_width(&text));
-        assert!(text.contains('…'), "{text}");
+    fn a_panel_taller_than_the_screen_stops_short_and_scrolls() {
+        let mut panel =
+            Panel::new("t".into(), (0..80).map(|i| Line::from(format!("row {i}"))).collect());
+        let screen = render(&mut panel, 80, 24).join("\n");
+        assert!(screen.contains("row 0"), "{screen}");
+        assert!(!screen.contains("row 79"), "the box outgrew the screen:\n{screen}");
+        panel.scroll = 1000;
+        let screen = render(&mut panel, 80, 24).join("\n");
+        assert!(screen.contains("row 79"), "scrolling past the end lost the last row:\n{screen}");
     }
 }

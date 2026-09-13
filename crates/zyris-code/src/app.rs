@@ -1818,7 +1818,7 @@ pub fn apply(state: &mut State, action: &Action) {
             // Pressing on the question screen picks that row.
             if let (Some(area), Some((_, a))) = (state.ask_area, state.asking.as_ref()) {
                 if *y >= area.y && *y < area.y + area.height {
-                    if let Some(i) = crate::widgets::ask_row_at(a, area, *y) {
+                    if let Some(i) = crate::widgets::ask_row_at(a, area, *y, state.lang) {
                         if let Some((_, a)) = &mut state.asking {
                             a.cursor = i;
                         }

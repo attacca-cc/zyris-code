@@ -1104,27 +1104,8 @@ fn clip_to(text: String, width: usize) -> String {
 /// Wraps to fit the width. **Cuts only by column count** — tool detail is JSON or raw text, so it
 /// must not be parsed as markdown.
 fn wrap_plain(text: &str, width: u16) -> Vec<String> {
-    let limit = (width as usize).max(8);
-    let mut out = Vec::new();
-    for raw in text.lines() {
-        if raw.is_empty() {
-            out.push(String::new());
-            continue;
-        }
-        let mut cur = String::new();
-        let mut used = 0usize;
-        for ch in raw.chars() {
-            let w = markdown::display_width(&ch.to_string()).max(1);
-            if used + w > limit {
-                out.push(std::mem::take(&mut cur));
-                used = 0;
-            }
-            cur.push(ch);
-            used += w;
-        }
-        out.push(cur);
-    }
-    out
+    // The one implementation lives in `crate::wrap`.
+    crate::wrap::columns(text, width as usize)
 }
 
 /// Colours one pretty-printed JSON line: a `"key"` in front of a colon stands out in `tool_arg`,

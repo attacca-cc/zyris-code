@@ -26,41 +26,9 @@ use crate::theme;
 ///
 /// A word longer than the width is cut by column instead, so an unbroken run cannot loop.
 fn wrap_words(text: &str, width: u16) -> Vec<String> {
-    let limit = (width as usize).max(8);
-    let mut out: Vec<String> = Vec::new();
-    let mut cur = String::new();
-    let mut used = 0usize;
-    for word in text.split_whitespace() {
-        let w = display_width(word);
-        let gap = usize::from(!cur.is_empty());
-        if used + gap + w > limit && !cur.is_empty() {
-            out.push(std::mem::take(&mut cur));
-            used = 0;
-        }
-        if w > limit {
-            // Longer than a line on its own — fill by column, since there is no break to find.
-            for ch in word.chars() {
-                let cw = display_width(&ch.to_string()).max(1);
-                if used + cw > limit {
-                    out.push(std::mem::take(&mut cur));
-                    used = 0;
-                }
-                cur.push(ch);
-                used += cw;
-            }
-            continue;
-        }
-        if !cur.is_empty() {
-            cur.push(' ');
-            used += 1;
-        }
-        cur.push_str(word);
-        used += w;
-    }
-    if !cur.is_empty() {
-        out.push(cur);
-    }
-    out
+    // The one implementation lives in `crate::wrap` now; this name stays because the callers and
+    // tests here read better for it.
+    crate::wrap::words(text, width as usize)
 }
 
 /// Appends `text` as however many lines it takes at this width.

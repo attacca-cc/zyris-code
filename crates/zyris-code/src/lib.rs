@@ -47,3 +47,4 @@ pub mod undo;
 pub mod update;
 pub mod usage;
 pub mod widgets;
+pub mod wrap;
