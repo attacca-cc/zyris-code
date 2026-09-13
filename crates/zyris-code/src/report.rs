@@ -57,7 +57,7 @@ pub fn of(event: &zyris_attacca::ZSessionEvent) -> Option<Report> {
         Some(status) => status == "success",
         // A deployment that says nothing about status: what is left is whether the call itself
         // came back in error.
-        None => !payload.get("error").is_some_and(|e| !e.is_null()),
+        None => payload.get("error").is_none_or(|e| e.is_null()),
     };
     Some(Report { seq: event.seq, ok, summary })
 }

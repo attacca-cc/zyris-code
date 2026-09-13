@@ -100,8 +100,8 @@ pub fn draw(frame: &mut Frame, area: Rect, panel: &mut Panel, lang: crate::lang:
         panel.scroll = max;
     }
     let mut lines: Vec<Line<'static>> = Vec::new();
-    for i in panel.scroll..panel.scroll.saturating_add(body_rows).min(body.len()) {
-        lines.push(body[i].clone());
+    for line in body.iter().skip(panel.scroll).take(body_rows) {
+        lines.push(line.clone());
     }
     while lines.len() < body_rows {
         lines.push(Line::from(""));
