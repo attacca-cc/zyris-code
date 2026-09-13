@@ -20,9 +20,18 @@ pub fn draw(
     // The centered box. Sized to the list, but never taller than the screen.
     // The two separator lines take a row each, so they must be counted for everything to fit.
     let rule = picker.is_create(0) && picker.rows.len() > 1;
-    let want_h = (picker.rows.len() as u16).saturating_add(5 + rule as u16).max(6);
+    // **The box is as wide as its widest row, capped by the screen.** A fixed 64 cut a command's
+    // description with an `…` on a screen three times that wide, and a description cut in half is
+    // worth less than either showing it whole or not showing it at all.
+    let widest = picker.rows.iter().map(row_need).max().unwrap_or(0);
+    let w = ((widest as u16 + 4).max(64)).min(area.width.saturating_sub(4)).max(20);
+    // The note the row under the cursor could not hold. Counted before the box is sized, because
+    // it costs rows.
+    let detail = cursor_detail(picker, w.saturating_sub(2) as usize);
+    let want_h = (picker.rows.len() as u16)
+        .saturating_add(5 + rule as u16 + detail.len() as u16)
+        .max(6);
     let h = want_h.min(area.height.saturating_sub(2)).max(3);
-    let w = 64.min(area.width.saturating_sub(4)).max(20);
     let box_area = Rect {
         x: area.x + (area.width.saturating_sub(w)) / 2,
         y: area.y + (area.height.saturating_sub(h)) / 2,
@@ -65,7 +74,9 @@ pub fn draw(
     // **The pure side decides** where each row goes (`picker::slots`). Here we just draw.
     // The rule and the key hints at the foot take a row each.
     let width = inner.width as usize;
-    let body_h = inner.height.saturating_sub(2) as usize;
+    // The rule, the hint and whatever the cursor's note needs under the list take rows from the
+    // body — the box cannot grow past the screen.
+    let body_h = inner.height.saturating_sub(2 + detail.len() as u16) as usize;
     // **Where the window ended up is stored back.** Without it the layout would be derived
     // from the cursor alone every frame, which pins the cursor to an edge — see `window_top`.
     let (laid, top) = crate::picker::slots(&picker.rows, picker.cursor, picker.top, body_h);
@@ -88,6 +99,15 @@ pub fn draw(
     // The key hints are not a row of the list, so a rule marks where the list ended. Without it
     // the last entry and the hints run together and the hints read as one more thing to pick.
     lines.push(Line::from(Span::styled("─".repeat(width), Style::default().fg(theme::border()))));
+
+    // **The note in full, for the row the cursor is on.** It left its row because it did not fit;
+    // it is here because it is the sentence saying what that row does.
+    for row in &detail {
+        lines.push(Line::from(Span::styled(
+            format!("  {row}"),
+            Style::default().fg(theme::text_muted()),
+        )));
+    }
 
     // The meaning of ← changes with the level. Say it plainly.
     let back = match picker.level {
@@ -173,6 +193,30 @@ fn row_line(
 /// However short the note is, it's worth showing at least this much. Narrower than this, drop it entirely.
 const NOTE_MIN: usize = 8;
 
+/// How wide a row wants to be: the caret, the status dot, the name, a gap and the note.
+fn row_need(row: &crate::picker::Row) -> usize {
+    2 + (row.status.is_some() as usize) * 2
+        + display_width(&row.label)
+        + row.note.as_deref().map_or(0, |note| 2 + display_width(note))
+}
+
+/// The note the cursor's row could not show inline, wrapped to the box — empty when the row held
+/// it, or has none.
+fn cursor_detail(picker: &Picker, width: usize) -> Vec<String> {
+    let Some(row) = picker.rows.get(picker.cursor) else {
+        return Vec::new();
+    };
+    let Some(note) = row.note.as_deref() else {
+        return Vec::new();
+    };
+    if split(width, &row.label, Some(note), row.status.is_some()).1.is_some() {
+        // The row already says it, and saying it twice is not a feature.
+        return Vec::new();
+    }
+    // Two columns of indent, so it reads as a note about the row above rather than another row.
+    crate::wrap::words(note, width.saturating_sub(2))
+}
+
 /// Splits one line into (name, note). **The name comes first.**
 ///
 /// Give the note the room first and the name gets cut — `/agent` actually got truncated to
@@ -190,10 +234,14 @@ fn split(width: usize, label: &str, note: Option<&str>, status: bool) -> (String
     };
     // Leave at least two columns between the name and the note. Stuck together, they read as one word.
     let room = width.saturating_sub(2 + dot + display_width(&label) + 2);
-    if room < NOTE_MIN {
+    if room < NOTE_MIN || display_width(note) > room {
+        // **A note that does not fit is left off the row rather than cut.** `…` keeps the beginning
+        // of a sentence and throws the end away — and on a description the end is the part that
+        // says what the thing does. The whole note goes under the list for the row the cursor is
+        // on, where the keys are acting (`cursor_detail`).
         return (label, None);
     }
-    (label, Some(truncate(note, room)))
+    (label, Some(note.to_string()))
 }
 
 /// Truncates to fit the column count. When cut, appends `…` to show it was cut.
@@ -452,6 +500,68 @@ mod tests {
         let (label, _) = split(20, &"가".repeat(40), None, false);
         assert!(display_width(&label) <= 18, "{} columns: {label}", display_width(&label));
         assert!(label.ends_with('…'), "no marker saying it was cut: {label}");
+    }
+
+    /// **A note too long for its row is left off, not cut.** `…` keeps the beginning of a sentence
+    /// and throws the end away — and on a description the end is the part that says what it does.
+    #[test]
+    fn a_note_too_long_for_the_row_is_left_off_rather_than_cut() {
+        let long = "에이전트를 고릅니다. 다음 메시지에서 새 쓰레드가 열립니다";
+        let (label, note) = split(62, "/agent", Some(long), false);
+        assert_eq!(label, "/agent");
+        assert!(note.is_none(), "a half-sentence was drawn: {note:?}");
+    }
+
+    /// Every row of the screen, wide characters not double-counted.
+    fn screen(picker: &mut Picker, w: u16, h: u16) -> Vec<String> {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).expect("terminal");
+        terminal.draw(|f| draw(f, f.area(), picker, crate::lang::Lang::Ko, 0)).expect("draw");
+        let buf = terminal.backend().buffer().clone();
+        (0..h)
+            .map(|y| {
+                let mut row = String::new();
+                let mut x = 0u16;
+                while x < w {
+                    let symbol = buf[(x, y)].symbol();
+                    row.push_str(symbol);
+                    x += display_width(symbol).max(1) as u16;
+                }
+                row
+            })
+            .collect()
+    }
+
+    /// **The box grows with the window.** A fixed 64 cut `/github`'s description with an `…` on a
+    /// screen three times that wide. The box is now as wide as its widest row, so the whole note
+    /// sits beside its command.
+    #[test]
+    fn a_wider_terminal_shows_a_command_note_whole() {
+        let mut picker = Picker::commands(crate::lang::Lang::Ko, &[]);
+        let rows = screen(&mut picker, 120, 24);
+        assert!(!rows.iter().any(|r| r.contains('…')), "{rows:#?}");
+        assert!(
+            rows.iter().any(|r| r.contains("/github") && r.contains("login reviewer")),
+            "the note was not beside its command:\n{}",
+            rows.join("\n")
+        );
+    }
+
+    /// **A note that does not fit goes under the list, whole, for the row the cursor is on.**
+    /// Knowing what a command does before typing it is the whole point of the list.
+    #[test]
+    fn a_note_that_does_not_fit_goes_under_the_list_in_full() {
+        let mut picker = Picker::commands(crate::lang::Lang::Ko, &[]);
+        let at = picker.rows.iter().position(|r| r.label == "/agent").expect("no /agent row");
+        picker.cursor = at;
+        let rows = screen(&mut picker, 60, 24);
+        let joined = rows.join("\n");
+        assert!(!joined.contains('…'), "{joined}");
+        // The note is wider than the box, so it is here on two lines — and whole.
+        assert!(joined.contains("에이전트를 고릅니다"), "{joined}");
+        assert!(joined.contains("열립니다"), "the end of the note was lost: {joined}");
     }
 
     /// When both fit, both show.

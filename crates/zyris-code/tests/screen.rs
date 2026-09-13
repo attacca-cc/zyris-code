@@ -1438,15 +1438,23 @@ fn the_panel_overlays_the_conversation_and_takes_the_keys() {
     }
     assert_eq!(s.input.text, "");
 
-    // ↓ scrolls the panel, Esc closes it.
+    // **↓ moves the cursor, it does not scroll.** The panel draws a cursor beside one of the four
+    // modes, so the arrows belong to that choice — the list already fits, and scrolling it was
+    // what the keys used to do: nothing at all. Esc then closes without applying.
     for a in on_key(&s, key(KeyCode::Down)) {
         apply(&mut s, &a);
     }
-    assert_eq!(s.panel.as_ref().unwrap().scroll, 1);
+    assert_eq!(
+        s.panel.as_ref().unwrap().mode_pick,
+        Some(zyris_code::mode::Mode::Normal),
+        "↓ did not move the cursor to the row below the last"
+    );
+    assert_eq!(s.mode, zyris_code::mode::Mode::Job, "moving the cursor applied a mode");
     for a in on_key(&s, key(KeyCode::Esc)) {
         apply(&mut s, &a);
     }
     assert!(s.panel.is_none(), "Esc did not close the panel");
+    assert_eq!(s.mode, zyris_code::mode::Mode::Job, "Esc applied the mode the cursor was on");
 }
 
 /// The two create rows behave differently. **Sessions are created right away; projects go through a form.**

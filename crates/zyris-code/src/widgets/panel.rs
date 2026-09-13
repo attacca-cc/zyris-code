@@ -17,11 +17,37 @@ use crate::wrap;
 
 pub fn draw(frame: &mut Frame, area: Rect, panel: &mut Panel, lang: crate::lang::Lang) {
     let has_button = panel.button.is_some();
+    // **A panel answers to different keys depending on what it is, so it says which.** Settled
+    // here, before the width, because the hint is a line the box must be wide enough for.
+    let keys = match (
+        panel.form.map(|f| f.lang),
+        panel.mode_pick.is_some(),
+        has_button,
+        panel.button_focused,
+    ) {
+        (Some(draft), _, _, _) => draft.form_keys(),
+        (None, true, _, _) => lang.mode_pick_keys().to_string(),
+        (None, false, true, true) => lang.panel_keys_button_focused(),
+        (None, false, true, false) => lang.panel_keys_button(),
+        (None, false, false, _) => lang.panel_keys(),
+    };
     // **The width is settled first**, because the wrapping needs it and the height falls out of how
-    // many lines the wrapping produced — the order `widgets/enroll.rs` already uses. Sizing the box
-    // from the lines the panel was built with is how a long description came to end in an `…`
-    // against the right border, and how the rows past the bottom would have gone missing instead.
-    let w = 72.min(area.width.saturating_sub(4)).max(20);
+    // many lines the wrapping produced — the order `widgets/enroll.rs` already uses.
+    //
+    // **And it is sized to the content, capped by the screen.** A fixed 72 threw away the room a
+    // wide terminal has: a mode's sentence is 90 columns of Korean and the box was 72 whatever the
+    // window was, so it wrapped on a screen with 200 columns to spare. Now the box is as wide as
+    // its longest line needs, and wrapping is the last resort for a screen that really is narrow.
+    let widest = panel
+        .lines
+        .iter()
+        .map(|line| line.spans.iter().map(|s| display_width(&s.content)).sum::<usize>())
+        // The title is drawn with a space either side of it, inside the border.
+        .chain(std::iter::once(display_width(&panel.title) + 4))
+        .chain(std::iter::once(display_width(&keys)))
+        .max()
+        .unwrap_or(0);
+    let w = (widest as u16 + 4).min(area.width.saturating_sub(4)).max(20);
     // The borders take a column each side; `Block::inner` below agrees with this.
     let body: Vec<Line<'static>> = panel
         .lines
@@ -78,15 +104,6 @@ pub fn draw(frame: &mut Frame, area: Rect, panel: &mut Panel, lang: crate::lang:
     if let Some(button) = panel.button {
         lines.push(button_line(button, panel.button_focused, lang, width));
     }
-    // **A form answers to different keys, so it says so.** Showing "↑↓ scroll · Esc close"
-    // over a box whose ↑↓ move a cursor and whose Esc throws work away would be a lie.
-    // The form draws its own language too — the draft may have changed it a moment ago.
-    let keys = match (panel.form.map(|f| f.lang), has_button, panel.button_focused) {
-        (Some(draft), _, _) => draft.form_keys(),
-        (None, true, true) => lang.panel_keys_button_focused(),
-        (None, true, false) => lang.panel_keys_button(),
-        (None, false, _) => lang.panel_keys(),
-    };
     lines.push(Line::from(Span::styled(keys, Style::default().fg(theme::text_muted()))));
 
     frame.render_widget(Paragraph::new(lines), inner);

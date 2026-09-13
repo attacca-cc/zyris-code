@@ -286,6 +286,14 @@ pub enum Action {
     PanelClose,
     /// Scroll the popup panel. Positive scrolls toward the top.
     PanelScroll(i32),
+    /// Move a panel's own cursor (`/mode`). Positive is down.
+    ///
+    /// **A panel that draws a cursor beside a row has to answer to the arrows.** `/mode` used to
+    /// take `↑↓` as a scroll over a list that already fitted, so the keys did nothing at all — in
+    /// every terminal, not only in kitty.
+    PanelMove(i32),
+    /// Apply the row a panel's cursor is on (Enter/Space on `/mode`).
+    PanelChoose,
     /// Move focus between the panel body and its button (Tab). No-op without one.
     PanelFocus,
     /// Activate the focused panel button (Enter/Space while it is focused).
@@ -1228,6 +1236,20 @@ pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
                 _ => vec![],
             };
         }
+        // **A panel that offers a choice takes the arrows.** `/mode` lists four modes with a
+        // cursor beside one of them; scrolling a list that fits is not what ↓ means.
+        if state.panel.as_ref().is_some_and(|p| p.mode_pick.is_some()) {
+            return match key.code {
+                KeyCode::Esc => vec![Action::PanelClose],
+                KeyCode::Up | KeyCode::Char('k') => vec![Action::PanelMove(-1)],
+                KeyCode::Down | KeyCode::Char('j') => vec![Action::PanelMove(1)],
+                KeyCode::Enter | KeyCode::Char(' ') => vec![Action::PanelChoose],
+                // **`Shift+Tab` still cycles**, and the panel closes with it: it draws the mode
+                // that was current when it opened, so leaving it up would show a stale one.
+                KeyCode::BackTab => vec![Action::CycleMode, Action::PanelClose],
+                _ => vec![],
+            };
+        }
         return match key.code {
             KeyCode::Esc => vec![Action::PanelClose],
             KeyCode::Tab | KeyCode::BackTab if has_button => vec![Action::PanelFocus],
@@ -1978,6 +2000,26 @@ pub fn apply(state: &mut State, action: &Action) {
             }
         }
         Action::PanelClose => state.panel = None,
+        // **Rebuilt, not nudged.** The body is plain lines with no idea which one is the cursor,
+        // so moving it is a rebuild with the new `pick` — which keeps the whole panel a pure
+        // function of (current mode, cursor).
+        Action::PanelMove(dir) => {
+            if let Some(on) = state.panel.as_ref().and_then(|p| p.mode_pick) {
+                let pick = step_mode(on, *dir);
+                state.panel = Some(crate::panel::mode(state.lang, state.mode, Some(pick)));
+            }
+        }
+        Action::PanelChoose => {
+            if let Some(m) = state.panel.as_ref().and_then(|p| p.mode_pick) {
+                if m != state.mode {
+                    state.mode = m;
+                    // The same words `/mode <name>` uses — one mode change, one way to say it.
+                    let said = state.lang.mode_changed(m.label(state.lang));
+                    state.timeline.say(said);
+                }
+            }
+            state.panel = None;
+        }
         Action::PanelFocus => {
             if let Some(p) = &mut state.panel {
                 if p.button.is_some() {
@@ -2652,7 +2694,7 @@ pub fn run_command(state: &mut State, text: &str) -> Option<crate::command::Comm
             // **The panel is the answer now** — a wall of text in the conversation was
             // the whole complaint. The four modes with the current one marked read
             // better than one sentence.
-            state.panel = Some(crate::panel::mode(state.lang, state.mode));
+            state.panel = Some(crate::panel::mode(state.lang, state.mode, None));
         }
         Command::Mode(Some(mode)) => {
             state.mode = *mode;
@@ -5561,6 +5603,17 @@ async fn flush_queue(
     }
 }
 
+/// The mode `dir` rows along the `/mode` list, wrapping at both ends.
+///
+/// The list on screen is `Mode::ALL` in order, so the step has to be that order — walking
+/// `Mode::next` would tie the panel's cursor to whatever order the cycle happens to use.
+fn step_mode(from: crate::mode::Mode, dir: i32) -> crate::mode::Mode {
+    let all = crate::mode::Mode::ALL;
+    let at = all.iter().position(|m| *m == from).unwrap_or(0) as i32;
+    let n = all.len() as i32;
+    all[(((at + dir) % n + n) % n) as usize]
+}
+
 /// Sets the session staging so the next message goes where the mode decided. **It only runs
 /// at the moment the mode changes.**
 ///
@@ -6275,12 +6328,19 @@ mod tests {
         assert!(s.panel.is_none(), "Esc closes the panel");
     }
 
-    /// ↑↓ scroll the panel, and so does the wheel while it is open — the transcript
-    /// is hidden behind it, so scrolling that instead would move unseen text.
+    /// ↑↓ scroll a panel that only shows something, and so does the wheel while it is open —
+    /// the transcript is hidden behind it, so scrolling that instead would move unseen text.
+    ///
+    /// **This used `/mode` until `/mode` grew a cursor.** A panel that offers a choice takes the
+    /// arrows for the choice (`the_mode_panel_moves_its_cursor_and_applies_it`), so scrolling is
+    /// tested on a panel that has nothing to choose.
     #[test]
     fn keys_and_wheel_scroll_the_panel() {
         let mut s = state();
-        run_command(&mut s, "/mode");
+        s.panel = Some(crate::panel::Panel::new(
+            "t".into(),
+            (0..30).map(|i| ratatui::text::Line::from(format!("row {i}"))).collect(),
+        ));
         for a in on_key(&s, key(KeyCode::Down, KeyModifiers::NONE)) {
             apply(&mut s, &a);
         }
@@ -6291,6 +6351,41 @@ mod tests {
         assert_eq!(s.panel.as_ref().unwrap().scroll, 0);
         // While the panel is open the wheel must not move the transcript.
         assert_eq!(s.scroll.top, 0, "the transcript scroll moved");
+    }
+
+    /// **`/mode` answers to the arrows, and Enter applies the row the cursor is on.** The panel
+    /// draws a cursor beside one of four modes, so `↑↓` is what anybody presses — it used to be a
+    /// scroll over a list that already fitted, which did nothing at all, in every terminal.
+    #[test]
+    fn the_mode_panel_moves_its_cursor_and_applies_it() {
+        let mut s = state();
+        s.mode = crate::mode::Mode::Plan;
+        run_command(&mut s, "/mode");
+        assert_eq!(s.panel.as_ref().unwrap().mode_pick, Some(crate::mode::Mode::Plan));
+        // One row down from 계획 is 일.
+        for a in on_key(&s, key(KeyCode::Down, KeyModifiers::NONE)) {
+            apply(&mut s, &a);
+        }
+        assert_eq!(s.panel.as_ref().unwrap().mode_pick, Some(crate::mode::Mode::Work));
+        assert_eq!(s.mode, crate::mode::Mode::Plan, "moving the cursor changed the mode");
+        apply(&mut s, &Action::PanelChoose);
+        assert_eq!(s.mode, crate::mode::Mode::Work, "Enter did not apply the row");
+        assert!(s.panel.is_none(), "the panel stayed up");
+    }
+
+    /// Esc on `/mode` leaves the mode alone. **Choosing and closing are different keys** — one
+    /// Enter is the only way to apply, or the panel would be a trap for anyone who only meant to
+    /// look at it.
+    #[test]
+    fn escape_on_the_mode_panel_changes_nothing() {
+        let mut s = state();
+        s.mode = crate::mode::Mode::Job;
+        run_command(&mut s, "/mode");
+        for a in on_key(&s, key(KeyCode::Down, KeyModifiers::NONE)) {
+            apply(&mut s, &a);
+        }
+        apply(&mut s, &Action::PanelClose);
+        assert_eq!(s.mode, crate::mode::Mode::Job, "closing the panel applied the cursor");
     }
 
     /// Tab moves focus onto the account panel's logout button, and Enter activates

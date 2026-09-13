@@ -1724,10 +1724,15 @@ impl Lang {
     pub fn current_mode(self) -> &'static str {
         self.pick("지금 모드", "Current mode")
     }
-    pub fn mode_cycle_hint(self) -> &'static str {
+    /// The hint line of the `/mode` panel.
+    ///
+    /// **It takes `↑↓` now.** The panel used to be read-only — you changed the mode with
+    /// `Shift+Tab` and the panel only told you what the four were — but it draws a cursor beside
+    /// one of them, so the arrows are what anybody presses.
+    pub fn mode_pick_keys(self) -> &'static str {
         self.pick(
-            "Shift+Tab으로 돌리거나 `/mode 일반`∙`/mode 계획`∙`/mode 일`∙`/mode 작업`으로 바꿉니다.",
-            "Cycle with Shift+Tab, or set it with `/mode normal`, `/mode plan`, `/mode work`, `/mode job`.",
+            "↑↓ 고르기 ∙ Enter 적용 ∙ Esc 닫기 ∙ Shift+Tab은 그대로 돕니다",
+            "↑↓ choose ∙ Enter apply ∙ Esc close ∙ Shift+Tab still cycles",
         )
     }
     /// One line on what each mode does, for the `/mode` panel. The words match the

@@ -23,7 +23,7 @@ use crate::tools::skill::SkillInfo;
 pub struct Panel {
     /// The title shown in the box's top border.
     pub title: String,
-    /// The styled body lines. Drawn one per row, truncated to the box width.
+    /// The styled body lines. Wrapped to the box width — never cut, never dropped.
     pub lines: Vec<Line<'static>>,
     /// Rows scrolled off the top. The widget clamps it to what fits.
     pub scroll: usize,
@@ -35,6 +35,13 @@ pub struct Panel {
     /// The editable settings, when this panel is the `/config` form. The other panels
     /// only show, so they carry `None` and their keys stay scroll-and-close.
     pub form: Option<Form>,
+    /// The mode `Enter` applies, when this panel is the `/mode` list.
+    ///
+    /// **It is also what says the arrows mean "choose", not "scroll".** `/mode` lists four
+    /// modes and draws a cursor beside one of them, so `↑↓` moving a scroll that is already at
+    /// the top is not what anybody pressing it means. Every other panel carries `None` and keeps
+    /// scroll-and-close.
+    pub mode_pick: Option<Mode>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -241,7 +248,15 @@ impl Panel {
     /// A panel holding pre-styled lines. `pub(crate)` because the widget's own tests build one
     /// directly — every panel a person sees comes from a builder below.
     pub(crate) fn new(title: String, lines: Vec<Line<'static>>) -> Self {
-        Self { title, lines, scroll: 0, button: None, button_focused: false, form: None }
+        Self {
+            title,
+            lines,
+            scroll: 0,
+            button: None,
+            button_focused: false,
+            form: None,
+            mode_pick: None,
+        }
     }
 
     /// Redraws the body from the form after a key moved the cursor or changed a value.
@@ -276,8 +291,19 @@ pub fn max_scroll(drawn: usize, visible: usize) -> usize {
 // Builders
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// The `/mode` panel — every mode with its description, the current one marked.
-pub fn mode(lang: Lang, now: Mode) -> Panel {
+/// The `/mode` panel — every mode with its own sentence, the cursor on the mode you are in.
+///
+/// **Rows are one line each and the sentence goes below the list.** Beside each row the sentences
+/// made the list ragged — the rows are one word and the sentences are twenty — and cut to fit they
+/// lost their end. One line under the list says the whole thing and leaves the list clean. It is
+/// the shape `/config` already uses for the setting under the cursor.
+///
+/// **`pick` is where the cursor is**, so the panel can be rebuilt as the arrows move. `None` opens
+/// it on the mode you are in.
+pub fn mode(lang: Lang, now: Mode, pick: Option<Mode>) -> Panel {
+    // Opening the panel puts the cursor on the mode you are in, so Enter on an untouched panel
+    // changes nothing.
+    let on = pick.unwrap_or(now);
     let mut lines = vec![
         Line::from(Span::styled(
             format!("{} ∙ {}", lang.current_mode(), now.label(lang)),
@@ -286,28 +312,54 @@ pub fn mode(lang: Lang, now: Mode) -> Panel {
         blank(),
     ];
     for m in Mode::ALL {
-        let on = m == now;
-        let mut spans = vec![
-            Span::styled(if on { "❯ " } else { "  " }, Style::default().fg(theme::accent())),
+        let cursor = m == on;
+        lines.push(Line::from(vec![
+            Span::styled(if cursor { "❯ " } else { "  " }, Style::default().fg(theme::accent())),
             Span::styled(
                 m.label(lang),
-                if on {
+                if cursor {
                     Style::default().fg(m.color()).add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(theme::text())
                 },
             ),
-            Span::styled(" ‒ ", Style::default().fg(theme::border_light())),
-            Span::styled(
-                lang.mode_desc(m),
-                Style::default().fg(if on { theme::text() } else { theme::text_muted() }),
-            ),
-        ];
-        lines.push(Line::from(std::mem::take(&mut spans)));
+        ]));
     }
     lines.push(blank());
-    lines.push(muted(lang.mode_cycle_hint().to_string()));
-    Panel::new(lang.title_mode().into(), lines)
+    lines.push(Line::from(bold_spans(lang.mode_desc(on))));
+    let mut panel = Panel::new(lang.title_mode().into(), lines);
+    panel.mode_pick = Some(on);
+    panel
+}
+
+/// Turns `**bold**` into bold spans.
+///
+/// **The mode sentences carry markdown and this panel draws raw text** — `**일**` was going to the
+/// screen with its asterisks on. There is no renderer wanted here: one marker, one line.
+fn bold_spans(text: &'static str) -> Vec<Span<'static>> {
+    let plain = || Style::default().fg(theme::text());
+    let mut spans = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("**") {
+        let (before, after) = rest.split_at(start);
+        if !before.is_empty() {
+            spans.push(Span::styled(before.to_string(), plain()));
+        }
+        // An unclosed marker is not a marker — the rest is plain text.
+        let Some(end) = after[2..].find("**") else {
+            spans.push(Span::styled(after.to_string(), plain()));
+            return spans;
+        };
+        spans.push(Span::styled(
+            after[2..2 + end].to_string(),
+            plain().add_modifier(Modifier::BOLD),
+        ));
+        rest = &after[2 + end + 2..];
+    }
+    if !rest.is_empty() {
+        spans.push(Span::styled(rest.to_string(), plain()));
+    }
+    spans
 }
 
 /// The `/mcp` panel — every attached server and how many tools it brought.
@@ -652,7 +704,7 @@ mod tests {
     /// reach is useless.
     #[test]
     fn the_mode_panel_lists_every_mode_and_marks_the_current_one() {
-        let p = mode(Lang::Ko, Mode::Plan);
+        let p = mode(Lang::Ko, Mode::Plan, None);
         assert_eq!(p.title, "모드");
         let lines = text(&p);
         let joined = lines.join("\n");
@@ -663,6 +715,33 @@ mod tests {
         let marked: Vec<&String> = lines.iter().filter(|l| l.contains('❯')).collect();
         assert_eq!(marked.len(), 1, "{lines:?}");
         assert!(marked[0].contains("계획"), "{marked:?}");
+        // And it is the one `Enter` would apply, so an untouched panel changes nothing.
+        assert_eq!(p.mode_pick, Some(Mode::Plan));
+    }
+
+    /// **The sentence under the list follows the cursor.** Rows are one line each now — the
+    /// sentence beside them made the list ragged, and cut to fit it lost its end.
+    #[test]
+    fn the_mode_panel_says_the_sentence_of_the_row_the_cursor_is_on() {
+        let p = mode(Lang::Ko, Mode::Normal, Some(Mode::Work));
+        let lines = text(&p);
+        let joined = lines.join("\n");
+        // The cursor sits on 일 and carries that sentence, not the current mode's.
+        assert!(lines.iter().any(|l| l.starts_with('❯') && l.contains('일')), "{lines:?}");
+        assert!(joined.contains("태스크로 쪼갭니다"), "{joined}");
+        assert!(!joined.contains("물어보지 않고"), "the current mode's sentence was drawn: {joined}");
+        assert_eq!(p.mode_pick, Some(Mode::Work));
+    }
+
+    /// **`**일**` must not reach the screen with its asterisks on.** The mode sentences carry
+    /// markdown and this panel draws plain text — a marker printed raw is a character nobody
+    /// typed, in the middle of the one sentence the panel exists to say.
+    #[test]
+    fn a_markdown_marker_in_a_mode_sentence_is_rendered_not_printed() {
+        let p = mode(Lang::Ko, Mode::Work, None);
+        let joined = text(&p).join("\n");
+        assert!(!joined.contains('*'), "the markers were printed: {joined}");
+        assert!(joined.contains("일(work)"), "the emphasised word lost its company: {joined}");
     }
 
     #[test]
@@ -746,7 +825,7 @@ mod tests {
     fn the_account_panel_carries_a_logout_button() {
         let p = account(Lang::Ko, "루마", "me@standoor.org", "user-1", None, None, &[]);
         assert_eq!(p.button, Some(PanelButton::Logout));
-        let p = mode(Lang::Ko, Mode::Normal);
+        let p = mode(Lang::Ko, Mode::Normal, None);
         assert_eq!(p.button, None, "a panel without an action must not show a button");
     }
 
