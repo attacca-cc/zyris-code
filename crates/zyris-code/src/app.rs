@@ -7514,7 +7514,13 @@ mod tests {
         let mut s = state();
         apply(
             &mut s,
-            &Action::Frame(Frame::Event { cursor: 42, entry: None, todo: None, plan: None, report: None }),
+            &Action::Frame(Frame::Event {
+                cursor: 42,
+                entry: None,
+                todo: None,
+                plan: None,
+                report: None,
+            }),
         );
         assert_eq!(s.last_cursor, Some(42));
     }
@@ -8072,7 +8078,12 @@ mod tests {
         s.connected = false;
         s.running = true;
         apply(&mut s, &Action::Submit("연결이 끊긴 동안 친 말".into()));
-        assert_eq!(s.queued, vec!["연결이 끊긴 동안 친 말"], "nothing is holding it: {}", s.connected);
+        assert_eq!(
+            s.queued,
+            vec!["연결이 끊긴 동안 친 말"],
+            "nothing is holding it: {}",
+            s.connected
+        );
         assert!(s.sent.is_empty(), "it entered the sent history before being sent");
     }
 
@@ -8322,7 +8333,7 @@ mod tests {
                 }),
                 todo: None,
                 plan: None,
-                        report: None,
+                report: None,
             })
         };
         // Aimed at another thread: dropped at the door, so nothing is applied here.
@@ -8359,7 +8370,7 @@ mod tests {
                 }),
                 todo: None,
                 plan: None,
-                        report: None,
+                report: None,
             })
         };
         let showing = |s: &State| s.asking.as_ref().unwrap().1.current().question.clone();
@@ -8546,8 +8557,8 @@ mod tests {
     fn a_fresh_thread_does_not_queue_messages_behind_the_old_turn() {
         let mut s = state();
         s.running = true; // the previous session's turn is running
-        // **Nowhere to send it, so it is held.** A live connection no longer holds anything —
-        // attacca takes a mid-turn message and carries it to the next turn.
+                          // **Nowhere to send it, so it is held.** A live connection no longer holds anything —
+                          // attacca takes a mid-turn message and carries it to the next turn.
         s.connected = false;
         apply(&mut s, &Action::Submit("앞 턴에 담아 둔 말".into()));
         assert_eq!(s.queued, vec!["앞 턴에 담아 둔 말"]);

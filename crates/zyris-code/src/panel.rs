@@ -354,8 +354,7 @@ pub fn mode(lang: Lang, now: Mode, pick: Option<Mode>) -> Panel {
     panel.mode_pick = Some(on);
     // **All four sentences, so the box is one size on all four rows.** Built from the one on
     // screen, it grew and shrank as the arrows moved.
-    panel.foot =
-        Mode::ALL.iter().map(|m| Line::from(bold_spans(lang.mode_desc(*m)))).collect();
+    panel.foot = Mode::ALL.iter().map(|m| Line::from(bold_spans(lang.mode_desc(*m)))).collect();
     panel
 }
 
@@ -768,7 +767,10 @@ mod tests {
         // The cursor sits on 일 and carries that sentence, not the current mode's.
         assert!(lines.iter().any(|l| l.starts_with('❯') && l.contains('일')), "{lines:?}");
         assert!(joined.contains("태스크로 쪼갭니다"), "{joined}");
-        assert!(!joined.contains("물어보지 않고"), "the current mode's sentence was drawn: {joined}");
+        assert!(
+            !joined.contains("물어보지 않고"),
+            "the current mode's sentence was drawn: {joined}"
+        );
         assert_eq!(p.mode_pick, Some(Mode::Work));
     }
 

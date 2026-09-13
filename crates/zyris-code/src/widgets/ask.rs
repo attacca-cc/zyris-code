@@ -162,10 +162,8 @@ pub fn card(a: &Answering, width: u16, room: usize, lang: crate::lang::Lang) -> 
         hint.push_str(&lang.pick_more(false, below));
     }
 
-    let mut lines = vec![Line::from(Span::styled(
-        "─".repeat(w),
-        Style::default().fg(theme::accent()),
-    ))];
+    let mut lines =
+        vec![Line::from(Span::styled("─".repeat(w), Style::default().fg(theme::accent())))];
     lines.extend(body[top..top + shown].iter().cloned());
     lines.push(Line::from(Span::styled(hint, Style::default().fg(theme::text_muted()))));
     // The rule is drawn above the body, so a caret on body line `y` is on screen line `y + 1` —
@@ -203,7 +201,10 @@ pub fn draw(frame: &mut Frame, area: Rect, a: &Answering, lang: crate::lang::Lan
     // syllable it is composing wherever the cursor was last left — which, with the input box
     // replaced by this card, is the activity line above it.
     if let Some((x, y)) = card.caret {
-        frame.set_cursor_position((area.x + x, (area.y + y).min(area.y + area.height.saturating_sub(1))));
+        frame.set_cursor_position((
+            area.x + x,
+            (area.y + y).min(area.y + area.height.saturating_sub(1)),
+        ));
     }
 }
 
@@ -229,8 +230,7 @@ fn row_lines(
     width: usize,
 ) -> Vec<Line<'static>> {
     let on = i == a.cursor && !a.typing;
-    let caret =
-        Span::styled(if on { "❯ " } else { "  " }, Style::default().fg(theme::accent()));
+    let caret = Span::styled(if on { "❯ " } else { "  " }, Style::default().fg(theme::accent()));
     let line = match row {
         RowKind::Option(j) => {
             let j = *j;
@@ -424,7 +424,10 @@ mod tests {
         }
         // The rule and the hint belong to no row.
         assert_eq!(row_at(&a, area, area.y, crate::lang::Lang::Ko), None);
-        assert_eq!(row_at(&a, area, area.y + card.lines.len() as u16 - 1, crate::lang::Lang::Ko), None);
+        assert_eq!(
+            row_at(&a, area, area.y + card.lines.len() as u16 - 1, crate::lang::Lang::Ko),
+            None
+        );
     }
 
     /// When the list cannot fit, the cursor's row is still on screen and the hint says how much is
@@ -435,7 +438,9 @@ mod tests {
             header: None,
             question: "고르세요".into(),
             multi: false,
-            options: (0..20).map(|i| Opt { label: format!("선택 {i}"), description: None }).collect(),
+            options: (0..20)
+                .map(|i| Opt { label: format!("선택 {i}"), description: None })
+                .collect(),
         }]);
         a.cursor = 18;
         let room = 8u16;

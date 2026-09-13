@@ -200,7 +200,16 @@ fn cell_bg(state: &mut State, w: u16, h: u16, x: u16, y: u16) -> Option<ratatui:
 
 fn said(state: &mut State, seq: i64, kind: EntryKind) {
     let entry = Some(Entry { seq, kind });
-    apply(state, &Action::Frame(AppFrame::Event { cursor: seq, entry, todo: None, plan: None , report: None}));
+    apply(
+        state,
+        &Action::Frame(AppFrame::Event {
+            cursor: seq,
+            entry,
+            todo: None,
+            plan: None,
+            report: None,
+        }),
+    );
 }
 
 /// **A scrolled-up view keeps looking at the same words when the width changes.**

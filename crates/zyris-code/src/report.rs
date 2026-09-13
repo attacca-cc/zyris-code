@@ -84,8 +84,11 @@ mod tests {
     /// The ordinary shape: `{status, summary}`.
     #[test]
     fn a_report_is_read_out_of_the_call_that_made_it() {
-        let r = of(&ev(7, call(json!({"status": "success", "summary": "빌드가 통과했습니다."}), json!("ok"))))
-            .expect("a report");
+        let r = of(&ev(
+            7,
+            call(json!({"status": "success", "summary": "빌드가 통과했습니다."}), json!("ok")),
+        ))
+        .expect("a report");
         assert_eq!(r.seq, 7);
         assert!(r.ok);
         assert_eq!(r.summary, "빌드가 통과했습니다.");
@@ -94,15 +97,19 @@ mod tests {
     /// **A failure is a report too** — the one a person most needs to see.
     #[test]
     fn a_failed_report_comes_through_as_a_failure() {
-        let r = of(&ev(1, call(json!({"status": "failure", "summary": "테스트가 깨졌습니다."}), json!(null))))
-            .expect("a report");
+        let r = of(&ev(
+            1,
+            call(json!({"status": "failure", "summary": "테스트가 깨졌습니다."}), json!(null)),
+        ))
+        .expect("a report");
         assert!(!r.ok);
     }
 
     /// Status missing: the call's own error is what is left to go on.
     #[test]
     fn a_report_without_a_status_falls_back_to_the_call_error() {
-        let ok = of(&ev(1, call(json!({"summary": "끝났습니다."}), json!("done")))).expect("a report");
+        let ok =
+            of(&ev(1, call(json!({"summary": "끝났습니다."}), json!("done")))).expect("a report");
         assert!(ok.ok);
         let mut failed = call(json!({"summary": "끝났습니다."}), json!(null));
         failed["error"] = json!("boom");
@@ -124,7 +131,11 @@ mod tests {
     /// A report with no words is not a card — an empty box over the input is worse than no box.
     #[test]
     fn a_report_with_nothing_in_it_is_not_offered() {
-        for args in [json!({}), json!({"status": "success"}), json!({"status": "success", "summary": "   "})] {
+        for args in [
+            json!({}),
+            json!({"status": "success"}),
+            json!({"status": "success", "summary": "   "}),
+        ] {
             assert!(of(&ev(1, call(args, json!(null)))).is_none(), "an empty card was offered");
         }
     }

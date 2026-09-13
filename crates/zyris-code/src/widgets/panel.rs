@@ -47,12 +47,8 @@ pub fn draw(frame: &mut Frame, area: Rect, panel: &mut Panel, lang: crate::lang:
     let inner_w = w.saturating_sub(2) as usize;
     // The rows the foot keeps, whichever sentence is up. **A box that resizes under the keys is
     // what all of this exists to prevent** — that is why `foot` holds every sentence, not one.
-    let foot_rows = panel
-        .foot
-        .iter()
-        .map(|line| wrap::line(line.clone(), inner_w).len())
-        .max()
-        .unwrap_or(0);
+    let foot_rows =
+        panel.foot.iter().map(|line| wrap::line(line.clone(), inner_w).len()).max().unwrap_or(0);
     let mut body: Vec<Line<'static>> =
         content.iter().cloned().flat_map(|line| wrap::line(line, inner_w)).collect();
     if let Some(foot) = foot {
@@ -242,11 +238,8 @@ mod tests {
         let rects: Vec<_> = crate::mode::Mode::ALL
             .iter()
             .map(|m| {
-                let mut panel = crate::panel::mode(
-                    crate::lang::Lang::Ko,
-                    crate::mode::Mode::Normal,
-                    Some(*m),
-                );
+                let mut panel =
+                    crate::panel::mode(crate::lang::Lang::Ko, crate::mode::Mode::Normal, Some(*m));
                 box_rect(&render(&mut panel, 100, 24))
             })
             .collect();

@@ -214,7 +214,10 @@ mod tests {
     fn wrapping_keeps_every_span_its_own_colour() {
         let line = Line::from(vec![
             Span::styled("❯ ", Style::default().fg(Color::Green)),
-            Span::styled("a description that is far too long to fit", Style::default().fg(Color::Red)),
+            Span::styled(
+                "a description that is far too long to fit",
+                Style::default().fg(Color::Red),
+            ),
         ]);
         let out = super::line(line, 16);
         assert!(out.len() > 1, "{:?}", text(&out));
@@ -227,7 +230,10 @@ mod tests {
                 assert_eq!(span.style.fg, Some(Color::Red), "{:?}", text(&out));
             }
         }
-        assert_eq!(text(&out).join(" ").replace("  ", " "), "❯ a description that is far too long to fit");
+        assert_eq!(
+            text(&out).join(" ").replace("  ", " "),
+            "❯ a description that is far too long to fit"
+        );
     }
 
     /// The break lands on a space when there is one, so words are not sliced in half for nothing.

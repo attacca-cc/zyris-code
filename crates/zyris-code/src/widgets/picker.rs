@@ -37,9 +37,8 @@ pub fn draw(
         .max()
         .unwrap_or(0);
     let detail = cursor_detail(picker, inner_w);
-    let want_h = (picker.rows.len() as u16)
-        .saturating_add(5 + rule as u16 + detail_rows as u16)
-        .max(6);
+    let want_h =
+        (picker.rows.len() as u16).saturating_add(5 + rule as u16 + detail_rows as u16).max(6);
     let h = want_h.min(area.height.saturating_sub(2)).max(3);
     let box_area = Rect {
         x: area.x + (area.width.saturating_sub(w)) / 2,
