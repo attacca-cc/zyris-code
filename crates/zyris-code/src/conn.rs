@@ -1119,8 +1119,15 @@ mod tests {
     /// `[slug · platform · "name"]` in front of every tool it relays, and matching on the name is
     /// how the agent picks this machine's tools out of the account's. Naming it any other way —
     /// "this node", "the local one" — leaves nothing to match against.
+    ///
+    /// **Under the host lock.** `node_name()` reads `$HOSTNAME`, and `a_long_hostname_does_not_…`
+    /// sets that to a fake long one — process-globally. Without the lock this test can read the
+    /// real name for its first assertion and the fake one for its second, and the failure is then
+    /// about the suite's order rather than about the block. That is exactly how it failed on a CI
+    /// runner whose hostname was long (2026-09-13) while passing here.
     #[test]
     fn the_node_block_names_what_the_tool_descriptions_name() {
+        let _g = HOST.lock().unwrap_or_else(|e| e.into_inner());
         let out = node_preamble(std::path::Path::new("/home/ruma/zyris-code"));
         assert!(out.contains(&node_name()), "the display name is what joins the two: {out}");
         assert!(out.contains(&node_slug()), "the slug is how a tool name reads: {out}");
