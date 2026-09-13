@@ -371,6 +371,21 @@ impl Answering {
         out.join("\n\n")
     }
 
+    /// Whether this message is an answer this app wrote, rather than something a person typed.
+    ///
+    /// **The shape is the signature.** `answer_text` writes one question line and then `  - `
+    /// bullets under it; a person writing a list bullets every line, and one writing a paragraph
+    /// indents nothing. The history that comes back from the server is this same text — the event
+    /// says `chat_user` either way — so shape is all there is to go on.
+    ///
+    /// A message that happens to be a line followed by an indented list reads as an answer. That
+    /// is a wrong guess about a rare message, and it costs nothing but the layout.
+    pub fn looks_like_an_answer(text: &str) -> bool {
+        let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+        let Some(first) = lines.first() else { return false };
+        !first.trim_start().starts_with('-') && lines[1..].iter().any(|l| l.starts_with("  - "))
+    }
+
     /// Answers the user **typed directly**. Pulled out separately to be shown differently in the history.
     pub fn free_answers(&self) -> Vec<String> {
         self.free.iter().map(|f| f.trim().to_string()).filter(|f| !f.is_empty()).collect()

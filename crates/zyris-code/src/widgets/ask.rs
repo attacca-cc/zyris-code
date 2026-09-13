@@ -20,6 +20,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
+use crate::markdown::display_width;
 use crate::question::{Act, Answering, RowKind};
 use crate::theme;
 use crate::wrap;
@@ -34,6 +35,14 @@ pub struct Card {
     pub owners: Vec<Option<usize>>,
     /// The body line the visible window starts at. Zero unless the body did not fit.
     pub top: usize,
+    /// Where the terminal's own cursor has to go, in cells of the area the card is drawn in.
+    ///
+    /// **This is not decoration — it is where the input method draws what it is composing.** A
+    /// Korean syllable being assembled is drawn by the IME *at the terminal's cursor*, and with the
+    /// cursor left where the input box used to be, the preedit appeared one line up on the activity
+    /// line while the finished word landed correctly in the field (reported 2026-09-13).
+    /// `widgets/input.rs` has always set this; the question card did not.
+    pub caret: Option<(u16, u16)>,
 }
 
 /// Lays the card out at this width, in at most `room` lines — rule and hint included.
@@ -44,6 +53,8 @@ pub fn card(a: &Answering, width: u16, room: usize, lang: crate::lang::Lang) -> 
     let room = room.max(3);
     let mut body: Vec<Line<'static>> = Vec::new();
     let mut owners: Vec<Option<usize>> = Vec::new();
+    // Where the caret lands, in body coordinates, while the free-text row is being typed into.
+    let mut caret: Option<(usize, usize)> = None;
 
     if a.in_review() {
         body.push(Line::from(Span::styled(
@@ -97,7 +108,23 @@ pub fn card(a: &Answering, width: u16, room: usize, lang: crate::lang::Lang) -> 
     }
 
     for (i, row) in a.rows().into_iter().enumerate() {
+        let first = body.len();
         add(&mut body, &mut owners, row_lines(a, &row, i, lang, w), Some(i));
+        // **The caret in the free-text row.** Wrapping only the text *before* the cursor gives the
+        // line and column it sits on, with the same wrapping the drawn line got — so a long answer
+        // that has already wrapped puts the caret on the right line of it.
+        if a.typing && matches!(row, RowKind::Free) {
+            let before: String = a.input.text.chars().take(a.input.cursor).collect();
+            let pre = Line::from(vec![
+                Span::styled("  ", Style::default().fg(theme::accent())),
+                Span::styled("✎ ", Style::default().fg(theme::accent())),
+                Span::styled(before, Style::default().fg(theme::text())),
+            ]);
+            let parts = wrap::line(pre, w);
+            let y = first + parts.len().saturating_sub(1);
+            let x = parts.last().map_or(0usize, |line| display_width(&line.to_string()));
+            caret = Some((x, y));
+        }
     }
 
     // **When the body does not fit, keep the cursor's row in view.** The card is pinned above the
@@ -141,7 +168,10 @@ pub fn card(a: &Answering, width: u16, room: usize, lang: crate::lang::Lang) -> 
     ))];
     lines.extend(body[top..top + shown].iter().cloned());
     lines.push(Line::from(Span::styled(hint, Style::default().fg(theme::text_muted()))));
-    Card { lines, owners, top }
+    // The rule is drawn above the body, so a caret on body line `y` is on screen line `y + 1` —
+    // and the window may have scrolled, hence the `top`.
+    let caret = caret.map(|(x, y)| (x as u16, (y + 1).saturating_sub(top) as u16));
+    Card { lines, owners, top, caret }
 }
 
 /// How many lines the card wants, never more than the caller can give it.
@@ -169,6 +199,12 @@ pub fn row_at(a: &Answering, area: Rect, y: u16, lang: crate::lang::Lang) -> Opt
 pub fn draw(frame: &mut Frame, area: Rect, a: &Answering, lang: crate::lang::Lang) {
     let card = card(a, area.width, area.height as usize, lang);
     frame.render_widget(Paragraph::new(card.lines), area);
+    // **The terminal's cursor goes where the typing is.** Without this the input method draws the
+    // syllable it is composing wherever the cursor was last left — which, with the input box
+    // replaced by this card, is the activity line above it.
+    if let Some((x, y)) = card.caret {
+        frame.set_cursor_position((area.x + x, (area.y + y).min(area.y + area.height.saturating_sub(1))));
+    }
 }
 
 /// Appends lines that all carry the same row. `None` means the line belongs to no row.
@@ -246,7 +282,6 @@ fn row_lines(
                         a.input.text.clone(),
                         Style::default().fg(theme::text()),
                     ));
-                    spans.push(Span::styled("▮", Style::default().fg(theme::accent())));
                 }
             } else if a.free_text().is_empty() {
                 spans.push(Span::styled(
@@ -312,6 +347,27 @@ mod tests {
                 Opt { label: "바로 실행".into(), description: None },
             ],
         }
+    }
+
+    /// **The terminal cursor goes where the typing is.** A Korean syllable being assembled is drawn
+    /// by the input method *at the cursor*; left where the input box used to be, the preedit showed
+    /// up on the activity line one row above while the committed word landed correctly in the field
+    /// (reported 2026-09-13).
+    #[test]
+    fn the_caret_sits_at_the_end_of_what_the_free_row_holds() {
+        let mut a = asking(vec![Step {
+            header: None,
+            question: "고르세요".into(),
+            multi: false,
+            options: vec![],
+        }]);
+        a.cursor = a.rows().iter().position(|r| matches!(r, RowKind::Free)).expect("a free row");
+        a.typing = true;
+        a.input.insert_str("한글");
+        let card = card(&a, 40, 12, crate::lang::Lang::Ko);
+        // `  ` + `✎ ` + the text: the caret is right after it, and the rule is drawn above the body
+        // — hence the `+ 1` on the line.
+        assert_eq!(card.caret, Some((8, 2)), "the caret is not where the typing is");
     }
 
     /// Renders the card and gives back its rows, wide characters not double-counted.

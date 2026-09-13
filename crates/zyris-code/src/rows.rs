@@ -557,17 +557,29 @@ fn make(item: &Item, width: u16, folds: &Folds, turn: Turn, lang: crate::lang::L
     let mut breathing: Vec<(usize, usize)> = Vec::new();
     match item {
         Item::User { text, .. } => {
+            // **An answer is drawn as an answer.** `question::answer_text` writes the question and
+            // then `  - ` bullets under it. Rendered as ordinary markdown that is a paragraph of
+            // bullets inside the person's own bar, with the question and the reply at the same
+            // weight (2026-09-13). The question gets a check, its answers an arrow.
+            let answered = crate::question::Answering::looks_like_an_answer(text);
             for (i, raw) in text.lines().enumerate() {
                 // **Typed-in answers look different.** The fact that the answer wasn't among the options is itself
                 // information, and if it blends in with the picked ones that distinction disappears.
                 // Answer lines arrive as `  - {free_mark}…` — the list marker must be stripped
                 // first for the prefix to show.
+                let bullet = raw.starts_with("  - ");
                 let bare = raw.trim_start().trim_start_matches("- ").trim_start();
                 let typed = bare.starts_with(lang.free_mark());
-                let body =
-                    if typed { bare.trim_start_matches(lang.free_mark()).trim() } else { raw };
+                let body = if typed || (answered && bullet) {
+                    bare.trim_start_matches(lang.free_mark()).trim()
+                } else {
+                    raw
+                };
                 let style = if typed {
                     Style::default().fg(theme::accent_hover()).add_modifier(Modifier::ITALIC)
+                } else if answered && !bullet {
+                    // The question is context by now, not the thing the person said.
+                    Style::default().fg(theme::text_muted())
                 } else {
                     Style::default().fg(theme::text())
                 };
@@ -575,6 +587,17 @@ fn make(item: &Item, width: u16, folds: &Folds, turn: Turn, lang: crate::lang::L
                 // wouldn't be distinguishable from an answer — the longer the question, the longer that stretch.
                 let _ = i;
                 let mut spans = vec![Span::styled("▌ ", Style::default().fg(theme::accent()))];
+                if answered {
+                    let (mark, colour) = if !bullet {
+                        ("✓ ", theme::success())
+                    } else if !typed {
+                        ("  → ", theme::accent())
+                    } else {
+                        // The ✎ is this line's mark already; it only needs to line up.
+                        ("    ", theme::accent())
+                    };
+                    spans.push(Span::styled(mark, Style::default().fg(colour)));
+                }
                 if typed {
                     spans.push(Span::styled("✎ ", Style::default().fg(theme::accent_hover())));
                 }
@@ -1170,6 +1193,45 @@ mod tests {
 
     fn plain(r: &Rendered) -> Vec<String> {
         r.plain()
+    }
+
+    /// **An answer is drawn as an answer.** The question gets a check and each answer an arrow —
+    /// rendered as plain markdown it was a paragraph of bullets inside the person's own bar, with
+    /// the question and the reply at the same weight.
+    #[test]
+    fn an_answer_message_is_drawn_as_a_question_and_its_answers() {
+        let text = "어느 쪽으로 갈까요?\n  - 계획을 먼저 (되돌리기 어렵습니다)\n  - ✎ 그냥 바로";
+        let r = live(
+            &[Item::User { seq: 1, text: text.into() }],
+            80,
+            &Folds::new(),
+            crate::lang::Lang::Ko,
+        );
+        let rows = plain(&r);
+        let joined = rows.join("\n");
+        assert!(joined.contains('✓'), "the question is not marked: {rows:?}");
+        assert!(joined.contains('→'), "the answers are not marked: {rows:?}");
+        assert!(joined.contains("계획을 먼저"), "{rows:?}");
+        assert!(joined.contains("그냥 바로"), "{rows:?}");
+        // The markdown bullet is gone — the arrow took its place.
+        assert!(!joined.contains("  - "), "a bullet survived: {rows:?}");
+    }
+
+    /// A person's own message is untouched: no check, no arrows, and its own list stays a list.
+    #[test]
+    fn an_ordinary_message_keeps_its_own_shape() {
+        let text = "이것 좀 봐 주세요\n- 하나\n- 둘";
+        let r = live(
+            &[Item::User { seq: 1, text: text.into() }],
+            80,
+            &Folds::new(),
+            crate::lang::Lang::Ko,
+        );
+        let rows = plain(&r);
+        let joined = rows.join("\n");
+        assert!(!joined.contains('✓'), "a plain message was dressed as an answer: {rows:?}");
+        assert!(!joined.contains('→'), "{rows:?}");
+        assert!(joined.contains("하나"), "{rows:?}");
     }
 
     /// One tool row. **Must not collide with the card's seq** — the cache key is the seq.
