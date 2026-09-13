@@ -3160,6 +3160,26 @@ pub fn probe_kitty_keyboard() -> bool {
     }
 }
 
+/// Writes one mouse event and what the hit-test under it makes of the screen.
+///
+/// **The second half is the one that matters.** A click that does nothing is either a click this
+/// app never received or a click that landed on a cell `view_cards` does not know about, and from
+/// the outside those look exactly alike. `content_at` is the same call the click itself will make,
+/// so the trace says which of the two it was.
+fn trace_mouse(trace: &crate::trace::Trace, state: &State, m: crossterm::event::MouseEvent) {
+    if !trace.wants(crate::trace::What::Mouse) {
+        return;
+    }
+    let hit = match state.content_at(m.column, m.row) {
+        Some((row, col)) => match state.view_cards.get(&row) {
+            Some(seq) => format!("content row {row} col {col} → fold {seq}"),
+            None => format!("content row {row} col {col} → nothing foldable"),
+        },
+        None => "off the conversation".to_string(),
+    };
+    trace.note(crate::trace::What::Mouse, &format!("{m:?} | {hit}"));
+}
+
 /// What a mouse event asks the app to do.
 ///
 /// **Both loops go through here.** `run_inner` has two — the one that waits for the first
@@ -3372,6 +3392,20 @@ pub async fn run(
     let kitty = probe_kitty_keyboard();
 
     let for_exit = bridge.clone();
+    // **What this terminal says it is, once.** The first line of any trace: two traces are only
+    // readable side by side if each says which terminal it came from, and the kitty verdict is the
+    // one thing about this terminal that changes how keys arrive.
+    let trace = crate::trace::Trace::detect();
+    trace.note(
+        crate::trace::What::Term,
+        &format!(
+            "TERM={:?} TERM_PROGRAM={:?} LC_TERMINAL={:?} kitty_keyboard={kitty} caps={caps:?}",
+            std::env::var("TERM").ok(),
+            std::env::var("TERM_PROGRAM").ok(),
+            std::env::var("LC_TERMINAL").ok(),
+        ),
+    );
+
     let result = run_inner(&mut terminal, api_rx, bridge, die, kitty).await;
 
     // **Leave no orphans.** When the app ends, background jobs end with it — left alive, a
@@ -3595,6 +3629,8 @@ async fn run_inner(
     kitty: bool,
 ) -> anyhow::Result<()> {
     let mut state = State::new();
+    // Read once, from the environment: what to trace, if anything. See `crate::trace`.
+    let trace = crate::trace::Trace::detect();
     // **The saved settings come in here.** `State::default` keeps the built-in defaults so
     // tests stay deterministic; this is the one place the disk is read.
     state.config = crate::config::Config::load();
@@ -3681,6 +3717,9 @@ async fn run_inner(
                 let mut quit = false;
                 match ev {
                     TermEvent::Key(k) => {
+                        if trace.wants(crate::trace::What::Keys) {
+                            trace.note(crate::trace::What::Keys, &format!("{k:?}"));
+                        }
                         for action in on_key(&state, k) {
                             if matches!(action, Action::Quit) {
                                 quit = true;
@@ -3696,6 +3735,7 @@ async fn run_inner(
                     // enrolment window — the one thing on it worth copying — impossible to drag
                     // across, while every other screen in the app could be.
                     TermEvent::Mouse(m) => {
+                        trace_mouse(&trace, &state, m);
                         for action in mouse_actions(&state, m) {
                             apply(&mut state, &action);
                         }
@@ -3907,6 +3947,9 @@ async fn run_inner(
             Some(Ok(ev)) = keys.next() => {
                 let actions = match ev {
                     TermEvent::Key(k) => {
+                        if trace.wants(crate::trace::What::Keys) {
+                            trace.note(crate::trace::What::Keys, &format!("{k:?}"));
+                        }
                         // **Rescue a paste burst as newlines.** A terminal without
                         // bracketed paste (mobile Termius and the like) lets a paste
                         // through as keys arriving in rapid succession. When keys arrive
@@ -3942,7 +3985,10 @@ async fn run_inner(
                         focus_back_at = None;
                         vec![]
                     }
-                    TermEvent::Mouse(m) => mouse_actions(&state, m),
+                    TermEvent::Mouse(m) => {
+                        trace_mouse(&trace, &state, m);
+                        mouse_actions(&state, m)
+                    }
                     // On regaining focus, redraw but **do not clear.** The focus event
                     // arrives every time the keyboard opens and closes on mobile SSH
                     // (Termius) — clearing everything each time makes the screen flash.

@@ -44,6 +44,7 @@ pub mod timeline;
 pub mod todos;
 pub mod tool_view;
 pub mod tools;
+pub mod trace;
 pub mod undo;
 pub mod update;
 pub mod usage;
