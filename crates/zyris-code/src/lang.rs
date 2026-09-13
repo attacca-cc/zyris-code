@@ -227,21 +227,56 @@ impl Lang {
             "Connected ‒ this terminal can't tell Shift+Enter apart from Enter. Use Alt+Enter for a newline.",
         )
     }
+    /// A span of seconds, in at most two units.
+    ///
+    /// **Seconds alone stop being readable long before a build finishes.** `110s` is a number
+    /// somebody has to divide in their head; `1분 50초` is a moment. Hours appear only once there
+    /// is one, and then the seconds are dropped — two units is as much as anybody takes in at a
+    /// glance, and the third is noise.
+    ///
+    /// The words are the language's: a Korean screen says `1분 50초`, an English one `1m 50s`.
+    pub fn duration(self, secs: u64) -> String {
+        let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+        match self {
+            Lang::Ko => match (h, m) {
+                (0, 0) => format!("{s}초"),
+                (0, m) => format!("{m}분 {s}초"),
+                (h, m) => format!("{h}시간 {m}분"),
+            },
+            Lang::En => match (h, m) {
+                (0, 0) => format!("{s}s"),
+                (0, m) => format!("{m}m {s}s"),
+                (h, m) => format!("{h}h {m}m"),
+            },
+        }
+    }
+    /// The head of a job's report card. **A failure says so in words as well as in colour** —
+    /// colour alone is not a message.
+    pub fn report_head(self, ok: bool) -> &'static str {
+        match (self, ok) {
+            (Lang::Ko, true) => "작업 결과 ∙ 성공",
+            (Lang::Ko, false) => "작업 결과 ∙ 실패",
+            (Lang::En, true) => "Job result ∙ ok",
+            (Lang::En, false) => "Job result ∙ failed",
+        }
+    }
+    /// The hint line of the report card — the one key it answers to.
+    pub fn report_keys(self) -> &'static str {
+        self.pick("Esc 닫기", "Esc close")
+    }
     /// What to show in the activity line while a command runs.
     pub fn running_command(self, command: &str, secs: u64) -> String {
-        match self {
-            Lang::Ko => format!("▶ {command}  ∙  {secs}초"),
-            Lang::En => format!("▶ {command}  ∙  {secs}s"),
-        }
+        format!("▶ {command}  ∙  {}", self.duration(secs))
     }
     /// Says once, on the status line, that a background job finished. **It says so on success
     /// too** — not knowing it is done leaves a person waiting.
     pub fn job_ended(self, id: &str, ok: bool, secs: u64) -> String {
+        let took = self.duration(secs);
         match (self, ok) {
-            (Lang::Ko, true) => format!("배경 {id} 끝남 ∙ 성공 ∙ {secs}초"),
-            (Lang::Ko, false) => format!("배경 {id} 끝남 ∙ 실패 ∙ {secs}초"),
-            (Lang::En, true) => format!("background {id} done ∙ ok ∙ {secs}s"),
-            (Lang::En, false) => format!("background {id} done ∙ failed ∙ {secs}s"),
+            (Lang::Ko, true) => format!("배경 {id} 끝남 ∙ 성공 ∙ {took}"),
+            (Lang::Ko, false) => format!("배경 {id} 끝남 ∙ 실패 ∙ {took}"),
+            (Lang::En, true) => format!("background {id} done ∙ ok ∙ {took}"),
+            (Lang::En, false) => format!("background {id} done ∙ failed ∙ {took}"),
         }
     }
     /// Background jobs on the activity line. With several, only the count and the oldest one —
@@ -253,10 +288,7 @@ impl Lang {
             (Lang::En, 1) => "background".to_string(),
             (Lang::En, n) => format!("background ×{n}"),
         };
-        match self {
-            Lang::Ko => format!("{head}  {id} {label}  ∙  {secs}초"),
-            Lang::En => format!("{head}  {id} {label}  ∙  {secs}s"),
-        }
+        format!("{head}  {id} {label}  ∙  {}", self.duration(secs))
     }
     pub fn jobs_none(self) -> &'static str {
         self.pick("배경에서 도는 것이 없습니다.", "Nothing running in the background.")
@@ -284,10 +316,7 @@ impl Lang {
     }
     /// One row of `/jobs`. The seconds suffix belongs here, not at the call site.
     pub fn jobs_row(self, id: &str, label: &str, secs: u64) -> String {
-        match self {
-            Lang::Ko => format!("\n  {id}  {label}  ∙  {secs}초"),
-            Lang::En => format!("\n  {id}  {label}  ∙  {secs}s"),
-        }
+        format!("\n  {id}  {label}  ∙  {}", self.duration(secs))
     }
     /// What to show in the activity line while waiting for a question.
     pub fn waiting_answer(self) -> &'static str {
@@ -2341,6 +2370,51 @@ mod tests {
         assert_eq!(Lang::En.tool_count(2), "2 tools");
         assert_eq!(Lang::Ko.tool_count(1), "도구 1개");
     }
+
+    /// **Seconds stop being readable past a minute.** `110s` has to be divided in somebody's head;
+    /// `1분 50초` does not. At most two units, and once there are hours the seconds go.
+    #[test]
+    fn a_span_of_seconds_is_split_into_minutes_and_hours() {
+        for (secs, want) in [
+            (0, "0초"),
+            (59, "59초"),
+            (60, "1분 0초"),
+            (110, "1분 50초"),
+            (252, "4분 12초"),
+            (3599, "59분 59초"),
+            (3600, "1시간 0분"),
+            (7325, "2시간 2분"),
+        ] {
+            assert_eq!(Lang::Ko.duration(secs), want, "{secs}초");
+        }
+        for (secs, want) in [
+            (0, "0s"),
+            (59, "59s"),
+            (60, "1m 0s"),
+            (110, "1m 50s"),
+            (252, "4m 12s"),
+            (3599, "59m 59s"),
+            (3600, "1h 0m"),
+            (7325, "2h 2m"),
+        ] {
+            assert_eq!(Lang::En.duration(secs), want, "{secs}s");
+        }
+    }
+
+    /// **The four places that show a span end up with the same words as each other**, because they
+    /// all go through `duration` — one of them rendering `초` on an English screen is exactly the
+    /// kind of drift a shared helper prevents.
+    #[test]
+    fn every_span_shown_uses_the_same_units() {
+        assert!(Lang::Ko.running_command("cargo build", 110).contains("1분 50초"));
+        assert!(Lang::En.running_command("cargo build", 110).contains("1m 50s"));
+        assert!(Lang::Ko.job_ended("b1", true, 3600).contains("1시간 0분"));
+        assert!(Lang::En.job_ended("b1", true, 3600).contains("1h 0m"));
+        assert!(Lang::Ko.background_job(1, "b1", "build", 110).contains("1분 50초"));
+        assert!(Lang::En.background_job(1, "b1", "build", 110).contains("1m 50s"));
+        assert!(Lang::Ko.jobs_row("b1", "build", 3660).contains("1시간 1분"));
+        assert!(Lang::En.jobs_row("b1", "build", 3660).contains("1h 1m"));
+    }
     use super::*;
 
     /// **Both languages' names are accepted.** Typing `/config lang` with a Korean word on an English screen
@@ -2614,6 +2688,23 @@ mod tests {
             );
         }
         assert!(!en.queued(3).chars().any(|c| ('가'..='힣').contains(&c)));
+        // **The duration words are units, not sentences.** `1m 50s`, never `1분 50초`.
+        for secs in [0, 59, 60, 110, 3599, 3600, 7325] {
+            let text = en.duration(secs);
+            assert!(!text.chars().any(|c| ('가'..='힣').contains(&c)), "Hangul in {text:?}");
+        }
+        for text in [
+            en.running_command("cargo build", 110),
+            en.job_ended("b1", true, 110),
+            en.job_ended("b1", false, 3660),
+            en.background_job(2, "b1", "build", 110),
+            en.jobs_row("b1", "build", 7325),
+            en.report_head(true).to_string(),
+            en.report_head(false).to_string(),
+            en.report_keys().to_string(),
+        ] {
+            assert!(!text.chars().any(|c| ('가'..='힣').contains(&c)), "Hangul in {text:?}");
+        }
         assert!(!en.threads_in("proj").chars().any(|c| ('가'..='힣').contains(&c)));
     }
 

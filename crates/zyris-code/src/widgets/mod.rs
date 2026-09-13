@@ -35,6 +35,7 @@ mod panel;
 mod picker;
 /// Public for the same reason as `todos` — `lines` is the pure seam the plan panel is read through.
 pub mod plan;
+mod report;
 /// Public for the same reason as `activity` — `left_spans` is the pure seam tests read the
 /// bottom bar through.
 pub mod status;
@@ -58,13 +59,15 @@ pub fn draw(frame: &mut Frame, state: &mut State) {
     // The input box grows with its content. It never exceeds half the screen.
     //
     // **There is only one input slot.** When a question is open the question takes it.
-    let input_h = match &state.asking {
-        Some((_, a)) => {
-            ask::height(a, area.width, area.height.saturating_sub(3), state.lang).saturating_sub(1)
-        }
-        None => {
-            state.input.height(area.width.saturating_sub(2)).min((area.height / 2).max(1)).max(1)
-        }
+    // **Three things can want the input's spot**, and only one of them can have it: the question
+    // the turn is blocked on, the report a job just handed back, and the input itself. The
+    // question comes first — it is the one somebody else is waiting on.
+    let input_h = if let Some((_, a)) = &state.asking {
+        ask::height(a, area.width, area.height.saturating_sub(3), state.lang).saturating_sub(1)
+    } else if let Some(r) = &state.report {
+        report::height(r, area.width, area.height.saturating_sub(3), state.lang).saturating_sub(1)
+    } else {
+        state.input.height(area.width.saturating_sub(2)).min((area.height / 2).max(1)).max(1)
     };
     // **The unfolded plan takes from the conversation, never from the input.** It sits directly
     // under the line whose count it explains, and is capped at a third of the screen — a plan of
@@ -96,16 +99,17 @@ pub fn draw(frame: &mut Frame, state: &mut State) {
     activity::draw(frame, chunks[1], state);
     todos::draw(frame, chunks[2], state);
     plan::draw(frame, chunks[3], state);
-    match &state.asking {
-        Some((_, a)) => {
+    state.ask_area = None;
+    match (&state.asking, &state.report) {
+        (Some((_, a)), _) => {
             // Moving a click to a row requires knowing this area.
             state.ask_area = Some(chunks[4]);
             ask::draw(frame, chunks[4], a, state.lang);
         }
-        None => {
-            state.ask_area = None;
-            input::draw(frame, chunks[4], state);
-        }
+        // **The report takes the input's spot too.** The turn is over and this is what is left to
+        // say; `Esc` or `Enter` gives the input back.
+        (None, Some(r)) => report::draw(frame, chunks[4], r, state.lang),
+        (None, None) => input::draw(frame, chunks[4], state),
     }
     input::rule(frame, chunks[5]);
     status::draw(frame, chunks[6], state);

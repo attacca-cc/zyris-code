@@ -33,6 +33,7 @@ pub mod plugin;
 pub mod print;
 pub mod question;
 pub mod repo;
+pub mod report;
 pub mod rows;
 pub mod runtime;
 pub mod scroll;

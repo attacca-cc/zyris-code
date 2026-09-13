@@ -33,6 +33,10 @@ pub enum Frame {
         /// widens every `Action` that goes down the channel by the size of the largest plan-shaped
         /// hole, which is what clippy's `large_enum_variant` is about.
         plan: Option<Box<crate::plan::Submitted>>,
+        /// The report this event handed back from a job, if it did. **Rides along for the same
+        /// reason `plan` does**: history replays through here, so a report from a job that
+        /// finished while nobody was watching is read when the thread is opened again.
+        report: Option<Box<crate::report::Report>>,
     },
     Delta {
         kind: ZDeltaKind,
@@ -282,6 +286,9 @@ pub enum Action {
     FormPrev,
     FormConfirm,
     FormCancel,
+    /// Put the report card away (Esc or Enter). It takes the input's spot, so this gives the
+    /// input back.
+    ReportClose,
     /// Close the popup panel (Esc or Enter).
     PanelClose,
     /// Scroll the popup panel. Positive scrolls toward the top.
@@ -481,6 +488,9 @@ pub struct State {
     /// A question lands here on its own when it arrives — the turn is blocked waiting for
     /// the answer, so the user should not have to open it separately.
     pub asking: Option<(i64, crate::question::Answering)>,
+    /// The report a job just handed back, waiting to be read. **It takes the input's spot**, the
+    /// way a question does — see `widgets::report`.
+    pub report: Option<crate::report::Report>,
     /// The plan waiting to be approved, if one is. **Not in `asking`** — a question replaces the
     /// input because answering it *is* the message, while a plan is decided by an ordinary message
     /// and the draft has to stay reachable to say what to change.
@@ -692,6 +702,7 @@ impl Default for State {
             dragging: false,
             screen: Vec::new(),
             asking: None,
+            report: None,
             plan: None,
             plan_decided: false,
             ask_area: None,
@@ -1112,6 +1123,7 @@ pub struct Past {
     pub entry: Option<Entry>,
     pub todo: Option<crate::todos::Change>,
     pub plan: Option<Box<crate::plan::Submitted>>,
+    pub report: Option<Box<crate::report::Report>>,
 }
 
 /// A clickable URL somewhere on the screen, in absolute cells.
@@ -1158,6 +1170,15 @@ pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
         if !(ctrl && matches!(key.code, KeyCode::Char('c'))) {
             return ask_key(a, key, ctrl);
         }
+    }
+
+    // **A report card takes the keys while it is up.** Nothing is waiting on it — the turn is over
+    // — so one key puts it away and the input comes back. Ctrl+C is still the way out.
+    if state.report.is_some() && !(ctrl && matches!(key.code, KeyCode::Char('c'))) {
+        return match key.code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char(' ') => vec![Action::ReportClose],
+            _ => vec![],
+        };
     }
 
     // **The GitHub screen takes the keys the same way the new-project form does.** Ctrl+C is the
@@ -1763,10 +1784,12 @@ pub fn apply(state: &mut State, action: &Action) {
                 state.command_out = Some(text.clone());
                 return;
             }
-            // **While work is running, hold it instead of sending.** It does not go into
-            // the sent history yet either — only adding it after it really goes out keeps
-            // "what was sent" from being a lie.
-            if state.running {
+            // **Held only when there is nowhere to send it.** A message typed while a turn is
+            // running goes out at once: attacca takes it and carries it to the next turn, so
+            // holding it here only meant the server never saw it, it died with the app, and it
+            // never appeared in the session's history. What is left for the hold is a window with
+            // no live connection — sending then would lose the message outright.
+            if !state.connected {
                 state.queued.push(text.clone());
                 return;
             }
@@ -1999,6 +2022,7 @@ pub fn apply(state: &mut State, action: &Action) {
                 p.down();
             }
         }
+        Action::ReportClose => state.report = None,
         Action::PanelClose => state.panel = None,
         // **Rebuilt, not nudged.** The body is plain lines with no idea which one is the cursor,
         // so moving it is a rebuild with the new `pick` — which keeps the whole panel a pure
@@ -2201,7 +2225,7 @@ pub fn apply(state: &mut State, action: &Action) {
 
 fn apply_frame(state: &mut State, frame: &Frame) {
     match frame {
-        Frame::Event { cursor, entry, todo, plan } => {
+        Frame::Event { cursor, entry, todo, plan, report } => {
             // The cursor advances even for an event we do not render — the resume position
             // must not be lost.
             state.last_cursor = Some(*cursor);
@@ -2227,6 +2251,14 @@ fn apply_frame(state: &mut State, frame: &Frame) {
                     // how a plan mode loop goes round, and the gate has to close behind it.
                     state.plan_decided = false;
                     state.plan = Some(crate::plan::Plan::new(plan));
+                }
+            }
+            // **The report takes the input's spot, the way a question does.** The turn is over;
+            // this is the sentence the agent wrote to say what came of it. A report updated in
+            // place replaces the one on screen only when it is the same one or a newer one.
+            if let Some(report) = report {
+                if state.report.as_ref().is_none_or(|r| r.seq <= report.seq) {
+                    state.report = Some((**report).clone());
                 }
             }
             let Some(entry) = entry else { return };
@@ -2440,6 +2472,7 @@ fn apply_frame(state: &mut State, frame: &Frame) {
                     entry: past.entry.clone(),
                     todo: past.todo.clone(),
                     plan: past.plan.clone(),
+                    report: past.report.clone(),
                 };
                 apply(state, &Action::Frame(frame));
             }
@@ -4652,6 +4685,7 @@ fn history_past(events: &[zyris_attacca::ZSessionEvent]) -> Vec<Past> {
             entry: crate::event::entry_from(e),
             todo: crate::todos::change_from(e),
             plan: crate::plan::submitted_from(e).map(Box::new),
+            report: crate::report::of(e).map(Box::new),
         })
         .collect();
 
@@ -4827,6 +4861,9 @@ fn clear_conversation(state: &mut State) {
     state.todos = crate::todos::Todos::new();
     state.folds = Folds::new();
     state.asking = None;
+    // **The report goes with the conversation too.** A job's result from the thread just left is
+    // not this thread's result.
+    state.report = None;
     state.last_cursor = None;
     state.scroll = Scroll::new(); // Start from the bottom.
 }
@@ -5771,6 +5808,9 @@ mod tests {
     /// session behind it, and before the first connection nothing reaches outward by design.
     fn state() -> State {
         let mut s = State::new();
+        // **Attached, and attached now.** What holds a message back is `!connected` — nowhere to
+        // send it — so a test that wants that case says so itself.
+        s.connected = true;
         s.ever_connected = true;
         s
     }
@@ -6113,6 +6153,10 @@ mod tests {
     #[test]
     fn esc_ends_the_app_when_the_enroll_window_is_all_there_is() {
         let mut s = state();
+        // Nothing has attached yet — which is the whole state this is about, and the one the
+        // helper no longer starts from.
+        s.connected = false;
+        s.ever_connected = false;
         apply(&mut s, &Action::Frame(Frame::Enroll(enroll())));
         assert!(!s.connected, "nothing has attached yet");
         assert_eq!(on_key(&s, key(KeyCode::Esc, KeyModifiers::NONE)), vec![Action::Quit]);
@@ -6932,6 +6976,7 @@ mod tests {
             entry: Some(Entry { seq, kind: EntryKind::WorkStart(String::new()) }),
             todo: None,
             plan: None,
+            report: None,
         })
     }
 
@@ -7100,6 +7145,7 @@ mod tests {
                 }),
                 todo: None,
                 plan: None,
+                report: None,
             }),
         );
 
@@ -7399,6 +7445,7 @@ mod tests {
             entry: crate::event::entry_from(&event),
             todo: crate::todos::change_from(&event),
             plan: None,
+            report: None,
         })
     }
 
@@ -7467,7 +7514,7 @@ mod tests {
         let mut s = state();
         apply(
             &mut s,
-            &Action::Frame(Frame::Event { cursor: 42, entry: None, todo: None, plan: None }),
+            &Action::Frame(Frame::Event { cursor: 42, entry: None, todo: None, plan: None, report: None }),
         );
         assert_eq!(s.last_cursor, Some(42));
     }
@@ -7581,6 +7628,7 @@ mod tests {
                 entry: None,
                 todo: None,
                 plan: Some(Box::new(plan)),
+                report: None,
             }),
         );
         assert_eq!(s.plan.as_ref().map(|p| p.seq), Some(5), "the plan never reached the screen");
@@ -7614,6 +7662,7 @@ mod tests {
                 entry: None,
                 todo: None,
                 plan: Some(Box::new(plan)),
+                report: None,
             }),
         );
         assert!(!s.plan_decided, "a new plan rode in on the last one's approval");
@@ -7642,6 +7691,7 @@ mod tests {
                 entry: None,
                 todo: None,
                 plan: Some(Box::new(settled.clone())),
+                report: None,
             }),
         );
         assert!(s.plan.is_none());
@@ -7655,6 +7705,7 @@ mod tests {
                 entry: None,
                 todo: None,
                 plan: Some(Box::new(open)),
+                report: None,
             }),
         );
         assert!(s.plan.is_some());
@@ -7665,6 +7716,7 @@ mod tests {
                 entry: None,
                 todo: None,
                 plan: Some(Box::new(settled)),
+                report: None,
             }),
         );
         assert!(s.plan.is_none(), "the panel stayed up on a plan that was already decided");
@@ -8000,22 +8052,35 @@ mod tests {
         assert_eq!(s.sent.len(), 1);
     }
 
-    /// **What is typed mid-turn is held, not sent.** It does not enter the sent history yet —
-    /// only what actually went out may count as "sent".
+    /// **What is typed mid-turn goes out.** attacca takes it and carries it to the next turn, so
+    /// holding it here only meant the server never saw it and it died with the app.
     #[test]
-    fn typing_during_a_turn_queues_instead_of_sending() {
+    fn typing_during_a_turn_sends_rather_than_queueing() {
         let mut s = state();
         s.running = true;
         apply(&mut s, &Action::Submit("일하는 중에 친 말".into()));
-        assert_eq!(s.queued, vec!["일하는 중에 친 말"]);
-        assert!(s.sent.is_empty(), "it entered the sent history before being sent");
+        assert!(s.queued.is_empty(), "the message was held back: {:?}", s.queued);
+        assert_eq!(s.sent, vec!["일하는 중에 친 말".to_string()]);
         assert_eq!(s.input.text, "", "the input must be cleared");
     }
 
-    /// Says to drain the queue the moment the turn ends. The sending itself is done by the I/O side.
+    /// **With nowhere to send it, it is still held, and the bar says so.** A dropped connection is
+    /// the one case the hold exists for now.
     #[test]
-    fn the_end_of_a_turn_asks_for_the_queue_to_be_flushed() {
+    fn a_message_with_no_connection_is_held() {
         let mut s = state();
+        s.connected = false;
+        s.running = true;
+        apply(&mut s, &Action::Submit("연결이 끊긴 동안 친 말".into()));
+        assert_eq!(s.queued, vec!["연결이 끊긴 동안 친 말"], "nothing is holding it: {}", s.connected);
+        assert!(s.sent.is_empty(), "it entered the sent history before being sent");
+    }
+
+    /// Says to drain the hold the moment the turn ends. The sending itself is done by the I/O side.
+    #[test]
+    fn the_end_of_a_turn_asks_for_the_held_message_to_be_flushed() {
+        let mut s = state();
+        s.connected = false;
         s.running = true;
         apply(&mut s, &Action::Submit("나중에 보낼 말".into()));
         apply(&mut s, &Action::Frame(Frame::Status { running: false }));
@@ -8051,6 +8116,8 @@ mod tests {
         let mut s = state();
         apply(&mut s, &Action::Submit("이미 보낸 말".into()));
         s.running = true;
+        // Held rather than sent — ↑ is what reaches for it.
+        s.connected = false;
         apply(&mut s, &Action::Submit("대기 중인 말".into()));
         apply(&mut s, &Action::RecallOlder);
         assert_eq!(on_key(&s, key(KeyCode::Up, KeyModifiers::NONE)), vec![]);
@@ -8090,6 +8157,7 @@ mod tests {
                 entry: Some(Entry { seq: 2, kind: EntryKind::Agent("먼저 볼게요".into()) }),
                 todo: None,
                 plan: None,
+                report: None,
             }),
         );
         apply(
@@ -8254,6 +8322,7 @@ mod tests {
                 }),
                 todo: None,
                 plan: None,
+                        report: None,
             })
         };
         // Aimed at another thread: dropped at the door, so nothing is applied here.
@@ -8290,6 +8359,7 @@ mod tests {
                 }),
                 todo: None,
                 plan: None,
+                        report: None,
             })
         };
         let showing = |s: &State| s.asking.as_ref().unwrap().1.current().question.clone();
@@ -8476,11 +8546,15 @@ mod tests {
     fn a_fresh_thread_does_not_queue_messages_behind_the_old_turn() {
         let mut s = state();
         s.running = true; // the previous session's turn is running
+        // **Nowhere to send it, so it is held.** A live connection no longer holds anything —
+        // attacca takes a mid-turn message and carries it to the next turn.
+        s.connected = false;
         apply(&mut s, &Action::Submit("앞 턴에 담아 둔 말".into()));
         assert_eq!(s.queued, vec!["앞 턴에 담아 둔 말"]);
 
         // A new thread was opened — the previous session's turn state gets cleared.
         leave_session(&mut s);
+        s.connected = true; // attached again, in the new thread
         assert!(
             s.queued.is_empty(),
             "the queue from the previous turn survived into the new screen: {:?}",
@@ -8641,6 +8715,9 @@ mod file_reference {
     /// session behind it, and before the first connection nothing reaches outward by design.
     fn state() -> State {
         let mut s = State::new();
+        // **Attached, and attached now.** What holds a message back is `!connected` — nowhere to
+        // send it — so a test that wants that case says so itself.
+        s.connected = true;
         s.ever_connected = true;
         s
     }
@@ -8762,6 +8839,9 @@ mod history_search {
     /// session behind it, and before the first connection nothing reaches outward by design.
     fn state() -> State {
         let mut s = State::new();
+        // **Attached, and attached now.** What holds a message back is `!connected` — nowhere to
+        // send it — so a test that wants that case says so itself.
+        s.connected = true;
         s.ever_connected = true;
         s
     }
@@ -8864,6 +8944,9 @@ mod polish {
     /// session behind it, and before the first connection nothing reaches outward by design.
     fn state() -> State {
         let mut s = State::new();
+        // **Attached, and attached now.** What holds a message back is `!connected` — nowhere to
+        // send it — so a test that wants that case says so itself.
+        s.connected = true;
         s.ever_connected = true;
         s
     }

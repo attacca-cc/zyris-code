@@ -245,6 +245,7 @@ fn measure_bytes_on_the_wire() {
                 entry: Some(entry),
                 todo: None,
                 plan: None,
+                report: None,
             }),
         );
         seq += 1;
@@ -259,6 +260,7 @@ fn measure_bytes_on_the_wire() {
                 entry: Some(entry),
                 todo: None,
                 plan: None,
+                report: None,
             }),
         );
     }

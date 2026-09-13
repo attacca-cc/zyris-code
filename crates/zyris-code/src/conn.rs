@@ -952,6 +952,7 @@ pub fn frame_from(f: ZTurnFrame) -> Frame {
             entry: entry_from(&event),
             todo: crate::todos::change_from(&event),
             plan: crate::plan::submitted_from(&event).map(Box::new),
+            report: crate::report::of(&event).map(Box::new),
         },
         ZTurnFrame::Delta { kind, text } => Frame::Delta { kind, text },
         ZTurnFrame::Status { running } => Frame::Status { running },
