@@ -49,7 +49,10 @@ pub fn lines(r: &Report, width: u16, max: usize, lang: crate::lang::Lang) -> Vec
 
     let mut out = vec![Line::from(Span::styled("─".repeat(w), Style::default().fg(colour(r.ok))))];
     out.push(Line::from(vec![
-        Span::styled("■ ", Style::default().fg(colour(r.ok))),
+        // **`◆`, not `■`.** A filled square reads the same but is East Asian Ambiguous — one
+        // column here, two on a terminal configured for CJK, taking the rest of the row with it.
+        // `◆` is on the kept list already, and it is this app's mark for what the agent said.
+        Span::styled("◆ ", Style::default().fg(colour(r.ok))),
         Span::styled(
             lang.report_head(r.ok),
             Style::default().fg(colour(r.ok)).add_modifier(Modifier::BOLD),
