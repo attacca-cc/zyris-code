@@ -42,6 +42,17 @@ pub struct Panel {
     /// the top is not what anybody pressing it means. Every other panel carries `None` and keeps
     /// scroll-and-close.
     pub mode_pick: Option<Mode>,
+    /// Every sentence this panel can show under its body — **all of them, not only the one on
+    /// screen.**
+    ///
+    /// The box is sized from these, so it is the same size whichever row the cursor is on. Sized
+    /// from the sentence actually up, it grew and shrank under the keys — and its position with
+    /// it, since a panel is centred.
+    ///
+    /// **The one being shown is the last line of `lines`.** That is the whole agreement between
+    /// the builder and the widget: `body_and_foot` splits them apart, and the widget keeps the
+    /// rows the tallest sentence needs whichever one is up.
+    pub foot: Vec<Line<'static>>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -256,6 +267,7 @@ impl Panel {
             button_focused: false,
             form: None,
             mode_pick: None,
+            foot: Vec::new(),
         }
     }
 
@@ -267,6 +279,17 @@ impl Panel {
         if let Some(form) = self.form {
             self.title = form.lang.title_config().to_string();
             self.lines = form_lines(&form);
+            self.foot = config_foot(&form);
+        }
+    }
+
+    /// The body, and the foot line that follows it — `None` when this panel has no foot.
+    ///
+    /// See `Panel::foot` for why the two are held apart.
+    pub fn body_and_foot(&self) -> (&[Line<'static>], Option<&Line<'static>>) {
+        match (self.foot.is_empty(), self.lines.split_last()) {
+            (true, _) | (false, None) => (self.lines.as_slice(), None),
+            (false, Some((foot, body))) => (body, Some(foot)),
         }
     }
 
@@ -329,6 +352,10 @@ pub fn mode(lang: Lang, now: Mode, pick: Option<Mode>) -> Panel {
     lines.push(Line::from(bold_spans(lang.mode_desc(on))));
     let mut panel = Panel::new(lang.title_mode().into(), lines);
     panel.mode_pick = Some(on);
+    // **All four sentences, so the box is one size on all four rows.** Built from the one on
+    // screen, it grew and shrank as the arrows moved.
+    panel.foot =
+        Mode::ALL.iter().map(|m| Line::from(bold_spans(lang.mode_desc(*m)))).collect();
     panel
 }
 
@@ -597,7 +624,19 @@ pub fn config(lang: Lang, config: crate::config::Config) -> Panel {
     let form = Form::new(lang, config);
     let mut panel = Panel::new(lang.title_config().into(), form_lines(&form));
     panel.form = Some(form);
+    // The same rule as `/mode`: sized for the longest sentence the form can show, so `↑↓` and
+    // `←→` never resize the box.
+    panel.foot = config_foot(&form);
     panel
+}
+
+/// Every sentence the config form can put under its rows: one per setting, per value.
+fn config_foot(form: &Form) -> Vec<Line<'static>> {
+    Form::ROWS
+        .into_iter()
+        .flat_map(|setting| (0..setting.count()).map(move |i| setting.describe(i, form.lang)))
+        .map(muted)
+        .collect()
 }
 
 /// The gap between the label column and the value field.
@@ -742,6 +781,37 @@ mod tests {
         let joined = text(&p).join("\n");
         assert!(!joined.contains('*'), "the markers were printed: {joined}");
         assert!(joined.contains("일(work)"), "the emphasised word lost its company: {joined}");
+    }
+
+    /// **Every sentence is kept, so the box can be sized for the tallest.** Built from the one on
+    /// screen, the box grew and shrank as the arrows moved — and its position with it.
+    #[test]
+    fn the_mode_panel_keeps_all_four_sentences_for_sizing() {
+        let p = mode(Lang::Ko, Mode::Normal, Some(Mode::Plan));
+        assert_eq!(p.foot.len(), Mode::ALL.len(), "{:?}", text(&p));
+        let joined: String = p.foot.iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n");
+        for word in ["물어보지", "돌리지", "쪼갭니다", "되묻는"] {
+            assert!(joined.contains(word), "{word} missing from the foot: {joined}");
+        }
+        // The one on screen is the last line of the body — the agreement `body_and_foot` keeps.
+        let (body, foot) = p.body_and_foot();
+        assert_eq!(body.len(), p.lines.len() - 1);
+        assert!(
+            foot.is_some_and(|f| f.to_string().contains("먼저 할 일을")),
+            "the sentence for the row under the cursor is not the one shown"
+        );
+    }
+
+    /// The config form's foot holds one sentence per setting **and per value** — that is what
+    /// keeps its box the same size while `←→` walks the values on a row.
+    #[test]
+    fn the_config_foot_covers_every_row_and_value() {
+        let p = config(Lang::Ko, crate::config::Config::default());
+        let want: usize = Form::ROWS.iter().map(|s| s.count()).sum();
+        assert_eq!(p.foot.len(), want, "{:?}", text(&p));
+        let (body, foot) = p.body_and_foot();
+        assert_eq!(body.len(), p.lines.len() - 1);
+        assert!(foot.is_some(), "no sentence was shown");
     }
 
     #[test]

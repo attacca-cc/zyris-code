@@ -25,11 +25,20 @@ pub fn draw(
     // worth less than either showing it whole or not showing it at all.
     let widest = picker.rows.iter().map(row_need).max().unwrap_or(0);
     let w = ((widest as u16 + 4).max(64)).min(area.width.saturating_sub(4)).max(20);
-    // The note the row under the cursor could not hold. Counted before the box is sized, because
-    // it costs rows.
-    let detail = cursor_detail(picker, w.saturating_sub(2) as usize);
+    let inner_w = w.saturating_sub(2) as usize;
+    // **The note area keeps room for every row's note, not only this one's.** Counted over all
+    // rows, so the box is one height whichever row the cursor is on — a list whose box jumps up
+    // and down as `↑↓` walks it is the same fault the panel's foot exists to prevent.
+    let detail_rows = picker
+        .rows
+        .iter()
+        .filter_map(|row| detail_of(row, inner_w))
+        .map(|note| note.len())
+        .max()
+        .unwrap_or(0);
+    let detail = cursor_detail(picker, inner_w);
     let want_h = (picker.rows.len() as u16)
-        .saturating_add(5 + rule as u16 + detail.len() as u16)
+        .saturating_add(5 + rule as u16 + detail_rows as u16)
         .max(6);
     let h = want_h.min(area.height.saturating_sub(2)).max(3);
     let box_area = Rect {
@@ -74,9 +83,9 @@ pub fn draw(
     // **The pure side decides** where each row goes (`picker::slots`). Here we just draw.
     // The rule and the key hints at the foot take a row each.
     let width = inner.width as usize;
-    // The rule, the hint and whatever the cursor's note needs under the list take rows from the
-    // body — the box cannot grow past the screen.
-    let body_h = inner.height.saturating_sub(2 + detail.len() as u16) as usize;
+    // The rule, the hint and the whole note area take rows from the body — the box cannot grow
+    // past the screen. The area's size is fixed, so the rows the list gets are too.
+    let body_h = inner.height.saturating_sub(2 + detail_rows as u16) as usize;
     // **Where the window ended up is stored back.** Without it the layout would be derived
     // from the cursor alone every frame, which pins the cursor to an edge — see `window_top`.
     let (laid, top) = crate::picker::slots(&picker.rows, picker.cursor, picker.top, body_h);
@@ -107,6 +116,11 @@ pub fn draw(
             format!("  {row}"),
             Style::default().fg(theme::text_muted()),
         )));
+    }
+    // **The rows left over stay empty, and that is the point.** A row whose note is one line and
+    // a row whose note is two must not give the list two different heights.
+    for _ in detail.len()..detail_rows {
+        lines.push(Line::from(""));
     }
 
     // The meaning of ← changes with the level. Say it plainly.
@@ -200,21 +214,25 @@ fn row_need(row: &crate::picker::Row) -> usize {
         + row.note.as_deref().map_or(0, |note| 2 + display_width(note))
 }
 
+/// The note `row` would put under the list **if the cursor were on it** — `None` when the row
+/// holds its own note, or has none.
+///
+/// The caller counts these over every row, which is how the note area comes to have one size
+/// whatever the cursor is on.
+fn detail_of(row: &crate::picker::Row, width: usize) -> Option<Vec<String>> {
+    let note = row.note.as_deref()?;
+    if split(width, &row.label, Some(note), row.status.is_some()).1.is_some() {
+        // The row already says it, and saying it twice is not a feature.
+        return None;
+    }
+    // Two columns of indent, so it reads as a note about the row above rather than another row.
+    Some(crate::wrap::words(note, width.saturating_sub(2)))
+}
+
 /// The note the cursor's row could not show inline, wrapped to the box — empty when the row held
 /// it, or has none.
 fn cursor_detail(picker: &Picker, width: usize) -> Vec<String> {
-    let Some(row) = picker.rows.get(picker.cursor) else {
-        return Vec::new();
-    };
-    let Some(note) = row.note.as_deref() else {
-        return Vec::new();
-    };
-    if split(width, &row.label, Some(note), row.status.is_some()).1.is_some() {
-        // The row already says it, and saying it twice is not a feature.
-        return Vec::new();
-    }
-    // Two columns of indent, so it reads as a note about the row above rather than another row.
-    crate::wrap::words(note, width.saturating_sub(2))
+    picker.rows.get(picker.cursor).and_then(|row| detail_of(row, width)).unwrap_or_default()
 }
 
 /// Splits one line into (name, note). **The name comes first.**
@@ -562,6 +580,29 @@ mod tests {
         // The note is wider than the box, so it is here on two lines — and whole.
         assert!(joined.contains("에이전트를 고릅니다"), "{joined}");
         assert!(joined.contains("열립니다"), "the end of the note was lost: {joined}");
+    }
+
+    /// The box the widget drew: its top and bottom row, and its left and right column.
+    fn box_rect(screen: &[String]) -> (usize, usize, usize, usize) {
+        let top = screen.iter().position(|r| r.contains('┌')).expect("no box was drawn");
+        let bottom = screen.iter().rposition(|r| r.contains('└')).expect("no box was drawn");
+        let left = screen[top].find('┌').expect("no left corner");
+        let right = screen[top].rfind('┐').expect("no right corner");
+        (top, bottom, left, right)
+    }
+
+    /// **The list keeps its height as the cursor walks it.** The note under the list is one line
+    /// for one row and two for the next, and the box used to follow it up and down — so the rows
+    /// the keys were moving through slid under them.
+    #[test]
+    fn the_picker_box_is_one_height_wherever_the_cursor_is() {
+        let mut picker = Picker::commands(crate::lang::Lang::Ko, &[]);
+        let mut rects = Vec::new();
+        for at in 0..picker.rows.len() {
+            picker.cursor = at;
+            rects.push(box_rect(&screen(&mut picker, 60, 30)));
+        }
+        assert!(rects.windows(2).all(|w| w[0] == w[1]), "the box moved: {rects:?}");
     }
 
     /// When both fit, both show.

@@ -31,16 +31,12 @@ pub fn draw(frame: &mut Frame, area: Rect, panel: &mut Panel, lang: crate::lang:
         (None, false, true, false) => lang.panel_keys_button(),
         (None, false, false, _) => lang.panel_keys(),
     };
-    // **The width is settled first**, because the wrapping needs it and the height falls out of how
-    // many lines the wrapping produced — the order `widgets/enroll.rs` already uses.
-    //
-    // **And it is sized to the content, capped by the screen.** A fixed 72 threw away the room a
-    // wide terminal has: a mode's sentence is 90 columns of Korean and the box was 72 whatever the
-    // window was, so it wrapped on a screen with 200 columns to spare. Now the box is as wide as
-    // its longest line needs, and wrapping is the last resort for a screen that really is narrow.
-    let widest = panel
-        .lines
+    // **The foot is measured too, and it is the foot that decides.** `Panel::foot` holds every
+    // sentence the panel can show, so the box is one size whichever row the cursor is on.
+    let (content, foot) = panel.body_and_foot();
+    let widest = content
         .iter()
+        .chain(panel.foot.iter())
         .map(|line| line.spans.iter().map(|s| display_width(&s.content)).sum::<usize>())
         // The title is drawn with a space either side of it, inside the border.
         .chain(std::iter::once(display_width(&panel.title) + 4))
@@ -48,13 +44,26 @@ pub fn draw(frame: &mut Frame, area: Rect, panel: &mut Panel, lang: crate::lang:
         .max()
         .unwrap_or(0);
     let w = (widest as u16 + 4).min(area.width.saturating_sub(4)).max(20);
-    // The borders take a column each side; `Block::inner` below agrees with this.
-    let body: Vec<Line<'static>> = panel
-        .lines
+    let inner_w = w.saturating_sub(2) as usize;
+    // The rows the foot keeps, whichever sentence is up. **A box that resizes under the keys is
+    // what all of this exists to prevent** — that is why `foot` holds every sentence, not one.
+    let foot_rows = panel
+        .foot
         .iter()
-        .cloned()
-        .flat_map(|line| wrap::line(line, w.saturating_sub(2) as usize))
-        .collect();
+        .map(|line| wrap::line(line.clone(), inner_w).len())
+        .max()
+        .unwrap_or(0);
+    let mut body: Vec<Line<'static>> =
+        content.iter().cloned().flat_map(|line| wrap::line(line, inner_w)).collect();
+    if let Some(foot) = foot {
+        // **Blank rows rather than a shorter box.** A sentence of one line and a sentence of two
+        // must not give two different heights.
+        let shown = wrap::line(foot.clone(), inner_w).len();
+        for _ in shown..foot_rows {
+            body.push(Line::from(""));
+        }
+        body.extend(wrap::line(foot.clone(), inner_w));
+    }
     // The box grows with the content, never taller than four fifths of the screen.
     // A button adds its own row between the body and the hint.
     let want_h = (body.len() as u16).saturating_add(3 + u16::from(has_button)).max(5);
@@ -213,5 +222,58 @@ mod tests {
         panel.scroll = 1000;
         let screen = render(&mut panel, 80, 24).join("\n");
         assert!(screen.contains("row 79"), "scrolling past the end lost the last row:\n{screen}");
+    }
+
+    /// The box the widget drew: its top and bottom row, and its left and right column.
+    fn box_rect(screen: &[String]) -> (usize, usize, usize, usize) {
+        let top = screen.iter().position(|r| r.contains('┌')).expect("no box was drawn");
+        let bottom = screen.iter().rposition(|r| r.contains('└')).expect("no box was drawn");
+        let left = screen[top].find('┌').expect("no left corner");
+        let right = screen[top].rfind('┐').expect("no right corner");
+        (top, bottom, left, right)
+    }
+
+    /// **The box does not resize as the cursor moves.** `/mode`'s sentence used to be what the box
+    /// was sized from, so moving the cursor onto a mode with a longer sentence grew the window —
+    /// and moved it, because a panel is centred. Every sentence is kept now (`Panel::foot`) and the
+    /// box is one size whichever one is up.
+    #[test]
+    fn the_mode_box_is_one_size_on_every_row() {
+        let rects: Vec<_> = crate::mode::Mode::ALL
+            .iter()
+            .map(|m| {
+                let mut panel = crate::panel::mode(
+                    crate::lang::Lang::Ko,
+                    crate::mode::Mode::Normal,
+                    Some(*m),
+                );
+                box_rect(&render(&mut panel, 100, 24))
+            })
+            .collect();
+        assert!(rects.windows(2).all(|w| w[0] == w[1]), "the box moved: {rects:?}");
+    }
+
+    /// `/config` is the other panel whose sentence changes under the cursor — one per setting and
+    /// value. `↑↓` and `←→` must leave the box exactly where it was.
+    #[test]
+    fn the_config_box_is_one_size_on_every_row_and_value() {
+        let mut panel =
+            crate::panel::config(crate::lang::Lang::Ko, crate::config::Config::default());
+        let mut rects = Vec::new();
+        for row in 0..crate::panel::Form::ROWS.len() {
+            if crate::panel::Form::ROWS[row] == crate::panel::Setting::Language {
+                // **The language row is left out on purpose.** Choosing a language re-letters the
+                // whole box on the spot — its title, its hint and every sentence are then in the
+                // other language, so a different size there is the point, not a fault.
+                continue;
+            }
+            panel.form.as_mut().expect("the config panel carries a form").cursor = row;
+            for _ in 0..crate::panel::Form::ROWS[row].count() {
+                panel.refresh();
+                rects.push(box_rect(&render(&mut panel, 100, 24)));
+                panel.form.as_mut().expect("the config panel carries a form").shift(1);
+            }
+        }
+        assert!(rects.windows(2).all(|w| w[0] == w[1]), "the box moved: {rects:?}");
     }
 }
