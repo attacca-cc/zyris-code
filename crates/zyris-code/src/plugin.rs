@@ -50,6 +50,24 @@ pub struct Plugin {
     /// Which directory it came from. **This is what tells fetched and hand-placed apart** — the
     /// name alone can't, and only the fetched side can be removed.
     pub root: PathBuf,
+    /// What the manifest says about itself besides its name: version, who wrote it, where it lives.
+    pub about: About,
+}
+
+/// What a manifest says about itself besides its name and its parts.
+///
+/// **Read for the screen, not for behaviour.** None of these changes what loads — they are what
+/// answers "what is this, and whose is it?" in the plugin panel, which used to show a name and a
+/// sentence and nothing else. Every field is optional because no plugin in the wild carries all of
+/// them, and a missing one must not stop the plugin from being read.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct About {
+    pub version: Option<String>,
+    pub author: Option<String>,
+    pub homepage: Option<String>,
+    pub repository: Option<String>,
+    pub license: Option<String>,
+    pub keywords: Vec<String>,
 }
 
 impl Plugin {
@@ -146,10 +164,43 @@ struct Manifest {
     name: String,
     #[serde(default)]
     description: String,
+    #[serde(default)]
+    version: Option<String>,
+    #[serde(default)]
+    author: Option<Author>,
+    #[serde(default)]
+    homepage: Option<String>,
+    #[serde(default)]
+    repository: Option<String>,
+    #[serde(default)]
+    license: Option<String>,
+    #[serde(default)]
+    keywords: Vec<String>,
     /// **Read through the same parser the config files use** (`mcp::bridge::SpecFile`), so a
     /// plugin can point at a remote server exactly the way a config file does.
     #[serde(default, rename = "mcpServers", alias = "mcp")]
     mcp: HashMap<String, crate::mcp::bridge::SpecFile>,
+}
+
+/// `author` is written both ways in the wild — a bare name, or an object with one in it.
+///
+/// **Untagged, so neither shape is an error.** A manifest that failed to parse is dropped whole
+/// (`discover_in`), so refusing the object shape would silently lose the plugin over a field that
+/// nothing here acts on.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum Author {
+    Named(String),
+    Object { name: Option<String> },
+}
+
+impl Author {
+    fn name(self) -> Option<String> {
+        match self {
+            Author::Named(name) => (!name.trim().is_empty()).then_some(name),
+            Author::Object { name } => name.filter(|n| !n.trim().is_empty()),
+        }
+    }
 }
 
 /// Pulls the place to clone and the directory name it lands in out of what the person typed.
@@ -258,6 +309,10 @@ pub fn active(cwd: &Path) -> Vec<Plugin> {
             None => found.push(plugin),
         }
     }
+    // **A plugin can be switched off without being thrown away.** Until this, the only way to stop
+    // a fetched plugin contributing was to delete its directory — which loses the `git` clone
+    // `update` needs, and the edits somebody made in it.
+    found.retain(|plugin| !allowed.plugin_off(&plugin.name));
     found.sort_by(|a, b| a.name.cmp(&b.name));
     found
 }
@@ -532,6 +587,14 @@ pub fn discover_in(dirs: &[PathBuf]) -> Vec<Plugin> {
                 commands: commands_in(&root.join("commands"), &name),
                 hooks: crate::hooks::read(&root, &name),
                 description: manifest.description,
+                about: About {
+                    version: manifest.version,
+                    author: manifest.author.and_then(Author::name),
+                    homepage: manifest.homepage,
+                    repository: manifest.repository,
+                    license: manifest.license,
+                    keywords: manifest.keywords,
+                },
                 root: root.clone(),
                 name,
             };
@@ -760,6 +823,7 @@ mod tests {
                 plugin: name.into(),
             }],
             hooks: vec![],
+            about: About::default(),
             root: "/tmp".into(),
         };
         let got = commands(&[plugin("a", "help"), plugin("b", "review"), plugin("c", "review")]);
@@ -808,6 +872,7 @@ mod tests {
             agents: None,
             commands: Vec::new(),
             hooks: Vec::new(),
+            about: About::default(),
             root: install_dir().join("받은것"),
         };
         let outside = Plugin { root: PathBuf::from("/tmp/직접둔것"), ..inside.clone() };

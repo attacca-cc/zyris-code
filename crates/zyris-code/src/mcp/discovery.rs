@@ -35,6 +35,17 @@ pub struct Allowed {
     servers: Vec<String>,
     #[serde(default)]
     approvals: Vec<Approval>,
+    /// Plugin names switched off by hand.
+    ///
+    /// **A field with a default, so the format version does not move.** Bumping `VERSION` makes
+    /// `load` throw every project approval away, and something that reads as nothing when it is
+    /// absent is not a reason to make anybody approve their repository's servers again.
+    ///
+    /// Keyed by name rather than by fingerprint, unlike the approvals above: switching a plugin
+    /// off is not a trust decision, and re-reading it after every edit to that plugin's files
+    /// would silently turn it back on.
+    #[serde(default)]
+    plugins_off: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -51,7 +62,12 @@ const fn current_version() -> u8 {
 
 impl Default for Allowed {
     fn default() -> Self {
-        Self { version: VERSION, servers: Vec::new(), approvals: Vec::new() }
+        Self {
+            version: VERSION,
+            servers: Vec::new(),
+            approvals: Vec::new(),
+            plugins_off: Vec::new(),
+        }
     }
 }
 
@@ -105,6 +121,27 @@ impl Allowed {
 
     pub fn allows(&self, slug: &str) -> bool {
         self.servers.iter().any(|s| s == slug)
+    }
+
+    /// Whether this plugin was switched off from the `/plugin` panel.
+    ///
+    /// **By name, across both tiers.** The name is what the panel shows and the only thing a
+    /// person can say; a plugin switched off on this machine and one of the same name in a
+    /// repository are one row in any case (`discover_in` merges by name).
+    pub fn plugin_off(&self, name: &str) -> bool {
+        self.plugins_off.iter().any(|off| off == name)
+    }
+
+    /// Switches a plugin off or on. Answers whether anything changed, so the caller can tell
+    /// "done" from "it already was" — a key that says nothing new reads as not having worked.
+    pub fn set_plugin_off(&mut self, name: &str, off: bool) -> bool {
+        let had = self.plugin_off(name);
+        if off && !had {
+            self.plugins_off.push(name.to_string());
+        } else if !off && had {
+            self.plugins_off.retain(|n| n != name);
+        }
+        had != off
     }
 
     /// Turns one on or off. Answers whether anything changed, so the caller can tell "done" from

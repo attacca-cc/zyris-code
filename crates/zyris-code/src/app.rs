@@ -331,6 +331,17 @@ pub enum Action {
     /// **Esc is `PanelClose`, which throws the draft away** — that is the whole reason the
     /// form edits a draft instead of the live settings.
     ConfigSave,
+    /// Move the manager's cursor (`/mcp`·`/plugin`). Positive is down.
+    ManagerMove(i32),
+    /// Switch what the manager's cursor is on (Enter/Space) — on or off, whichever it is not.
+    ManagerAct,
+    /// Take the row under the manager's cursor away. **Asks first**: the second press is the
+    /// answer.
+    ManagerRemove,
+    /// Fetch the newest version of the fetched plugin under the cursor.
+    ManagerUpdate,
+    /// Read the disk again — another window or another client may have changed it.
+    ManagerReload,
     CycleMode,
     /// From the start of the draft up to the cursor (`Ctrl+U`). With the cursor at the end —
     /// where it nearly always is — that is the whole draft, which is what this used to be.
@@ -556,6 +567,13 @@ pub struct State {
     /// Filled when the form takes Enter — (name, description). The I/O side does the
     /// creating.
     pub project_out: Option<(String, String)>,
+    /// What the `/mcp`·`/plugin` manager asked for.
+    ///
+    /// **`apply` is pure, so every act lands here** — switching a server on, taking an entry out
+    /// of a config file, deleting a fetched plugin — and the loop below carries it out, the same
+    /// way `command_out` and `project_out` are carried. The panel stays up across it: it is the
+    /// thing being used, and closing on every toggle would mean reopening it for the second one.
+    pub manager_out: Option<ManagerAsk>,
     /// Session usage — credits, context, tokens. Polled off the draw loop (`Frame::Poll`) and
     /// shown on the bottom bar's right edge.
     pub usage: crate::usage::Usage,
@@ -750,6 +768,7 @@ impl Default for State {
             github_out: None,
             panel: None,
             project_out: None,
+            manager_out: None,
             usage: crate::usage::Usage::default(),
             title: "Zyris Code".into(),
             breath_origin: Instant::now(),
@@ -1262,6 +1281,21 @@ pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
                 KeyCode::Down | KeyCode::Char('j') => vec![Action::ConfigMove(-1)],
                 KeyCode::Left | KeyCode::Char('h') => vec![Action::ConfigShift(-1)],
                 KeyCode::Right | KeyCode::Char('l') => vec![Action::ConfigShift(1)],
+                _ => vec![],
+            };
+        }
+        // **A manager acts on the row under its cursor.** ↑↓ walk it, Enter/Space switches it,
+        // `d` takes it away (asking first), `u` fetches a fetched plugin's update, `r` reads the
+        // disk again. Nothing here scrolls: a list built to fit is not scrolled with ↓.
+        if state.panel.as_ref().is_some_and(|p| p.manager.is_some()) {
+            return match key.code {
+                KeyCode::Esc => vec![Action::PanelClose],
+                KeyCode::Up | KeyCode::Char('k') => vec![Action::ManagerMove(-1)],
+                KeyCode::Down | KeyCode::Char('j') => vec![Action::ManagerMove(1)],
+                KeyCode::Enter | KeyCode::Char(' ') => vec![Action::ManagerAct],
+                KeyCode::Char('d') | KeyCode::Delete => vec![Action::ManagerRemove],
+                KeyCode::Char('u') => vec![Action::ManagerUpdate],
+                KeyCode::Char('r') => vec![Action::ManagerReload],
                 _ => vec![],
             };
         }
@@ -2061,6 +2095,99 @@ pub fn apply(state: &mut State, action: &Action) {
             }
         }
         Action::PanelClose => state.panel = None,
+        // **The cursor is the panel's own state**, so moving it is a rebuild of the one thing the
+        // widget draws — the same rule `ConfigMove` follows.
+        Action::ManagerMove(by) => {
+            if let Some(manager) = state.panel.as_mut().and_then(|p| p.manager.as_mut()) {
+                manager.move_cursor(*by);
+                manager.note = None;
+            }
+            refresh_the_manager_body(state);
+        }
+        // **The act is I/O and belongs to the loop below.** What happens here is only noting it
+        // down — or saying why this row will not take that key.
+        Action::ManagerAct => {
+            let lang = state.lang;
+            let ask = {
+                let Some(manager) = state.panel.as_mut().and_then(|p| p.manager.as_mut()) else {
+                    return;
+                };
+                let Some(row) = manager.row().cloned() else { return };
+                match ask_from(manager.kind, &row, Verb::Switch) {
+                    Some(ask) => {
+                        manager.note = None;
+                        Some(ask)
+                    }
+                    None => {
+                        manager.note = Some(lang.manager_cannot(&row.id));
+                        None
+                    }
+                }
+            };
+            if ask.is_some() {
+                state.manager_out = ask;
+            }
+            refresh_the_manager_body(state);
+        }
+        Action::ManagerRemove => {
+            let lang = state.lang;
+            let ask = {
+                let Some(manager) = state.panel.as_mut().and_then(|p| p.manager.as_mut()) else {
+                    return;
+                };
+                let Some(row) = manager.row().cloned() else { return };
+                match ask_from(manager.kind, &row, Verb::Remove) {
+                    None => {
+                        manager.note = Some(lang.manager_cannot(&row.id));
+                        None
+                    }
+                    Some(ask) => {
+                        // **Two presses, and the question names the row.** A deleted directory
+                        // cannot be put back, and `d` sits one key from the row above it.
+                        if manager.confirm.as_deref() == Some(row.id.as_str()) {
+                            manager.confirm = None;
+                            manager.note = None;
+                            Some(ask)
+                        } else {
+                            manager.confirm = Some(row.id.clone());
+                            manager.note = Some(lang.manager_confirm(&row.id));
+                            None
+                        }
+                    }
+                }
+            };
+            if ask.is_some() {
+                state.manager_out = ask;
+            }
+            refresh_the_manager_body(state);
+        }
+        Action::ManagerUpdate => {
+            let lang = state.lang;
+            let ask = {
+                let Some(manager) = state.panel.as_mut().and_then(|p| p.manager.as_mut()) else {
+                    return;
+                };
+                let Some(row) = manager.row().cloned() else { return };
+                match ask_from(manager.kind, &row, Verb::Update) {
+                    Some(ask) => Some(ask),
+                    None => {
+                        manager.note = Some(lang.manager_cannot(&row.id));
+                        None
+                    }
+                }
+            };
+            if ask.is_some() {
+                state.manager_out = ask;
+            }
+            refresh_the_manager_body(state);
+        }
+        Action::ManagerReload => {
+            if let Some(manager) = state.panel.as_mut().and_then(|p| p.manager.as_mut()) {
+                manager.note = None;
+                manager.confirm = None;
+            }
+            state.manager_out = Some(ManagerAsk::Reload);
+        }
         // **Rebuilt, not nudged.** The body is plain lines with no idea which one is the cursor,
         // so moving it is a rebuild with the new `pick` — which keeps the whole panel a pure
         // function of (current mode, cursor).
@@ -4291,6 +4418,17 @@ async fn run_inner(
                         bridge.sync(state.mode, &state.config, state.plan_decided);
                     }
 
+                    // **A manager key reaches the disk here.** `apply` only noted what was asked
+                    // for; this is where an entry leaves a config file, a server is switched, or a
+                    // fetched plugin is updated — and then the panel is rebuilt from what is now
+                    // on disk, so the row shows the truth rather than what was asked for.
+                    if let Some(ask) = state.manager_out.take() {
+                        if let Some(said) = carry_out_manager_ask(&mut state, ask).await {
+                            state.timeline.say(said);
+                        }
+                        refresh_the_manager(&mut state, &bridge);
+                    }
+
                     // **The `@` list asked for a walk.** `apply` set the flag and put the
                     // loading box up; the disk is touched here, and only the first `@` of the
                     // run pays for it.
@@ -5129,15 +5267,7 @@ async fn finish_command(
         // since this window started, and a list that only knew about launch time would keep saying
         // it is not there.
         Command::Mcp(None) => {
-            let allowed = crate::mcp::discovery::Allowed::load();
-            let found: Vec<(String, String, bool)> = crate::mcp::discovery::found(&state.cwd)
-                .into_iter()
-                .map(|f| {
-                    let on = allowed.allows_found(&state.cwd, &f);
-                    (f.spec.slug.clone(), f.source, on)
-                })
-                .collect();
-            state.panel = Some(crate::panel::mcp(state.lang, &bridge.mcp_report(), &found));
+            open_mcp_panel(state, bridge);
         }
         Command::Mcp(Some(switch)) => {
             use crate::command::McpSwitch;
@@ -5198,15 +5328,7 @@ async fn finish_command(
             match what {
                 // The listing is a panel now — one row per plugin reads better than
                 // a paragraph of bullets.
-                P::List => {
-                    let allowed = crate::mcp::discovery::Allowed::load();
-                    state.panel = Some(crate::panel::plugins(
-                        state.lang,
-                        &state.cwd,
-                        &crate::plugin::discover(&state.cwd),
-                        &allowed,
-                    ));
-                }
+                P::List => open_plugin_panel(state),
                 other => {
                     let said = run_plugin(state, other).await;
                     // **An empty answer means the command opened something instead of finishing.**
@@ -5784,6 +5906,415 @@ async fn switch_agent(
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// The `/mcp` and `/plugin` managers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// What a manager key asked the I/O side for.
+///
+/// **`apply` is pure, so it cannot do any of it.** Each variant is one write to disk or one
+/// approval recorded, and the loop that owns the disk carries it out — the road `command_out` and
+/// `project_out` already take.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManagerAsk {
+    /// Switch a server: `/mcp on|off` under another name.
+    SetMcp {
+        slug: String,
+        on: bool,
+    },
+    /// Take a server out of the file it is written in.
+    RemoveMcp {
+        slug: String,
+    },
+    /// Forget that this machine said yes to a server another program set up.
+    ForgetMcp {
+        slug: String,
+    },
+    SetPlugin {
+        name: String,
+        on: bool,
+    },
+    RemovePlugin {
+        name: String,
+    },
+    UpdatePlugin {
+        name: String,
+    },
+    /// Read the disk again.
+    Reload,
+}
+
+/// Which act a key asked for, so one function turns a row into the right request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verb {
+    Switch,
+    Remove,
+    Update,
+}
+
+/// Turns the row under the cursor into what to ask for. `None` when the row will not take that key
+/// — which the caller says out loud rather than swallowing.
+fn ask_from(
+    kind: crate::panel::ManagerKind,
+    row: &crate::panel::ManagerRow,
+    verb: Verb,
+) -> Option<ManagerAsk> {
+    use crate::panel::{ManagerKind as K, Origin, Removal};
+    use ManagerAsk as A;
+    match (kind, verb) {
+        (K::Mcp, Verb::Switch) => row.toggle.map(|on| A::SetMcp { slug: row.id.clone(), on: !on }),
+        (K::Mcp, Verb::Remove) => match row.remove {
+            Some(Removal::FromFile) => Some(A::RemoveMcp { slug: row.id.clone() }),
+            Some(Removal::Approval) => Some(A::ForgetMcp { slug: row.id.clone() }),
+            _ => None,
+        },
+        (K::Plugins, Verb::Switch) => {
+            row.toggle.map(|on| A::SetPlugin { name: row.id.clone(), on: !on })
+        }
+        (K::Plugins, Verb::Remove) => match row.remove {
+            Some(Removal::Directory) => Some(A::RemovePlugin { name: row.id.clone() }),
+            _ => None,
+        },
+        // **Only something fetched can be pulled.** A plugin placed by hand has no remote, and one
+        // in a repository belongs to that repository's history — `git pull` here would fetch into
+        // somebody else's tree.
+        (K::Plugins, Verb::Update) => {
+            matches!(row.origin, Origin::Fetched).then(|| A::UpdatePlugin { name: row.id.clone() })
+        }
+        (K::Mcp, Verb::Update) => None,
+    }
+}
+
+/// Opens the `/mcp` manager.
+///
+/// **Read off disk at the moment it is asked for.** Another client may have added a server since
+/// this window started, and a list that only knew about launch time would keep saying it is not
+/// there.
+fn open_mcp_panel(state: &mut State, bridge: &crate::tools::bridge::Bridge) {
+    let lang = state.lang;
+    let allowed = crate::mcp::discovery::Allowed::load();
+    let found = crate::mcp::discovery::found(&state.cwd);
+    let plugins = crate::plugin::active(&state.cwd);
+    let rows = mcp_rows(lang, &state.cwd, &bridge.mcp_report(), &allowed, &found, &plugins);
+    state.panel = Some(crate::panel::mcp_manager(lang, rows));
+}
+
+/// Opens the `/plugin` manager.
+///
+/// **`discover`, not `active`.** A plugin switched off still gets a row, with its dot hollow —
+/// listing only what is on would make switching one back on impossible from here.
+fn open_plugin_panel(state: &mut State) {
+    let lang = state.lang;
+    let allowed = crate::mcp::discovery::Allowed::load();
+    let rows = plugin_rows(lang, &state.cwd, &crate::plugin::discover(&state.cwd), &allowed);
+    state.panel = Some(crate::panel::plugin_manager(lang, rows));
+}
+
+/// Rebuilds a manager's body from its own state. **Pure** — the cursor moved, nothing is read.
+fn refresh_the_manager_body(state: &mut State) {
+    if let Some(panel) = state.panel.as_mut() {
+        panel.refresh();
+    }
+}
+
+/// Reads the disk again and rebuilds whichever manager is up, **keeping the cursor on the same row
+/// where that row is still there**.
+///
+/// **After every act.** The panel would otherwise show what was asked for rather than what
+/// happened, and the failure case is exactly the one where believing the screen costs something.
+fn refresh_the_manager(state: &mut State, bridge: &crate::tools::bridge::Bridge) {
+    use crate::panel::ManagerKind;
+    let Some(kind) = state.panel.as_ref().and_then(|p| p.manager.as_ref()).map(|m| m.kind) else {
+        return;
+    };
+    let was = state
+        .panel
+        .as_ref()
+        .and_then(|p| p.manager.as_ref())
+        .and_then(|m| m.row())
+        .map(|row| row.id.clone());
+    let lang = state.lang;
+    let allowed = crate::mcp::discovery::Allowed::load();
+    let mut fresh = match kind {
+        ManagerKind::Mcp => {
+            let found = crate::mcp::discovery::found(&state.cwd);
+            let plugins = crate::plugin::active(&state.cwd);
+            let rows = mcp_rows(lang, &state.cwd, &bridge.mcp_report(), &allowed, &found, &plugins);
+            crate::panel::mcp_manager(lang, rows)
+        }
+        ManagerKind::Plugins => {
+            let rows =
+                plugin_rows(lang, &state.cwd, &crate::plugin::discover(&state.cwd), &allowed);
+            crate::panel::plugin_manager(lang, rows)
+        }
+    };
+    if let (Some(was), Some(manager)) = (was, fresh.manager.as_mut()) {
+        if let Some(at) = manager.rows.iter().position(|row| row.id == was) {
+            manager.cursor = at;
+        }
+    }
+    state.panel = Some(fresh);
+}
+
+/// Every MCP server this machine knows about, **one row each**.
+///
+/// Layered exactly the way they are started (`tools::start_mcp`): what the plugins contribute, then
+/// this app's own config, then the repository and the other clients' discoveries — a later
+/// definition replacing an earlier one of the same name, because the definition nearest this
+/// working directory is the specific one.
+///
+/// **One row per server, not one per place it is mentioned.** Two sections meant the same server
+/// could appear twice — once as something that failed to start and once as the candidate it came
+/// from — and the cursor could only ever act on one of them.
+fn mcp_rows(
+    lang: crate::lang::Lang,
+    cwd: &std::path::Path,
+    running: &[(String, Result<usize, String>)],
+    allowed: &crate::mcp::discovery::Allowed,
+    found: &[crate::mcp::discovery::Found],
+    plugins: &[crate::plugin::Plugin],
+) -> Vec<crate::panel::ManagerRow> {
+    use crate::panel::{ManagerRow as Row, Origin, Removal};
+
+    /// What is known about one server before the panel's own shape is put on it.
+    struct Draft {
+        spec: crate::mcp::bridge::ServerSpec,
+        origin: Origin,
+        subtitle: String,
+        toggle: Option<bool>,
+        remove: Option<Removal>,
+    }
+    fn put(drafts: &mut Vec<Draft>, draft: Draft) {
+        match drafts.iter_mut().find(|d| d.spec.slug == draft.spec.slug) {
+            Some(slot) => *slot = draft,
+            None => drafts.push(draft),
+        }
+    }
+
+    let mut drafts: Vec<Draft> = Vec::new();
+    for plugin in plugins {
+        for spec in &plugin.mcp {
+            put(
+                &mut drafts,
+                Draft {
+                    spec: spec.clone(),
+                    origin: Origin::Plugin(plugin.name.clone()),
+                    subtitle: lang.mcp_from_plugin(&plugin.name),
+                    // A plugin is switched off as a whole, one row over.
+                    toggle: None,
+                    remove: None,
+                },
+            );
+        }
+    }
+    for spec in crate::mcp::bridge::load_user_config() {
+        put(
+            &mut drafts,
+            Draft {
+                spec,
+                origin: Origin::User,
+                subtitle: lang.mcp_from_user().to_string(),
+                // **Written down here, so it starts itself.** There is nothing to switch; what
+                // this row offers is the way to take it out of the file.
+                toggle: None,
+                remove: Some(Removal::FromFile),
+            },
+        );
+    }
+    for one in found {
+        let on = allowed.allows_found(cwd, one);
+        let (origin, remove) = if one.project {
+            (Origin::Project, Removal::FromFile)
+        } else {
+            (Origin::Elsewhere, Removal::Approval)
+        };
+        put(
+            &mut drafts,
+            Draft {
+                spec: one.spec.clone(),
+                origin,
+                subtitle: lang.mcp_found_from(&one.source, on),
+                toggle: Some(on),
+                remove: Some(remove),
+            },
+        );
+    }
+
+    let mut rows: Vec<Row> = Vec::new();
+    for draft in drafts {
+        // **The name the bridge recorded is the sanitized capability name** (`mcp_<slug>`), not the
+        // slug itself — matching on the slug would find nothing and draw every server as stopped.
+        let wire = crate::mcp::client::sanitize(&format!("mcp_{}", draft.spec.slug));
+        let outcome = running.iter().find(|(name, _)| *name == wire).map(|(_, outcome)| outcome);
+        let (subtitle, state) = match outcome {
+            Some(Ok(n)) => (lang.mcp_row_running(*n), lang.mcp_row_running(*n)),
+            Some(Err(why)) => (lang.mcp_failed(why), lang.mcp_failed(why)),
+            None => (
+                draft.subtitle.clone(),
+                match draft.toggle {
+                    Some(on) => lang.on_off(on).to_string(),
+                    None => lang.mcp_row_always_on().to_string(),
+                },
+            ),
+        };
+        let mut detail = vec![
+            (lang.d_state().to_string(), state),
+            (lang.d_source().to_string(), draft.subtitle.clone()),
+            (lang.d_runs().to_string(), draft.spec.transport.detail()),
+        ];
+        let handed = draft.spec.transport.handed_names();
+        if !handed.is_empty() {
+            detail.push((lang.d_env().to_string(), handed.join(", ")));
+        }
+        detail.push((lang.d_agent().to_string(), wire));
+        if let Some(Ok(n)) = outcome {
+            detail.push((lang.d_tools().to_string(), lang.mcp_tools(*n)));
+        }
+        rows.push(Row {
+            id: draft.spec.slug.clone(),
+            title: draft.spec.slug,
+            subtitle,
+            detail,
+            origin: draft.origin,
+            toggle: draft.toggle,
+            remove: draft.remove,
+        });
+    }
+    rows.sort_by(|a, b| a.id.cmp(&b.id));
+    rows
+}
+
+/// Every plugin, whatever its tier, as one row each — with what its manifest says about itself and
+/// what it contributes.
+fn plugin_rows(
+    lang: crate::lang::Lang,
+    cwd: &std::path::Path,
+    plugins: &[crate::plugin::Plugin],
+    allowed: &crate::mcp::discovery::Allowed,
+) -> Vec<crate::panel::ManagerRow> {
+    use crate::panel::{ManagerRow as Row, Origin, Removal};
+    let install = crate::plugin::install_dir();
+    let project_dir = cwd.join(".zyris-code/plugins");
+    let mut rows: Vec<Row> = plugins
+        .iter()
+        .map(|p| {
+            let origin = if p.root.starts_with(&install) {
+                Origin::Fetched
+            } else if p.root.starts_with(&project_dir) {
+                Origin::InProject
+            } else {
+                Origin::HandPlaced
+            };
+            let on = !allowed.plugin_off(&p.name)
+                && (!matches!(origin, Origin::InProject) || allowed.allows_plugin(cwd, p));
+            let subtitle = match origin {
+                Origin::InProject => lang.plugin_row_project(on),
+                _ => lang.plugin_row_fetched().to_string(),
+            };
+            let mut detail: Vec<(String, String)> = Vec::new();
+            if !p.description.is_empty() {
+                detail.push((lang.d_about().to_string(), p.description.clone()));
+            }
+            let about = &p.about;
+            for (label, value) in [
+                (lang.d_version(), about.version.clone()),
+                (lang.d_author(), about.author.clone()),
+                (lang.d_home(), about.homepage.clone()),
+                (lang.d_repo(), about.repository.clone()),
+                (lang.d_license(), about.license.clone()),
+            ] {
+                if let Some(value) = value {
+                    detail.push((label.to_string(), value));
+                }
+            }
+            if !about.keywords.is_empty() {
+                detail.push((lang.d_keywords().to_string(), about.keywords.join(", ")));
+            }
+            detail.push((lang.d_path().to_string(), p.root.display().to_string()));
+            let skills = usize::from(p.skills.is_some()) + usize::from(p.agents.is_some());
+            detail.push((
+                lang.d_adds().to_string(),
+                lang.plugin_adds_line(p.commands.len(), skills, p.hooks.len(), p.mcp.len()),
+            ));
+            if !p.commands.is_empty() {
+                let names: Vec<String> =
+                    p.commands.iter().map(|c| format!("/{}", c.name)).collect();
+                detail.push((lang.d_agent().to_string(), names.join(" ")));
+            }
+            Row {
+                id: p.name.clone(),
+                title: p.name.clone(),
+                subtitle,
+                detail,
+                origin: origin.clone(),
+                toggle: Some(on),
+                // **Only what was fetched is deleted** — that flag is what tells the two apart, and
+                // it is also what makes the act safe: this app put the directory there.
+                remove: matches!(origin, Origin::Fetched).then_some(Removal::Directory),
+            }
+        })
+        .collect();
+    rows.sort_by(|a, b| a.id.cmp(&b.id));
+    rows
+}
+
+/// Carries out what a manager key asked for, and says what happened.
+///
+/// **The sentence goes to the conversation**, the way every other command's answer does; the panel
+/// is rebuilt from disk right after (`refresh_the_manager`), so the row itself shows the truth.
+async fn carry_out_manager_ask(state: &mut State, ask: ManagerAsk) -> Option<String> {
+    use ManagerAsk as A;
+    match ask {
+        A::SetMcp { slug, on } => {
+            let found =
+                crate::mcp::discovery::found(&state.cwd).into_iter().find(|f| f.spec.slug == slug);
+            let Some(found) = found else { return Some(state.lang.mcp_not_found(&slug)) };
+            let mut allowed = crate::mcp::discovery::Allowed::load();
+            Some(if allowed.set_found(&state.cwd, &found, on) {
+                allowed.save();
+                state.lang.mcp_switched(&slug, on)
+            } else {
+                state.lang.mcp_already(&slug, on)
+            })
+        }
+        A::RemoveMcp { slug } => {
+            // **Which file it is in decides which file is written.** A name in this app's own
+            // config is not necessarily in the repository's, and the two mean different things.
+            let in_user = crate::mcp::bridge::load_user_config().iter().any(|s| s.slug == slug);
+            let at = if in_user {
+                crate::conn::app_dir().map(|dir| dir.join("mcp.json"))
+            } else {
+                Some(state.cwd.join(".mcp.json"))
+            };
+            Some(match at {
+                Some(path) => match crate::mcp::bridge::remove_server(&path, &slug) {
+                    Ok(()) => state.lang.mcp_removed(&slug, &path.display().to_string()),
+                    Err(why) => why,
+                },
+                None => state.lang.mcp_not_found(&slug),
+            })
+        }
+        A::ForgetMcp { slug } => {
+            let mut allowed = crate::mcp::discovery::Allowed::load();
+            if allowed.set(&slug, false) {
+                allowed.save();
+            }
+            Some(state.lang.mcp_forgotten(&slug))
+        }
+        A::SetPlugin { name, on } => Some(switch_plugin(state, &name, on)),
+        A::RemovePlugin { name } => Some(match crate::plugin::remove(&name) {
+            Ok(()) => state.lang.plugin_removed(&name),
+            Err(why) => why,
+        }),
+        A::UpdatePlugin { name } => {
+            let done = crate::plugin::update(Some(&name)).await;
+            Some(state.lang.plugin_update_text(&done))
+        }
+        // Nothing said: re-reading the disk is not news, and the panel redrawing is the answer.
+        A::Reload => None,
+    }
+}
+
 /// `/plugin`. **Installing means putting someone else's code on this computer** — say so.
 async fn run_plugin(state: &mut State, what: crate::command::Plugin) -> String {
     use crate::command::Plugin as P;
@@ -5815,12 +6346,20 @@ async fn run_plugin(state: &mut State, what: crate::command::Plugin) -> String {
 }
 
 fn switch_plugin(state: &State, name: &str, on: bool) -> String {
-    let found = crate::plugin::discover(&state.cwd)
-        .into_iter()
-        .find(|p| p.name == name && p.root.starts_with(state.cwd.join(".zyris-code/plugins")));
+    // **The key does not know which tier it is acting on, and must not have to.** A plugin in the
+    // repository was never trusted, so switching it on is an approval bound to what its files
+    // contain (`Allowed::set_plugin` forgets that approval the moment they change); one fetched or
+    // placed by hand is already trusted, so switching it off is a plain no (`set_plugin_off`) and
+    // switching it on takes it back.
+    let found = crate::plugin::discover(&state.cwd).into_iter().find(|p| p.name == name);
     let Some(found) = found else { return state.lang.plugin_switch_not_found(name) };
     let mut allowed = crate::mcp::discovery::Allowed::load();
-    if allowed.set_plugin(&state.cwd, &found, on) {
+    let changed = if found.root.starts_with(state.cwd.join(".zyris-code/plugins")) {
+        allowed.set_plugin(&state.cwd, &found, on)
+    } else {
+        allowed.set_plugin_off(name, !on)
+    };
+    if changed {
         allowed.save();
         state.lang.plugin_switched(name, on)
     } else {
@@ -8702,6 +9241,101 @@ mod tests {
         assert!(s.status().is_some());
         apply(&mut s, &Action::Frame(Frame::History { entries: vec![] }));
         assert_eq!(s.status(), None, "{:?}", s.status());
+    }
+
+    /// One manager row, so these tests say what the keys do rather than repeating the shape.
+    fn manager_row(
+        id: &str,
+        origin: crate::panel::Origin,
+        toggle: Option<bool>,
+        remove: Option<crate::panel::Removal>,
+    ) -> crate::panel::ManagerRow {
+        crate::panel::ManagerRow {
+            id: id.into(),
+            title: id.into(),
+            subtitle: String::new(),
+            detail: Vec::new(),
+            origin,
+            toggle,
+            remove,
+        }
+    }
+
+    /// **The keys of `/mcp` become acts, and the acts become writes.** `apply` is pure, so what it
+    /// does is note the ask down; the loop below carries it out.
+    #[test]
+    fn the_mcp_keys_note_down_what_to_do_and_removal_asks_first() {
+        use crate::panel::{Origin, Removal};
+        let mut s = state();
+        s.panel = Some(crate::panel::mcp_manager(
+            s.lang,
+            vec![
+                manager_row("cursor-one", Origin::Elsewhere, Some(false), Some(Removal::Approval)),
+                manager_row("ours", Origin::User, None, Some(Removal::FromFile)),
+            ],
+        ));
+
+        // Enter switches the row under the cursor, whichever way it is not.
+        apply(&mut s, &Action::ManagerAct);
+        assert_eq!(s.manager_out, Some(ManagerAsk::SetMcp { slug: "cursor-one".into(), on: true }));
+
+        // **The first `d` asks and does nothing else.** A deleted thing cannot be put back.
+        s.manager_out = None;
+        apply(&mut s, &Action::ManagerRemove);
+        assert_eq!(s.manager_out, None, "the first press took something away");
+        let manager = s.panel.as_ref().and_then(|p| p.manager.as_ref()).expect("a manager");
+        assert_eq!(manager.confirm.as_deref(), Some("cursor-one"));
+        assert!(manager.note.is_some(), "nothing was asked");
+
+        // The second press answers it, and the act matches where the row came from.
+        apply(&mut s, &Action::ManagerRemove);
+        assert_eq!(s.manager_out, Some(ManagerAsk::ForgetMcp { slug: "cursor-one".into() }));
+
+        // A row with nothing to switch says so rather than doing nothing quietly.
+        s.manager_out = None;
+        apply(&mut s, &Action::ManagerMove(1));
+        apply(&mut s, &Action::ManagerAct);
+        assert_eq!(s.manager_out, None);
+        let manager = s.panel.as_ref().and_then(|p| p.manager.as_ref()).expect("a manager");
+        assert!(manager.note.is_some(), "a key that does nothing said nothing");
+    }
+
+    /// **A plugin's key knows which store to write to.** A repository plugin is an approval bound
+    /// to its contents; one fetched or placed by hand is a plain name on the off list.
+    #[test]
+    fn the_plugin_keys_take_the_tier_into_account() {
+        use crate::panel::{Origin, Removal};
+        let mut s = state();
+        s.panel = Some(crate::panel::plugin_manager(
+            s.lang,
+            vec![
+                manager_row("project-one", Origin::InProject, Some(false), None),
+                manager_row("fetched-one", Origin::Fetched, Some(true), Some(Removal::Directory)),
+            ],
+        ));
+
+        apply(&mut s, &Action::ManagerAct);
+        assert_eq!(
+            s.manager_out,
+            Some(ManagerAsk::SetPlugin { name: "project-one".into(), on: true })
+        );
+
+        s.manager_out = None;
+        apply(&mut s, &Action::ManagerMove(1));
+        apply(&mut s, &Action::ManagerUpdate);
+        assert_eq!(
+            s.manager_out,
+            Some(ManagerAsk::UpdatePlugin { name: "fetched-one".into() })
+        );
+
+        // Removing is offered on a fetched plugin and nowhere else.
+        s.manager_out = None;
+        apply(&mut s, &Action::ManagerRemove);
+        apply(&mut s, &Action::ManagerRemove);
+        assert_eq!(
+            s.manager_out,
+            Some(ManagerAsk::RemovePlugin { name: "fetched-one".into() })
+        );
     }
 
     /// **A frame is not a key.** While an answer streams — or on an idle screen, where the usage

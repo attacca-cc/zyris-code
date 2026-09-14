@@ -1891,6 +1891,15 @@ impl Lang {
             }
         }
     }
+    /// Asked to take out a server the file does not name. **The file may have been edited since
+    /// the panel was drawn** — saying so beats reporting a success nobody can see.
+    pub fn mcp_not_in_file(self, slug: &str) -> String {
+        match self {
+            Lang::Ko => format!("`{slug}`이 그 파일에 없습니다. `r`로 다시 읽어 보세요."),
+            Lang::En => format!("`{slug}` is not in that file. Press `r` to read it again."),
+        }
+    }
+
     /// Nothing changed, because it already was that way.
     pub fn mcp_already(self, slug: &str, on: bool) -> String {
         match (self, on) {
@@ -1899,6 +1908,209 @@ impl Lang {
             (Lang::En, true) => format!("`{slug}` is already on."),
             (Lang::En, false) => format!("`{slug}` is already off."),
         }
+    }
+
+    // ── The managers (`/mcp` · `/plugin`)
+
+    /// The question asked before something is taken away. **It names the row** — the cursor can
+    /// move between the two presses, and "press again" with no name would be a question about
+    /// whatever happens to be under the cursor when it is answered.
+    pub fn manager_confirm(self, id: &str) -> String {
+        match self {
+            Lang::Ko => format!("`{id}`을 지우려면 한 번 더 누르세요."),
+            Lang::En => format!("Press again to remove `{id}`."),
+        }
+    }
+
+    /// A key that does nothing on this row, and why. **Said rather than swallowed** — a key that
+    /// quietly does nothing reads as the panel being broken.
+    ///
+    /// One sentence for all three keys (`Enter`, `d`, `u`), because what it says is the same
+    /// thing: this row does not take that act. **One sentence also keeps the box one size** —
+    /// it is measured against every question the panel can ask (`panel::room_for`).
+    pub fn manager_cannot(self, id: &str) -> String {
+        match self {
+            Lang::Ko => format!("`{id}`에는 이 키가 하는 일이 없습니다."),
+            Lang::En => format!("`{id}`: that key does nothing here."),
+        }
+    }
+
+    /// A server taken out of a config file.
+    pub fn mcp_removed(self, slug: &str, at: &str) -> String {
+        match self {
+            Lang::Ko => format!("`{slug}`을 `{at}`에서 지웠습니다."),
+            Lang::En => format!("Removed `{slug}` from `{at}`."),
+        }
+    }
+
+    /// An approval forgotten. **The entry in the other program's file is untouched** — that file
+    /// is not ours to write, and saying so is the difference between a person understanding this
+    /// and believing the server was deleted.
+    pub fn mcp_forgotten(self, slug: &str) -> String {
+        match self {
+            Lang::Ko => {
+                format!(
+                    "`{slug}`을 승인 목록에서 뺐습니다. 그 프로그램의 설정 파일은 그대로입니다."
+                )
+            }
+            Lang::En => format!(
+                "`{slug}` is off our list. The file that wrote it belongs to another program and \
+                 was left alone."
+            ),
+        }
+    }
+
+    /// The key hint along the bottom of a manager. **It is the whole discovery surface for the
+    /// keys** — nothing else says `d` removes and `u` updates.
+    pub fn manager_keys(self, kind: crate::panel::ManagerKind) -> String {
+        use crate::panel::ManagerKind;
+        match (self, kind) {
+            (Lang::Ko, ManagerKind::Mcp) => {
+                "↑↓ 고르기 ‒ Enter 켜기/끄기 ‒ d 지우기 ‒ r 다시 읽기 ‒ Esc 닫기".to_string()
+            }
+            (Lang::En, ManagerKind::Mcp) => {
+                "↑↓ pick ‒ Enter on/off ‒ d remove ‒ r re-read ‒ Esc close".to_string()
+            }
+            (Lang::Ko, ManagerKind::Plugins) => {
+                "↑↓ 고르기 ‒ Enter 켜기/끄기 ‒ u 갱신 ‒ d 지우기 ‒ r 다시 읽기 ‒ Esc 닫기"
+                    .to_string()
+            }
+            (Lang::En, ManagerKind::Plugins) => {
+                "↑↓ pick ‒ Enter on/off ‒ u update ‒ d remove ‒ r re-read ‒ Esc close".to_string()
+            }
+        }
+    }
+
+    /// The detail block's labels. **Short, because they are a column** — the value is the sentence.
+    pub fn d_state(self) -> &'static str {
+        self.pick("상태", "state")
+    }
+    pub fn d_source(self) -> &'static str {
+        self.pick("출처", "from")
+    }
+    pub fn d_runs(self) -> &'static str {
+        self.pick("실행", "runs")
+    }
+    pub fn d_env(self) -> &'static str {
+        self.pick("환경변수", "env")
+    }
+    pub fn d_tools(self) -> &'static str {
+        self.pick("도구", "tools")
+    }
+    pub fn d_agent(self) -> &'static str {
+        self.pick("에이전트가 부르는 이름", "called as")
+    }
+    pub fn d_path(self) -> &'static str {
+        self.pick("자리", "path")
+    }
+    pub fn d_adds(self) -> &'static str {
+        self.pick("주는 것", "adds")
+    }
+    pub fn d_about(self) -> &'static str {
+        self.pick("설명", "about")
+    }
+    pub fn d_version(self) -> &'static str {
+        self.pick("판", "version")
+    }
+    pub fn d_author(self) -> &'static str {
+        self.pick("만든이", "author")
+    }
+    pub fn d_home(self) -> &'static str {
+        self.pick("홈", "home")
+    }
+    pub fn d_repo(self) -> &'static str {
+        self.pick("저장소", "repo")
+    }
+    pub fn d_license(self) -> &'static str {
+        self.pick("라이선스", "license")
+    }
+    pub fn d_keywords(self) -> &'static str {
+        self.pick("낱말", "keywords")
+    }
+
+    pub fn on_off(self, on: bool) -> &'static str {
+        match (self, on) {
+            (Lang::Ko, true) => "켜짐",
+            (Lang::Ko, false) => "꺼짐",
+            (Lang::En, true) => "on",
+            (Lang::En, false) => "off",
+        }
+    }
+
+    /// Where a server written in one of our own files came from.
+    pub fn mcp_from_user(self) -> &'static str {
+        self.pick("이 앱의 설정", "this app's settings")
+    }
+    pub fn mcp_from_project(self) -> &'static str {
+        self.pick("이 저장소", "this repository")
+    }
+    pub fn mcp_from_plugin(self, name: &str) -> String {
+        match self {
+            Lang::Ko => format!("플러그인 `{name}`"),
+            Lang::En => format!("the plugin `{name}`"),
+        }
+    }
+    /// A server that is running, and what it brought.
+    pub fn mcp_row_running(self, n: usize) -> String {
+        match self {
+            Lang::Ko => format!("돌고 있습니다 ‒ 도구 {n}개"),
+            Lang::En => format!("running ‒ {n} tools"),
+        }
+    }
+    /// Nothing was switched off: it is written down here, so it starts itself.
+    pub fn mcp_row_always_on(self) -> &'static str {
+        self.pick("적혀 있어서 스스로 뜹니다", "written down, so it starts itself")
+    }
+
+    /// A plugin row's sentence about where it came from.
+    pub fn plugin_row_fetched(self) -> &'static str {
+        self.pick("받아 둔 것", "fetched")
+    }
+    pub fn plugin_row_project(self, on: bool) -> String {
+        match (self, on) {
+            (Lang::Ko, true) => "이 저장소 ‒ 켜짐".to_string(),
+            (Lang::Ko, false) => "이 저장소 ‒ 꺼짐 (승인 필요)".to_string(),
+            (Lang::En, true) => "this repository ‒ on".to_string(),
+            (Lang::En, false) => "this repository ‒ off (needs approval)".to_string(),
+        }
+    }
+    /// What a plugin contributes, as one line of counts.
+    pub fn plugin_adds_line(
+        self,
+        commands: usize,
+        skills: usize,
+        hooks: usize,
+        mcp: usize,
+    ) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if commands > 0 {
+            parts.push(match self {
+                Lang::Ko => format!("명령 {commands}개"),
+                Lang::En => format!("{commands} commands"),
+            });
+        }
+        if skills > 0 {
+            parts.push(match self {
+                Lang::Ko => format!("스킬 {skills}개"),
+                Lang::En => format!("{skills} skills"),
+            });
+        }
+        if mcp > 0 {
+            parts.push(match self {
+                Lang::Ko => format!("MCP {mcp}개"),
+                Lang::En => format!("{mcp} MCP servers"),
+            });
+        }
+        if hooks > 0 {
+            parts.push(match self {
+                Lang::Ko => format!("훅 {hooks}개"),
+                Lang::En => format!("{hooks} hooks"),
+            });
+        }
+        if parts.is_empty() {
+            return self.pick("얹는 것이 없습니다", "adds nothing").to_string();
+        }
+        parts.join(" ‒ ")
     }
 
     // ── Skills panel
@@ -2710,6 +2922,7 @@ mod tests {
                 agents: None,
                 commands: Vec::new(),
                 hooks: Vec::new(),
+                about: crate::plugin::About::default(),
                 root: "/tmp".into(),
             }),
             en.plugin_added(
@@ -2721,6 +2934,7 @@ mod tests {
                     agents: None,
                     commands: Vec::new(),
                     hooks: Vec::new(),
+                    about: crate::plugin::About::default(),
                     root: "/tmp".into(),
                 },
                 "contents",

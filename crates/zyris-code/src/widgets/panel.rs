@@ -19,17 +19,22 @@ pub fn draw(frame: &mut Frame, area: Rect, panel: &mut Panel, lang: crate::lang:
     let has_button = panel.button.is_some();
     // **A panel answers to different keys depending on what it is, so it says which.** Settled
     // here, before the width, because the hint is a line the box must be wide enough for.
-    let keys = match (
-        panel.form.map(|f| f.lang),
-        panel.mode_pick.is_some(),
-        has_button,
-        panel.button_focused,
-    ) {
-        (Some(draft), _, _, _) => draft.form_keys(),
-        (None, true, _, _) => lang.mode_pick_keys().to_string(),
-        (None, false, true, true) => lang.panel_keys_button_focused(),
-        (None, false, true, false) => lang.panel_keys_button(),
-        (None, false, false, _) => lang.panel_keys(),
+    // **A manager says what its own keys are.** They are not scroll-and-close — `d` takes
+    // something away — and the hint is the only place that says so.
+    let keys = match panel.manager.as_ref() {
+        Some(manager) => lang.manager_keys(manager.kind),
+        None => match (
+            panel.form.map(|f| f.lang),
+            panel.mode_pick.is_some(),
+            has_button,
+            panel.button_focused,
+        ) {
+            (Some(draft), _, _, _) => draft.form_keys(),
+            (None, true, _, _) => lang.mode_pick_keys().to_string(),
+            (None, false, true, true) => lang.panel_keys_button_focused(),
+            (None, false, true, false) => lang.panel_keys_button(),
+            (None, false, false, _) => lang.panel_keys(),
+        },
     };
     // **The foot is measured too, and it is the foot that decides.** `Panel::foot` holds every
     // sentence the panel can show, so the box is one size whichever row the cursor is on.
