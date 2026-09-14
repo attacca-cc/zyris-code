@@ -105,12 +105,11 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut State) {
     // The question being answered in the panel below is not drawn again inside the conversation.
     let skip = state.asking.as_ref().map(|(seq, _)| *seq);
 
-    // **Driven by the clock, not by the frame counter.** `State.tick` counts timer fires, and a
-    // fire is not a draw: the streaming gate drops some, a keystroke and the healing repaint draw
-    // extra ones at the same tick, and a stalled loop fires several back to back. Multiplying that
-    // count by the nominal frame length is fictional time, and the eye reads the difference as the
-    // breath speeding up and stalling. Where the breath actually is depends on nothing but how
-    // long the turn has been going.
+    // **Driven by the clock, not by a frame count.** A timer fire is not a draw: the streaming
+    // gate drops some, a keystroke and the healing repaint draw extra frames between two of them,
+    // and a stalled loop fires several back to back. Stepping an animation by that count is
+    // fictional time, and the eye reads the difference as the breath speeding up and stalling.
+    // Where the breath actually is depends on nothing but how long the turn has been going.
     let breath = if state.running { breath_at(state.breath_ms()) } else { 0.0 };
 
     // **What the viewport was looking at, taken before the relayout.** `Scroll.top` is an

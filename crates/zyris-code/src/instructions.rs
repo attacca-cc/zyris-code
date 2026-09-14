@@ -8,16 +8,16 @@
 //! `/home/ruma/zyris-code/CLAUDE.md` (this repo's conventions) both apply to this directory.
 //! Outer ones go first and inner ones last, so **the more specific one comes later**.
 //!
-//! **If both are in one directory, `CLAUDE.md` wins.** Usually the same thing is written twice,
-//! so loading both would just double the context.
+//! **If both are in one directory, both apply.** `AGENTS.md` is loaded first and `CLAUDE.md`
+//! second. Only normalized-identical bodies are deduplicated.
 //!
 //! It goes out as the session preamble, so **it's fixed when the session is created and can't change later**
 //! (attacca's `ZNewSession`). After editing the files, you must open a new session for it to take effect.
 
 use std::path::{Path, PathBuf};
 
-/// Names looked for in one directory. The earlier one wins.
-const NAMES: [&str; 2] = ["CLAUDE.md", "AGENTS.md"];
+/// Names looked for in one directory, in application order.
+const NAMES: [&str; 2] = ["AGENTS.md", "CLAUDE.md"];
 /// Load at most this much in total. If over, **drop from the outside first** — the nearer one is more specific.
 const TOTAL_LIMIT: usize = 32 * 1024;
 /// Maximum length taken from one file.
@@ -33,21 +33,31 @@ pub struct Found {
 /// Walks upward from the working directory collecting instructions. **Outer ones first, inner ones last.**
 pub fn collect(cwd: &Path) -> Vec<Found> {
     let mut found = Vec::new();
-    // Walk from inside out, then reverse — `ancestors` yields the opposite order.
-    for dir in cwd.ancestors() {
+    let dirs: Vec<&Path> = cwd.ancestors().collect();
+    for dir in dirs.into_iter().rev() {
         for name in NAMES {
             let at = dir.join(name);
             let Ok(text) = std::fs::read_to_string(&at) else { continue };
             if !text.trim().is_empty() {
-                found.push(Found { path: at, text: clip(text, ONE_LIMIT) });
+                found.push(Found { path: at, text });
             }
-            // Don't look at `AGENTS.md` in the same directory — it usually says the same thing.
-            break;
         }
     }
+
+    // Keep the nearest/later source when an identical rule body appears more than once.
+    let mut seen = std::collections::HashSet::new();
     found.reverse();
+    found.retain(|item| seen.insert(normalized(&item.text)));
+    found.reverse();
+    for item in &mut found {
+        item.text = clip(std::mem::take(&mut item.text), ONE_LIMIT);
+    }
     trim_to_budget(&mut found);
     found
+}
+
+fn normalized(text: &str) -> String {
+    text.replace("\r\n", "\n").trim().to_string()
 }
 
 /// The text to load when creating a session. `None` if there is nothing.
@@ -59,7 +69,9 @@ pub fn preamble(cwd: &Path) -> Option<String> {
     let mut out = String::from(
         "이 작업 디렉터리에는 아래 지침이 있습니다. **코드보다 이것이 우선입니다** ‒ \
          저장소마다 다른 규약과, 코드를 읽어서는 알 수 없는 제약이 여기 적혀 있습니다. \
-         뒤에 오는 것일수록 이 디렉터리에 가깝고, 겹치면 가까운 쪽을 따르세요.\n",
+         같은 디렉터리에서는 AGENTS.md 다음 CLAUDE.md 순서이고, 뒤에 오는 것일수록 \
+         이 디렉터리에 가깝습니다. 충돌하면 더 엄격한 안전 규칙을 따르고, 어느 쪽이 \
+         더 엄격한지 불분명하면 사용자에게 물으세요.\n",
     );
     for f in found {
         out.push_str(&format!("\n--- {} ---\n{}\n", f.path.display(), f.text.trim_end()));
@@ -85,12 +97,13 @@ fn clip(text: String, limit: usize) -> String {
     if text.len() <= limit {
         return text;
     }
-    let mut cut = limit;
+    const NOTICE: &str = "\n\n… (길어서 여기까지만 실었습니다)";
+    let mut cut = limit.saturating_sub(NOTICE.len());
     while cut > 0 && !text.is_char_boundary(cut) {
         cut -= 1;
     }
     // Say that it was clipped. Otherwise rules in the tail would be read as "absent".
-    format!("{}\n\n… (길어서 여기까지만 실었습니다)", &text[..cut])
+    format!("{}{NOTICE}", &text[..cut])
 }
 
 #[cfg(test)]
@@ -121,16 +134,28 @@ mod tests {
         assert!(found[0].text.contains("여기 규약"));
     }
 
-    /// **If both are in one directory, `CLAUDE.md` wins.** Usually the same thing is written twice,
-    /// so loading both would just double the context.
     #[test]
-    fn claude_md_wins_over_agents_md_in_the_same_directory() {
+    fn both_instruction_files_are_loaded() {
         let d = tempfile::tempdir().unwrap();
-        write(d.path(), "CLAUDE.md", "이것을 읽어라");
-        write(d.path(), "AGENTS.md", "이것은 말고");
+        write(d.path(), "CLAUDE.md", "Claude-specific rule");
+        write(d.path(), "AGENTS.md", "Agent-wide rule");
+        let found = collect(d.path());
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(found[0].path.ends_with("AGENTS.md"), "{found:?}");
+        assert!(found[1].path.ends_with("CLAUDE.md"), "{found:?}");
+        assert!(found[0].text.contains("Agent-wide rule"));
+        assert!(found[1].text.contains("Claude-specific rule"));
+    }
+
+    #[test]
+    fn normalized_identical_bodies_are_loaded_once() {
+        let d = tempfile::tempdir().unwrap();
+        write(d.path(), "AGENTS.md", "same rules\r\n");
+        write(d.path(), "CLAUDE.md", "  same rules\n");
+
         let found = collect(d.path());
         assert_eq!(found.len(), 1, "{found:?}");
-        assert!(found[0].text.contains("이것을 읽어라"));
+        assert!(found[0].path.ends_with("CLAUDE.md"), "the later source should be retained");
     }
 
     /// **Walks upward.** This machine actually looks like that —
@@ -147,6 +172,31 @@ mod tests {
         // **The more specific one comes last.** The preamble says to follow the later one on conflict.
         assert!(found[0].text.contains("작업 홈"), "{found:?}");
         assert!(found[1].text.contains("이 리포"), "{found:?}");
+    }
+
+    #[test]
+    fn budget_trimming_keeps_both_nearby_instruction_files() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        write(root.path(), "CLAUDE.md", &"outer".repeat(2_000));
+        write(&repo, "AGENTS.md", &"agents".repeat(2_000));
+        write(&repo, "CLAUDE.md", &"claude".repeat(2_000));
+
+        let found = collect(&repo);
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(found[0].path.ends_with("AGENTS.md"), "{found:?}");
+        assert!(found[1].path.ends_with("CLAUDE.md"), "{found:?}");
+    }
+
+    #[test]
+    fn two_maximum_sized_peers_fit_the_total_budget() {
+        let d = tempfile::tempdir().unwrap();
+        write(d.path(), "AGENTS.md", &"a".repeat(ONE_LIMIT + 100));
+        write(d.path(), "CLAUDE.md", &"c".repeat(ONE_LIMIT + 100));
+
+        let found = collect(d.path());
+        assert_eq!(found.len(), 2, "one same-directory source was dropped: {found:?}");
+        assert!(found.iter().map(|item| item.text.len()).sum::<usize>() <= TOTAL_LIMIT);
     }
 
     /// An empty file only takes up space.
@@ -167,10 +217,13 @@ mod tests {
     #[test]
     fn the_preamble_says_where_each_part_came_from() {
         let d = tempfile::tempdir().unwrap();
-        write(d.path(), "CLAUDE.md", "규약");
+        write(d.path(), "AGENTS.md", "공통 규약");
+        write(d.path(), "CLAUDE.md", "추가 규약");
         let p = preamble(d.path()).unwrap();
+        assert!(p.contains("AGENTS.md"), "{p}");
         assert!(p.contains("CLAUDE.md"), "{p}");
-        assert!(p.contains("규약"), "{p}");
+        assert!(p.contains("더 엄격한 안전 규칙"), "{p}");
+        assert!(p.contains("사용자에게 물으세요"), "{p}");
     }
 
     /// **If it was clipped, say so.** Otherwise the rules in the tail get read as "absent".
@@ -179,7 +232,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         write(d.path(), "CLAUDE.md", &"가".repeat(ONE_LIMIT));
         let found = collect(d.path());
-        assert!(found[0].text.len() <= ONE_LIMIT + 64, "{} bytes", found[0].text.len());
+        assert!(found[0].text.len() <= ONE_LIMIT, "{} bytes", found[0].text.len());
         assert!(found[0].text.contains("여기까지만"), "it doesn't say it was clipped");
     }
 

@@ -194,13 +194,17 @@ impl Waits {
         Waits { jobs, api, bridge }
     }
 
-    /// Put a started job on the screen, and clear it once it ends.
+    /// Watches a started job to its end and tells the screen when it gets there.
     ///
     /// Only the reaping task in `Jobs` knows when it ends, so we wait on that signal here.
     /// **To keep one single way to the screen** we did not plant a callback in `jobs.rs`.
-    fn tell_the_screen(&self, id: &str, label: &str) {
-        self.bridge
-            .frame(crate::app::Frame::JobStart { id: id.to_string(), label: label.to_string() });
+    ///
+    /// **Its start is not said from here.** The id exists only once `start` has returned it, and
+    /// the conversation that asked for it — the thing the screen needs to attribute the job to
+    /// the right thread — is known to the guard and not to this file. So `guard.rs` frames
+    /// `JobStart` off the answer (`tell_the_screen_a_job_started`), and this keeps the half that
+    /// is about a process ending.
+    fn watch_to_the_end(&self, id: &str) {
         let (Some(mut ended), bridge, jobs, id) =
             (self.jobs.ended(id), self.bridge.clone(), self.jobs.clone(), id.to_string())
         else {
@@ -261,7 +265,7 @@ impl Wait for Waits {
         };
         let id = self.jobs.start(spec).map_err(WireError::invalid_params)?;
         let snap = self.known(&id)?;
-        self.tell_the_screen(&id, &snap.label);
+        self.watch_to_the_end(&id);
         Ok(Started {
             id: id.clone(),
             label: snap.label,

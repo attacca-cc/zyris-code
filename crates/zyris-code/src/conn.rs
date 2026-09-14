@@ -952,7 +952,6 @@ pub fn frame_from(f: ZTurnFrame) -> Frame {
             entry: entry_from(&event),
             todo: crate::todos::change_from(&event),
             plan: crate::plan::submitted_from(&event).map(Box::new),
-            report: crate::report::of(&event).map(Box::new),
         },
         ZTurnFrame::Delta { kind, text } => Frame::Delta { kind, text },
         ZTurnFrame::Status { running } => Frame::Status { running },
@@ -984,12 +983,19 @@ pub async fn create_project(
     Ok((p.id, p.name))
 }
 
-/// The project list in the shape the picker uses.
-pub async fn projects(api: &AttaccaApiClient) -> Result<Vec<(String, String, bool)>> {
+/// The project list in the shape the picker uses: `(id, name, description, is_default)`.
+///
+/// **The description rides along instead of being dropped.** It is the only thing that says what a
+/// project is for, and the picker has exactly one place to say it — the note area under the list
+/// (`Row::note`, drawn by `widgets::picker::detail_of`). A description that stopped here left the
+/// project list showing bare names.
+pub async fn projects(
+    api: &AttaccaApiClient,
+) -> Result<Vec<(String, String, Option<String>, bool)>> {
     let items = within(api, api.list_projects())
         .await
         .map_err(|e| anyhow!(crate::lang::current().project_list_error(&e.to_string())))?;
-    Ok(items.into_iter().map(|p| (p.id, p.name, p.is_default)).collect())
+    Ok(items.into_iter().map(|p| (p.id, p.name, p.description, p.is_default)).collect())
 }
 
 /// A project's session list. A session without a title is pre-first-message, so it's labeled as such.

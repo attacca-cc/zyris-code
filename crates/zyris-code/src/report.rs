@@ -1,12 +1,10 @@
 //! The `report_result` call, in a form a person can read.
 //!
-//! **A job's result is the one thing the window cannot infer.** Everything else about a long run —
-//! what it touched, what failed, how long it took — is a row in the conversation, and the rows
-//! scroll away. The report is the sentence the agent wrote to say what came of it, and until now
-//! it only ever appeared as one line on the status bar for a few seconds.
-//!
-//! So it becomes a card, in the same place the question card goes: the turn is over and this is
-//! what is left to say. `Esc` or `Enter` puts it away.
+//! **A run's result is the one thing the window cannot infer.** Everything else about a long run —
+//! what it touched, what failed, how long it took — is a row in the conversation. The report is the
+//! sentence the agent wrote to say what came of it, and it is read as a row of its own: `event.rs`
+//! turns it into `EntryKind::Report` and the timeline gives it an `Item::Report`, so it stands where
+//! it happened and can be scrolled back to later.
 //!
 //! This module is pure — it only reads a session event.
 

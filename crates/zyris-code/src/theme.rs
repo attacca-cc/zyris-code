@@ -88,13 +88,147 @@ pub fn detect() -> Theme {
     }
 }
 
-/// Picks between the two palettes. Every role below is one line because of it.
-fn pick(dark: (u8, u8, u8), light: (u8, u8, u8)) -> Color {
-    let (r, g, b) = match current() {
-        Theme::Dark => dark,
-        Theme::Light => light,
+/// An explicit, read-only palette. Tests can inspect either theme without changing process state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Palette {
+    theme: Theme,
+}
+
+/// Selects a palette without changing the theme used by production rendering.
+pub fn palette(choice: crate::config::ThemeChoice) -> Palette {
+    Palette { theme: choice.resolve() }
+}
+
+fn selected() -> Palette {
+    let choice = match current() {
+        Theme::Dark => crate::config::ThemeChoice::Dark,
+        Theme::Light => crate::config::ThemeChoice::Light,
     };
-    Color::Rgb(r, g, b)
+    palette(choice)
+}
+
+impl Palette {
+    fn pick(self, dark: (u8, u8, u8), light: (u8, u8, u8)) -> Color {
+        let (r, g, b) = match self.theme {
+            Theme::Dark => dark,
+            Theme::Light => light,
+        };
+        Color::Rgb(r, g, b)
+    }
+
+    pub fn bg(self) -> Color {
+        self.pick((0x0f, 0x0d, 0x0a), (0xfa, 0xf7, 0xf2))
+    }
+
+    pub fn user_bg(self) -> Color {
+        self.pick((0x2a, 0x20, 0x1a), (0xf0, 0xe6, 0xd8))
+    }
+
+    pub fn selection_bg(self) -> Color {
+        self.pick((0x3f, 0x2e, 0x22), (0xef, 0xdc, 0xca))
+    }
+
+    pub fn border(self) -> Color {
+        self.pick((0x3a, 0x30, 0x29), (0xd6, 0xcc, 0xc0))
+    }
+
+    pub fn border_light(self) -> Color {
+        self.pick((0x4a, 0x3e, 0x36), (0xb3, 0xa6, 0x97))
+    }
+
+    pub fn fade(self, colour: Color, amount: f64) -> Color {
+        let amount = amount.clamp(0.0, 1.0);
+        let (Color::Rgb(r, g, b), Color::Rgb(br, bg, bb)) = (colour, self.bg()) else {
+            return colour;
+        };
+        let mix =
+            |from: u8, to: u8| (from as f64 + (to as f64 - from as f64) * amount).round() as u8;
+        Color::Rgb(mix(r, br), mix(g, bg), mix(b, bb))
+    }
+
+    pub fn text(self) -> Color {
+        self.pick((0xe8, 0xe2, 0xdc), (0x2b, 0x26, 0x22))
+    }
+
+    pub fn text_muted(self) -> Color {
+        self.pick((0x9c, 0x94, 0x8d), (0x6b, 0x62, 0x59))
+    }
+
+    pub fn text_heading(self) -> Color {
+        self.pick((0xf1, 0xed, 0xe8), (0x1a, 0x16, 0x13))
+    }
+
+    pub fn accent(self) -> Color {
+        self.pick((0xc9, 0x73, 0x4d), (0xa8, 0x50, 0x1f))
+    }
+
+    pub fn accent_hover(self) -> Color {
+        self.pick((0xb5, 0x62, 0x3e), (0x8f, 0x43, 0x19))
+    }
+
+    pub fn success(self) -> Color {
+        self.pick((0x8f, 0xae, 0x5c), (0x4a, 0x7a, 0x1f))
+    }
+
+    pub fn warning(self) -> Color {
+        self.pick((0xd9, 0xa4, 0x41), (0x8a, 0x5d, 0x00))
+    }
+
+    pub fn danger(self) -> Color {
+        self.pick((0xc1, 0x50, 0x3f), (0xa3, 0x27, 0x1a))
+    }
+
+    pub fn notice(self) -> Color {
+        self.pick((0x9c, 0x94, 0x8d), (0x6b, 0x62, 0x59))
+    }
+
+    pub fn ahead(self) -> Color {
+        self.pick((0x6f, 0xb0, 0x7a), (0x2f, 0x6f, 0x3f))
+    }
+
+    pub fn behind(self) -> Color {
+        self.pick((0x6f, 0x9c, 0xc4), (0x2a, 0x5c, 0x86))
+    }
+
+    pub fn untracked(self) -> Color {
+        self.pick((0x8c, 0x8f, 0xa6), (0x5c, 0x60, 0x7a))
+    }
+
+    pub fn mode_plan(self) -> Color {
+        self.pick((0xb4, 0x8e, 0xad), (0x6b, 0x4d, 0x9e))
+    }
+
+    pub fn tool(self) -> Color {
+        self.pick((0x7f, 0xb0, 0xd4), (0x1f, 0x5f, 0x8b))
+    }
+
+    pub fn tool_arg(self) -> Color {
+        self.pick((0x6b, 0x8a, 0xa0), (0x3d, 0x6b, 0x82))
+    }
+
+    pub fn topic(self) -> Color {
+        self.pick((0xe0, 0xc2, 0x8e), (0x8a, 0x6a, 0x2e))
+    }
+
+    pub fn link(self) -> Color {
+        self.pick((0x56, 0xb6, 0xc2), (0x0f, 0x6b, 0x62))
+    }
+
+    pub fn in_progress(self) -> Color {
+        self.pick((0x6f, 0x9c, 0xe0), (0x1f, 0x5c, 0xa8))
+    }
+
+    pub fn merged(self) -> Color {
+        self.pick((0xa3, 0x71, 0xf7), (0x82, 0x50, 0xdf))
+    }
+
+    pub fn diff_add(self) -> Color {
+        self.pick((0x7e, 0xc0, 0x50), (0x2f, 0x7a, 0x1f))
+    }
+
+    pub fn diff_del(self) -> Color {
+        self.pick((0xe0, 0x6c, 0x75), (0xa3, 0x2a, 0x2a))
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -103,7 +237,7 @@ fn pick(dark: (u8, u8, u8), light: (u8, u8, u8)) -> Color {
 
 /// `--zyris-bg` of the Zyris web palette. **Not painted by default** — see `page_bg`.
 pub fn bg() -> Color {
-    pick((0x0f, 0x0d, 0x0a), (0xfa, 0xf7, 0xf2))
+    selected().bg()
 }
 
 /// The background laid over the whole screen. **Default is none — the terminal uses its own.**
@@ -156,7 +290,7 @@ fn hex(text: &str) -> Option<Color> {
 /// stain, and painting everything makes nothing distinguishable. This one band is the "this is
 /// where I spoke" signal.
 pub fn user_bg() -> Color {
-    pick((0x2a, 0x20, 0x1a), (0xf0, 0xe6, 0xd8))
+    selected().user_bg()
 }
 
 /// The wash painted over the cells a mouse drag has selected.
@@ -168,7 +302,7 @@ pub fn user_bg() -> Color {
 /// theme's own ground so the words underneath remain readable: this is "these letters are
 /// chosen", not a box around them.
 pub fn selection_bg() -> Color {
-    pick((0x3f, 0x2e, 0x22), (0xef, 0xdc, 0xca))
+    selected().selection_bg()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -177,12 +311,12 @@ pub fn selection_bg() -> Color {
 
 /// The line dividing areas.
 pub fn border() -> Color {
-    pick((0x3a, 0x30, 0x29), (0xd6, 0xcc, 0xc0))
+    selected().border()
 }
 
 /// Divider glyphs, disabled rows, placeholders, an unlit blink.
 pub fn border_light() -> Color {
-    pick((0x4a, 0x3e, 0x36), (0xb3, 0xa6, 0x97))
+    selected().border_light()
 }
 
 /// A colour mixed `amount` of the way toward the background, where 0 is the colour untouched and 1
@@ -199,12 +333,7 @@ pub fn border_light() -> Color {
 /// Anything that is not true colour is returned untouched: there is nothing to interpolate between
 /// on a sixteen-colour terminal, and a guess would be worse than leaving it alone.
 pub fn fade(colour: Color, amount: f64) -> Color {
-    let amount = amount.clamp(0.0, 1.0);
-    let (Color::Rgb(r, g, b), Color::Rgb(br, bg_, bb)) = (colour, bg()) else {
-        return colour;
-    };
-    let mix = |from: u8, to: u8| (from as f64 + (to as f64 - from as f64) * amount).round() as u8;
-    Color::Rgb(mix(r, br), mix(g, bg_), mix(b, bb))
+    selected().fade(colour, amount)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -212,15 +341,15 @@ pub fn fade(colour: Color, amount: f64) -> Color {
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub fn text() -> Color {
-    pick((0xe8, 0xe2, 0xdc), (0x2b, 0x26, 0x22))
+    selected().text()
 }
 
 pub fn text_muted() -> Color {
-    pick((0x9c, 0x94, 0x8d), (0x6b, 0x62, 0x59))
+    selected().text_muted()
 }
 
 pub fn text_heading() -> Color {
-    pick((0xf1, 0xed, 0xe8), (0x1a, 0x16, 0x13))
+    selected().text_heading()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -229,12 +358,12 @@ pub fn text_heading() -> Color {
 
 /// The brand colour: box borders, cursors, the input prompt, the user's own bar.
 pub fn accent() -> Color {
-    pick((0xc9, 0x73, 0x4d), (0xa8, 0x50, 0x1f))
+    selected().accent()
 }
 
 /// The accent one step down. Used where an accent sits behind something else.
 pub fn accent_hover() -> Color {
-    pick((0xb5, 0x62, 0x3e), (0x8f, 0x43, 0x19))
+    selected().accent_hover()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -242,17 +371,17 @@ pub fn accent_hover() -> Color {
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub fn success() -> Color {
-    pick((0x8f, 0xae, 0x5c), (0x4a, 0x7a, 0x1f))
+    selected().success()
 }
 
 /// Something worth noticing that is **not** wrong: unsent messages, a dirty repo, a lapsed code.
 pub fn warning() -> Color {
-    pick((0xd9, 0xa4, 0x41), (0x8a, 0x5d, 0x00))
+    selected().warning()
 }
 
 /// Something is wrong: a failed tool, an error entry, a conflict, a refusal.
 pub fn danger() -> Color {
-    pick((0xc1, 0x50, 0x3f), (0xa3, 0x27, 0x1a))
+    selected().danger()
 }
 
 /// A passing remark on the activity line — connected, another window is open, a command answered.
@@ -261,7 +390,7 @@ pub fn danger() -> Color {
 /// colour for both, an error looked exactly like "connected", and the one line whose whole job is
 /// to say what is happening could not say that something had gone wrong.
 pub fn notice() -> Color {
-    pick((0x9c, 0x94, 0x8d), (0x6b, 0x62, 0x59))
+    selected().notice()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -275,13 +404,13 @@ pub fn notice() -> Color {
 /// arrow rather than see it. They stay away from `warning()`, which is reserved here for what is
 /// not committed yet: pushing is a later, calmer errand than committing.
 pub fn ahead() -> Color {
-    pick((0x6f, 0xb0, 0x7a), (0x2f, 0x6f, 0x3f))
+    selected().ahead()
 }
 
 /// Commits the upstream has and this checkout does not — someone else's, waiting to be pulled.
 /// Blue against `ahead()`'s green, because the two are opposite directions and are read together.
 pub fn behind() -> Color {
-    pick((0x6f, 0x9c, 0xc4), (0x2a, 0x5c, 0x86))
+    selected().behind()
 }
 
 /// Files git does not track.
@@ -290,7 +419,7 @@ pub fn behind() -> Color {
 /// be lit permanently and stop being read. But quiet is not the same as invisible: it carries a
 /// tint so it does not read as the path beside it.
 pub fn untracked() -> Color {
-    pick((0x8c, 0x8f, 0xa6), (0x5c, 0x60, 0x7a))
+    selected().untracked()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -305,7 +434,7 @@ pub fn untracked() -> Color {
 /// have to be far apart, since the eye compares against the mode it just left:
 /// green → violet → blue → yellow.
 pub fn mode_plan() -> Color {
-    pick((0xb4, 0x8e, 0xad), (0x6b, 0x4d, 0x9e))
+    selected().mode_plan()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -317,18 +446,18 @@ pub fn mode_plan() -> Color {
 /// Inside an expanded card reasoning fills the screen; if tools were also `text_muted()`, the
 /// actual "what was done" would be buried. What the reader scans is the tool line.
 pub fn tool() -> Color {
-    pick((0x7f, 0xb0, 0xd4), (0x1f, 0x5f, 0x8b))
+    selected().tool()
 }
 
 /// The tool line's argument summary. One step below the name.
 pub fn tool_arg() -> Color {
-    pick((0x6b, 0x8a, 0xa0), (0x3d, 0x6b, 0x82))
+    selected().tool_arg()
 }
 
 /// A reasoning chip's title inside a work card. A warm tone, so it reads as a heading distinct
 /// from `tool()` (blue) and from muted reasoning — the eye scans chip titles to find a section.
 pub fn topic() -> Color {
-    pick((0xe0, 0xc2, 0x8e), (0x8a, 0x6a, 0x2e))
+    selected().topic()
 }
 
 /// A link's text. Underlined in the renderer; the underline plus a distinct colour is what says
@@ -337,7 +466,7 @@ pub fn topic() -> Color {
 /// **Not the same as `tool()`.** The two were byte-identical, so a link sitting beside a tool name
 /// — which happens on every tool line carrying a URL — was indistinguishable from it.
 pub fn link() -> Color {
-    pick((0x56, 0xb6, 0xc2), (0x0f, 0x6b, 0x62))
+    selected().link()
 }
 
 /// The added line in a diff. Green.
@@ -351,7 +480,7 @@ pub fn link() -> Color {
 /// made for one of them moves the other. Blue because the other two states of a task are already
 /// spoken for, and because it reads as "in hand" beside a green that reads as "done".
 pub fn in_progress() -> Color {
-    pick((0x6f, 0x9c, 0xe0), (0x1f, 0x5c, 0xa8))
+    selected().in_progress()
 }
 
 /// A pull request that has landed.
@@ -360,31 +489,27 @@ pub fn in_progress() -> Color {
 /// which is what an open pull request is; green and red are already spoken for by what CI said,
 /// and a merged pull request is neither of those — it is over.
 pub fn merged() -> Color {
-    pick((0xa3, 0x71, 0xf7), (0x82, 0x50, 0xdf))
+    selected().merged()
 }
 
 pub fn diff_add() -> Color {
-    pick((0x7e, 0xc0, 0x50), (0x2f, 0x7a, 0x1f))
+    selected().diff_add()
 }
 
 /// The removed line in a diff. Red.
 pub fn diff_del() -> Color {
-    pick((0xe0, 0x6c, 0x75), (0xa3, 0x2a, 0x2a))
+    selected().diff_del()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Serialises the theme so the tests below can restore it — they run in one process and the
-    /// palette is global.
-    fn with(theme: Theme, body: impl FnOnce()) {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let before = current();
-        set(theme);
-        body();
-        set(before);
+    fn palettes() -> [(Theme, Palette); 2] {
+        [
+            (Theme::Dark, palette(crate::config::ThemeChoice::Dark)),
+            (Theme::Light, palette(crate::config::ThemeChoice::Light)),
+        ]
     }
 
     /// **Fading is the terminal's opacity.** A cell has one foreground colour, so the only way to
@@ -392,18 +517,17 @@ mod tests {
     /// exactly the colour and exactly the background, or an animation would jump at its edges.
     #[test]
     fn fading_walks_a_colour_to_the_background_and_no_further() {
-        with(Theme::Dark, || {
-            let c = warning();
-            assert_eq!(fade(c, 0.0), c, "no fade must change nothing");
-            assert_eq!(fade(c, 1.0), bg(), "a full fade must land on the background");
-            assert_eq!(fade(c, -1.0), c);
-            assert_eq!(fade(c, 2.0), bg());
+        let palette = palette(crate::config::ThemeChoice::Dark);
+        let c = palette.warning();
+        assert_eq!(palette.fade(c, 0.0), c, "no fade must change nothing");
+        assert_eq!(palette.fade(c, 1.0), palette.bg(), "a full fade must land on the background");
+        assert_eq!(palette.fade(c, -1.0), c);
+        assert_eq!(palette.fade(c, 2.0), palette.bg());
 
-            let (mid, (a, b)) = (rgb(fade(c, 0.5)), (rgb(c), rgb(bg())));
-            for (m, (x, y)) in [(mid.0, (a.0, b.0)), (mid.1, (a.1, b.1)), (mid.2, (a.2, b.2))] {
-                assert!(m >= x.min(y) && m <= x.max(y), "half a fade left the range");
-            }
-        });
+        let (mid, (a, b)) = (rgb(palette.fade(c, 0.5)), (rgb(c), rgb(palette.bg())));
+        for (m, (x, y)) in [(mid.0, (a.0, b.0)), (mid.1, (a.1, b.1)), (mid.2, (a.2, b.2))] {
+            assert!(m >= x.min(y) && m <= x.max(y), "half a fade left the range");
+        }
     }
 
     /// **No two marks on the repository strip may share a colour.** Untracked, ahead and behind
@@ -415,25 +539,23 @@ mod tests {
     /// Both palettes, because a colour that only separates in the dark is not a distinction.
     #[test]
     fn no_two_marks_on_the_repository_strip_share_a_colour() {
-        for theme in [Theme::Dark, Theme::Light] {
-            with(theme, || {
-                let marks = [
-                    ("conflict", danger()),
-                    ("uncommitted", warning()),
-                    ("untracked", untracked()),
-                    ("ahead", ahead()),
-                    ("behind", behind()),
-                    ("the path itself", text_muted()),
-                    // A landed pull request sits on this row too, and it must not read as any of
-                    // the states above it — least of all as the green that means CI passed.
-                    ("merged", merged()),
-                ];
-                for (i, (an, a)) in marks.iter().enumerate() {
-                    for (bn, b) in marks.iter().skip(i + 1) {
-                        assert_ne!(a, b, "{an} and {bn} are one colour in {theme:?}");
-                    }
+        for (theme, palette) in palettes() {
+            let marks = [
+                ("conflict", palette.danger()),
+                ("uncommitted", palette.warning()),
+                ("untracked", palette.untracked()),
+                ("ahead", palette.ahead()),
+                ("behind", palette.behind()),
+                ("the path itself", palette.text_muted()),
+                // A landed pull request sits on this row too, and it must not read as any of
+                // the states above it — least of all as the green that means CI passed.
+                ("merged", palette.merged()),
+            ];
+            for (i, (an, a)) in marks.iter().enumerate() {
+                for (bn, b) in marks.iter().skip(i + 1) {
+                    assert_ne!(a, b, "{an} and {bn} are one colour in {theme:?}");
                 }
-            });
+            }
         }
     }
 
@@ -467,51 +589,45 @@ mod tests {
     /// value is kept as it is. Every other role clears 4.5 comfortably.
     #[test]
     fn text_colours_are_readable_on_their_own_background() {
-        for theme in [Theme::Dark, Theme::Light] {
-            with(theme, || {
-                let on = bg();
-                for (name, colour) in [
-                    ("text", text()),
-                    ("text_muted", text_muted()),
-                    ("text_heading", text_heading()),
-                    ("accent", accent()),
-                    ("success", success()),
-                    ("warning", warning()),
-                    ("danger", danger()),
-                    ("notice", notice()),
-                    ("mode_plan", mode_plan()),
-                    ("tool", tool()),
-                    ("tool_arg", tool_arg()),
-                    ("link", link()),
-                    ("diff_add", diff_add()),
-                    ("diff_del", diff_del()),
-                ] {
-                    let ratio = contrast(colour, on);
-                    assert!(ratio >= 4.0, "{theme:?} {name} is {ratio:.2}:1 — too close to read");
-                }
-            });
+        for (theme, palette) in palettes() {
+            let on = palette.bg();
+            for (name, colour) in [
+                ("text", palette.text()),
+                ("text_muted", palette.text_muted()),
+                ("text_heading", palette.text_heading()),
+                ("accent", palette.accent()),
+                ("success", palette.success()),
+                ("warning", palette.warning()),
+                ("danger", palette.danger()),
+                ("notice", palette.notice()),
+                ("mode_plan", palette.mode_plan()),
+                ("tool", palette.tool()),
+                ("tool_arg", palette.tool_arg()),
+                ("link", palette.link()),
+                ("diff_add", palette.diff_add()),
+                ("diff_del", palette.diff_del()),
+            ] {
+                let ratio = contrast(colour, on);
+                assert!(ratio >= 4.0, "{theme:?} {name} is {ratio:.2}:1 — too close to read");
+            }
         }
     }
 
     /// The user's own band is a background, so the text on it has to hold up too.
     #[test]
     fn text_is_readable_on_the_user_band() {
-        for theme in [Theme::Dark, Theme::Light] {
-            with(theme, || {
-                let ratio = contrast(text(), user_bg());
-                assert!(ratio >= 4.5, "{theme:?} text on the user band is {ratio:.2}:1");
-            });
+        for (theme, palette) in palettes() {
+            let ratio = contrast(palette.text(), palette.user_bg());
+            assert!(ratio >= 4.5, "{theme:?} text on the user band is {ratio:.2}:1");
         }
     }
 
     /// The selection wash is a background; the words it sits under must stay readable.
     #[test]
     fn text_is_readable_on_the_selection_band() {
-        for theme in [Theme::Dark, Theme::Light] {
-            with(theme, || {
-                let ratio = contrast(text(), selection_bg());
-                assert!(ratio >= 4.5, "{theme:?} text on the selection is {ratio:.2}:1");
-            });
+        for (theme, palette) in palettes() {
+            let ratio = contrast(palette.text(), palette.selection_bg());
+            assert!(ratio >= 4.5, "{theme:?} text on the selection is {ratio:.2}:1");
         }
     }
 
@@ -520,24 +636,22 @@ mod tests {
     /// and plan mode was `accent()`, the same paint as every border on screen.
     #[test]
     fn roles_that_mean_different_things_have_different_colours() {
-        for theme in [Theme::Dark, Theme::Light] {
-            with(theme, || {
-                let roles = [
-                    ("accent", accent()),
-                    ("mode_plan", mode_plan()),
-                    ("tool", tool()),
-                    ("link", link()),
-                    ("warning", warning()),
-                    ("notice", notice()),
-                    ("danger", danger()),
-                    ("success", success()),
-                ];
-                for (i, (an, a)) in roles.iter().enumerate() {
-                    for (bn, b) in &roles[i + 1..] {
-                        assert_ne!(a, b, "{theme:?}: {an} and {bn} are the same colour");
-                    }
+        for (theme, palette) in palettes() {
+            let roles = [
+                ("accent", palette.accent()),
+                ("mode_plan", palette.mode_plan()),
+                ("tool", palette.tool()),
+                ("link", palette.link()),
+                ("warning", palette.warning()),
+                ("notice", palette.notice()),
+                ("danger", palette.danger()),
+                ("success", palette.success()),
+            ];
+            for (i, (an, a)) in roles.iter().enumerate() {
+                for (bn, b) in &roles[i + 1..] {
+                    assert_ne!(a, b, "{theme:?}: {an} and {bn} are the same colour");
                 }
-            });
+            }
         }
     }
 
@@ -545,15 +659,14 @@ mod tests {
     /// different colours.
     #[test]
     fn the_dark_palette_matches_the_brand_values() {
-        with(Theme::Dark, || {
-            assert_eq!(bg(), Color::Rgb(0x0f, 0x0d, 0x0a));
-            assert_eq!(accent(), Color::Rgb(0xc9, 0x73, 0x4d));
-            assert_eq!(text(), Color::Rgb(0xe8, 0xe2, 0xdc));
-            assert_eq!(text_muted(), Color::Rgb(0x9c, 0x94, 0x8d));
-            assert_eq!(text_heading(), Color::Rgb(0xf1, 0xed, 0xe8));
-            assert_eq!(border(), Color::Rgb(0x3a, 0x30, 0x29));
-            assert_eq!(danger(), Color::Rgb(0xc1, 0x50, 0x3f));
-        });
+        let palette = palette(crate::config::ThemeChoice::Dark);
+        assert_eq!(palette.bg(), Color::Rgb(0x0f, 0x0d, 0x0a));
+        assert_eq!(palette.accent(), Color::Rgb(0xc9, 0x73, 0x4d));
+        assert_eq!(palette.text(), Color::Rgb(0xe8, 0xe2, 0xdc));
+        assert_eq!(palette.text_muted(), Color::Rgb(0x9c, 0x94, 0x8d));
+        assert_eq!(palette.text_heading(), Color::Rgb(0xf1, 0xed, 0xe8));
+        assert_eq!(palette.border(), Color::Rgb(0x3a, 0x30, 0x29));
+        assert_eq!(palette.danger(), Color::Rgb(0xc1, 0x50, 0x3f));
     }
 
     #[test]

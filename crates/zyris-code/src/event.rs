@@ -36,6 +36,18 @@ pub enum EntryKind {
         /// What to show when expanded, already hardened into a drawable shape.
         detail: crate::tool_view::Detail,
     },
+    /// What a run came to, in the agent's own words — the `report_result` call.
+    ///
+    /// **A report is read, not watched.** As a tool row it was one more call among the calls, and
+    /// the sentence it carries is the one thing the whole run was for. It becomes an item of its own
+    /// (`timeline::Item::Report`), which is also how it reaches the conversation when a thread is
+    /// reopened — it used to ride along on the frame beside the entry, and only as a popup card.
+    Report {
+        /// Whether the work came out.
+        ok: bool,
+        /// The agent's own sentence.
+        summary: String,
+    },
     /// What the agent asked. Picking an answer sends it back as an ordinary message.
     ///
     /// A question that already has an answer isn't shown again — `answered` is the marker for that.
@@ -109,6 +121,14 @@ pub fn entry_from(event: &ZSessionEvent) -> Option<Entry> {
                         kind: EntryKind::Question { steps, answered },
                     });
                 }
+            }
+            // **The agent's own summary of what it did is not a call to watch.** It is the sentence
+            // the run was for, and the timeline draws it as a row of its own.
+            if let Some(report) = crate::report::of(event) {
+                return Some(Entry {
+                    seq: event.seq,
+                    kind: EntryKind::Report { ok: report.ok, summary: report.summary },
+                });
             }
             let args = p.get("arguments");
             let result = p.get("result").filter(|v| !v.is_null());
@@ -456,6 +476,54 @@ mod tests {
             entry_from(&e).unwrap().kind,
             EntryKind::Tool { detail: crate::tool_view::Detail::Json { .. }, .. }
         ));
+    }
+
+    /// **A report becomes a row of its own, not a tool row.** As a call it read as one more thing
+    /// that ran, and the sentence it carries is what the whole run was for.
+    #[test]
+    fn a_report_result_call_becomes_a_report_entry() {
+        let e = ev(
+            4,
+            "tool_call",
+            json!({
+                "kind": "tool_call", "name": "report_result",
+                "arguments": {"status": "success", "summary": "빌드가 통과했습니다."},
+                "result": "ok", "error": null
+            }),
+        );
+        assert_eq!(
+            entry_from(&e).unwrap().kind,
+            EntryKind::Report { ok: true, summary: "빌드가 통과했습니다.".into() }
+        );
+        // A node's tools arrive prefixed; the report is recognised by the tail either way.
+        let prefixed = ev(
+            5,
+            "tool_call",
+            json!({
+                "kind": "tool_call", "name": wire("report_result"),
+                "arguments": {"status": "failure", "summary": "테스트가 깨졌습니다."},
+                "result": null, "error": null
+            }),
+        );
+        assert_eq!(
+            entry_from(&prefixed).unwrap().kind,
+            EntryKind::Report { ok: false, summary: "테스트가 깨졌습니다.".into() }
+        );
+    }
+
+    /// A `report_result` with no words is not a report — it falls back to an ordinary tool row
+    /// rather than putting an empty line in the conversation.
+    #[test]
+    fn a_report_with_nothing_in_it_stays_a_tool_row() {
+        let e = ev(
+            6,
+            "tool_call",
+            json!({
+                "kind": "tool_call", "name": "report_result",
+                "arguments": {"status": "success"}, "result": null, "error": null
+            }),
+        );
+        assert!(matches!(entry_from(&e).unwrap().kind, EntryKind::Tool { .. }));
     }
 
     /// An unknown kind must not kill the app. It must survive even when attacca adds new events.

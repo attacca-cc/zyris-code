@@ -371,19 +371,34 @@ impl Answering {
         out.join("\n\n")
     }
 
-    /// Whether this message is an answer this app wrote, rather than something a person typed.
+    /// Whether this message is an answer this app wrote, rather than something a person typed —
+    /// and what was picked, boiled down to one line.
     ///
-    /// **The shape is the signature.** `answer_text` writes one question line and then `  - `
-    /// bullets under it; a person writing a list bullets every line, and one writing a paragraph
-    /// indents nothing. The history that comes back from the server is this same text — the event
-    /// says `chat_user` either way — so shape is all there is to go on.
+    /// **The shape is the signature.** `answer_text` writes one question line and then the answer
+    /// under it, indented two columns (a line per pick beside a `- ` when there are several). A
+    /// person writing a message indents nothing, so nothing of theirs comes back as an answer. The
+    /// history that comes back from the server is this same text — the event says `chat_user`
+    /// either way — so shape is all there is to go on.
     ///
-    /// A message that happens to be a line followed by an indented list reads as an answer. That
-    /// is a wrong guess about a rare message, and it costs nothing but the layout.
-    pub fn looks_like_an_answer(text: &str) -> bool {
-        let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
-        let Some(first) = lines.first() else { return false };
-        !first.trim_start().starts_with('-') && lines[1..].iter().any(|l| l.starts_with("  - "))
+    /// `None` when no indented line was found: with nothing to show there is nothing to lay under
+    /// the question, and the message has to stand on its own.
+    ///
+    /// **The question lines are left behind.** The card the answer is laid under already says what
+    /// was asked, and repeating it was most of what made an answer read as a wall of text.
+    pub fn answer_picks(text: &str) -> Option<String> {
+        let mut picks: Vec<String> = Vec::new();
+        for line in text.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.is_empty() || trimmed.len() == line.len() {
+                // An unindented line is the question this answer was to. Nothing else is.
+                continue;
+            }
+            let pick = trimmed.strip_prefix("- ").unwrap_or(trimmed).trim();
+            if !pick.is_empty() {
+                picks.push(pick.to_string());
+            }
+        }
+        (!picks.is_empty()).then(|| picks.join(", "))
     }
 
     /// Answers the user **typed directly**. Pulled out separately to be shown differently in the history.
@@ -606,6 +621,46 @@ mod tests {
         assert!(text.contains("A안 (빠르다)"), "the description must be carried too:\n{text}");
         assert!(text.contains("- 로그"), "several of them must be split across lines:\n{text}");
         assert!(text.contains("- 지표"), "{text}");
+    }
+
+    /// **The picks come back as one line.** The answer is laid under the question it answered, so
+    /// what is wanted out of the text is what was picked — not the question, which the card already
+    /// says.
+    #[test]
+    fn the_picks_of_a_written_answer_come_back_as_one_line() {
+        let mut a = Answering::new(parse(&args()).unwrap());
+        a.toggle(); // A안 (빠르다)
+        a.confirm();
+        a.toggle(); // 로그
+        a.down();
+        a.toggle(); // 지표
+        assert!(a.confirm(), "confirming the last step ends it");
+        let text = a.answer_text(crate::lang::Lang::Ko);
+        assert_eq!(Answering::answer_picks(&text).as_deref(), Some("A안 (빠르다), 로그, 지표"));
+    }
+
+    /// **A typed-in answer keeps its mark.** That it was not among the options is information, and
+    /// the one line under the question is the only place it survives.
+    #[test]
+    fn a_typed_in_answer_is_marked_in_the_picks() {
+        let mut a = Answering::new(parse(&json!({"questions": [{"question": "왜죠?"}]})).unwrap());
+        a.toggle();
+        for c in "그냥요".chars() {
+            a.input.insert(c);
+        }
+        a.confirm();
+        let text = a.answer_text(crate::lang::Lang::Ko);
+        assert_eq!(Answering::answer_picks(&text).as_deref(), Some("직접 입력: 그냥요"));
+    }
+
+    /// **Nothing a person wrote is taken for an answer.** Their message indents nothing, so there
+    /// is no line to lay under a question — and it stays the message it is.
+    #[test]
+    fn a_message_of_ones_own_is_not_read_as_an_answer() {
+        assert!(Answering::answer_picks("이건 그냥 물어보는 말입니다").is_none());
+        assert!(Answering::answer_picks("").is_none());
+        // What the app sends when every step was skipped is not an answer either.
+        assert!(Answering::answer_picks(crate::lang::Lang::Ko.all_skipped()).is_none());
     }
 
     #[test]

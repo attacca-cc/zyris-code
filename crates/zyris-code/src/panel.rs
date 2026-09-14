@@ -449,7 +449,14 @@ pub fn mcp(
     Panel::new(lang.title_mcp().into(), lines)
 }
 
-/// The `/skills` panel — name and one-line description per skill.
+/// The `/skills` panel — one entry per skill: its name, and the sentence under it saying when to
+/// use it.
+///
+/// **The name on the row, the sentence under it.** Beside the name, a skill's description made the
+/// list ragged — one row one word wide and the next a paragraph — and worse, it put descriptions in
+/// two places at once: a short one sat on its row while a long one wrapped below it, so the same
+/// list changed shape from row to row (reported 2026-09-13). Below is where a description lives
+/// everywhere else in this app: the picker's note area, `/mode`'s sentence.
 pub fn skills(lang: Lang, skills: &[SkillInfo]) -> Panel {
     if skills.is_empty() {
         return Panel::new(
@@ -457,25 +464,34 @@ pub fn skills(lang: Lang, skills: &[SkillInfo]) -> Panel {
             vec![muted(lang.skills_empty().to_string())],
         );
     }
-    let lines = skills
-        .iter()
-        .map(|s| {
-            Line::from(vec![
-                Span::styled("∙ ", Style::default().fg(theme::accent())),
-                Span::styled(
-                    s.name.clone(),
-                    Style::default().fg(theme::text_heading()).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(" ‒ ", Style::default().fg(theme::border_light())),
-                Span::styled(s.description.clone(), Style::default().fg(theme::text_muted())),
-            ])
-        })
-        .collect();
+    let mut lines = Vec::new();
+    for s in skills {
+        lines.push(Line::from(vec![
+            Span::styled("∙ ", Style::default().fg(theme::accent())),
+            Span::styled(
+                s.name.clone(),
+                Style::default().fg(theme::text_heading()).add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        // **Two columns, so the sentence starts under the name it belongs to** — the same two
+        // columns `∙ ` takes, which is also what a wrapped line hangs under (`wrap::line`).
+        if !s.description.trim().is_empty() {
+            lines.push(Line::from(Span::styled(
+                format!("  {}", s.description),
+                Style::default().fg(theme::text_muted()),
+            )));
+        }
+    }
     Panel::new(lang.title_skills().into(), lines)
 }
 
 /// The `/plugin` panel — every fetched plugin, what it ships underneath.
-pub fn plugins(lang: Lang, found: &[Plugin]) -> Panel {
+pub fn plugins(
+    lang: Lang,
+    cwd: &std::path::Path,
+    found: &[Plugin],
+    allowed: &crate::mcp::discovery::Allowed,
+) -> Panel {
     if found.is_empty() {
         return Panel::new(
             lang.title_plugins().into(),
@@ -491,17 +507,27 @@ pub fn plugins(lang: Lang, found: &[Plugin]) -> Panel {
                 Style::default().fg(theme::text_heading()).add_modifier(Modifier::BOLD),
             ),
         ];
-        if !p.fetched() {
+        let project = p.root.starts_with(cwd.join(".zyris-code/plugins"));
+        if project {
+            spans.push(Span::styled(
+                lang.plugin_project_state(crate::plugin::enabled(cwd, p, allowed)),
+                Style::default().fg(theme::text_muted()),
+            ));
+        } else if !p.fetched() {
             spans.push(Span::styled(
                 lang.plugin_hand_placed(),
                 Style::default().fg(theme::text_muted()),
             ));
         }
-        if !p.description.is_empty() {
-            spans.push(Span::styled(" ‒ ", Style::default().fg(theme::border_light())));
-            spans.push(Span::styled(p.description.clone(), Style::default().fg(theme::text())));
-        }
         lines.push(Line::from(spans));
+        if !p.description.is_empty() {
+            // **Under the name, not beside it.** The same rule as `/skills` — a description is a
+            // sentence about the thing above it, and the panel reads as a list of names otherwise.
+            lines.push(Line::from(Span::styled(
+                format!("    {}", p.description),
+                Style::default().fg(theme::text()),
+            )));
+        }
         for spec in &p.mcp {
             lines.push(muted(format!(
                 "    {}",
@@ -870,6 +896,81 @@ mod tests {
         let joined = text(&p).join("\n");
         assert!(joined.contains("검색"), "{joined}");
         assert!(joined.contains("코드에서 무언가를 찾는다"), "{joined}");
+    }
+
+    /// **The name on its own row, the description under it.** Beside the name a short description
+    /// sat on the row while a long one wrapped below, so one list had two shapes — reported
+    /// 2026-09-13, and the reason the picker's notes all moved under the list as well.
+    #[test]
+    fn a_skills_description_goes_under_its_name_not_beside_it() {
+        let p = skills(
+            Lang::Ko,
+            &[
+                SkillInfo { name: "짧은".into(), description: "짧은 설명".into() },
+                SkillInfo {
+                    name: "긴것".into(), description: "아주 길고 긴 설명입니다".into()
+                },
+            ],
+        );
+        let lines = text(&p);
+        let name = lines.iter().position(|l| l.contains("짧은") && !l.contains("설명"));
+        let name = name.expect("no row carries the name alone");
+        assert_eq!(lines[name], "∙ 짧은", "the name shares its row: {lines:?}");
+        assert_eq!(lines[name + 1], "  짧은 설명", "the description is not under it: {lines:?}");
+        // And the long one is placed the same way — the list keeps one shape.
+        let long = lines.iter().position(|l| l.contains("긴것")).expect("{lines:?}");
+        assert_eq!(lines[long], "∙ 긴것", "{lines:?}");
+        assert!(
+            lines[long + 1].starts_with("  아주 길고") && !lines[long].contains("설명"),
+            "the long description is placed differently: {lines:?}"
+        );
+    }
+
+    /// The same rule on `/plugin`: a name, then the sentence about it.
+    #[test]
+    fn a_plugins_description_goes_under_its_name_too() {
+        let p = plugins(
+            Lang::Ko,
+            std::path::Path::new("/repo"),
+            &[Plugin {
+                name: "그것".into(),
+                description: "무엇을 하는지".into(),
+                mcp: Vec::new(),
+                skills: None,
+                agents: None,
+                commands: Vec::new(),
+                hooks: Vec::new(),
+                // Not under the install directory, so it reads as hand-placed — the name row then
+                // carries a note of its own, which the description must not be part of.
+                root: std::path::PathBuf::from("/tmp/plugins/그것"),
+            }],
+            &crate::mcp::discovery::Allowed::default(),
+        );
+        let lines = text(&p);
+        let name = lines.iter().position(|l| l.contains("그것")).expect("no plugin row");
+        assert!(!lines[name].contains("무엇을"), "the description is beside the name: {lines:?}");
+        assert!(
+            lines.get(name + 1).is_some_and(|l| l.contains("무엇을")),
+            "the description is not under it: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_project_plugin_is_shown_as_off_before_approval() {
+        let cwd = tempfile::tempdir().unwrap();
+        let plugin = Plugin {
+            name: "local".into(),
+            description: String::new(),
+            mcp: Vec::new(),
+            skills: None,
+            agents: None,
+            commands: Vec::new(),
+            hooks: Vec::new(),
+            root: cwd.path().join(".zyris-code/plugins/local"),
+        };
+        let panel =
+            plugins(Lang::Ko, cwd.path(), &[plugin], &crate::mcp::discovery::Allowed::default());
+        assert!(text(&panel).join("\n").contains("꺼짐"));
     }
 
     #[test]

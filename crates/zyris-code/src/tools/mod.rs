@@ -88,7 +88,7 @@ pub fn announce(
 
     // What the plugins want run around a tool call. **Read once, here** — the gate wraps every
     // capability separately, so a list held per wrapper would drift the moment one was rebuilt.
-    bridge.set_hooks(crate::plugin::hooks(&crate::plugin::discover(&cwd)));
+    bridge.set_hooks(crate::plugin::hooks(&crate::plugin::active(&cwd)));
 
     // Three things to put in the session: **which node this is**, **this repo's conventions**
     // (`CLAUDE.md`·`AGENTS.md`) and the skill list. Where the person is sitting comes first — it
@@ -143,23 +143,23 @@ pub fn start_mcp(caps: zyris::Capabilities, cwd: PathBuf, bridge: Bridge) {
     tokio::spawn(async move {
         // What plugins add + what the config file says. **The config file wins** — what a person
         // wrote directly is more specific.
-        let mut specs = crate::plugin::mcp_servers(&crate::plugin::discover(&cwd));
-        for spec in crate::mcp::bridge::load_config(&cwd) {
+        let mut specs = crate::plugin::mcp_servers(&crate::plugin::active(&cwd));
+        for spec in crate::mcp::bridge::load_user_config() {
             match specs.iter_mut().find(|s| s.slug == spec.slug) {
                 Some(slot) => *slot = spec,
                 None => specs.push(spec),
             }
         }
-        // **What another client set up starts only if this machine said yes** (`/mcp on`). Those
-        // entries name a program somebody else's client was told to run, and running it because it
-        // happened to be on disk is not a decision this app gets to make.
+        // Repository and other-client entries start only if this machine said yes (`/mcp on`).
+        // Merely finding an executable definition on disk is not consent to run it.
         let allowed = crate::mcp::discovery::Allowed::load();
         for found in crate::mcp::discovery::found(&cwd) {
-            if !allowed.allows(&found.spec.slug) {
+            if !allowed.allows_found(&cwd, &found) {
                 continue;
             }
-            if !specs.iter().any(|s| s.slug == found.spec.slug) {
-                specs.push(found.spec);
+            match specs.iter_mut().find(|s| s.slug == found.spec.slug) {
+                Some(slot) => *slot = found.spec,
+                None => specs.push(found.spec),
             }
         }
         if specs.is_empty() {

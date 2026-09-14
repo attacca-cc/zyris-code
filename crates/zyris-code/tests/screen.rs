@@ -10,6 +10,7 @@ use zyris_code::app::{apply, Action, Frame as AppFrame, State};
 use zyris_code::event::{Entry, EntryKind};
 use zyris_code::markdown::display_width;
 use zyris_code::widgets;
+use zyris_code::widgets::activity::BLINK_HALF_MS;
 
 /// A write sink that counts the bytes that went out. Same trick as `perf.rs` — hook the real crossterm backend to a memory
 /// buffer and see **whether a wide trailing cell actually goes out on the wire**. Looking only at the cell buffer
@@ -127,7 +128,6 @@ fn a_user_message_appears_above_the_input() {
             entry: Some(Entry { seq: 1, kind: EntryKind::User("안녕하세요".into()) }),
             todo: None,
             plan: None,
-            report: None,
         }),
     );
     let screen = dump(&mut s, 40, 10);
@@ -163,7 +163,6 @@ fn the_servers_copy_of_a_submitted_message_does_not_double_it() {
             entry: Some(Entry { seq: 1, kind: EntryKind::User("안녕하세요".into()) }),
             todo: None,
             plan: None,
-            report: None,
         }),
     );
     let screen = dump(&mut s, 40, 12);
@@ -200,16 +199,7 @@ fn cell_bg(state: &mut State, w: u16, h: u16, x: u16, y: u16) -> Option<ratatui:
 
 fn said(state: &mut State, seq: i64, kind: EntryKind) {
     let entry = Some(Entry { seq, kind });
-    apply(
-        state,
-        &Action::Frame(AppFrame::Event {
-            cursor: seq,
-            entry,
-            todo: None,
-            plan: None,
-            report: None,
-        }),
-    );
+    apply(state, &Action::Frame(AppFrame::Event { cursor: seq, entry, todo: None, plan: None }));
 }
 
 /// **A scrolled-up view keeps looking at the same words when the width changes.**
@@ -386,6 +376,47 @@ fn a_blank_heal_forces_only_blank_cells_to_be_resent() {
     );
 }
 
+/// **The cell behind a glyph that shrank is written out again.** ratatui skips the cell after a
+/// wide character — it trusts the terminal to paint the glyph across both — so when a wide glyph
+/// turns into a narrow one, that cell reads as unchanged on both buffers and is never written
+/// again: the right half of the old glyph stays on screen. The heal is exactly that cell, put out
+/// again on the frame where the shrink happens — no timer, no whole-screen rewrite (`Heal` in
+/// `app.rs`, `$ZYRIS_CODE_HEAL`).
+#[test]
+fn the_cell_behind_a_glyph_that_shrank_is_written_out_again() {
+    let mut s = State::new();
+    said(&mut s, 1, EntryKind::Agent("안".into()));
+    let mut term = Terminal::new(TestBackend::new(60, 12)).unwrap();
+    let before = term.draw(|f| widgets::draw(f, &mut s)).unwrap();
+
+    // The glyph's own cell, and the placeholder behind it — the cell that keeps the residue.
+    let glyph = before
+        .buffer
+        .content
+        .iter()
+        .position(|c| c.symbol() == "안")
+        .expect("the wide glyph must be on screen");
+    assert_eq!(before.buffer.content[glyph + 1].symbol(), " ", "that is the placeholder");
+
+    // The same row, now narrow — the cell behind the glyph stands on its own.
+    said(&mut s, 1, EntryKind::Agent("a".into()));
+    let after = term.draw(|f| widgets::draw(f, &mut s)).unwrap();
+    assert_eq!(after.buffer.content[glyph].symbol(), "a", "the test's own arrangement");
+    assert_eq!(
+        after.buffer.content[glyph + 1].diff_option,
+        ratatui::buffer::CellDiffOption::AlwaysUpdate,
+        "the cell behind the shrunken glyph was left to the diff, which cannot see it"
+    );
+
+    // **And a frame where nothing shrank plants nothing.** This is not a standing rewrite of the
+    // screen — it is the one cell, on the one frame it concerns.
+    let quiet = term.draw(|f| widgets::draw(f, &mut s)).unwrap();
+    assert!(
+        quiet.buffer.content.iter().all(|c| c.diff_option == ratatui::buffer::CellDiffOption::None),
+        "a still screen was rewritten anyway"
+    );
+}
+
 /// **A blank heal never marks a wide char itself.** The trailing cell behind a wide
 /// character is blank, so `AlwaysUpdate` gets planted on it — but the diff always skips it
 /// when emitting the wide char, or the right half of the glyph would be erased. The heal
@@ -468,7 +499,6 @@ fn there_is_no_header_taking_up_the_top_line() {
             entry: Some(Entry { seq: 1, kind: EntryKind::User("첫 줄".into()) }),
             todo: None,
             plan: None,
-            report: None,
         }),
     );
     let screen = dump(&mut s, 40, 10);
@@ -490,7 +520,6 @@ fn drawing_at_a_very_narrow_width_does_not_panic() {
             }),
             todo: None,
             plan: None,
-            report: None,
         }),
     );
     let _ = dump(&mut s, 12, 6);
@@ -567,7 +596,6 @@ fn planned(state: &mut State, seq: i64, content: &str, status: &str) {
             entry: zyris_code::event::entry_from(&event),
             todo: zyris_code::todos::change_from(&event),
             plan: None,
-            report: None,
         }),
     );
 }
@@ -765,7 +793,6 @@ fn a_form_being_open_does_not_swallow_what_the_server_says() {
                 entry: Some(Entry { seq: 42, kind: EntryKind::Agent("들어온 말".into()) }),
                 todo: None,
                 plan: None,
-                report: None,
             }),
         );
         assert_eq!(s.last_cursor, Some(42), "the resume position was lost (form {open_a_form})");
@@ -797,25 +824,18 @@ fn cell_fg(state: &mut State, w: u16, h: u16, x: u16, y: u16) -> Option<ratatui:
     term.backend().buffer()[(x, y)].style().fg
 }
 
-/// **The palette reaches the screen.** The dark text is nearly the colour of a light terminal's
-/// paper (1.19:1), and this app paints no background of its own — so if the theme did not actually
-/// change what is drawn, a light terminal would still show words on words.
 #[test]
-fn the_light_theme_actually_changes_what_is_drawn() {
-    use zyris_code::theme::{self, Theme};
+fn light_theme_palette_is_selected_explicitly() {
+    use zyris_code::config::ThemeChoice;
+    use zyris_code::theme;
 
-    let mut s = State::new();
-    said(&mut s, 1, EntryKind::User("안녕하세요".into()));
+    let before = theme::current();
+    let dark = theme::palette(ThemeChoice::Dark);
+    let light = theme::palette(ThemeChoice::Light);
 
-    theme::set(Theme::Dark);
-    let (dark_text, dark_colours) = dump_with_colours(&mut s, 40, 10);
-
-    theme::set(Theme::Light);
-    let (light_text, light_colours) = dump_with_colours(&mut s, 40, 10);
-
-    theme::set(Theme::Dark);
-    assert_eq!(dark_text, light_text, "only the colours change, never the layout");
-    assert_ne!(dark_colours, light_colours, "the palette never reached the cells");
+    assert_ne!(dark.text(), light.text());
+    assert_ne!(dark.bg(), light.bg());
+    assert_eq!(theme::current(), before, "selecting a test palette changed global state");
 }
 
 /// The dot blinks only while working. A still dot can't say anything is running, and
@@ -830,17 +850,23 @@ fn the_dot_blinks_only_while_working() {
     let mut s = State::new();
     s.connected = true;
 
+    // **The phase comes from a clock now**, so a test moves the origin back rather than sleeping —
+    // the same way the breath's tests pick a phase.
+    let phase = |s: &mut State, ms: u64| {
+        s.blink_origin = std::time::Instant::now() - std::time::Duration::from_millis(ms);
+    };
+
     s.running = false;
-    s.tick = 0;
+    phase(&mut s, 0);
     let idle_a = cell_fg(&mut s, 40, H, DOT_X, y);
-    s.tick = 8;
+    phase(&mut s, BLINK_HALF_MS);
     let idle_b = cell_fg(&mut s, 40, H, DOT_X, y);
     assert_eq!(idle_a, idle_b, "the dot blinks while idle");
 
     s.running = true;
-    s.tick = 0;
+    phase(&mut s, 0);
     let on = cell_fg(&mut s, 40, H, DOT_X, y);
-    s.tick = 8;
+    phase(&mut s, BLINK_HALF_MS);
     let off = cell_fg(&mut s, 40, H, DOT_X, y);
     assert_ne!(on, off, "the dot does not blink while working");
 }
@@ -914,7 +940,6 @@ fn the_head_keeps_breathing_while_nothing_else_changes() {
             entry: Some(Entry { seq: 1, kind: EntryKind::WorkStart("빌드하는 중".into()) }),
             todo: None,
             plan: None,
-            report: None,
         }),
     );
     apply(&mut s, &Action::Frame(AppFrame::Status { running: true }));
@@ -958,7 +983,6 @@ fn clicking_a_work_card_toggles_it() {
             entry: Some(Entry { seq: 1, kind: EntryKind::WorkStart("작업".into()) }),
             todo: None,
             plan: None,
-            report: None,
         }),
     );
     // Streaming reasoning gives the card a chip, so there are two targets to tell apart.
@@ -1012,7 +1036,6 @@ fn dragging_selects_text_and_the_selection_survives_the_release() {
             }),
             todo: None,
             plan: None,
-            report: None,
         }),
     );
     let _ = dump(&mut s, 60, 12);
@@ -1040,7 +1063,6 @@ fn a_click_without_moving_does_not_select() {
             entry: Some(Entry { seq: 1, kind: EntryKind::Agent("본문".into()) }),
             todo: None,
             plan: None,
-            report: None,
         }),
     );
     let _ = dump(&mut s, 60, 12);
@@ -1064,7 +1086,6 @@ fn the_selection_survives_releasing_the_mouse() {
             }),
             todo: None,
             plan: None,
-            report: None,
         }),
     );
     let _ = dump(&mut s, 60, 12);
@@ -1092,7 +1113,6 @@ fn moving_after_release_does_not_grow_the_selection() {
             }),
             todo: None,
             plan: None,
-            report: None,
         }),
     );
     let _ = dump(&mut s, 60, 12);
@@ -1120,7 +1140,6 @@ fn scrolling_keeps_the_selection() {
                 }),
                 todo: None,
                 plan: None,
-                report: None,
             }),
         );
     }
@@ -1155,7 +1174,6 @@ fn the_highlight_covers_only_the_selected_columns() {
             entry: Some(Entry { seq: 1, kind: EntryKind::Agent("abcdefghij".into()) }),
             todo: None,
             plan: None,
-            report: None,
         }),
     );
     let _ = dump(&mut s, 60, 12);
@@ -1197,7 +1215,6 @@ fn typing_drops_the_selection() {
             }),
             todo: None,
             plan: None,
-            report: None,
         }),
     );
     let _ = dump(&mut s, 60, 12);
@@ -1233,7 +1250,6 @@ fn question_event(seq: i64, result: serde_json::Value) -> AppFrame {
         }),
         todo: None,
         plan: None,
-        report: None,
     }
 }
 
@@ -1278,7 +1294,6 @@ fn an_open_ended_question_whose_wait_ran_out_is_still_answerable() {
         }),
         todo: None,
         plan: None,
-        report: None,
     };
 
     let mut s = State::new();
@@ -1412,11 +1427,13 @@ fn the_picker_overlays_the_conversation_and_takes_the_keys() {
             entry: Some(Entry { seq: 1, kind: EntryKind::Agent("뒤에 있는 대화".into()) }),
             todo: None,
             plan: None,
-            report: None,
         }),
     );
     s.picker = Some(Picker::projects(
-        vec![("p1".into(), "기본 프로젝트".into(), true), ("p2".into(), "zyris".into(), false)],
+        vec![
+            ("p1".into(), "기본 프로젝트".into(), Some("계정의 기본 프로젝트".into()), true),
+            ("p2".into(), "zyris".into(), Some("zyris 코드 개발".into()), false),
+        ],
         zyris_code::lang::Lang::Ko,
     ));
 
@@ -1424,6 +1441,9 @@ fn the_picker_overlays_the_conversation_and_takes_the_keys() {
     assert!(screen.contains("프로젝트"), "\n{screen}");
     assert!(screen.contains("＋ 새 프로젝트"), "no create row\n{screen}");
     assert!(screen.contains("zyris"), "\n{screen}");
+    // **What the project is for is on screen, under the list.** The cursor starts on the first real
+    // project, so that is whose description is drawn — with the default marker, since it is that one.
+    assert!(screen.contains("기본 ∙ 계정의 기본 프로젝트"), "the description is nowhere\n{screen}");
 
     // While the list is open, typed characters must not leak into the input box.
     for a in on_key(&s, KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)) {
@@ -1490,8 +1510,10 @@ fn the_panel_overlays_the_conversation_and_takes_the_keys() {
 fn the_create_rows_behave_differently_by_level() {
     use zyris_code::picker::{Pick, Picker};
 
-    let projects =
-        Picker::projects(vec![("p1".into(), "기본".into(), true)], zyris_code::lang::Lang::Ko);
+    let projects = Picker::projects(
+        vec![("p1".into(), "기본".into(), None, true)],
+        zyris_code::lang::Lang::Ko,
+    );
     let mut at_create = projects.clone();
     at_create.cursor = 0;
     assert_eq!(at_create.pick(), Some(Pick::NewProject));
@@ -1580,7 +1602,7 @@ fn inside_the_picker_right_does_nothing_and_left_goes_back() {
 
     let mut s = State::new();
     s.picker = Some(Picker::projects(
-        vec![("p1".into(), "기본".into(), true)],
+        vec![("p1".into(), "기본".into(), None, true)],
         zyris_code::lang::Lang::Ko,
     ));
     assert!(on_key(&s, key(KeyCode::Right)).is_empty(), "→ must do nothing");
@@ -1606,7 +1628,7 @@ fn going_back_from_sessions_never_closes_the_picker_in_apply() {
 
     // Even after I/O has moved it back to the project list, apply must not close it.
     s.picker = Some(Picker::projects(
-        vec![("p1".into(), "기본".into(), true)],
+        vec![("p1".into(), "기본".into(), None, true)],
         zyris_code::lang::Lang::Ko,
     ));
     apply(&mut s, &Action::PickBack);
@@ -1635,12 +1657,11 @@ fn the_picker_box_stays_inside_the_screen_with_wide_text_behind() {
                 }),
                 todo: None,
                 plan: None,
-                report: None,
             }),
         );
     }
     s.picker = Some(Picker::projects(
-        vec![("p1".into(), "기본".into(), true)],
+        vec![("p1".into(), "기본".into(), None, true)],
         zyris_code::lang::Lang::Ko,
     ));
 
@@ -1653,28 +1674,42 @@ fn the_picker_box_stays_inside_the_screen_with_wide_text_behind() {
     }
 }
 
-/// A typed answer must look different from a chosen one — that it wasn't among the options is information.
+/// **An answer is one line under the question it answered**, and a pick the person typed keeps its
+/// own mark — that it wasn't among the options is information.
 #[test]
-fn typed_answers_look_different_from_chosen_ones_in_history() {
+fn an_answer_is_one_line_under_its_question_and_a_typed_pick_is_marked() {
     let mut s = State::new();
     s.lang = zyris_code::lang::Lang::Ko;
+    apply(&mut s, &Action::Frame(question_event(1, serde_json::json!({"status": "answered"}))));
     apply(
         &mut s,
         &Action::Frame(AppFrame::Event {
-            cursor: 1,
+            cursor: 2,
             entry: Some(Entry {
-                seq: 1,
-                kind: EntryKind::User("질문?\n  - A안 (설명)\n  - 직접 입력: 내가 쓴 답".into()),
+                seq: 2,
+                kind: EntryKind::User(
+                    "어느 쪽으로 갈까요?\n  - A안 (빠르다)\n  - 직접 입력: 내가 쓴 답".into(),
+                ),
             }),
             todo: None,
             plan: None,
-            report: None,
         }),
     );
-    let screen = dump(&mut s, 70, 12);
+    let screen = dump(&mut s, 70, 14);
     assert!(screen.contains("✎ 내가 쓴 답"), "no marker for a typed answer\n{screen}");
     assert!(!screen.contains("직접 입력: 내가 쓴 답"), "the preamble is still shown\n{screen}");
-    assert!(screen.contains("A안 (설명)"), "the choice must stay as it was\n{screen}");
+    assert!(screen.contains("A안 (빠르다)"), "the choice must stay as it was\n{screen}");
+    // **Both picks are on one line, under the question** — and the question is not repeated inside
+    // them, which is most of what made an answer read as a message the person had typed out.
+    let line = screen.lines().find(|l| l.contains("A안 (빠르다)")).expect("no answer line");
+    assert!(line.contains("✎ 내가 쓴 답"), "the picks are not on one line: {line:?}");
+    assert_eq!(
+        screen.matches("어느 쪽으로 갈까요?").count(),
+        1,
+        "the question is either missing or doubled\n{screen}"
+    );
+    // **Not a message.** The bar belongs to what the person typed as a message, and this is a pick.
+    assert!(!screen.contains('▌'), "the answer wears the person's bar\n{screen}");
 }
 
 /// The active question must live only in the bottom panel. Drawn again in the conversation area, it would appear twice.
@@ -1917,7 +1952,6 @@ fn state_with_edit_tool() -> State {
             }),
             todo: None,
             plan: None,
-            report: None,
         }),
     );
     apply(
@@ -1944,7 +1978,6 @@ fn state_with_edit_tool() -> State {
             }),
             todo: None,
             plan: None,
-            report: None,
         }),
     );
     s.folds.insert(1, Fold { open: true, user_touched: true });
@@ -2191,7 +2224,6 @@ fn the_enroll_window_overlays_the_conversation() {
             entry: Some(Entry { seq: 1, kind: EntryKind::Agent("뒤에 있는 대화".into()) }),
             todo: None,
             plan: None,
-            report: None,
         }),
     );
     apply(&mut s, &Action::Frame(AppFrame::Enroll(enroll_view())));
@@ -2212,6 +2244,46 @@ fn long_session_list(n: usize) -> zyris_code::picker::Picker {
             .collect(),
         zyris_code::lang::Lang::Ko,
     )
+}
+
+/// **`Tab` opens the note under the list, and `Tab` again holds it back to a line.** The note area
+/// is one line until it is asked for, so a list does not pay — on every row — for the longest
+/// description it happens to carry. The cursor never moves and no turn is started by it.
+#[test]
+fn tab_opens_the_note_under_the_list_and_puts_it_back() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use zyris_code::app::on_key;
+    use zyris_code::picker::Picker;
+
+    let mut s = State::new();
+    s.lang = zyris_code::lang::Lang::Ko;
+    s.picker = Some(Picker::projects(
+        vec![(
+            "p1".into(),
+            "zyris".into(),
+            Some("이 프로젝트는 TUI를 다룹니다. 그리고 마지막에만 나오는 표식 ZZZ".into()),
+            false,
+        )],
+        zyris_code::lang::Lang::Ko,
+    ));
+
+    let held = dump(&mut s, 80, 24);
+    assert!(held.contains('…'), "the cut note is not marked:\n{held}");
+    assert!(!held.contains("ZZZ"), "the whole note was drawn without being asked for:\n{held}");
+
+    let keys = on_key(&s, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(keys, vec![Action::PickExpand], "`Tab` does nothing while the list is up");
+    for a in keys {
+        apply(&mut s, &a);
+    }
+    let opened = dump(&mut s, 80, 24);
+    assert!(opened.contains("ZZZ"), "`Tab` did not open the note:\n{opened}");
+    assert_eq!(s.picker.as_ref().map(|p| p.cursor), Some(1), "`Tab` moved the cursor");
+
+    for a in on_key(&s, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)) {
+        apply(&mut s, &a);
+    }
+    assert!(!dump(&mut s, 80, 24).contains("ZZZ"), "`Tab` did not hold the note back again");
 }
 
 /// **At the cut edge, say how many more there are.** Without it, the list looks like it ends there.
@@ -2317,6 +2389,42 @@ fn a_link_in_an_answer_is_wrapped_in_osc8() {
     );
 }
 
+#[test]
+fn an_overlay_blocks_the_transcript_hyperlink_below_it() {
+    let mut s = State::new();
+    s.caps.hyperlinks = true;
+    let url = "https://example.com/under-overlay";
+    let label = std::iter::repeat_n("x", 2_000).collect::<Vec<_>>().join(" ");
+    said(&mut s, 1, EntryKind::Agent(format!("[{label}]({url})")));
+    apply(&mut s, &Action::Frame(AppFrame::Enroll(enroll_view())));
+
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| widgets::draw(f, &mut s)).unwrap();
+    let open = format!("\x1b]8;;{url}\x1b\\");
+    let close = "\x1b]8;;\x1b\\";
+    let buffer = term.backend().buffer();
+    for cell in &buffer.content {
+        assert!(
+            !cell.modifier.contains(ratatui::style::Modifier::RAPID_BLINK),
+            "the private link marker reached the terminal buffer"
+        );
+        if let Some(glyph) = cell.symbol().strip_prefix(&open).and_then(|s| s.strip_suffix(close)) {
+            assert!(
+                glyph == "x" || glyph == " ",
+                "overlay glyph inherited the hidden URL: {glyph:?}"
+            );
+        }
+    }
+    let corner = buffer
+        .content
+        .iter()
+        .position(|cell| cell.symbol() == "┌")
+        .expect("the overlay has no top-left corner");
+    let x = (corner % buffer.area.width as usize) as u16;
+    let y = (corner / buffer.area.width as usize) as u16;
+    assert_eq!(s.link_at(x, y), None, "the overlay border clicks the hidden URL");
+}
+
 /// **A terminal that never learned OSC 8 prints the bytes.** Then the sequence is not merely
 /// ignored — it lands across the transcript as rubbish, and the diff believes those cells are
 /// right, so it stays until something forces a full repaint.
@@ -2378,6 +2486,76 @@ fn a_bare_url_in_an_answer_is_not_wrapped() {
         buf.content.iter().all(|c| !c.symbol().starts_with("\u{1b}]8;;")),
         "a bare URL must not be wrapped in OSC 8"
     );
+}
+
+/// **A report is a row of the conversation, not a card over the input.**
+///
+/// It used to take the input's spot and wait to be put away with `Esc` — so the one sentence saying
+/// what a run came to was also the one thing that could be missed entirely by not pressing a key at
+/// the right moment, and it was put away for good once it was.
+#[test]
+fn a_report_is_a_row_and_leaves_the_input_alone() {
+    let event = zyris_attacca::ZSessionEvent {
+        seq: 1,
+        cursor: 1,
+        kind: "tool_call".into(),
+        payload: serde_json::json!({
+            "kind": "tool_call", "name": "report_result",
+            "arguments": {
+                "status": "success",
+                "summary": "빌드를 통과시켰습니다. 남은 것은 커밋입니다."
+            },
+            "result": "ok", "error": null
+        }),
+        created_at: None,
+    };
+    let mut s = State::new();
+    s.lang = zyris_code::lang::Lang::Ko;
+    apply(
+        &mut s,
+        &Action::Frame(AppFrame::Event {
+            cursor: 1,
+            entry: zyris_code::event::entry_from(&event),
+            todo: None,
+            plan: None,
+        }),
+    );
+    let screen = dump(&mut s, 70, 16);
+    assert!(screen.contains("작업 결과"), "the report row is missing:\n{screen}");
+    assert!(screen.contains("빌드를 통과시켰습니다"), "\n{screen}");
+    assert!(screen.contains("남은 것은 커밋입니다"), "the sentence was cut:\n{screen}");
+    // **The input is still there.** Nothing has to be pressed to get it back.
+    assert!(
+        screen.lines().any(|l| l.trim_start().starts_with("> ")),
+        "the input box gave up its place:\n{screen}"
+    );
+    // And no key hint — there is nothing to put away.
+    assert!(!screen.contains("Esc 닫기"), "\n{screen}");
+}
+
+/// **Only the newest thing the agent said keeps a row of its own.**
+///
+/// An older one folds into the working that produced it — the conversation was a column of
+/// one-line messages with the work hidden in between, which is what this replaces. It is not
+/// dropped: opening the card shows the words again.
+#[test]
+fn an_older_saying_folds_into_the_card_on_screen() {
+    let mut s = State::new();
+    s.lang = zyris_code::lang::Lang::Ko;
+    said(&mut s, 1, EntryKind::WorkStart("빌드하는 중".into()));
+    said(&mut s, 2, EntryKind::Agent("먼저 빌드부터 돌립니다".into()));
+    let before = dump(&mut s, 70, 16);
+    assert!(before.contains("먼저 빌드부터 돌립니다"), "\n{before}");
+
+    said(&mut s, 3, EntryKind::Agent("빌드가 통과했습니다".into()));
+    let after = dump(&mut s, 70, 16);
+    assert!(after.contains("빌드가 통과했습니다"), "\n{after}");
+    assert!(!after.contains("먼저 빌드부터"), "the older saying kept a row of its own:\n{after}");
+
+    // Still there, inside the card it came out of.
+    apply(&mut s, &Action::ToggleFold);
+    let opened = dump(&mut s, 70, 16);
+    assert!(opened.contains("먼저 빌드부터"), "it was dropped, not folded:\n{opened}");
 }
 
 /// Prints a work card built **from real events**, so the shape and every tool renderer can be

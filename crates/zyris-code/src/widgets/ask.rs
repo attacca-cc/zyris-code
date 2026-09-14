@@ -194,18 +194,22 @@ pub fn row_at(a: &Answering, area: Rect, y: u16, lang: crate::lang::Lang) -> Opt
     card.owners.get(card.top + line - 1).copied().flatten()
 }
 
-pub fn draw(frame: &mut Frame, area: Rect, a: &Answering, lang: crate::lang::Lang) {
+pub fn draw(frame: &mut Frame, area: Rect, a: &Answering, lang: crate::lang::Lang) -> bool {
     let card = card(a, area.width, area.height as usize, lang);
     frame.render_widget(Paragraph::new(card.lines), area);
     // **The terminal's cursor goes where the typing is.** Without this the input method draws the
     // syllable it is composing wherever the cursor was last left — which, with the input box
     // replaced by this card, is the activity line above it.
-    if let Some((x, y)) = card.caret {
-        frame.set_cursor_position((
-            area.x + x,
-            (area.y + y).min(area.y + area.height.saturating_sub(1)),
-        ));
-    }
+    //
+    // **`false` when there is nowhere to type.** A card being *chosen from* has no caret, and a
+    // frame that asks for no position leaves ratatui hiding the cursor — which is why it used to
+    // vanish while a question was up. The caller puts it somewhere sensible instead.
+    let Some((x, y)) = card.caret else { return false };
+    frame.set_cursor_position((
+        area.x + x,
+        (area.y + y).min(area.y + area.height.saturating_sub(1)),
+    ));
+    true
 }
 
 /// Appends lines that all carry the same row. `None` means the line belongs to no row.
@@ -375,7 +379,11 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(w, h)).expect("terminal");
         let room = height(a, w, h.saturating_sub(3), crate::lang::Lang::Ko) as usize;
         let area = Rect { x: 0, y: 0, width: w, height: room as u16 };
-        terminal.draw(|f| draw(f, area, a, crate::lang::Lang::Ko)).expect("draw");
+        terminal
+            .draw(|f| {
+                draw(f, area, a, crate::lang::Lang::Ko);
+            })
+            .expect("draw");
         let buf = terminal.backend().buffer().clone();
         (0..h)
             .map(|y| {

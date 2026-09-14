@@ -56,10 +56,10 @@ sha2 = "0.10"
 # with rustls, so declaring it here adds no new build. Keep `default-features = false`: the default
 # set drags in a second TLS stack, and on this machine that is minutes of build and a lot of RAM.
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json", "http2", "system-proxy", "query", "form"] }
+# Downloaded installers need an exclusively created private directory and file with owned cleanup.
+tempfile = "3"
 
 [dev-dependencies]
-# Tool tests write real files. A mock filesystem can't catch path-resolution mistakes.
-tempfile = "3"
 # **A pseudo-terminal on every platform.** A unix pty here, a ConPTY there
 # (`CreatePseudoConsole`, Windows 10 1809+), behind one API. The smoke scripts under `scripts/`
 # are built on Python's unix-only `pty` module, which left Windows — the console that differs

@@ -30,6 +30,9 @@ pub struct Call {
     /// A credential file this call is reaching for. **No policy makes this allowed** — see
     /// `decide`.
     pub secret: Option<PathBuf>,
+    /// A write through a symlink whose target does not exist. It must not be reinterpreted as a
+    /// harmless new file, even when outside-directory access is enabled.
+    pub dangling: Option<PathBuf>,
 }
 
 impl Call {
@@ -40,6 +43,7 @@ impl Call {
             target,
             outside: None,
             secret: None,
+            dangling: None,
         }
     }
 
@@ -50,6 +54,11 @@ impl Call {
 
     pub fn reaching_for(mut self, secret: Option<PathBuf>) -> Call {
         self.secret = secret;
+        self
+    }
+
+    pub fn through_dangling(mut self, path: Option<PathBuf>) -> Call {
+        self.dangling = path;
         self
     }
 
@@ -117,6 +126,12 @@ pub fn decide(mode: Mode, config: &Config, call: &Call, plan_decided: bool) -> D
                 .into(),
         );
     }
+    if let Some(path) = &call.dangling {
+        return Decision::Refuse(format!(
+            "`{}`은(는) 대상이 없는 심볼릭 링크라 쓸 수 없습니다.",
+            path.display()
+        ));
+    }
     // **A credential is refused whatever the setting says.**
     //
     // `dir_access: allow` exists so an agent can work across directories, and that is a reasonable
@@ -164,7 +179,11 @@ const PATH_KEYS: &[&str] =
 /// there is no way to read the text and know what it touches — one `sh -c` line does anything. What
 /// this does is filter visible absolute paths — a net to catch **accidentally leaving**, not a wall.
 pub fn escaping_path(root: &Path, capability: &str, tool: &str, args: &Value) -> Option<PathBuf> {
-    candidates(root, capability, tool, args).into_iter().find(|p| escapes(root, p))
+    let root = policy_path(root);
+    candidates(&root, capability, tool, args)
+        .into_iter()
+        .map(|p| policy_path(&p))
+        .find(|p| escapes(&root, p))
 }
 
 /// Whether this call is reaching for one of **this app's credential files**.
@@ -179,7 +198,88 @@ pub fn secret_path(
     tool: &str,
     args: &Value,
 ) -> Option<PathBuf> {
-    candidates(root, capability, tool, args).into_iter().find(|p| is_secret_file(app_dir, p))
+    let root = policy_path(root);
+    let app_dir = policy_path(app_dir);
+    candidates(&root, capability, tool, args)
+        .into_iter()
+        .map(|p| policy_path(&p))
+        .find(|p| is_secret_file(&app_dir, p))
+}
+
+/// A dangling final symlink is never a safe creation target. This applies only to explicit file
+/// writes; shell command text remains a best-effort warning rather than a sandbox.
+pub fn dangling_write(root: &Path, capability: &str, tool: &str, args: &Value) -> Option<PathBuf> {
+    let writes = matches!(
+        (capability, tool),
+        ("file_io", "write" | "edit") | ("code_edit", "write" | "edit")
+    );
+    if !writes {
+        return None;
+    }
+    candidates(root, capability, tool, args).into_iter().find(|path| {
+        std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())
+            && std::fs::canonicalize(path).is_err()
+    })
+}
+
+/// Replace explicit file-tool paths with the targets that policy checked. This closes the ordinary
+/// check/use gap for symlinked files and parents without pretending to sandbox shell commands.
+pub fn resolved_args(root: &Path, capability: &str, args: &Value) -> Value {
+    if !matches!(capability, "file_io" | "code_edit" | "search") {
+        return args.clone();
+    }
+    let mut resolved = args.clone();
+    let Some(object) = resolved.as_object_mut() else { return resolved };
+    for key in PATH_KEYS {
+        let Some(path) = object.get_mut(*key) else { continue };
+        let Some(text) = path.as_str().filter(|text| !text.is_empty()) else { continue };
+        *path = Value::String(
+            policy_path(&zyris_caps::resolve_under(root, text)).to_string_lossy().into_owned(),
+        );
+    }
+    resolved
+}
+
+/// Resolve a present target, or its nearest existing ancestor plus the missing suffix. A dangling
+/// symlink is followed by its recorded target so policy sees where a write would really land.
+fn policy_path(path: &Path) -> PathBuf {
+    fn resolve(path: &Path, depth: u8) -> PathBuf {
+        if depth == 16 {
+            return path.to_path_buf();
+        }
+        if let Ok(path) = std::fs::canonicalize(path) {
+            return path;
+        }
+        let mut at = path;
+        let mut missing = Vec::new();
+        loop {
+            if std::fs::symlink_metadata(at).is_ok_and(|m| m.file_type().is_symlink()) {
+                if let Ok(target) = std::fs::read_link(at) {
+                    let target = if target.is_absolute() {
+                        target
+                    } else {
+                        at.parent().unwrap_or_else(|| Path::new(".")).join(target)
+                    };
+                    let mut resolved = resolve(&target, depth + 1);
+                    for part in missing.iter().rev() {
+                        resolved.push(part);
+                    }
+                    return resolved;
+                }
+            }
+            if let Ok(mut resolved) = std::fs::canonicalize(at) {
+                for part in missing.iter().rev() {
+                    resolved.push(part);
+                }
+                return resolved;
+            }
+            let Some(name) = at.file_name() else { return path.to_path_buf() };
+            missing.push(name.to_os_string());
+            let Some(parent) = at.parent() else { return path.to_path_buf() };
+            at = parent;
+        }
+    }
+    resolve(path, 0)
 }
 
 /// The files that must never be handed to a tool.
@@ -386,6 +486,84 @@ mod tests {
         call(cap, tool, "")
             .leaving(escaping_path(root(), cap, tool, &args))
             .reaching_for(secret_path(app(), root(), cap, tool, &args))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_to_outside_is_denied() {
+        use std::os::unix::fs::symlink;
+
+        let project = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("secret.txt");
+        std::fs::write(&target, "secret").unwrap();
+        let link = project.path().join("looks-local.txt");
+        symlink(&target, &link).unwrap();
+
+        let escaped = escaping_path(project.path(), "file_io", "read", &json!({ "path": link }));
+        assert_eq!(escaped.as_deref(), Some(target.as_path()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_parent_cannot_create_outside() {
+        use std::os::unix::fs::symlink;
+
+        let project = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let linked = project.path().join("generated");
+        symlink(outside.path(), &linked).unwrap();
+        let requested = linked.join("new.txt");
+        let args = json!({ "path": requested });
+
+        assert_eq!(
+            escaping_path(project.path(), "code_edit", "write", &args).as_deref(),
+            Some(outside.path().join("new.txt").as_path()),
+        );
+        let resolved = resolved_args(project.path(), "code_edit", &args);
+        assert_eq!(
+            resolved.get("path").and_then(Value::as_str),
+            Some(outside.path().join("new.txt").to_string_lossy().as_ref()),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_to_an_app_secret_is_still_secret() {
+        use std::os::unix::fs::symlink;
+
+        let project = tempfile::tempdir().unwrap();
+        let app = tempfile::tempdir().unwrap();
+        let secret = app.path().join("github.json");
+        std::fs::write(&secret, "token").unwrap();
+        let link = project.path().join("ordinary.json");
+        symlink(&secret, &link).unwrap();
+
+        assert_eq!(
+            secret_path(app.path(), project.path(), "file_io", "read", &json!({ "path": link }),)
+                .as_deref(),
+            Some(secret.as_path()),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_is_never_a_write_target() {
+        use std::os::unix::fs::symlink;
+
+        let project = tempfile::tempdir().unwrap();
+        let link = project.path().join("new.txt");
+        symlink(project.path().join("missing.txt"), &link).unwrap();
+        let args = json!({ "path": link });
+        let asked = call("code_edit", "write", "new.txt").through_dangling(dangling_write(
+            project.path(),
+            "code_edit",
+            "write",
+            &args,
+        ));
+        let allow = Config { dir_access: DirAccess::Allow, ..Config::default() };
+
+        assert!(matches!(decide(Mode::Normal, &allow, &asked, true), Decision::Refuse(_)));
     }
 
     /// **A credential is refused however the directory setting is set.**

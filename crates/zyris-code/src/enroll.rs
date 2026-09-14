@@ -189,8 +189,8 @@ impl AccountGrant {
     /// occasionally, it is an appointment — and attacca answers a replay past its 30-second grace
     /// with `revoke_all_for_node`. CLAUDE.md has a section on this — "nothing locks credential
     /// rotation", spelled `### 자격 회전을 잠그는 것은 아무것도 없다` there, and quoted so it can be
-    /// searched for. Nothing here is a lock either; re-reading is only what keeps the odds where
-    /// that note says they are.
+    /// searched for. The store transaction acquired by `bearer` now makes that re-read and any
+    /// resulting rotation one cross-process operation.
     async fn account(&self) -> Result<Arc<zyris::Account>, CredentialsError> {
         if let Some(account) = self.usable().await {
             return Ok(account);
@@ -354,6 +354,9 @@ impl AccountGrant {
 #[async_trait::async_trait]
 impl Credentials for AccountGrant {
     async fn bearer(&self) -> Result<String, CredentialsError> {
+        // Held through the re-read, possible refresh request, and rotation persistence. A second
+        // process cannot present the same single-use refresh token while this transaction runs.
+        let _transaction = self.store.lock().await.map_err(store_trouble)?;
         let account = self.account().await?;
         let asked = account.bearer().await;
         // Before the answer is read, because a rotation that could not be stored is fatal whatever
@@ -385,11 +388,23 @@ impl Credentials for AccountGrant {
     }
 
     async fn refresh(&self) -> Result<bool, CredentialsError> {
+        let _transaction = self.store.lock().await.map_err(store_trouble)?;
         let mut held = self.held.lock().await;
         // Nothing held means nothing was presented, so the refusal was not about a token of ours.
         let Some(account) = held.take() else { return Ok(false) };
 
-        let forced = self.restore(due_now(account.credential().await));
+        let held_credential = account.credential().await;
+        // Another process may have rotated while this one waited for the file lock. Adopt that
+        // complete pair instead of replaying the refresh token this process used before the 401.
+        let credential = match self.stored().await? {
+            Some(stored) if stored.refresh_token != held_credential.refresh_token => {
+                *held = Some(Arc::new(self.restore(stored)));
+                return Ok(true);
+            }
+            Some(stored) => stored,
+            None => held_credential,
+        };
+        let forced = self.restore(due_now(credential));
         let asked = forced.bearer().await;
         if let Some(stop) = self.cannot_go_on().await {
             return Err(stop);
@@ -634,6 +649,13 @@ impl Reauth {
     pub async fn discard(&self) -> bool {
         // Anything automatic afterwards would be pointless: there is nothing left to discard.
         self.spent.store(true, Ordering::SeqCst);
+        let _transaction = match self.store.lock().await {
+            Ok(lock) => lock,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not lock the credentials for discard");
+                return false;
+            }
+        };
         let cleared = match self.store.clear().await {
             Ok(()) => true,
             Err(e) => {

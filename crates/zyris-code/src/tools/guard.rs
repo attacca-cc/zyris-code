@@ -17,7 +17,7 @@ use zyris::{
 
 use crate::app::Frame;
 use crate::tools::bridge::Bridge;
-use crate::tools::gate::{escaping_path, target_of, Call, Decision};
+use crate::tools::gate::{dangling_write, escaping_path, resolved_args, target_of, Call, Decision};
 
 pub struct Gate<C> {
     inner: C,
@@ -49,7 +49,7 @@ impl<C: ServeCapability> ServeCapability for Gate<C> {
         descriptor
     }
 
-    async fn dispatch(&self, call: IncomingCall) -> Result<Outgoing> {
+    async fn dispatch(&self, mut call: IncomingCall) -> Result<Outgoing> {
         // If the args can't be read, the target is unknown, and without the target it's unknown
         // what is running. Then leave it as the empty value and take the decision.
         let args = call.params.to_json().unwrap_or(Value::Null);
@@ -61,13 +61,19 @@ impl<C: ServeCapability> ServeCapability for Gate<C> {
         let secret = crate::conn::app_dir().and_then(|dir| {
             crate::tools::gate::secret_path(&dir, &root, &self.capability, &call.tool, &args)
         });
-        let gated =
-            Call::new(&self.capability, &call.tool, target).leaving(outside).reaching_for(secret);
+        let dangling = dangling_write(&root, &self.capability, &call.tool, &args);
+        let gated = Call::new(&self.capability, &call.tool, target)
+            .leaving(outside)
+            .reaching_for(secret)
+            .through_dangling(dangling);
 
         match self.bridge.decide(&gated) {
             Decision::Run => {}
             Decision::Refuse(why) => return Err(WireError::invalid_params(why)),
         }
+
+        let args = resolved_args(&root, &self.capability, &args);
+        call.params = Payload::from_json(args.clone());
 
         // **A plugin's hooks run here and nowhere else.** This is the one point every tool call
         // already passes, so there is no second path to keep in step — and a hook can only refuse,
@@ -87,7 +93,11 @@ impl<C: ServeCapability> ServeCapability for Gate<C> {
         // looking at the screen alone can't tell whether a window missed it or wasn't asked.
         tracing::info!(capability = %gated.capability, tool = %gated.tool, "took a tool call");
 
-        let running = self.tell_the_screen_it_started(&gated, &args, asking_session(&call));
+        // **Which conversation asked, read once.** `call` is moved into the dispatch below, and
+        // both announcements — the command about to run, and the job that does the running after
+        // it — need this.
+        let session = asking_session(&call);
+        let running = self.tell_the_screen_it_started(&gated, &args, session.clone());
         let out = self.inner.dispatch(call).await;
         if let Some(id) = running {
             self.bridge.frame(crate::app::Frame::ExecDone { id });
@@ -98,6 +108,11 @@ impl<C: ServeCapability> ServeCapability for Gate<C> {
             crate::hooks::run(&hooks, crate::hooks::When::After, &named, &args).await;
         }
         let out = out?;
+        // **A background job is announced from here, not from `wait.rs`.** Its id only exists
+        // once the call has returned, and which conversation asked for it is known here
+        // (`asking_session`) and nowhere downstream — the same reason `exec` is announced from
+        // this file rather than from the capability that runs it.
+        self.tell_the_screen_a_job_started(&gated, &out, session);
         self.note_the_shells(&gated, &args, &out);
         Ok(match cut {
             Some(deadline) => note_the_cut(out, deadline),
@@ -124,6 +139,35 @@ impl<C: ServeCapability> Gate<C> {
         let id = self.bridge.next_id();
         self.bridge.frame(crate::app::Frame::ExecStart { id, command, session });
         Some(id)
+    }
+
+    /// Tells the screen that a background job started, **and which conversation asked for it.**
+    ///
+    /// Does nothing for any other call: `wait.start` is the only way a job begins, so this is the
+    /// whole of it. It runs *after* the call because the job's id is the job's own, handed back in
+    /// the answer (`jobs.rs` makes it) — and the conversation comes from the same `meta` the
+    /// running command above uses, so a job started in a thread nobody is looking at is drawn as
+    /// that thread's work rather than as the work of whatever is on screen.
+    fn tell_the_screen_a_job_started(&self, call: &Call, out: &Outgoing, session: Option<String>) {
+        if (call.capability.as_str(), call.tool.as_str()) != ("wait", "start") {
+            return;
+        }
+        let Some(body) = response_json(out) else { return };
+        let (Some(id), Some(label)) =
+            (body.get("id").and_then(Value::as_str), body.get("label").and_then(Value::as_str))
+        else {
+            // **A job with nothing to call it would be invisible**, which is the one thing this
+            // frame exists to prevent. Saying so in the log beats a build nobody can see.
+            tracing::warn!(
+                "wait.start answered without an id and a label: the job stays off screen"
+            );
+            return;
+        };
+        self.bridge.frame(crate::app::Frame::JobStart {
+            id: id.to_string(),
+            label: label.to_string(),
+            session,
+        });
     }
 
     /// **`exec`'s `timeout_ms` is held inside the ceiling this node enforces.**
@@ -205,6 +249,19 @@ fn asking_session(call: &IncomingCall) -> Option<String> {
     let meta = call.meta.to_json().ok()?;
     let id = meta.get("session_id")?.as_str()?.trim();
     (!id.is_empty()).then(|| id.to_string())
+}
+
+/// The JSON body of a plain response — a response, or a stream head. `None` when there is nothing
+/// readable in it.
+///
+/// Same shape as `pty_id_of` below and for the same reason: an answer says what was made by
+/// naming it, so a thing's id is read off the answer rather than guessed at beforehand.
+fn response_json(out: &Outgoing) -> Option<Value> {
+    let payload = match out {
+        Outgoing::Response(p) => p,
+        Outgoing::Stream { head, .. } => head,
+    };
+    payload.to_json().ok()
 }
 
 /// Identifier of the opened PTY. Same spot in a unary response or a stream head.

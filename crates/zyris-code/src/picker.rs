@@ -34,7 +34,8 @@ pub struct Row {
     /// What picking it becomes. `None` means it's the "New" row.
     pub id: Option<String>,
     pub label: String,
-    /// A note shown dimmed on the right.
+    /// The sentence under the list while the cursor is on this row. **Never on the row itself** — a
+    /// list whose rows carried their own descriptions had two shapes at once (2026-09-13).
     pub note: Option<String>,
     /// Whether it can be picked.
     pub enabled: bool,
@@ -256,6 +257,11 @@ pub struct Picker {
     /// A deletion waiting to be confirmed. **Held here rather than acted on at once**: a list is
     /// exactly where the wrong row gets hit, and Del sits next to keys nobody aims carefully.
     pub confirm: Option<Armed>,
+    /// **Whether the note under the list is shown whole or held to a single line.** A list measures
+    /// every row's note so that the box is one height whichever row the cursor is on; when the
+    /// longest of them is a paragraph, that reserve is blank rows under every other one. Collapsed,
+    /// the cursor's note is cut to a line and marked with `…`; `Tab` opens it (`Action::PickExpand`).
+    pub expanded: bool,
 }
 
 /// What a pending deletion is about. The name is carried so the question can say it — by the time
@@ -280,6 +286,7 @@ impl Picker {
             top: 0,
             loading: true,
             confirm: None,
+            expanded: false,
         }
     }
 
@@ -293,11 +300,19 @@ impl Picker {
             top: 0,
             loading: true,
             confirm: None,
+            expanded: false,
         }
     }
 
     /// The projects list. The top row is new-project.
-    pub fn projects(items: Vec<(String, String, bool)>, lang: crate::lang::Lang) -> Self {
+    ///
+    /// Each item is `(id, name, description, is_default)`. **The description goes under the list,
+    /// not on the row** — the row carries the name and nothing else, exactly as every other list
+    /// here does, so a project with a paragraph of description is the same shape as one with none.
+    pub fn projects(
+        items: Vec<(String, String, Option<String>, bool)>,
+        lang: crate::lang::Lang,
+    ) -> Self {
         let mut rows = vec![Row {
             id: None,
             label: lang.new_project().into(),
@@ -306,16 +321,30 @@ impl Picker {
             enabled: true,
             status: None,
         }];
-        rows.extend(items.into_iter().map(|(id, name, is_default)| Row {
-            id: Some(id),
-            label: name,
-            note: is_default.then(|| lang.default_project().to_string()),
-            enabled: true,
-            status: None,
+        rows.extend(items.into_iter().map(|(id, name, description, is_default)| {
+            // **The default marker shares the line with the description.** It says where a job
+            // opened with no project lands, which is worth knowing before picking — and the note
+            // area is the only place a row can say anything, so neither one replaces the other.
+            let described = description.filter(|d| !d.trim().is_empty());
+            let note = match (is_default, described) {
+                (true, Some(d)) => Some(format!("{} ∙ {d}", lang.default_project())),
+                (true, None) => Some(lang.default_project().to_string()),
+                (false, Some(d)) => Some(d),
+                (false, None) => None,
+            };
+            Row { id: Some(id), label: name, note, enabled: true, status: None }
         }));
         // The first row is the unselectable 'new project', so start on the second (first real project).
         let cursor = if rows.len() > 1 { 1 } else { 0 };
-        Self { level: Level::Projects, rows, cursor, top: 0, loading: false, confirm: None }
+        Self {
+            level: Level::Projects,
+            rows,
+            cursor,
+            top: 0,
+            loading: false,
+            confirm: None,
+            expanded: false,
+        }
     }
 
     /// One project's session list. The top row is new-session.
@@ -348,6 +377,7 @@ impl Picker {
             top: 0,
             loading: false,
             confirm: None,
+            expanded: false,
         }
     }
 
@@ -360,12 +390,21 @@ impl Picker {
             top: 0,
             loading: true,
             confirm: None,
+            expanded: false,
         }
     }
 
     /// The agents list. Opened by `/agent`.
     pub fn agents(rows: Vec<Row>) -> Self {
-        Self { level: Level::Agents, rows, cursor: 0, top: 0, loading: false, confirm: None }
+        Self {
+            level: Level::Agents,
+            rows,
+            cursor: 0,
+            top: 0,
+            loading: false,
+            confirm: None,
+            expanded: false,
+        }
     }
 
     /// Where to put a plugin about to be fetched.
@@ -396,6 +435,7 @@ impl Picker {
             top: 0,
             loading: false,
             confirm: None,
+            expanded: false,
         }
     }
 
@@ -429,7 +469,15 @@ impl Picker {
             enabled: true,
             status: None,
         }));
-        Self { level: Level::Commands, rows, cursor: 0, top: 0, loading: false, confirm: None }
+        Self {
+            level: Level::Commands,
+            rows,
+            cursor: 0,
+            top: 0,
+            loading: false,
+            confirm: None,
+            expanded: false,
+        }
     }
 
     /// What has been sent, most recent first, narrowed by `query`.
@@ -463,6 +511,7 @@ impl Picker {
             top: 0,
             loading: false,
             confirm: None,
+            expanded: false,
         }
     }
 
@@ -479,6 +528,7 @@ impl Picker {
             top: 0,
             loading: true,
             confirm: None,
+            expanded: false,
         }
     }
 
@@ -525,7 +575,15 @@ impl Picker {
                 status: None,
             })
             .collect();
-        Self { level: Level::Files { at }, rows, cursor: 0, top: 0, loading: false, confirm: None }
+        Self {
+            level: Level::Files { at },
+            rows,
+            cursor: 0,
+            top: 0,
+            loading: false,
+            confirm: None,
+            expanded: false,
+        }
     }
 
     /// How many file rows are built per keystroke. The list scrolls, so more than this is not
@@ -658,7 +716,10 @@ mod tests {
 
     fn projects() -> Picker {
         Picker::projects(
-            vec![("p1".into(), "기본 프로젝트".into(), true), ("p2".into(), "zyris".into(), false)],
+            vec![
+                ("p1".into(), "기본 프로젝트".into(), Some("계정의 기본 프로젝트".into()), true),
+                ("p2".into(), "zyris".into(), Some("zyris 코드 개발".into()), false),
+            ],
             crate::lang::Lang::Ko,
         )
     }
@@ -980,6 +1041,32 @@ mod tests {
     #[test]
     fn the_cursor_starts_on_the_first_real_project() {
         assert_eq!(projects().cursor, 1);
+    }
+
+    /// **A project's description is what the list says about the project.** It was fetched and
+    /// dropped — the row carried the name alone, and the note was at best the default marker — so
+    /// opening the list on a project whose name you couldn't place said nothing about it.
+    #[test]
+    fn a_projects_description_becomes_the_note_under_the_list() {
+        assert_eq!(projects().rows[2].note.as_deref(), Some("zyris 코드 개발"));
+        // **The default marker is not given up for it.** It says where a job opened with no project
+        // lands, which is worth knowing before picking.
+        assert_eq!(projects().rows[1].note.as_deref(), Some("기본 ∙ 계정의 기본 프로젝트"));
+    }
+
+    /// No description and not the default means nothing under the list — the note area belongs to
+    /// the rows that have something to say.
+    #[test]
+    fn a_project_with_no_description_says_nothing_under_the_list() {
+        let plain = |description: Option<&str>, is_default: bool| {
+            let item =
+                ("p1".into(), "어떤 프로젝트".into(), description.map(str::to_string), is_default);
+            Picker::projects(vec![item], crate::lang::Lang::Ko).rows[1].note.clone()
+        };
+        assert_eq!(plain(None, false), None);
+        assert_eq!(plain(Some("   "), false), None, "a blank description is not a description");
+        // A default project with no description still says it is the default.
+        assert_eq!(plain(None, true).as_deref(), Some("기본"));
     }
 
     #[test]

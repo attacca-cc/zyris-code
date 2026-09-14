@@ -115,8 +115,17 @@ pub struct McpCapability {
 
 impl McpCapability {
     pub async fn start(spec: &ServerSpec) -> anyhow::Result<McpCapability> {
+        Self::start_with_timeout(spec, super::REQUEST_TIMEOUT).await
+    }
+
+    async fn start_with_timeout(
+        spec: &ServerSpec,
+        request_timeout: std::time::Duration,
+    ) -> anyhow::Result<McpCapability> {
         let mut client = match &spec.transport {
-            Transport::Stdio { command, args, env } => McpClient::spawn(command, args, env).await?,
+            Transport::Stdio { command, args, env } => {
+                McpClient::spawn_with_timeout(command, args, env, request_timeout).await?
+            }
             Transport::Http { url, headers } => McpClient::connect(url, headers).await?,
         };
         let tools = client.list_tools().await?;
@@ -191,7 +200,23 @@ pub fn config_paths(cwd: &Path) -> Vec<PathBuf> {
 
 /// The servers that are written down. Unreadable files are silently skipped — no config is normal.
 pub fn load_config(cwd: &Path) -> Vec<ServerSpec> {
-    let files: Vec<Value> = config_paths(cwd)
+    load_paths(&config_paths(cwd))
+}
+
+/// What the user wrote for this app. Presence here is already an explicit trust decision.
+pub fn load_user_config() -> Vec<ServerSpec> {
+    let paths: Vec<PathBuf> =
+        crate::conn::app_dir().into_iter().map(|dir| dir.join("mcp.json")).collect();
+    load_paths(&paths)
+}
+
+/// What arrived with the repository. These specs are candidates until explicitly approved.
+pub fn load_project_config(cwd: &Path) -> Vec<ServerSpec> {
+    load_paths(&[cwd.join(".mcp.json")])
+}
+
+fn load_paths(paths: &[PathBuf]) -> Vec<ServerSpec> {
+    let files: Vec<Value> = paths
         .iter()
         .filter_map(|p| std::fs::read_to_string(p).ok())
         .filter_map(|s| match serde_json::from_str::<Value>(&s) {
@@ -239,10 +264,17 @@ pub fn merge_configs(files: Vec<Value>) -> Vec<ServerSpec> {
 /// Only the successful ones are returned; failures are reported as (name, reason) — if one fell
 /// out silently, a person would wait thinking the tool exists.
 pub async fn start_all(specs: &[ServerSpec]) -> (Vec<McpCapability>, Vec<(String, String)>) {
+    start_all_with_timeout(specs, super::REQUEST_TIMEOUT).await
+}
+
+async fn start_all_with_timeout(
+    specs: &[ServerSpec],
+    request_timeout: std::time::Duration,
+) -> (Vec<McpCapability>, Vec<(String, String)>) {
     let mut started: Vec<McpCapability> = Vec::new();
     let mut failed = Vec::new();
     for spec in specs {
-        match McpCapability::start(spec).await {
+        match McpCapability::start_with_timeout(spec, request_timeout).await {
             Ok(cap) => started.push(cap),
             Err(e) => failed.push((spec.slug.clone(), e.to_string())),
         }
@@ -435,6 +467,36 @@ mod tests {
         assert_eq!(started.len(), 1, "the one that works must come up");
         assert_eq!(failed.len(), 1, "what failed must be reported");
         assert_eq!(failed[0].0, "없는놈");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hung_stdio_server_does_not_block_the_next_server() {
+        let specs = vec![
+            ServerSpec {
+                slug: "hung".into(),
+                transport: Transport::Stdio {
+                    command: "sh".into(),
+                    args: vec!["-c".into(), "sleep 60".into()],
+                    env: HashMap::new(),
+                },
+            },
+            ServerSpec {
+                slug: "next".into(),
+                transport: Transport::Stdio {
+                    command: "cat".into(),
+                    args: vec![],
+                    env: HashMap::new(),
+                },
+            },
+        ];
+
+        let (started, failed) =
+            start_all_with_timeout(&specs, std::time::Duration::from_millis(100)).await;
+        assert_eq!(started.len(), 1, "the server after the hung one did not start");
+        assert_eq!(failed.len(), 1, "the hung server was not reported");
+        assert_eq!(failed[0].0, "hung");
+        assert!(failed[0].1.contains("timed out"), "{}", failed[0].1);
     }
 
     /// Having no config is normal. Dying then would make the app unusable.

@@ -24,6 +24,8 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use zyris::AccountCredential;
@@ -37,6 +39,9 @@ use zyris::AccountCredential;
 /// its version, this has to move with it — otherwise every enrolled user is silently told to
 /// enroll again.
 const CREDENTIAL_VERSION: u32 = 1;
+const LOCK_WAIT: Duration = Duration::from_secs(10);
+const LOCK_POLL: Duration = Duration::from_millis(25);
+static TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 /// What went wrong reaching a credential, in the only two shades the caller can act on.
 ///
@@ -98,6 +103,11 @@ impl CredentialStoreError {
 /// before the trait existed and is bounded by one small read or write per process lifetime.
 #[async_trait]
 pub trait CredentialStore: Send + Sync + 'static {
+    /// Hold an inter-process transaction boundary when this backend needs one. Non-file stores
+    /// default to no lock; their own implementation already owns consistency.
+    async fn lock(&self) -> Result<CredentialLock, CredentialStoreError> {
+        Ok(CredentialLock { file: None })
+    }
     /// The stored credential, or `None` when this node has never enrolled.
     async fn load(&self) -> Result<Option<AccountCredential>, CredentialStoreError>;
     /// Write, replacing whatever was there. Callers persist *before* using a credential, so a
@@ -109,6 +119,19 @@ pub trait CredentialStore: Send + Sync + 'static {
     /// Where this backend keeps things, for the one debug line a node logs at startup. Must never
     /// contain a secret — this is a path or a URL, not a token.
     fn describe(&self) -> String;
+}
+
+/// Released on drop, including cancellation and error paths.
+pub struct CredentialLock {
+    file: Option<fs::File>,
+}
+
+impl Drop for CredentialLock {
+    fn drop(&mut self) {
+        if let Some(file) = &self.file {
+            let _ = fs::File::unlock(file);
+        }
+    }
 }
 
 /// Keeps a credential for exactly as long as the process lives.
@@ -252,6 +275,53 @@ impl FileCredentialStore {
 
 #[async_trait]
 impl CredentialStore for FileCredentialStore {
+    async fn lock(&self) -> Result<CredentialLock, CredentialStoreError> {
+        let lock_path = self.path.with_extension("lock");
+        if let Some(parent) = lock_path.parent() {
+            fs::create_dir_all(parent).map_err(CredentialStoreError::other)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
+                    .map_err(CredentialStoreError::other)?;
+            }
+        }
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            // **Said out loud, because it is the intent and not a default.** Nothing is ever
+            // written through this handle — it exists so `try_lock` has something to hold — and
+            // truncating it would only mean two processes racing to empty a file neither reads.
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(CredentialStoreError::other)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(fs::Permissions::from_mode(0o600))
+                .map_err(CredentialStoreError::other)?;
+        }
+        let started = Instant::now();
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(CredentialLock { file: Some(file) }),
+                Err(fs::TryLockError::WouldBlock) => {
+                    if started.elapsed() >= LOCK_WAIT {
+                        return Err(CredentialStoreError::Refused(format!(
+                            "timed out waiting for credential lock {}; try again",
+                            lock_path.display()
+                        )));
+                    }
+                    tokio::time::sleep(LOCK_POLL).await;
+                }
+                Err(fs::TryLockError::Error(error)) => {
+                    return Err(CredentialStoreError::other(error))
+                }
+            }
+        }
+    }
+
     async fn load(&self) -> Result<Option<AccountCredential>, CredentialStoreError> {
         Ok(load(&self.path)?)
     }
@@ -349,11 +419,16 @@ fn save(path: &Path, credential: &AccountCredential) -> Result<(), StoreError> {
         }
     }
 
-    let temp = path.with_extension("tmp");
+    let id = TEMP_ID.fetch_add(1, Ordering::Relaxed);
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("credential");
+    let temp = path.with_file_name(format!(".{name}.{}.{stamp}.{id}.tmp", std::process::id()));
     let bytes = serde_json::to_vec_pretty(credential).map_err(StoreError::Corrupt)?;
-    {
+    let written = (|| -> Result<(), StoreError> {
         use std::io::Write;
-        let mut file = fs::File::create(&temp)?;
+        let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&temp)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -362,9 +437,13 @@ fn save(path: &Path, credential: &AccountCredential) -> Result<(), StoreError> {
         }
         file.write_all(&bytes)?;
         file.sync_all()?;
+        fs::rename(&temp, path)?;
+        Ok(())
+    })();
+    if written.is_err() {
+        let _ = fs::remove_file(&temp);
     }
-    fs::rename(&temp, path)?;
-    Ok(())
+    written
 }
 
 /// Forget a credential the server no longer honours, so the next start enrolls cleanly instead of
@@ -498,6 +577,31 @@ mod tests {
         store.clear().await.unwrap();
         assert_eq!(store.load().await.unwrap(), None);
         store.clear().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_refresh_rotates_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("creds.json");
+        let store = FileCredentialStore::at(&path);
+        store.save(&credential()).await.unwrap();
+
+        let rotate = |path: PathBuf| async move {
+            let store = FileCredentialStore::at(path);
+            let _transaction = store.lock().await.unwrap();
+            let mut current = store.load().await.unwrap().unwrap();
+            if current.refresh_token != "znr_refresh" {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            current.refresh_token = "znr_rotated".into();
+            store.save(&current).await.unwrap();
+            true
+        };
+        let (first, second) = tokio::join!(rotate(path.clone()), rotate(path.clone()));
+
+        assert_eq!(u8::from(first) + u8::from(second), 1);
+        assert_eq!(store.load().await.unwrap().unwrap().refresh_token, "znr_rotated");
     }
 
     #[cfg(unix)]

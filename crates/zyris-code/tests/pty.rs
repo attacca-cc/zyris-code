@@ -287,6 +287,17 @@ fn only_the_mouse_modes_this_app_reads_are_switched_on() {
     for (what, seq) in [("any-motion", "\x1b[?1003h"), ("urxvt coordinates", "\x1b[?1015h")] {
         assert!(!out.contains(seq), "{what} tracking was switched on and is never read ({seq:?})");
     }
+
+    // **And the motion level has to be asked for last.** `?1000`, `?1002` and `?1003` are levels of
+    // *one* terminal setting, so whichever is sent last is the one in force. With `?1000h` after
+    // `?1002h` the terminal ends up in button-only mode, and a terminal that forwards
+    // motion-while-held only in its motion mode swallows every drag: presses and releases still
+    // arrive (so a click still folds a row) while dragging selects nothing at all. Measured on
+    // kitty 0.47 — `MOUSE_MODE(…, mouse_tracking_mode, …)` in `screen.c` assigns to one enum, and
+    // `should_handle_in_kitty` in `mouse.c` forwards motion only for MOTION_MODE/ANY_MODE.
+    let buttons = out.find("\x1b[?1000h").expect("checked above");
+    let drag = out.find("\x1b[?1002h").expect("checked above");
+    assert!(buttons < drag, "`?1002h` (drag) must be asked for after `?1000h` (buttons)");
 }
 
 /// Drops ANSI escape sequences, leaving what a person would see.

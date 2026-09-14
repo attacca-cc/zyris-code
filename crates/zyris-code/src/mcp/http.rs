@@ -44,7 +44,7 @@ impl HttpClient {
         let http = reqwest::Client::builder()
             // **A server that never answers must not hold a tool call open forever.** attacca cuts
             // a node call at 60s, so anything past that is a worse error than saying so here.
-            .timeout(std::time::Duration::from_secs(30))
+            .timeout(super::REQUEST_TIMEOUT)
             .build()
             .context("could not build the HTTP client")?;
         let mut client = HttpClient {

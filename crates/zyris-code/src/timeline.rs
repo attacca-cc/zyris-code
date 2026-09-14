@@ -72,6 +72,15 @@ pub fn live_think_key(card_seq: i64) -> i64 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Part {
     Think(Think),
+    /// Something the agent **said** — laid inside the working, not beside it.
+    ///
+    /// **What it says is part of the working out.** A turn thinks, runs something and says where
+    /// it has got to, several times over. Standing each of those sayings outside the card left the
+    /// conversation as a column of one-line messages with the work hidden in between; only the last
+    /// thing said is still current, and `fold_older_sayings` lays the earlier ones in here. It keeps
+    /// a fold key of the saying's own seq, exactly as a chip does, so the person can open it and
+    /// read the words that were addressed to them.
+    Said(Think),
     Step(Step),
 }
 
@@ -79,7 +88,7 @@ impl Part {
     /// The fold key of this part.
     pub fn key(&self) -> i64 {
         match self {
-            Part::Think(t) => t.seq,
+            Part::Think(t) | Part::Said(t) => t.seq,
             Part::Step(s) => s.seq,
         }
     }
@@ -124,6 +133,15 @@ pub enum Item {
         seq: i64,
         steps: Vec<crate::question::Step>,
         answered: bool,
+        /// What was picked, boiled down to one line (`Answering::answer_picks`). `None` while the
+        /// question has not been answered.
+        ///
+        /// **The answer is not an item of its own.** It goes back to the server as an ordinary
+        /// message, so it arrives as one: the person's own bar around it and the question repeated
+        /// verbatim above its answers, which made one row picked off a list read as a paragraph
+        /// they had typed. The one thing worth knowing is which row was picked, and where to know
+        /// it is under the question — see `fold_answers_into_questions`.
+        answer: Option<String>,
     },
     /// What the app said. Slash-command results and revert notices land here.
     ///
@@ -132,6 +150,19 @@ pub enum Item {
     System {
         seq: i64,
         text: String,
+    },
+    /// What a run came to, in the agent's own words — the `report_result` call, drawn as a row.
+    ///
+    /// **A row in the conversation, not a card over the input.** A card took the input's spot and
+    /// waited to be put away with `Esc`; the sentence it carries is part of what happened, and the
+    /// timeline is where what happened is read — and scrolled back to later, without anybody having
+    /// had to press a key at the right moment.
+    Report {
+        seq: i64,
+        /// Whether the work came out. The row's colour and one word come from this.
+        ok: bool,
+        /// The agent's own sentence, whole. Nothing is cut — the timeline scrolls.
+        summary: String,
     },
 }
 
@@ -144,6 +175,7 @@ impl Item {
             | Item::Error { seq, .. }
             | Item::Subagent { seq, .. }
             | Item::System { seq, .. }
+            | Item::Report { seq, .. }
             | Item::Question { seq, .. } => *seq,
         }
     }
@@ -385,7 +417,12 @@ impl Timeline {
                 EntryKind::Question { steps, answered } => {
                     // A question must not be buried in a card. Close the run and stand it outside.
                     open_work = None;
-                    out.push(Item::Question { seq, steps: steps.clone(), answered: *answered });
+                    out.push(Item::Question {
+                        seq,
+                        steps: steps.clone(),
+                        answered: *answered,
+                        answer: None,
+                    });
                 }
                 EntryKind::WorkStart(title) => {
                     // **A summary retitles the open card instead of starting another one.** See
@@ -413,6 +450,12 @@ impl Timeline {
                             text: text.clone(),
                         }));
                     }
+                }
+                EntryKind::Report { ok, summary } => {
+                    // **A report ends the stretch of working, exactly as speaking does**, and it
+                    // stands outside the card: it is the sentence the run was for.
+                    open_work = None;
+                    out.push(Item::Report { seq, ok: *ok, summary: summary.clone() });
                 }
                 EntryKind::Tool { name, action, state, detail } => {
                     let at = card_for(&mut out, &mut open_work, seq);
@@ -460,7 +503,15 @@ impl Timeline {
 
         // Snippets meant to sit after future events (anchors not yet arrived) are carried over.
         self.live_text = live;
-        self.weave_in_what_was_said_here(out)
+        // **Then an answer is laid under the question it answered.** After the weaving, because
+        // the weaving is what puts the person's own message in place — the echo of it, before the
+        // server's copy arrives — and the answer is that message.
+        let out = fold_answers_into_questions(self.weave_in_what_was_said_here(out));
+        // **Then what is left of the sayings is settled, newest first.** It runs after the weaving,
+        // because the weaving is what puts the person's own messages in place — and a saying's
+        // neighbour is what decides what it can fold into. Joining the turn back into one card comes
+        // last, because it is a saying folding that leaves two cards side by side.
+        merge_adjacent_cards(fold_older_sayings(out))
     }
 
     /// Weaves what was said here into its place among the server events.
@@ -540,6 +591,120 @@ fn last_seq(item: &Item) -> i64 {
 /// cache treat two items as one.
 fn implicit_seq(first: i64) -> i64 {
     i64::MIN + first
+}
+
+/// **An answer belongs under the question it answered.** The `question` tool takes the next
+/// message verbatim, so the picked answer comes back as an ordinary `chat_user` event — and, until
+/// it does, as this app's own echo of it. Drawn as a message it wears the person's bar, repeats the
+/// question verbatim above its own answers, and turns one row picked off a list into a wall of text
+/// that says the person typed it out. It becomes the question's own answer line instead.
+///
+/// **Only a reply this app wrote is taken.** `question::Answering::answer_picks` reads the shape
+/// `answer_text` writes; a message of somebody's own has none, and is left standing as the message
+/// it is. That is also what keeps a question somebody put away unanswered from swallowing whatever
+/// they type next.
+fn fold_answers_into_questions(items: Vec<Item>) -> Vec<Item> {
+    let mut out: Vec<Item> = Vec::with_capacity(items.len());
+    for item in items {
+        if let Item::User { text, .. } = &item {
+            if let Some(Item::Question { answer, .. }) = out.last_mut() {
+                if let Some(picks) = crate::question::Answering::answer_picks(text) {
+                    *answer = Some(picks);
+                    continue;
+                }
+            }
+        }
+        out.push(item);
+    }
+    out
+}
+
+/// The fold key of a card that exists only to hold something the agent said.
+///
+/// **`saturating_add`, because a saying that is still streaming has a negative seq** — it is handed
+/// out by the same counter as the app's own sayings — and `i64::MIN + n` would wrap round into the
+/// positive side, which is a server seq's territory.
+fn said_card_seq(saying: i64) -> i64 {
+    i64::MIN.saturating_add(saying.max(0))
+}
+
+/// Joins the stretches of working that belong to one turn into one card.
+///
+/// **A turn is one card, not one per saying.** Speaking ends a stretch of working — that is what
+/// makes the newest saying stand outside — but the next stretch is the same turn carrying on.
+/// Left apart, each stretch was its own card, and each drew its own `✻ 완료` line once the turn was
+/// over: a column of finished cards down the conversation with the work hidden behind every one of
+/// them (2026-09-13 user report). A saying that has just folded is exactly what leaves two cards
+/// next to each other, so joining them is what puts the turn back together.
+///
+/// **The boundaries are everything else.** A message, a question, a report, an error — those are
+/// not working, and the turn does not carry on across them.
+///
+/// **The identity is the first card's seq.** That is the fold key the person's own choice is filed
+/// under, so it must not move when a later stretch joins, and the title is the last non-empty one —
+/// a later `work_summary` is the newest status of the same stretch of thinking.
+fn merge_adjacent_cards(items: Vec<Item>) -> Vec<Item> {
+    let mut out: Vec<Item> = Vec::with_capacity(items.len());
+    for item in items {
+        let Item::Work { seq, title, parts } = item else {
+            out.push(item);
+            continue;
+        };
+        match out.last_mut() {
+            Some(Item::Work { title: head, parts: had, .. }) => {
+                had.extend(parts);
+                if !title.is_empty() {
+                    *head = title;
+                }
+                // `seq` is dropped on purpose — the first card keeps its identity, and with it the
+                // fold the person set.
+            }
+            _ => out.push(Item::Work { seq, title, parts }),
+        }
+    }
+    out
+}
+
+/// Lays every saying but the newest inside the working it came out of.
+///
+/// **The last thing said stands out; the rest becomes part of how it got there.** A turn is not a
+/// column of messages — it thinks, it runs something, it says where it has got to, and it does that
+/// several times over. Leaving every one of them outside the card made the conversation a column of
+/// one-line messages with the work hidden in between. What is still current keeps its row; and a
+/// report, which is the finished sentence the run was for, retires the last one too.
+///
+/// A saying folds into the card above it, because that is the working that produced it. With no card
+/// above — a short answer with no tools, spoken again later — a card is opened to hold it. **What
+/// the agent said is never dropped**, which is why that arm exists at all.
+fn fold_older_sayings(items: Vec<Item>) -> Vec<Item> {
+    // The one that stays: the last saying, unless a report came after it.
+    let last_saying = items.iter().rposition(|i| matches!(i, Item::Agent { .. }));
+    let last_report = items.iter().rposition(|i| matches!(i, Item::Report { .. }));
+    let stands = match (last_saying, last_report) {
+        (Some(said), Some(report)) if report > said => None,
+        (said, _) => said,
+    };
+    let mut out: Vec<Item> = Vec::with_capacity(items.len());
+    for (at, item) in items.into_iter().enumerate() {
+        let Item::Agent { seq, text } = item else {
+            out.push(item);
+            continue;
+        };
+        if stands == Some(at) {
+            out.push(Item::Agent { seq, text });
+            continue;
+        }
+        let said = Part::Said(Think { seq, title: None, text });
+        match out.last_mut() {
+            Some(Item::Work { parts, .. }) => parts.push(said),
+            _ => out.push(Item::Work {
+                seq: said_card_seq(seq),
+                title: String::new(),
+                parts: vec![said],
+            }),
+        }
+    }
+    out
 }
 
 /// Pushes streaming snippets whose anchor is before `up_to` into their current spot.
@@ -722,8 +887,13 @@ mod tests {
         t.echo("다음 질문");
         assert_eq!(t.items().last().map(|i| i.seq()), Some(-1), "{:?}", t.items());
         t.upsert(e(3, EntryKind::Agent("두 번째 답".into())));
-        let seqs: Vec<i64> = t.items().iter().map(|i| i.seq()).collect();
-        assert_eq!(seqs, vec![1, 2, -1, 3], "the echo must keep its place: {seqs:?}");
+        // The first answer is no longer the newest thing said, so it has folded into the working
+        // it came out of — a card of its own, there being no tool run above it — and **the echo
+        // still stands exactly where it was typed**, between the two answers.
+        assert_eq!(
+            shape(&mut t),
+            vec!["user 첫 질문", "card[](said 첫 답)", "user 다음 질문", "said 두 번째 답",]
+        );
     }
 
     /// Echoes draw from the same negative counter as `say`, so nothing can collide with a server
@@ -1121,6 +1291,7 @@ mod tests {
                         .iter()
                         .map(|p| match p {
                             Part::Think(k) => format!("think {}", k.text),
+                            Part::Said(k) => format!("said {}", k.text),
                             Part::Step(s) => format!("tool {}", s.name),
                         })
                         .collect();
@@ -1128,33 +1299,228 @@ mod tests {
                 }
                 Item::Agent { text, .. } => format!("said {text}"),
                 Item::User { text, .. } => format!("user {text}"),
+                Item::Report { ok, summary, .. } => {
+                    format!("report {} {summary}", if *ok { "ok" } else { "failed" })
+                }
                 other => format!("{other:?}"),
             })
             .collect()
     }
 
-    /// **What the agent says closes the stretch of working and stands outside it.** It used to be
-    /// folded into the card among the reasoning, where it read as one more thought rather than as
-    /// words addressed to the person — and it is the one thing in the turn they came for.
+    /// **Only the newest saying stands outside the card; the rest is how it got there.**
+    ///
+    /// It used to be every one of them: the conversation read as a column of one-line messages
+    /// with the work hidden between them. A saying is part of the stretch of working that produced
+    /// it, and it folds back into that card the moment something newer — another saying, or the
+    /// report the run was for — arrives.
     #[test]
-    fn what_the_agent_says_closes_the_card_and_stands_outside_it() {
+    fn only_the_newest_saying_stands_outside_the_card() {
         let mut t = Timeline::new();
         t.upsert(e(1, EntryKind::WorkStart("커밋".into())));
         t.upsert(e(2, EntryKind::Agent("이제 커밋합니다".into())));
         t.upsert(tool_at(3, "exec", "git commit"));
         t.upsert(e(4, EntryKind::Agent("커밋하고 푸시하는 중".into())));
         t.upsert(tool_at(5, "exec", "git push"));
+        t.upsert(e(6, EntryKind::Agent("푸시했습니다".into())));
 
         assert_eq!(
             shape(&mut t),
             vec![
-                "card[커밋]()",
-                "said 이제 커밋합니다",
-                "card[](tool exec)",
-                "said 커밋하고 푸시하는 중",
-                "card[](tool exec)",
+                "card[커밋](said 이제 커밋합니다, tool exec, said 커밋하고 푸시하는 중, tool exec)",
+                "said 푸시했습니다",
             ]
         );
+    }
+
+    /// **A turn that said three things is still one card.**
+    ///
+    /// This is what a column of `✻ 완료` lines was: speaking ends a stretch of working, every
+    /// stretch became a card of its own, and once the turn was over each of them drew its own
+    /// finished head — with the reasoning hidden behind every one of them (2026-09-13 user report).
+    /// Joining the stretches is what leaves one head for the turn, and the newest saying outside it.
+    #[test]
+    fn a_turn_that_said_three_things_is_still_one_card() {
+        let mut t = Timeline::new();
+        t.upsert(e(1, EntryKind::WorkStart("첫 주제".into())));
+        t.upsert(tool_at(2, "grep", "rows"));
+        t.upsert(e(3, EntryKind::Agent("먼저 찾았습니다".into())));
+        t.upsert(tool_at(4, "edit", "rows.rs"));
+        t.upsert(e(5, EntryKind::Agent("고쳤습니다".into())));
+        t.upsert(tool_at(6, "exec", "cargo test"));
+        t.upsert(e(7, EntryKind::Agent("테스트가 통과했습니다".into())));
+
+        assert_eq!(
+            shape(&mut t),
+            vec![
+                "card[첫 주제](tool grep, said 먼저 찾았습니다, tool edit, said 고쳤습니다, tool exec)",
+                "said 테스트가 통과했습니다",
+            ]
+        );
+    }
+
+    /// **A report is a boundary, not a join.** The turn after it is a different piece of work, so
+    /// the cards on either side stay apart even though nothing was said in between.
+    #[test]
+    fn a_report_does_not_join_two_cards_together() {
+        let mut t = Timeline::new();
+        t.upsert(e(1, EntryKind::WorkStart("첫 일".into())));
+        t.upsert(tool_at(2, "exec", "cargo build"));
+        t.upsert(e(3, EntryKind::Report { ok: true, summary: "빌드했습니다.".into() }));
+        t.upsert(e(4, EntryKind::WorkStart("둘째 일".into())));
+        t.upsert(tool_at(5, "exec", "cargo test"));
+
+        assert_eq!(
+            shape(&mut t),
+            vec!["card[첫 일](tool exec)", "report ok 빌드했습니다.", "card[둘째 일](tool exec)",]
+        );
+    }
+
+    /// **Joining the stretches does not move the fold key.** It is the first card's seq, and that is
+    /// what the person's own open/closed choice is filed under — a key that moved when a later
+    /// stretch joined would open or close a card under their hands.
+    #[test]
+    fn joining_the_stretches_keeps_the_first_cards_fold_key() {
+        let mut t = Timeline::new();
+        t.upsert(e(1, EntryKind::WorkStart("첫 조각".into())));
+        t.upsert(tool_at(2, "grep", "rows"));
+        let before = t.items()[0].seq();
+        t.upsert(e(3, EntryKind::Agent("하나 했습니다".into())));
+        t.upsert(tool_at(4, "edit", "rows.rs"));
+        t.upsert(e(5, EntryKind::Agent("다 했습니다".into())));
+
+        let items = t.items().to_vec();
+        assert_eq!(items.len(), 2, "{items:?}");
+        assert_eq!(items[0].seq(), before, "the fold key moved when the stretches joined");
+    }
+
+    /// One question step, for the tests that need a question in the timeline.
+    fn one_step() -> Vec<crate::question::Step> {
+        vec![crate::question::Step {
+            header: None,
+            question: "어느 쪽으로 갈까요?".into(),
+            options: vec![],
+            multi: false,
+        }]
+    }
+
+    /// **An answer is laid under the question it answered, not drawn as a message.** The `question`
+    /// tool takes the next message verbatim, so the picked answer arrives as an ordinary
+    /// `chat_user` event — and as a message of its own it wore the person's bar and repeated the
+    /// question verbatim above its own answers.
+    #[test]
+    fn an_answer_is_laid_under_the_question_it_answered() {
+        let mut t = Timeline::new();
+        t.upsert(e(1, EntryKind::Question { steps: one_step(), answered: true }));
+        t.upsert(e(2, EntryKind::User("어느 쪽으로 갈까요?\n  - A안 (빠르다)".into())));
+        let items = t.items().to_vec();
+        assert_eq!(items.len(), 1, "the answer must not be an item of its own: {items:?}");
+        match &items[0] {
+            Item::Question { answer, .. } => assert_eq!(answer.as_deref(), Some("A안 (빠르다)")),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// **A message the person wrote stays a message**, even standing right after a question. Only
+    /// the shape `answer_text` writes is read as an answer, and theirs has none — which is also
+    /// what keeps a question put away unanswered from swallowing what they type next.
+    #[test]
+    fn a_message_of_the_persons_own_is_not_an_answer() {
+        let mut t = Timeline::new();
+        t.upsert(e(1, EntryKind::Question { steps: one_step(), answered: true }));
+        t.upsert(e(2, EntryKind::User("아니 그건 말고 다른 걸로 해 주세요".into())));
+        let items = t.items().to_vec();
+        assert_eq!(items.len(), 2, "their message was swallowed: {items:?}");
+        assert!(matches!(items[1], Item::User { .. }), "{items:?}");
+        assert!(
+            matches!(&items[0], Item::Question { answer: None, .. }),
+            "an answer was invented: {items:?}"
+        );
+    }
+
+    /// **The echo of an answer folds as well.** What was picked is on screen the instant it is
+    /// sent, before the server's copy of that message comes back — and the two are the same answer,
+    /// so they have to land in the same place.
+    #[test]
+    fn the_echo_of_an_answer_lands_under_the_question_too() {
+        let mut t = Timeline::new();
+        t.upsert(e(1, EntryKind::Question { steps: one_step(), answered: false }));
+        t.echo("어느 쪽으로 갈까요?\n  - A안 (빠르다)");
+        let items = t.items().to_vec();
+        assert_eq!(items.len(), 1, "the echo stood on its own: {items:?}");
+        match &items[0] {
+            Item::Question { answer, .. } => assert_eq!(answer.as_deref(), Some("A안 (빠르다)")),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// **A saying folds into the card above it, keeping its fold key.** The card that swallowed it
+    /// reaches the saying's seq, so opening the card opens the words that were addressed to the
+    /// person — and they are the saying's own event, not a copy of it.
+    #[test]
+    fn a_folded_saying_keeps_the_key_of_its_own_event() {
+        let mut t = Timeline::new();
+        t.upsert(e(1, EntryKind::WorkStart("런".into())));
+        t.upsert(e(2, EntryKind::Agent("먼저 보겠습니다".into())));
+        t.upsert(e(3, EntryKind::Agent("다 봤습니다".into())));
+
+        let items = t.items().to_vec();
+        let Some(Item::Work { parts, .. }) = items.first() else { panic!("{items:?}") };
+        match parts.as_slice() {
+            [Part::Said(said)] => {
+                assert_eq!(said.seq, 2, "the saying must keep its own seq as the fold key");
+                assert_eq!(said.text, "먼저 보겠습니다");
+            }
+            other => panic!("expected the one folded saying: {other:?}"),
+        }
+        assert!(
+            items.iter().any(|i| matches!(i, Item::Agent { seq: 3, .. })),
+            "the newest saying must keep its row: {items:?}"
+        );
+    }
+
+    /// **A saying with no working above it is not dropped.** A short answer that used no tools,
+    /// followed by another one: there is no card to fold into, so one is opened for it.
+    #[test]
+    fn a_saying_with_no_card_above_it_opens_one() {
+        let mut t = Timeline::new();
+        t.upsert(e(1, EntryKind::User("안녕".into())));
+        t.upsert(e(2, EntryKind::Agent("네 안녕하세요".into())));
+        t.upsert(e(3, EntryKind::Agent("그런데 하나 더 있습니다".into())));
+
+        assert_eq!(
+            shape(&mut t),
+            vec!["user 안녕", "card[](said 네 안녕하세요)", "said 그런데 하나 더 있습니다",]
+        );
+    }
+
+    /// **A report is a row of the conversation, in the agent's own words**, and it retires the
+    /// saying before it — the report says what came of the run, and the last thing said on the way
+    /// is part of how it got there.
+    #[test]
+    fn a_report_is_a_row_of_its_own_and_folds_the_saying_before_it() {
+        let mut t = Timeline::new();
+        t.upsert(e(1, EntryKind::WorkStart("실행".into())));
+        t.upsert(tool_at(2, "exec", "cargo test"));
+        t.upsert(e(3, EntryKind::Agent("전부 통과했습니다".into())));
+        t.upsert(e(4, EntryKind::Report { ok: true, summary: "테스트를 다 돌렸습니다.".into() }));
+
+        assert_eq!(
+            shape(&mut t),
+            vec![
+                "card[실행](tool exec, said 전부 통과했습니다)",
+                "report ok 테스트를 다 돌렸습니다.",
+            ]
+        );
+    }
+
+    /// The report is a row whether or not anything was said, and a failure is still a report —
+    /// the one a person most needs to see.
+    #[test]
+    fn a_report_stands_on_its_own_even_with_nothing_said() {
+        let mut t = Timeline::new();
+        t.upsert(e(1, EntryKind::WorkStart("실행".into())));
+        t.upsert(e(2, EntryKind::Report { ok: false, summary: "테스트가 깨졌습니다.".into() }));
+        assert_eq!(shape(&mut t), vec!["card[실행]()", "report failed 테스트가 깨졌습니다."]);
     }
 
     /// **A streaming snippet closes the card exactly as its durable twin will.** Placed inside, the
@@ -1172,8 +1538,9 @@ mod tests {
         );
     }
 
-    /// **Streaming text split by a tool stays two answers** — merged into one,
-    /// the two messages would look like a single block.
+    /// **Streaming text split by a tool stays two sayings** — the older one folds into the working
+    /// it came out of, the newer one keeps its row. Merged into one they would read as a single
+    /// message the agent never sent.
     #[test]
     fn live_text_split_by_a_tool_stays_two_segments() {
         let mut t = Timeline::new();
@@ -1184,12 +1551,7 @@ mod tests {
 
         assert_eq!(
             shape(&mut t),
-            vec![
-                "card[커밋]()",
-                "said 이제 커밋합니다",
-                "card[](tool exec)",
-                "said 커밋하고 푸시하는 중",
-            ]
+            vec!["card[커밋](said 이제 커밋합니다, tool exec)", "said 커밋하고 푸시하는 중",]
         );
     }
 

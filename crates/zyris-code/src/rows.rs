@@ -251,6 +251,9 @@ fn affecting(item: &Item, folds: &Folds, running: bool) -> Affecting {
     for part in parts {
         match part {
             Part::Think(t) => out.push(at(t.seq, NodeKind::Chip)),
+            // **A saying has nothing to fold and nothing to hide.** It is written out whole, so
+            // there is no fold state of its own for the cache to watch.
+            Part::Said(_) => {}
             Part::Step(s) => out.push(at(s.seq, NodeKind::Tool)),
         }
     }
@@ -284,9 +287,11 @@ pub fn inside(items: &[Item], card: i64) -> Vec<i64> {
             Item::Work { seq, parts, .. } if *seq == card => Some(
                 parts
                     .iter()
-                    .map(|part| match part {
-                        Part::Think(t) => t.seq,
-                        Part::Step(s) => s.seq,
+                    .filter_map(|part| match part {
+                        Part::Think(t) => Some(t.seq),
+                        // A saying is never folded open or shut, so it holds no state to forget.
+                        Part::Said(_) => None,
+                        Part::Step(s) => Some(s.seq),
                     })
                     .collect(),
             ),
@@ -557,69 +562,26 @@ fn make(item: &Item, width: u16, folds: &Folds, turn: Turn, lang: crate::lang::L
     let mut breathing: Vec<(usize, usize)> = Vec::new();
     match item {
         Item::User { text, .. } => {
-            // **An answer is drawn as an answer.** `question::answer_text` writes the question and
-            // then `  - ` bullets under it. Rendered as ordinary markdown that is a paragraph of
-            // bullets inside the person's own bar, with the question and the reply at the same
-            // weight (2026-09-13). The question gets a check, its answers an arrow.
-            let answered = crate::question::Answering::looks_like_an_answer(text);
-            for (i, raw) in text.lines().enumerate() {
-                // **Typed-in answers look different.** The fact that the answer wasn't among the options is itself
-                // information, and if it blends in with the picked ones that distinction disappears.
-                // Answer lines arrive as `  - {free_mark}…` — the list marker must be stripped
-                // first for the prefix to show.
-                let bullet = raw.starts_with("  - ");
-                let bare = raw.trim_start().trim_start_matches("- ").trim_start();
-                let typed = bare.starts_with(lang.free_mark());
-                let body = if typed || (answered && bullet) {
-                    bare.trim_start_matches(lang.free_mark()).trim()
-                } else {
-                    raw
-                };
-                let style = if typed {
-                    Style::default().fg(theme::accent_hover()).add_modifier(Modifier::ITALIC)
-                } else if answered && !bullet {
-                    // The question is context by now, not the thing the person said.
-                    Style::default().fg(theme::text_muted())
-                } else {
-                    Style::default().fg(theme::text())
-                };
-                // **The bar stands on every line.** Set only on the first line, the second line onward
-                // wouldn't be distinguishable from an answer — the longer the question, the longer that stretch.
-                let _ = i;
-                let mut spans = vec![Span::styled("▌ ", Style::default().fg(theme::accent()))];
-                if answered {
-                    let (mark, colour) = if !bullet {
-                        ("✓ ", theme::success())
-                    } else if !typed {
-                        ("  → ", theme::accent())
-                    } else {
-                        // The ✎ is this line's mark already; it only needs to line up.
-                        ("    ", theme::accent())
-                    };
-                    spans.push(Span::styled(mark, Style::default().fg(colour)));
-                }
-                if typed {
-                    spans.push(Span::styled("✎ ", Style::default().fg(theme::accent_hover())));
-                }
-                let prefix_w =
-                    spans.iter().map(|s| markdown::display_width(&s.content)).sum::<usize>();
-                let rendered = markdown::render_rich(body, body_width(width));
+            // **The person's own words, and nothing read into them.** An answer to a question does
+            // not reach here at all — the timeline lays it under the question that asked it
+            // (`Item::Question::answer`), so what arrives as this item is something they typed.
+            for raw in text.lines() {
+                let rendered = markdown::render_rich(raw, body_width(width));
                 for (li, line) in rendered.lines.into_iter().enumerate() {
-                    let mut row = spans.clone();
-                    row.extend(line.spans.into_iter().map(|sp| {
-                        if typed {
-                            Span::styled(sp.content.to_string(), style)
-                        } else {
-                            sp
-                        }
-                    }));
-                    // **The background rides on the line, not the spans.** Painted on a span it breaks at glyph widths
-                    // into blotches, and padding with spaces to fill the width lets those spaces
-                    // travel through `plain()` into the clipboard. Stretching to the screen width is
-                    // done where it draws (`widgets::transcript::stretch`).
-                    out.push(Line::from(row).style(Style::default().bg(theme::user_bg())));
+                    // **The bar stands on every line.** Set only on the first line, the second line
+                    // onward wouldn't be distinguishable from the message before it — the longer
+                    // the message, the longer that stretch.
+                    let bar = Span::styled("▌ ", Style::default().fg(theme::accent()));
+                    let prefix_w = markdown::display_width(&bar.content);
+                    let mut spans = vec![bar];
+                    spans.extend(line.spans);
+                    // **The background rides on the line, not the spans.** Painted on a span it
+                    // breaks at glyph widths into blotches, and padding with spaces to fill the
+                    // width lets those spaces travel through `plain()` into the clipboard.
+                    // Stretching to the screen width is done where it draws
+                    // (`widgets::transcript::stretch`).
+                    out.push(Line::from(spans).style(Style::default().bg(theme::user_bg())));
                     links.push(shift_links(&rendered.links[li], prefix_w));
-                    spans = vec![Span::styled("▌ ", Style::default().fg(theme::accent()))];
                 }
             }
         }
@@ -651,8 +613,8 @@ fn make(item: &Item, width: u16, folds: &Folds, turn: Turn, lang: crate::lang::L
             links.push(Vec::new());
         }
         // The question being answered doesn't come here — `layout` filters it out.
-        Item::Question { steps, answered, .. } => {
-            let rows = question_rows(steps, *answered, width, lang);
+        Item::Question { steps, answered, answer, .. } => {
+            let rows = question_rows(steps, *answered, answer.as_deref(), width, lang);
             let n = rows.len();
             out.extend(rows);
             links.extend(std::iter::repeat_with(Vec::new).take(n));
@@ -678,6 +640,29 @@ fn make(item: &Item, width: u16, folds: &Folds, turn: Turn, lang: crate::lang::L
                 Span::styled(summary.clone(), Style::default().fg(theme::text_muted())),
             ]));
             links.push(Vec::new());
+        }
+        // **What a run came to, in the agent's own words.** A row of the conversation — the same
+        // head the card used to draw, without taking the input's spot and without a key to press.
+        // Nothing is cut: the timeline scrolls, and the sentence is the point.
+        Item::Report { ok, summary, .. } => {
+            let colour = if *ok { theme::success() } else { theme::danger() };
+            out.push(Line::from(vec![
+                Span::styled("◆ ", Style::default().fg(colour)),
+                Span::styled(
+                    lang.report_head(*ok),
+                    Style::default().fg(colour).add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            links.push(Vec::new());
+            let rendered = markdown::render_rich(summary, body_width(width).saturating_sub(2));
+            for (li, line) in rendered.lines.into_iter().enumerate() {
+                let mut spans = vec![pad(), pad()];
+                let prefix_w =
+                    spans.iter().map(|s| markdown::display_width(&s.content)).sum::<usize>();
+                spans.extend(line.spans);
+                out.push(Line::from(spans));
+                links.push(shift_links(&rendered.links[li], prefix_w));
+            }
         }
         Item::Work { seq, title, parts } => {
             // ── Card head ────────────────────────────────────────────────────────────────────
@@ -793,6 +778,36 @@ fn make(item: &Item, width: u16, folds: &Folds, turn: Turn, lang: crate::lang::L
                             spans.extend(line.spans.into_iter().map(|s| {
                                 Span::styled(s.content.to_string(), s.style.fg(theme::text_muted()))
                             }));
+                            out.push(Line::from(spans));
+                            links.push(shift_links(&rendered.links[li], prefix_w));
+                        }
+                    }
+                    Part::Said(t) => {
+                        // **Something the agent said, written out.** It sits inside the working,
+                        // because that is where the work that produced it is — but it is not a chip
+                        // and it is not dimmed like the reasoning: opening the card is enough to
+                        // read the sentence, and it keeps the colour of words addressed to the
+                        // person. `◆` is this app's mark for the agent's own words, so it is never
+                        // taken for one more thought.
+                        //
+                        // **Nothing about it folds.** As a chip with a chevron of its own it was a
+                        // heading the person had to open a second time to find the sentence under
+                        // it (2026-09-13 user report).
+                        let rendered =
+                            markdown::render_rich(&t.text, body_width(width).saturating_sub(2));
+                        for (li, line) in rendered.lines.into_iter().enumerate() {
+                            let mut spans = vec![
+                                pad(),
+                                Span::styled(
+                                    if li == 0 { "◆ " } else { "  " },
+                                    Style::default().fg(theme::accent()),
+                                ),
+                            ];
+                            let prefix_w = spans
+                                .iter()
+                                .map(|s| markdown::display_width(&s.content))
+                                .sum::<usize>();
+                            spans.extend(line.spans);
                             out.push(Line::from(spans));
                             links.push(shift_links(&rendered.links[li], prefix_w));
                         }
@@ -1152,10 +1167,15 @@ fn json_line(raw: &str, base: ratatui::style::Color) -> Vec<Span<'static>> {
     spans
 }
 
+/// The mark a question's answer line wears. **Four columns, and the width is taken from it** —
+/// the answer is cut to what is left rather than drawn over the edge.
+const ANSWER_MARK: &str = "  → ";
+
 /// Question card. While awaiting an answer it can be chosen; after the answer it's read-only.
 fn question_rows(
     steps: &[crate::question::Step],
     answered: bool,
+    answer: Option<&str>,
     width: u16,
     lang: crate::lang::Lang,
 ) -> Vec<Line<'static>> {
@@ -1180,9 +1200,27 @@ fn question_rows(
             Style::default().fg(theme::text_muted()),
         ));
     }
-    out.push(Line::from(head));
+    // **The question wraps.** It is the whole reason this row is up, and a long one used to be cut
+    // at the right edge in silence — `ratatui` drops whatever runs past it. The wrapped part hangs
+    // under the marker, where the arrow of the answer below it also lines up.
+    out.extend(crate::wrap::line(Line::from(head), width as usize));
 
-    let _ = width;
+    // **What was answered, in one line, under the question.** One row picked off a list is not a
+    // paragraph the person typed, so it does not wear their bar; the question is not repeated,
+    // because the head above already asks it. A long answer is cut with an `…` — this is a note
+    // saying where the turn went on from, and what it went on from is what the agent did next.
+    if let Some(answer) = answer.filter(|a| !a.trim().is_empty()) {
+        let room = (width as usize).saturating_sub(markdown::display_width(ANSWER_MARK));
+        // **A pick the person typed keeps the mark it had.** `answer_text` writes the lang's
+        // preamble (`직접 입력:`) for the model's sake; on screen one glyph says the same thing in
+        // one column, and that it was not among the options is information worth that column.
+        let shown = answer.replace(lang.free_mark(), "✎");
+        out.push(Line::from(vec![
+            Span::styled(ANSWER_MARK.to_string(), Style::default().fg(theme::text_muted())),
+            Span::styled(markdown::truncate_to(&shown, room), Style::default().fg(theme::text())),
+        ]));
+    }
+
     out
 }
 
@@ -1195,26 +1233,64 @@ mod tests {
         r.plain()
     }
 
-    /// **An answer is drawn as an answer.** The question gets a check and each answer an arrow —
-    /// rendered as plain markdown it was a paragraph of bullets inside the person's own bar, with
-    /// the question and the reply at the same weight.
+    /// **The answer sits under the question, in one line.** It is not the person's bar and it is not
+    /// the question again — one row picked off a list read as a paragraph they had typed out.
     #[test]
-    fn an_answer_message_is_drawn_as_a_question_and_its_answers() {
-        let text = "어느 쪽으로 갈까요?\n  - 계획을 먼저 (되돌리기 어렵습니다)\n  - ✎ 그냥 바로";
-        let r = live(
-            &[Item::User { seq: 1, text: text.into() }],
-            80,
-            &Folds::new(),
-            crate::lang::Lang::Ko,
-        );
-        let rows = plain(&r);
-        let joined = rows.join("\n");
-        assert!(joined.contains('✓'), "the question is not marked: {rows:?}");
-        assert!(joined.contains('→'), "the answers are not marked: {rows:?}");
-        assert!(joined.contains("계획을 먼저"), "{rows:?}");
-        assert!(joined.contains("그냥 바로"), "{rows:?}");
-        // The markdown bullet is gone — the arrow took its place.
-        assert!(!joined.contains("  - "), "a bullet survived: {rows:?}");
+    fn an_answered_question_carries_its_answer_under_it() {
+        let steps = vec![crate::question::Step {
+            header: Some("방식".into()),
+            question: "어느 쪽으로 갈까요".into(),
+            options: vec![],
+            multi: false,
+        }];
+        let items = [Item::Question {
+            seq: 1,
+            steps,
+            answered: true,
+            answer: Some("계획을 먼저 (되돌리기 어렵습니다), 직접 입력: 그냥 바로".into()),
+        }];
+        let out = plain(&rows(&items, 80, &Folds::new(), crate::lang::Lang::Ko));
+        assert!(out[0].starts_with('✓'), "the question is not marked: {out:?}");
+        assert!(out[0].contains("어느 쪽으로 갈까요"), "{out:?}");
+        assert!(out[1].starts_with("  → "), "no answer line: {out:?}");
+        assert!(out[1].contains("계획을 먼저"), "{out:?}");
+        assert!(out[1].contains("그냥 바로"), "{out:?}");
+        assert!(!out[1].contains("어느 쪽으로"), "the question was repeated: {out:?}");
+        // **Not a message.** The bar belongs to what the person typed, and they picked a row.
+        assert!(!out.iter().any(|l| l.starts_with('▌')), "{out:?}");
+    }
+
+    /// **A long answer is cut with a mark, not wrapped.** One line is what says where the turn went
+    /// on from; a wrapped answer would take back the height this change was for.
+    #[test]
+    fn a_long_answer_is_cut_with_a_mark() {
+        let steps = vec![crate::question::Step {
+            header: None,
+            question: "고르세요".into(),
+            options: vec![],
+            multi: false,
+        }];
+        let items =
+            [Item::Question { seq: 1, steps, answered: true, answer: Some("가".repeat(200)) }];
+        let out = plain(&rows(&items, 60, &Folds::new(), crate::lang::Lang::Ko));
+        assert_eq!(out.len(), 2, "an answer must be one line: {out:?}");
+        assert!(crate::markdown::display_width(&out[1]) <= 60, "it ran past the width: {out:?}");
+        assert!(out[1].ends_with('…'), "the cut is silent: {out:?}");
+    }
+
+    /// An unanswered question is one line and wears `?` — nothing is invented under it.
+    #[test]
+    fn an_unanswered_question_has_no_answer_line() {
+        let steps = vec![crate::question::Step {
+            header: None,
+            question: "아직 안 물어본 것".into(),
+            options: vec![],
+            multi: false,
+        }];
+        let items = [Item::Question { seq: 1, steps, answered: false, answer: None }];
+        let out = plain(&rows(&items, 80, &Folds::new(), crate::lang::Lang::Ko));
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!(out[0].starts_with('?'), "{out:?}");
     }
 
     /// A person's own message is untouched: no check, no arrows, and its own list stays a list.
@@ -1407,6 +1483,79 @@ mod tests {
         assert_eq!(out.len(), 1, "a finished card must be one line: {out:?}");
         assert!(out[0].contains(crate::lang::Lang::Ko.run_done()), "{out:?}");
         assert!(out[0].contains("도구 1개"), "the head still says what it did: {out:?}");
+    }
+
+    /// **A report is a row**, in this app's mark for what the agent said, and it has no fold key —
+    /// nothing about it is hidden, so there is nothing to press. It is not cut, either: the
+    /// timeline scrolls, and the sentence is the point.
+    #[test]
+    fn a_report_is_a_row_with_a_head_and_its_whole_sentence() {
+        let items = [Item::Report {
+            seq: 4,
+            ok: true,
+            summary: "빌드가 통과했습니다. 남은 것은 커밋입니다.".into(),
+        }];
+        let r = rows(&items, 60, &Folds::new(), crate::lang::Lang::Ko);
+        let out = plain(&r);
+        assert!(out[0].starts_with("◆ "), "{out:?}");
+        assert!(out[0].contains("작업 결과"), "{out:?}");
+        assert!(out[0].contains("성공"), "{out:?}");
+        assert!(
+            out.iter().any(|l| l.contains("남은 것은 커밋입니다")),
+            "the sentence was cut: {out:?}"
+        );
+        assert!(r.cards.is_empty(), "a report has nothing to fold: {:?}", r.cards);
+    }
+
+    /// **A failure wears the other colour and says so in words.** Colour alone is not a message.
+    #[test]
+    fn a_failed_report_says_failed_in_words_and_in_colour() {
+        let items =
+            [Item::Report { seq: 5, ok: false, summary: "테스트가 깨졌습니다.".into() }];
+        let r = rows(&items, 60, &Folds::new(), crate::lang::Lang::Ko);
+        let text: String = r.lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("실패"), "{text:?}");
+        let colour =
+            r.lines[0].spans.iter().find(|s| s.content.contains("작업 결과")).unwrap().style.fg;
+        assert_eq!(colour, Some(theme::danger()));
+    }
+
+    /// **A saying laid in the working is written out, whole, in the colour of what the agent says.**
+    /// Opening the card is enough to read it — no second click, and no dimming like the reasoning.
+    #[test]
+    fn a_saying_in_the_working_is_written_out_and_not_dimmed() {
+        let item = Item::Work {
+            seq: 1,
+            title: "빌드하는 중".into(),
+            parts: vec![Part::Said(crate::timeline::Think {
+                seq: 7,
+                title: None,
+                text: "먼저 빌드부터 돌립니다\n그 뒤에 테스트를 돌립니다".into(),
+            })],
+        };
+        let opened = Folds::from([(1, Fold { open: true, user_touched: true })]);
+        let r = rows(std::slice::from_ref(&item), 60, &opened, crate::lang::Lang::Ko);
+        let out = plain(&r);
+        let said = out.iter().find(|l| l.contains("빌드부터")).expect("no saying");
+        assert!(said.starts_with("  ◆ "), "the saying is not marked as the agent's own: {said:?}");
+        assert!(
+            out.iter().any(|l| l.contains("그 뒤에 테스트를")),
+            "the sentence was not written out whole: {out:?}"
+        );
+        // **It folds nothing.** As a chip with a chevron of its own it was a heading the person had
+        // to open a second time to find the sentence under it (2026-09-13 user report).
+        assert!(!r.cards.values().any(|s| *s == 7), "a saying must not fold: {:?}", r.cards);
+        assert!(
+            !out.iter().any(|l| l.contains('┊')),
+            "the saying wore the reasoning gutter: {out:?}"
+        );
+        let body =
+            out.iter().position(|l| l.contains("그 뒤에 테스트를")).expect("the second line");
+        assert!(
+            r.lines[body].spans.iter().all(|s| s.style.fg != Some(theme::text_muted())),
+            "the sentence was dimmed like reasoning: {:?}",
+            r.lines[body].spans.iter().map(|s| (s.content.clone(), s.style.fg)).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -1735,7 +1884,7 @@ mod tests {
         }];
         let items = vec![
             Item::User { seq: 1, text: "골라 줘".into() },
-            Item::Question { seq: 2, steps, answered: false },
+            Item::Question { seq: 2, steps, answered: false, answer: None },
         ];
         let mut cache = Cache::new();
         cache.layout(

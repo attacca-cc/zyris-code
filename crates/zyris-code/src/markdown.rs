@@ -63,6 +63,11 @@ pub fn render_rich(src: &str, width: u16) -> Rendered {
     let mut style = Style::default().fg(theme::text());
     let mut in_code = false;
     let mut list_depth: usize = 0;
+    // **The indent a list item's own text sits at**, so a wrapped line stays inside the item it
+    // belongs to. It is set when the item opens and handed to every paragraph of that item; the
+    // first paragraph's first line does not take it, because the bullet is already standing there.
+    let mut item_indent = String::new();
+    let mut item_first_para = true;
     let mut table: Option<Table> = None;
     // The link currently being read. Its text carries this URL. `None` outside a link.
     let mut cur_link: Option<String> = None;
@@ -78,7 +83,7 @@ pub fn render_rich(src: &str, width: u16) -> Rendered {
                 style = Style::default().fg(theme::text_heading()).add_modifier(Modifier::BOLD);
             }
             Event::End(TagEnd::Heading(_)) => {
-                flush(&mut out, &mut out_links, &mut buf, width, "");
+                flush(&mut out, &mut out_links, &mut buf, width, "", false);
                 style = Style::default().fg(theme::text());
             }
             Event::Start(Tag::Emphasis) => style = style.add_modifier(Modifier::ITALIC),
@@ -89,10 +94,17 @@ pub fn render_rich(src: &str, width: u16) -> Rendered {
             Event::End(TagEnd::Strong) => style = Style::default().fg(theme::text()),
             Event::Start(Tag::BlockQuote(_)) => style = Style::default().fg(theme::text_muted()),
             Event::End(TagEnd::BlockQuote(_)) => {
-                flush(&mut out, &mut out_links, &mut buf, width, "│ ");
+                flush(&mut out, &mut out_links, &mut buf, width, "│ ", false);
                 style = Style::default().fg(theme::text());
             }
-            Event::Start(Tag::List(_)) => list_depth += 1,
+            Event::Start(Tag::List(_)) => {
+                // **A nested list starts on its own line.** A tight list has no paragraph to end
+                // the line, so without this the inner bullet is glued onto the end of the outer
+                // item's sentence: `∙ 바깥  ∙ 안쪽`. The flush carries the outer item's margin,
+                // which is what the line it closes belongs to.
+                flush(&mut out, &mut out_links, &mut buf, width, &item_indent, false);
+                list_depth += 1;
+            }
             Event::End(TagEnd::List(_)) => list_depth = list_depth.saturating_sub(1),
             Event::Start(Tag::Item) => {
                 buf.push(Piece {
@@ -102,10 +114,23 @@ pub fn render_rich(src: &str, width: u16) -> Rendered {
                     ),
                     url: None,
                 });
+                // **The bullet and its text are one margin wide**, so the item's own indent is the
+                // whole of it — `  ` per level, which is what `∙ ` fills at the first level.
+                item_indent = "  ".repeat(list_depth);
+                item_first_para = true;
             }
-            Event::End(TagEnd::Item) => flush(&mut out, &mut out_links, &mut buf, width, "  "),
+            Event::End(TagEnd::Item) => {
+                // **A tight list item ends here and nowhere else.** With no paragraph of its own
+                // (that is what "tight" means) the item's text is still in the buffer, and this is
+                // the only flush it gets — so this is where its margin has to be passed.
+                flush(&mut out, &mut out_links, &mut buf, width, &item_indent, false);
+                // **Back out one level, not to nothing.** An item inside an item leaves the outer
+                // item's margin behind it, which is where its own remaining text belongs.
+                item_indent = "  ".repeat(list_depth.saturating_sub(1));
+                item_first_para = false;
+            }
             Event::Start(Tag::CodeBlock(kind)) => {
-                flush(&mut out, &mut out_links, &mut buf, width, "");
+                flush(&mut out, &mut out_links, &mut buf, width, "", false);
                 let lang = match &kind {
                     CodeBlockKind::Fenced(l) if !l.is_empty() => l.to_string(),
                     _ => String::new(),
@@ -160,7 +185,7 @@ pub fn render_rich(src: &str, width: u16) -> Rendered {
             // Cell text is collected, then drawn once with widths aligned when the table ends. Column
             // widths need every row, so they can't be drawn midway.
             Event::Start(Tag::Table(_)) => {
-                flush(&mut out, &mut out_links, &mut buf, width, "");
+                flush(&mut out, &mut out_links, &mut buf, width, "", false);
                 table = Some(Table::default());
             }
             Event::End(TagEnd::Table) => {
@@ -203,7 +228,14 @@ pub fn render_rich(src: &str, width: u16) -> Rendered {
             Event::SoftBreak | Event::HardBreak => {
                 buf.push(Piece { span: Span::styled(" ", style), url: cur_link.clone() })
             }
-            Event::End(TagEnd::Paragraph) => flush(&mut out, &mut out_links, &mut buf, width, ""),
+            Event::End(TagEnd::Paragraph) => {
+                // **A list item's paragraph carries the item's margin into its wrapped lines.** A
+                // second paragraph of the same item is indented from its own first line, because
+                // the bullet is not in front of it — the item's first paragraph is the one line the
+                // bullet stands on.
+                flush(&mut out, &mut out_links, &mut buf, width, &item_indent, !item_first_para);
+                item_first_para = false;
+            }
             Event::Rule => {
                 out.push(Line::from(Span::styled(
                     "─".repeat(width),
@@ -214,7 +246,7 @@ pub fn render_rich(src: &str, width: u16) -> Rendered {
             _ => {}
         }
     }
-    flush(&mut out, &mut out_links, &mut buf, width, "");
+    flush(&mut out, &mut out_links, &mut buf, width, "", false);
     Rendered { lines: out, links: out_links }
 }
 
@@ -452,28 +484,48 @@ pub fn truncate_to(s: &str, limit: usize) -> String {
 ///
 /// Along with each line it records the links on it — a word that carries a URL opens a
 /// range at its column, and the range closes when the next word has a different URL (or none).
+///
+/// **`indent` is the margin of what was wrapped.** It opens every line but the first when
+/// `indent_first` is false, and every line when it is true. A list item's first line already
+/// carries its bullet, which fills exactly that margin; a second paragraph of the same item
+/// carries nothing, so its own first line takes it too. Before this, a wrapped line started at
+/// column zero and stepped out of the list it belonged to. `width` is the whole room and the
+/// margin is counted inside it, so nothing is drawn past the edge.
 fn flush(
     out: &mut Vec<Line<'static>>,
     out_links: &mut Vec<Vec<Link>>,
     buf: &mut Vec<Piece>,
     width: usize,
     indent: &str,
+    indent_first: bool,
 ) {
     if buf.is_empty() {
         return;
     }
+    // **The margin comes out of the width, not on top of it.** A line that fits is a line that
+    // fits with its indent.
+    let limit = width.max(1);
     let indent_w = display_width(indent);
-    let limit = width.saturating_sub(indent_w).max(1);
+    let margin = || Span::styled(indent.to_string(), Style::default().fg(theme::border_light()));
     let mut line: Vec<Span<'static>> = Vec::new();
     let mut links: Vec<Link> = Vec::new();
     let mut used = 0usize;
+    // **Words, not columns.** A line holding only the margin is not a line: a break must not be
+    // decided on one, or the first word of every item would be pushed a line down on its own.
+    let mut words = 0usize;
     // The link currently being placed on this line, and the column it started at.
     let mut open: Option<(usize, String)> = None;
+
+    if indent_first && indent_w > 0 {
+        line.push(margin());
+        used = indent_w;
+    }
 
     for piece in buf.drain(..) {
         for word in split_keeping_spaces(&piece.span.content) {
             let w = display_width(&word);
-            if used + w > limit && used > 0 {
+            let blank = word.trim().is_empty();
+            if used + w > limit && words > 0 {
                 // Close the open link at the end of this line; the next line reopens it.
                 if let Some((start, url)) = open.take() {
                     links.push(Link { start, end: used, url });
@@ -481,9 +533,16 @@ fn flush(
                 out.push(Line::from(std::mem::take(&mut line)));
                 out_links.push(std::mem::take(&mut links));
                 used = 0;
+                words = 0;
                 // Leading spaces carried onto a new line are dropped — they'd look like indentation.
-                if word.trim().is_empty() {
+                if blank {
                     continue;
+                }
+                // **The margin opens the next line.** Dropped with the spaces above, the wrapped
+                // part would sit against the left edge it was told to stay away from.
+                if indent_w > 0 {
+                    line.push(margin());
+                    used = indent_w;
                 }
             }
             match (&open, &piece.url) {
@@ -506,6 +565,9 @@ fn flush(
                 }
             }
             used += w;
+            if !blank {
+                words += 1;
+            }
             line.push(Span::styled(word, piece.span.style));
         }
     }
@@ -827,6 +889,57 @@ mod tests {
         assert!(out.iter().any(|l| l.contains('1')), "{out:?}");
         let rows = out.iter().filter(|l| l.starts_with('│')).count();
         assert_eq!(rows, 2, "the row was split: {out:?}");
+    }
+
+    /// **A wrapped list item stays in its list.** The bullet is one margin wide, and every line
+    /// after the first is indented by exactly that much — without it the tail of a long item sat
+    /// against the left edge and read as ordinary text that had escaped the list.
+    #[test]
+    fn a_wrapped_list_item_keeps_its_margin() {
+        let out = plain(&render(
+            "- 이 항목의 설명이 아주 길어서 좁은 폭에서는 반드시 여러 줄로 접힌다",
+            24,
+        ));
+        assert!(out.len() > 1, "nothing wrapped: {out:?}");
+        assert!(out[0].starts_with("∙ "), "{out:?}");
+        for line in &out[1..] {
+            assert!(line.starts_with("  "), "the tail did not hang under the bullet: {out:?}");
+            assert!(!line.trim_start().starts_with('∙'), "the bullet was repeated: {out:?}");
+        }
+        assert!(out.iter().all(|l| display_width(l) <= 24), "{out:?}");
+        // **Not a character was lost on the way out.** Korean is cut per column rather than at
+        // word boundaries, so the check is on the characters, not on the words.
+        let squashed = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+        let src = "- 이 항목의 설명이 아주 길어서 좁은 폭에서는 반드시 여러 줄로 접힌다";
+        assert_eq!(squashed(&out.concat()), squashed(&src.replace('-', "∙")), "{out:?}");
+    }
+
+    /// **A nested item hangs under its own bullet**, not under the outer one — the margin grows
+    /// with the depth, exactly as the bullet's does.
+    #[test]
+    fn a_nested_item_hangs_under_its_own_bullet() {
+        let out = plain(&render(
+            "- 바깥 항목\n  - 안쪽 항목의 설명이 길어서 좁은 폭에서 여러 줄로 접힌다",
+            26,
+        ));
+        let inner = out.iter().position(|l| l.contains("안쪽 항목")).expect("{out:?}");
+        // **It starts on its own line.** Inside the outer item's sentence it read as more of it.
+        assert!(out[inner].starts_with("  ∙ "), "{out:?}");
+        for line in &out[inner + 1..] {
+            assert!(line.starts_with("    "), "the nested tail did not hang: {out:?}");
+        }
+    }
+
+    /// A table is drawn to the width it was given and is never re-wrapped by a margin that is not
+    /// its own — nothing about a list item's margin may leak into one drawn after it.
+    #[test]
+    fn a_table_after_a_list_keeps_its_own_width() {
+        let out = plain(&render("- 항목\n\n| 이름 | 값 |\n|---|---|\n| 가나다 | 1 |", 24));
+        let border = out.iter().find(|l| l.starts_with('┌')).expect("{out:?}");
+        assert!(display_width(border) <= 24, "{out:?}");
+        for line in out.iter().filter(|l| l.contains('│')) {
+            assert!(display_width(line) <= 24, "{out:?}");
+        }
     }
 
     #[test]
