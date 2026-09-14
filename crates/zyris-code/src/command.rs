@@ -13,9 +13,8 @@ pub enum Command {
     Help,
     /// Without an argument, reports the current mode; with one, changes it.
     Mode(Option<Mode>),
-    /// `/mcp` on its own lists; `/mcp on|off <name>` decides whether a **discovered** server may
-    /// start (`mcp::discovery`). What was written for this app directly is not switchable — it was
-    /// written for this app.
+    /// `/mcp` on its own lists; `/mcp on|off <name>` decides whether a discovered or repository
+    /// server may start (`mcp::discovery`). User-level zyris-code config is already explicit.
     Mcp(Option<McpSwitch>),
     Skills,
     /// Which `CLAUDE.md`·`AGENTS.md` are loaded into the session.
@@ -95,6 +94,9 @@ pub enum Plugin {
     Remove(String),
     /// Without a name, everything fetched.
     Update(Option<String>),
+    /// Trust or disable one repository-local plugin from the next launch.
+    On(String),
+    Off(String),
     /// It's unclear what's being asked. **Not swallowed silently.**
     Unknown(String),
 }
@@ -274,6 +276,10 @@ fn plugin_action(arg: &str) -> Plugin {
         ("remove" | "rm" | "uninstall", what) => Plugin::Remove(what.to_string()),
         ("update" | "upgrade", "") => Plugin::Update(None),
         ("update" | "upgrade", what) => Plugin::Update(Some(what.to_string())),
+        ("on", "") => Plugin::Unknown("on ‒ 켤 이름을 같이 적어 주세요".into()),
+        ("on", what) => Plugin::On(what.to_string()),
+        ("off", "") => Plugin::Unknown("off ‒ 끌 이름을 같이 적어 주세요".into()),
+        ("off", what) => Plugin::Off(what.to_string()),
         // **`/plugin owner/repo` is accepted too.** Forgetting `add` is the most common mistake.
         (what, "") if what.contains('/') || what.contains("://") => Plugin::Add(what.to_string()),
         (what, _) => Plugin::Unknown(format!("plugin {what}")),
@@ -640,6 +646,12 @@ mod tests {
             parse("/plugin update 깃허브"),
             Some(Command::Plugin(Plugin::Update(Some("깃허브".into()))))
         );
+    }
+
+    #[test]
+    fn project_plugin_can_be_switched() {
+        assert_eq!(parse("/plugin on local"), Some(Command::Plugin(Plugin::On("local".into()))));
+        assert_eq!(parse("/plugin off local"), Some(Command::Plugin(Plugin::Off("local".into()))));
     }
 
     /// Some agents have spaces in their names ("Main Agent"). Cutting at the first word would make them unpickable.

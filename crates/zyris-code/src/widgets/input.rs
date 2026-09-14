@@ -33,13 +33,13 @@ pub fn rule(frame: &mut Frame, area: Rect) {
     frame.render_widget(Paragraph::new(line), area);
 }
 
-pub fn draw(frame: &mut Frame, area: Rect, state: &State) {
+pub fn draw(frame: &mut Frame, area: Rect, state: &State) -> bool {
     // **A terminal can report no size at all**, and everything below assumes there is a row to put
     // the cursor on: `area.height - 1` then goes negative and takes the whole app with it. Measured
     // on a pseudo-terminal opened without a window size — a debug build panics outright, and a
     // release build wraps to 65535 and draws the cursor somewhere off the screen.
     if area.width == 0 || area.height == 0 {
-        return;
+        return false;
     }
     let inner = area.width.saturating_sub(PROMPT_WIDTH);
     let (wrapped, (crow, ccol)) = state.input.wrapped(inner);
@@ -74,4 +74,8 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &State) {
     let usable = area.width.saturating_sub(1);
     let y = area.y + 1 + (crow as usize).saturating_sub(start) as u16;
     frame.set_cursor_position((area.x + col.min(usable), y.min(area.y + area.height - 1)));
+    // **Says it put the cursor on screen.** A frame that asks for no position makes ratatui hide
+    // the cursor, and it stays hidden until some later frame asks — so a surface that leaves this
+    // to somebody else is how the cursor disappeared altogether (`widgets::draw` puts one back).
+    true
 }

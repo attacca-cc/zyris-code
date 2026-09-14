@@ -318,6 +318,7 @@ impl Runner {
             credentials = %credentials.describe(),
             scopes = ?self.config.scopes,
             capabilities = self.node.capabilities().descriptors().len(),
+            built = %build_line(),
             "starting zyris node"
         );
 
@@ -441,8 +442,52 @@ fn jitter(base: Duration) -> Duration {
     base.mul_f64(factor)
 }
 
+/// **Which binary is running, and how old it is** — one line in the log, and an answer that until
+/// now nothing could give.
+///
+/// A `zyris-code` on `$PATH` can be a build from days ago, and nothing said so: the version is the
+/// same for every build of a release, so "the fix did not work" can really mean "the fix was never
+/// in the binary that ran". That happened on this machine — a copy in `~/.local/bin` predated a
+/// whole round of work, and the running process was yet another inode that `cargo build` had since
+/// replaced. The file the process was started from is `current_exe()` (`/proc/self/exe` on Linux)
+/// and its modification time is when that build landed, so printing the path and the age together
+/// answers "am I testing what I just built?" in one line of `/tmp/zyris-code.log`.
+fn build_line() -> String {
+    let Ok(exe) = std::env::current_exe() else {
+        return "unknown".to_string();
+    };
+    let age = std::fs::metadata(&exe)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|at| std::time::SystemTime::now().duration_since(at).ok())
+        .map(|age| ago(age.as_secs()))
+        .unwrap_or_else(|| "?".to_string());
+    format!("{} ({age} old)", exe.display())
+}
+
+/// `3s`, `1m`, `1h07m`, `3d` — how long ago something was written, coarsely. **Coarse on
+/// purpose:** this is read to answer "is this a fresh build?", not to do arithmetic.
+fn ago(secs: u64) -> String {
+    match secs {
+        0..=59 => format!("{secs}s"),
+        60..=3599 => format!("{}m", secs / 60),
+        3600..=86_399 => format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60),
+        _ => format!("{}d", secs / 86_400),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// The stamp is coarse and that is the point — it answers "is this the build I just made?".
+    #[test]
+    fn the_binarys_age_is_reported_coarsely() {
+        assert_eq!(super::ago(3), "3s");
+        assert_eq!(super::ago(90), "1m");
+        assert_eq!(super::ago(3600), "1h00m");
+        assert_eq!(super::ago(3600 + 7 * 60), "1h07m");
+        assert_eq!(super::ago(86_400 * 3), "3d");
+    }
+
     use super::*;
 
     #[test]

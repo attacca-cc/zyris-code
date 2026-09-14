@@ -106,6 +106,13 @@ pub fn columns(text: &str, width: usize) -> Vec<String> {
 /// The break prefers the last space that still fits, so a word is only cut when it could not fit
 /// on a line of its own — the same order of preference [`words`] uses, carried across spans.
 ///
+/// **A wrapped line hangs under the line it came from.** The left margin is what says which thing
+/// a line belongs to — a bullet under a bullet, an option under its caret, a body under its
+/// marker — and lines after the first used to start at column zero, so one long sentence stepped
+/// out of the list it was part of and left the pane looking broken. The margin is measured once
+/// ([`hang_width`]) and every continuation line carries it as **spaces**: the marker's own glyph
+/// would read as another row if it were repeated.
+///
 /// **A line that already fits comes back untouched**, which is what keeps every caller's existing
 /// output — a panel, a question — exactly as it was until the text is genuinely too long.
 pub fn line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
@@ -121,14 +128,26 @@ pub fn line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
             cells.push((ch, span.style));
         }
     }
+    // **The hang.** What the marker is painted in stays with it — these are spaces, so the only
+    // thing it can show is a background, and a background that stops at the indent would be worse
+    // than none.
+    let hang_style = cells.first().map_or_else(Style::default, |(_, style)| *style);
+    // Never so wide that nothing is left for the words: a continuation is still text.
+    let hang = hang_width(&cells).min(limit.saturating_sub(MIN));
+    let indent = || -> Vec<(char, Style)> { vec![(' ', hang_style); hang] };
+
     let mut whole: Vec<Vec<(char, Style)>> = Vec::new();
     let mut cur: Vec<(char, Style)> = Vec::new();
     let mut used = 0usize;
     // Where the last space we passed sits, held by index — the place to break at.
     let mut space: Option<usize> = None;
+    // **Only the first line keeps the marker's own columns.** Every later one is short by the
+    // hang, because it carries the indent instead.
+    let mut first = true;
     for (ch, style) in cells {
         let w = cell_width(ch);
-        if used + w > limit && !cur.is_empty() {
+        let cap = if first { limit } else { limit.saturating_sub(hang) };
+        if used + w > cap && !cur.is_empty() {
             match space.filter(|i| *i > 0) {
                 Some(i) => {
                     let tail = cur.split_off(i);
@@ -139,6 +158,8 @@ pub fn line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
                 // Nowhere to break — a word wider than the line. Cut it here.
                 None => whole.push(std::mem::take(&mut cur)),
             }
+            first = false;
+            cur = indent().into_iter().chain(cur).collect();
             used = cur.iter().map(|(c, _)| cell_width(*c)).sum();
             space = None;
         }
@@ -164,6 +185,67 @@ pub fn line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
             Line::from(spans)
         })
         .collect()
+}
+
+/// How far a wrapped line's continuation is indented.
+///
+/// **The left margin of the line is what the eye reads as "which thing is this"**, so it is what a
+/// wrap has to carry. Two kinds of column make it up: plain spaces, and a marker glyph followed by
+/// a space. Both count. Counting a marker costs it nothing, because the continuation draws spaces
+/// in its place ([`line`]) — `❯ 모드` and `  모드` therefore hang by the same two columns, and no
+/// second bullet appears.
+///
+/// The scan stops at the first text character: the hang is a margin, not the whole prefix, and a
+/// line is not indented by its own sentence.
+fn hang_width(cells: &[(char, Style)]) -> usize {
+    let mut w = 0usize;
+    let mut i = 0usize;
+    loop {
+        while i < cells.len() && cells[i].0 == ' ' {
+            w += cell_width(cells[i].0);
+            i += 1;
+        }
+        // **A marker counts only when a space follows it.** Without one it is the text itself:
+        // `─────` is a rule and `+12` is a count, and neither is a margin.
+        if i + 1 < cells.len() && is_marker(cells[i].0) && cells[i + 1].0 == ' ' {
+            w += cell_width(cells[i].0) + 1;
+            i += 2;
+            continue;
+        }
+        return w;
+    }
+}
+
+/// The glyphs these panes use to mark a line — a caret, a bullet, a chip's chevron, `?` for a
+/// question.
+///
+/// **A marker is not text.** It stands in the left margin, outside the sentence, which is exactly
+/// why a wrapped line hangs under it instead of starting at column zero.
+fn is_marker(ch: char) -> bool {
+    matches!(
+        ch,
+        '❯' | '▸'
+            | '▾'
+            | '●'
+            | '○'
+            | '✓'
+            | '✎'
+            | '✕'
+            | '→'
+            | '∙'
+            | '•'
+            | '‒'
+            | '◆'
+            | '✻'
+            | '┊'
+            | '│'
+            | '◈'
+            | '└'
+            | '?'
+            | '-'
+            | '*'
+            | '+'
+    )
 }
 
 #[cfg(test)]
@@ -224,16 +306,57 @@ mod tests {
         // The marker stays on the first line only, in its own colour.
         assert_eq!(out[0].spans[0].content.as_ref(), "❯ ");
         assert_eq!(out[0].spans[0].style.fg, Some(Color::Green));
-        // Every continuation line kept the description's colour.
-        for line in &out[1..] {
-            for span in &line.spans {
-                assert_eq!(span.style.fg, Some(Color::Red), "{:?}", text(&out));
-            }
+        let joined = text(&out).join(" ");
+        // **The words keep the description's colour.** The hang is spaces and carries the
+        // marker's — spaces show no foreground, so nothing is repainted by them.
+        for span in out.iter().flat_map(|l| &l.spans).filter(|s| !s.content.trim().is_empty()) {
+            let first = span.content.as_ref() == "❯ ";
+            assert_eq!(
+                span.style.fg,
+                Some(if first { Color::Green } else { Color::Red }),
+                "{joined:?}"
+            );
         }
-        assert_eq!(
-            text(&out).join(" ").replace("  ", " "),
-            "❯ a description that is far too long to fit"
-        );
+        // Not one word went missing, and the marker did not come back on the next line.
+        for word in "a description that is far too long to fit".split(' ') {
+            assert!(joined.contains(word), "{word:?} went missing: {joined:?}");
+        }
+        assert_eq!(joined.matches('❯').count(), 1, "the marker was repeated: {joined:?}");
+    }
+
+    /// **A wrapped line hangs under the line it came from.** A list whose cursor row begins with
+    /// `❯ ` and whose other rows begin with two spaces must wrap to the same shape — the marker
+    /// stands in the same two columns as that margin, so it is measured the same way.
+    #[test]
+    fn a_wrapped_line_hangs_under_its_own_margin() {
+        let long = "one two three four five six seven eight";
+        let bordered = |margin: &'static str| {
+            text(&super::line(
+                Line::from(vec![
+                    Span::styled(margin, Style::default().fg(Color::Green)),
+                    Span::styled(long, Style::default().fg(Color::Red)),
+                ]),
+                14,
+            ))
+        };
+        let marker = bordered("❯ ");
+        let spaces = bordered("  ");
+        assert!(marker.len() > 1, "nothing wrapped: {marker:?}");
+        for line in &marker[1..] {
+            assert!(line.starts_with("  "), "the wrapped part did not hang: {marker:?}");
+        }
+        assert_eq!(marker.len(), spaces.len(), "{marker:?} {spaces:?}");
+        for (a, b) in marker.iter().zip(&spaces) {
+            // **Columns, not bytes.** `❯` is three bytes wide and one column, and the whole point
+            // of the margin is that the two shapes line up on screen.
+            assert_eq!(
+                display_width(a),
+                display_width(b),
+                "the two margins do not line up: {marker:?} {spaces:?}"
+            );
+        }
+        // **The margin is inside the width, not on top of it.**
+        assert!(marker.iter().all(|l| display_width(l) <= 14), "{marker:?}");
     }
 
     /// The break lands on a space when there is one, so words are not sliced in half for nothing.

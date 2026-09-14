@@ -23,6 +23,9 @@
 //! aside first, which the filesystem allows even though overwriting it would not be. Either way
 //! what is at the path afterwards is the new version, which is what gets started.
 
+use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -303,6 +306,42 @@ pub fn installer_command(script: &Path, tag: &str, dir: &Path) -> (String, Vec<S
     }
 }
 
+/// Owns a downloaded installer and the private directory containing it.
+///
+/// Dropping this value removes both, including when starting or running the installer fails.
+#[doc(hidden)]
+pub struct StagedInstaller {
+    file: tempfile::NamedTempFile,
+    // Declared after `file` so Windows closes the open handle before removing the directory.
+    _directory: tempfile::TempDir,
+}
+
+impl StagedInstaller {
+    pub fn path(&self) -> &Path {
+        self.file.path()
+    }
+}
+
+/// Writes an installer into exclusively created current-user-only temporary storage.
+#[doc(hidden)]
+pub fn stage_downloaded_installer(contents: &[u8]) -> anyhow::Result<StagedInstaller> {
+    let directory = tempfile::Builder::new().prefix("zyris-code-update-").tempdir()?;
+    #[cfg(unix)]
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+
+    let suffix = if cfg!(windows) { ".ps1" } else { ".sh" };
+    let mut file = tempfile::Builder::new()
+        .prefix("installer-")
+        .suffix(suffix)
+        .tempfile_in(directory.path())?;
+    #[cfg(unix)]
+    file.as_file().set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    file.write_all(contents)?;
+    file.as_file().sync_all()?;
+
+    Ok(StagedInstaller { file, _directory: directory })
+}
+
 /// Fetches the release's installer and runs it, with its output going to this terminal.
 ///
 /// **Inherited, not captured.** Downloading and checking a binary takes long enough that silence
@@ -315,28 +354,23 @@ pub async fn install(tag: &str) -> anyhow::Result<()> {
     // A stand-in installer, given rather than fetched — see `newest`. Everything after this point
     // is the same, which is the only reason running against it proves anything.
     let given = std::env::var_os("ZYRIS_CODE_UPDATE_SCRIPT").map(PathBuf::from);
-    let path = match &given {
-        Some(path) => path.clone(),
+    let staged = match &given {
+        Some(_) => None,
         None => {
             let client =
                 client().ok_or_else(|| anyhow::anyhow!("could not build an HTTP client"))?;
             let script =
-                client.get(install_url(tag)).send().await?.error_for_status()?.text().await?;
-            let ext = if cfg!(windows) { "ps1" } else { "sh" };
-            let path = std::env::temp_dir()
-                .join(format!("zyris-code-install-{}.{ext}", std::process::id()));
-            std::fs::write(&path, script)?;
-            path
+                client.get(install_url(tag)).send().await?.error_for_status()?.bytes().await?;
+            Some(stage_downloaded_installer(&script)?)
         }
     };
+    let path = given
+        .as_deref()
+        .or_else(|| staged.as_ref().map(StagedInstaller::path))
+        .expect("an installer path exists");
 
-    let (program, args) = installer_command(&path, tag, &dir);
+    let (program, args) = installer_command(path, tag, &dir);
     let status = tokio::process::Command::new(program).args(args).status().await;
-    // What we fetched has done its work or failed; either way it is not worth keeping around. What
-    // somebody handed us is theirs.
-    if given.is_none() {
-        let _ = std::fs::remove_file(&path);
-    }
 
     match status? {
         s if s.success() => Ok(()),

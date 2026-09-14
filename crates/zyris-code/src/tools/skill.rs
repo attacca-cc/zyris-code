@@ -173,7 +173,7 @@ fn strip_front_matter(body: &str) -> &str {
 
 /// Skill directories contributed by plugins. The definition lives in `plugin`; here we only borrow the name.
 pub fn plugin_skill_dirs(cwd: &std::path::Path) -> Vec<PathBuf> {
-    crate::plugin::skill_dirs(&crate::plugin::discover(cwd))
+    crate::plugin::skill_dirs(&crate::plugin::active(cwd))
 }
 
 #[cfg(test)]

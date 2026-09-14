@@ -9,13 +9,13 @@
 //! disk is not a decision this app gets to make. `/mcp on <name>` is how it gets turned on, and the
 //! answer is kept in this app's own settings (`config.rs`).
 //!
-//! What zyris-code was told directly — `~/.config/zyris-code/mcp.json` and `./.mcp.json` — is a
-//! different thing and still starts by itself. Those files are ours; somebody wrote them *for*
-//! this app.
+//! What the user wrote in `~/.config/zyris-code/mcp.json` still starts by itself. A repository's
+//! `./.mcp.json` is only a candidate: cloning a repository is not consent to run its programs.
 
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::mcp::bridge::{merge_configs, ServerSpec};
 
@@ -25,10 +25,34 @@ use crate::mcp::bridge::{merge_configs, ServerSpec};
 /// fixed-width value cell per line; this is an open-ended list toggled by `/mcp on|off` and never
 /// drawn there. Folding it in would have made the whole settings form carry a growable field for
 /// something it does not show.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+const VERSION: u8 = 2;
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Allowed {
+    #[serde(default = "current_version")]
+    version: u8,
     #[serde(default)]
     servers: Vec<String>,
+    #[serde(default)]
+    approvals: Vec<Approval>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct Approval {
+    project: String,
+    kind: String,
+    name: String,
+    digest: String,
+}
+
+const fn current_version() -> u8 {
+    VERSION
+}
+
+impl Default for Allowed {
+    fn default() -> Self {
+        Self { version: VERSION, servers: Vec::new(), approvals: Vec::new() }
+    }
 }
 
 /// Where the answers are kept. Beside the settings and the credentials.
@@ -40,10 +64,19 @@ impl Allowed {
     pub fn load() -> Allowed {
         let Some(at) = store() else { return Allowed::default() };
         let Ok(text) = std::fs::read_to_string(&at) else { return Allowed::default() };
-        serde_json::from_str(&text).unwrap_or_else(|e| {
+        let mut allowed: Allowed = serde_json::from_str(&text).unwrap_or_else(|e| {
             tracing::warn!(error = %e, "could not read which MCP servers are allowed");
             Allowed::default()
-        })
+        });
+        if allowed.version != VERSION {
+            tracing::warn!(
+                version = allowed.version,
+                "ignoring project approvals from an unknown format"
+            );
+            allowed.approvals.clear();
+            allowed.version = VERSION;
+        }
+        allowed
     }
 
     /// **The app keeps running if this fails** — the answer is already in effect for this run.
@@ -53,7 +86,19 @@ impl Allowed {
             let _ = std::fs::create_dir_all(dir);
         }
         let Ok(text) = serde_json::to_string(self) else { return };
-        if let Err(e) = std::fs::write(&at, text) {
+        let temp = at.with_extension(format!("{}.tmp", std::process::id()));
+        let written = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+            .and_then(|mut file| {
+                use std::io::Write;
+                file.write_all(text.as_bytes())?;
+                file.sync_all()
+            })
+            .and_then(|()| std::fs::rename(&temp, &at));
+        if let Err(e) = written {
+            let _ = std::fs::remove_file(&temp);
             tracing::warn!(error = %e, "could not save which MCP servers are allowed");
         }
     }
@@ -73,6 +118,103 @@ impl Allowed {
         }
         had != on
     }
+
+    pub fn allows_found(&self, cwd: &Path, found: &Found) -> bool {
+        if !found.project {
+            return self.allows(&found.spec.slug);
+        }
+        self.allows_exact(
+            cwd,
+            &format!("mcp:{}", found.source),
+            &found.spec.slug,
+            &server_digest(&found.spec),
+        )
+    }
+
+    pub fn set_found(&mut self, cwd: &Path, found: &Found, on: bool) -> bool {
+        if !found.project {
+            return self.set(&found.spec.slug, on);
+        }
+        self.set_exact(
+            cwd,
+            &format!("mcp:{}", found.source),
+            &found.spec.slug,
+            server_digest(&found.spec),
+            on,
+        )
+    }
+
+    pub fn allows_plugin(&self, cwd: &Path, plugin: &crate::plugin::Plugin) -> bool {
+        self.allows_exact(cwd, "plugin", &plugin.name, &crate::plugin::fingerprint(plugin))
+    }
+
+    pub fn set_plugin(&mut self, cwd: &Path, plugin: &crate::plugin::Plugin, on: bool) -> bool {
+        self.set_exact(cwd, "plugin", &plugin.name, crate::plugin::fingerprint(plugin), on)
+    }
+
+    fn allows_exact(&self, cwd: &Path, kind: &str, name: &str, digest: &str) -> bool {
+        let project = project_id(cwd);
+        self.approvals
+            .iter()
+            .any(|a| a.project == project && a.kind == kind && a.name == name && a.digest == digest)
+    }
+
+    fn set_exact(&mut self, cwd: &Path, kind: &str, name: &str, digest: String, on: bool) -> bool {
+        let project = project_id(cwd);
+        let had = self.approvals.iter().any(|a| {
+            a.project == project && a.kind == kind && a.name == name && a.digest == digest
+        });
+        self.approvals.retain(|a| !(a.project == project && a.kind == kind && a.name == name));
+        if on {
+            self.approvals.push(Approval {
+                project,
+                kind: kind.to_string(),
+                name: name.to_string(),
+                digest,
+            });
+        }
+        had != on
+    }
+}
+
+fn project_id(cwd: &Path) -> String {
+    std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf()).to_string_lossy().into_owned()
+}
+
+fn server_digest(spec: &ServerSpec) -> String {
+    let mut hash = Sha256::new();
+    hash.update(spec.slug.as_bytes());
+    match &spec.transport {
+        crate::mcp::bridge::Transport::Stdio { command, args, env } => {
+            hash.update(b"stdio\0");
+            hash.update(command.as_bytes());
+            for arg in args {
+                hash.update(b"\0arg\0");
+                hash.update(arg.as_bytes());
+            }
+            let mut env: Vec<_> = env.iter().collect();
+            env.sort_by_key(|(key, _)| *key);
+            for (key, value) in env {
+                hash.update(b"\0env\0");
+                hash.update(key.as_bytes());
+                hash.update(b"\0");
+                hash.update(value.as_bytes());
+            }
+        }
+        crate::mcp::bridge::Transport::Http { url, headers } => {
+            hash.update(b"http\0");
+            hash.update(url.as_bytes());
+            let mut headers: Vec<_> = headers.iter().collect();
+            headers.sort_by_key(|(key, _)| *key);
+            for (key, value) in headers {
+                hash.update(b"\0header\0");
+                hash.update(key.as_bytes());
+                hash.update(b"\0");
+                hash.update(value.as_bytes());
+            }
+        }
+    }
+    format!("{:x}", hash.finalize())
 }
 
 /// A server somebody else's client knows about.
@@ -82,34 +224,40 @@ pub struct Found {
     /// Which client it was read from, for `/mcp` to say. **Where a server came from is the whole
     /// basis for deciding whether to trust it.**
     pub source: String,
+    pub project: bool,
 }
 
 /// Where to look, and what to call what is found there.
 ///
 /// Home-level files come first and project-level after, matching how those clients read them
 /// themselves. **A file that is not there is not an error** — almost nobody has all of these.
-fn sources(home: Option<PathBuf>, cwd: &Path) -> Vec<(String, PathBuf)> {
-    let mut out: Vec<(String, PathBuf)> = Vec::new();
+fn sources(home: Option<PathBuf>, cwd: &Path) -> Vec<(String, PathBuf, bool)> {
+    let mut out: Vec<(String, PathBuf, bool)> = Vec::new();
     if let Some(home) = home {
-        out.push(("Claude Code".into(), home.join(".claude.json")));
-        out.push(("Claude Code".into(), home.join(".claude/settings.json")));
-        out.push(("Cursor".into(), home.join(".cursor/mcp.json")));
-        out.push(("Gemini CLI".into(), home.join(".gemini/settings.json")));
-        out.push(("Windsurf".into(), home.join(".codeium/windsurf/mcp_config.json")));
+        out.push(("Claude Code".into(), home.join(".claude.json"), false));
+        out.push(("Claude Code".into(), home.join(".claude/settings.json"), false));
+        out.push(("Cursor".into(), home.join(".cursor/mcp.json"), false));
+        out.push(("Gemini CLI".into(), home.join(".gemini/settings.json"), false));
+        out.push(("Windsurf".into(), home.join(".codeium/windsurf/mcp_config.json"), false));
     }
-    out.push(("Claude Code".into(), cwd.join(".claude/settings.json")));
-    out.push(("Claude Code".into(), cwd.join(".claude/settings.local.json")));
-    out.push(("Cursor".into(), cwd.join(".cursor/mcp.json")));
-    out.push(("VS Code".into(), cwd.join(".vscode/mcp.json")));
+    out.push(("Claude Code".into(), cwd.join(".claude/settings.json"), true));
+    out.push(("Claude Code".into(), cwd.join(".claude/settings.local.json"), true));
+    out.push(("Cursor".into(), cwd.join(".cursor/mcp.json"), true));
+    out.push(("VS Code".into(), cwd.join(".vscode/mcp.json"), true));
     out
 }
 
-/// Everything the other clients know about, minus what this app was told directly.
+/// Everything that needs an explicit MCP approval: the repository and other clients.
 ///
-/// **Ours win and are not listed twice.** A name that appears in both is already going to start;
-/// offering to turn it on again would read as two different servers.
+/// **The repository wins duplicate names.** It is the definition nearest this working directory,
+/// but remains off until approved.
 pub fn found(cwd: &Path) -> Vec<Found> {
+    let user: Vec<String> =
+        crate::mcp::bridge::load_user_config().into_iter().map(|spec| spec.slug).collect();
     found_in(crate::conn::user_home(), cwd)
+        .into_iter()
+        .filter(|found| found.project || !user.contains(&found.spec.slug))
+        .collect()
 }
 
 /// The same, over a home directory that is given rather than looked up.
@@ -120,20 +268,18 @@ pub fn found(cwd: &Path) -> Vec<Found> {
 /// that belonged to the person running them (2026-08-17). Whether a test passes must not depend on
 /// whose machine it is.
 pub fn found_in(home: Option<PathBuf>, cwd: &Path) -> Vec<Found> {
-    let ours: Vec<String> =
-        crate::mcp::bridge::load_config(cwd).into_iter().map(|s| s.slug).collect();
-    let mut out: Vec<Found> = Vec::new();
-    for (source, path) in sources(home, cwd) {
+    let mut out: Vec<Found> = crate::mcp::bridge::load_project_config(cwd)
+        .into_iter()
+        .map(|spec| Found { spec, source: ".mcp.json".to_string(), project: true })
+        .collect();
+    for (source, path, project) in sources(home, cwd) {
         for spec in read(&path) {
-            if ours.contains(&spec.slug) {
-                continue;
-            }
             // The same server in two clients is one server. **The first sighting wins**, so the
             // home-level file — the one a person is most likely to recognise — names it.
             if out.iter().any(|f| f.spec.slug == spec.slug) {
                 continue;
             }
-            out.push(Found { spec, source: source.clone() });
+            out.push(Found { spec, source: source.clone(), project });
         }
     }
     out.sort_by(|a, b| a.spec.slug.cmp(&b.spec.slug));
@@ -187,6 +333,7 @@ mod tests {
         assert_eq!(got.len(), 1, "{got:?}");
         assert_eq!(got[0].spec.slug, "playwright");
         assert_eq!(got[0].source, "Cursor");
+        assert!(got[0].project);
     }
 
     /// **A remote server is read as remote**, whether or not the file bothered to say `type`.
@@ -208,14 +355,17 @@ mod tests {
         }
     }
 
-    /// **What this app was told directly is not offered as a discovery.** It already starts, and
-    /// listing it again reads as a second server of the same name.
+    /// The repository definition is the candidate shown to the user and shadows another client's
+    /// entry of the same name. It no longer starts merely because it exists.
     #[test]
-    fn a_server_this_app_already_runs_is_not_offered_again() {
+    fn a_project_server_shadows_the_same_discovered_name() {
         let dir = tempfile::tempdir().unwrap();
         write(&dir.path().join(".mcp.json"), r#"{"mcpServers":{"mine":{"command":"a"}}}"#);
         write(&dir.path().join(".cursor/mcp.json"), r#"{"mcpServers":{"mine":{"command":"b"}}}"#);
-        assert!(found_here(dir.path()).is_empty(), "{:?}", found_here(dir.path()));
+        let found = found_here(dir.path());
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].project);
+        assert_eq!(found[0].spec.transport.summary(), "a");
     }
 
     /// The same server set up in two clients is one server, named by the first sighting.
@@ -252,6 +402,7 @@ mod tests {
         let got = found_in(Some(home.path().to_path_buf()), cwd.path());
         assert_eq!(got.len(), 1, "{got:?}");
         assert_eq!(got[0].spec.slug, "athome");
+        assert!(!got[0].project);
     }
 
     /// Claude Code files a project's servers under `projects.<path>`, so that block is read too.
@@ -265,5 +416,32 @@ mod tests {
         let got = found_here(dir.path());
         assert_eq!(got.len(), 1, "{got:?}");
         assert_eq!(got[0].spec.slug, "deep");
+    }
+
+    #[test]
+    fn project_mcp_is_disabled_until_approved() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join(".mcp.json"),
+            r#"{"mcpServers":{"project-server":{"command":"first"}}}"#,
+        );
+        let found = found_here(dir.path());
+        let server = found.iter().find(|f| f.spec.slug == "project-server").unwrap();
+        let mut allowed = Allowed::default();
+
+        assert!(server.project);
+        assert!(!allowed.allows_found(dir.path(), server));
+        let legacy: Allowed = serde_json::from_str(r#"{"servers":["project-server"]}"#).unwrap();
+        assert!(!legacy.allows_found(dir.path(), server));
+        assert!(allowed.set_found(dir.path(), server, true));
+        assert!(allowed.allows_found(dir.path(), server));
+
+        write(
+            &dir.path().join(".mcp.json"),
+            r#"{"mcpServers":{"project-server":{"command":"changed"}}}"#,
+        );
+        let changed = found_here(dir.path());
+        let changed = changed.iter().find(|f| f.spec.slug == "project-server").unwrap();
+        assert!(!allowed.allows_found(dir.path(), changed));
     }
 }

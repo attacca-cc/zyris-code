@@ -170,7 +170,19 @@ fn plain(text: &str) {
 }
 
 fn colours() -> bool {
-    std::env::var_os("NO_COLOR").is_none() && std::io::stderr().is_terminal()
+    colours_with(std::env::var_os("NO_COLOR").as_deref(), std::io::stderr().is_terminal())
+}
+
+/// **The decision itself**, over the two things it reads.
+///
+/// **Split out because the ambient answer cannot be tested.** The test below used to assert
+/// `!colours()` on the reasoning that "a test isn't a terminal" — but `is_terminal()` asks the real
+/// fd 2, and libtest's capture only redirects the printing macros. So a plain `cargo test` typed
+/// into a terminal leaves stderr a terminal, and the suite went red **on a program that was
+/// behaving correctly**; run through a pipe (CI, a tool, `cargo test > log`) the same suite was
+/// green, which is how a test like that survives. Here the rule can be driven directly.
+fn colours_with(no_color: Option<&std::ffi::OsStr>, stderr_is_a_terminal: bool) -> bool {
+    no_color.is_none() && stderr_is_a_terminal
 }
 
 /// A tracing layer that collects failure reasons.
@@ -289,10 +301,18 @@ mod tests {
         assert!(n.0.last.lock().unwrap().is_some());
     }
 
-    /// **`NO_COLOR` is respected.** Escapes are garbage for something receiving through a pipe.
+    /// **`NO_COLOR` is respected, and a pipe gets no escapes.** Driven directly rather than asked
+    /// of the process: the ambient answer depends on where the suite was started from, which is
+    /// how this test was red for anybody running `cargo test` in a terminal while the program was
+    /// right (see `colours_with`).
     #[test]
     fn no_color_turns_the_escapes_off() {
-        // A test isn't a terminal, so it should be off anyway.
-        assert!(!colours(), "colour must not go out to somewhere that isn't a terminal");
+        use std::ffi::OsStr;
+        assert!(
+            !colours_with(None, false),
+            "colour must not go out to somewhere that isn't a terminal"
+        );
+        assert!(!colours_with(Some(OsStr::new("1")), true), "NO_COLOR was not respected");
+        assert!(colours_with(None, true), "a terminal with no NO_COLOR should get colour");
     }
 }

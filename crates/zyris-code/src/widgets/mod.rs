@@ -35,7 +35,6 @@ mod panel;
 mod picker;
 /// Public for the same reason as `todos` — `lines` is the pure seam the plan panel is read through.
 pub mod plan;
-mod report;
 /// Public for the same reason as `activity` — `left_spans` is the pure seam tests read the
 /// bottom bar through.
 pub mod status;
@@ -58,14 +57,11 @@ pub fn draw(frame: &mut Frame, state: &mut State) {
     let area = full;
     // The input box grows with its content. It never exceeds half the screen.
     //
-    // **There is only one input slot.** When a question is open the question takes it.
-    // **Three things can want the input's spot**, and only one of them can have it: the question
-    // the turn is blocked on, the report a job just handed back, and the input itself. The
-    // question comes first — it is the one somebody else is waiting on.
+    // **There is only one input slot.** When a question is open the question takes it — the turn is
+    // blocked on the answer, so that is the one thing to do right now. Nothing else takes it: a
+    // report used to, and it no longer does (it is a row of the conversation now).
     let input_h = if let Some((_, a)) = &state.asking {
         ask::height(a, area.width, area.height.saturating_sub(3), state.lang).saturating_sub(1)
-    } else if let Some(r) = &state.report {
-        report::height(r, area.width, area.height.saturating_sub(3), state.lang).saturating_sub(1)
     } else {
         state.input.height(area.width.saturating_sub(2)).min((area.height / 2).max(1)).max(1)
     };
@@ -93,6 +89,7 @@ pub fn draw(frame: &mut Frame, state: &mut State) {
     // one that moved must not be clickable where it used to be.
     state.screen_links.clear();
     transcript::draw(frame, chunks[0], state);
+    mark_transcript_links(frame, state);
     // A click on this row opens the plan, and `apply` is pure — so where it landed is written
     // down here.
     state.activity_row = Some(chunks[1].y);
@@ -100,23 +97,33 @@ pub fn draw(frame: &mut Frame, state: &mut State) {
     todos::draw(frame, chunks[2], state);
     plan::draw(frame, chunks[3], state);
     state.ask_area = None;
-    match (&state.asking, &state.report) {
-        (Some((_, a)), _) => {
+    let placed = match &state.asking {
+        Some((_, a)) => {
             // Moving a click to a row requires knowing this area.
             state.ask_area = Some(chunks[4]);
-            ask::draw(frame, chunks[4], a, state.lang);
+            ask::draw(frame, chunks[4], a, state.lang)
         }
-        // **The report takes the input's spot too.** The turn is over and this is what is left to
-        // say; `Esc` or `Enter` gives the input back.
-        (None, Some(r)) => report::draw(frame, chunks[4], r, state.lang),
-        (None, None) => input::draw(frame, chunks[4], state),
+        None => input::draw(frame, chunks[4], state),
+    };
+    // **Something always gets the cursor.** A frame that asks for no position makes ratatui hide
+    // it, and it stays hidden until some later frame asks — so a surface with no field of its own
+    // (a question card being chosen from rather than typed into) used to leave the cursor nowhere
+    // at all, and that is also where the input method wants to compose. The input and the card
+    // hand their own place back; this is the one place that puts it on the screen.
+    if !placed {
+        frame.set_cursor_position((area.x, chunks[4].y));
     }
     input::rule(frame, chunks[5]);
     status::draw(frame, chunks[6], state);
 
     // The picker overlaps at the very top — while it is open, that is the current task.
+    //
+    // **The blink is read before the picker is borrowed mutably.** `state.blink_ms()` takes the
+    // whole state, and `&mut state.picker` is already holding a field of it, so the two cannot be
+    // alive at once. It used to be `state.tick`, a `Copy` field, which is what hid this.
+    let blink_ms = state.blink_ms();
     if let Some(p) = &mut state.picker {
-        picker::draw(frame, full, p, state.lang, state.tick);
+        picker::draw(frame, full, p, state.lang, blink_ms);
     }
 
     // **The new-project form is laid on top of the picker.** The picker stays below, so pressing Esc
@@ -163,6 +170,41 @@ pub fn draw(frame: &mut Frame, state: &mut State) {
                 cell.bg = bg;
             }
         }
+    }
+
+    // **The cell behind a glyph that shrank is the one cell the diff cannot fix, and it is the
+    // whole of the residue this app heals.** ratatui skips the cell after a wide character — it
+    // trusts the terminal to paint the glyph across both — so when a wide glyph turns into a
+    // narrow one that cell reads as unchanged on both buffers and is never written again,
+    // leaving the right half of the old glyph on screen. Putting a space back into exactly those
+    // cells, on the frame where it happens, touches the few cells it ever concerns — and it
+    // replaces a timer that re-emitted the whole screen (or every blank on it) twice a second to
+    // catch the same handful (`Heal` in `app.rs`, `$ZYRIS_CODE_HEAL`).
+    //
+    // **What was wide is remembered, not guessed.** The cell that needs a space put back is one
+    // that *was* the trailing half and is not any more. Writing the placeholder of a glyph that
+    // is still wide would blot out half of it, which is exactly why the blank pass had to keep
+    // off the cells right after a wide character.
+    {
+        use ratatui::buffer::CellDiffOption;
+        let width = frame.buffer_mut().area.width as usize;
+        let cells = frame.buffer_mut().content.as_mut_slice();
+        let mut now_wide = vec![false; cells.len()];
+        for i in 1..cells.len() {
+            if width > 1
+                && i % width != 0
+                && crate::markdown::display_width(cells[i - 1].symbol()) >= 2
+            {
+                now_wide[i] = true;
+            }
+        }
+        for i in 1..cells.len() {
+            let was = state.prev_wide.get(i).copied().unwrap_or(false);
+            if was && !now_wide[i] && cells[i].symbol() == " " {
+                cells[i].set_diff_option(CellDiffOption::AlwaysUpdate);
+            }
+        }
+        state.prev_wide = now_wide;
     }
 
     // **Self-healing frame: force every cell out again.** Overwriting without clearing removes the ghost of
@@ -260,7 +302,8 @@ pub fn draw(frame: &mut Frame, state: &mut State) {
     // snapshot — the snapshot must hold plain text, not escape sequences, for mouse selection.
     // The diff sees the escaped symbols, so a changed link rewrites its cells and a removed
     // one reverts to plain.
-    inject_links(frame, state);
+    let transcript_links = inject_links(frame, state);
+    state.screen_links.extend(transcript_links);
 }
 
 /// Wraps the cells under each visible link in an OSC 8 hyperlink sequence, so the terminal
@@ -270,29 +313,49 @@ pub fn draw(frame: &mut Frame, state: &mut State) {
 /// columns the cell really occupies — without it, the escape bytes would inflate the computed
 /// width and the diff would misplace every following cell. A wide glyph advances the column by
 /// its own width (2), so its empty placeholder cell is never visited and never written over.
-fn inject_links(frame: &mut Frame, state: &State) {
+fn inject_links(frame: &mut Frame, state: &State) -> Vec<crate::app::ScreenLink> {
     use ratatui::buffer::CellDiffOption;
     use std::num::NonZeroU16;
 
+    let mut visible = Vec::new();
     // **A terminal that never learned OSC 8 prints the bytes.** Then a link is not merely
     // un-clickable — the escape sequence lands across the transcript as rubbish, and the diff
     // believes those cells are right, so it stays until a full repaint. Ctrl+click still opens
     // the URL without this, because the app opens it itself (`open_url`) rather than leaving it
     // to the emulator, so the cost of guessing "no" is the underline and nothing else.
-    if !state.caps.hyperlinks || state.view_links.is_empty() {
-        return;
+    if state.view_links.is_empty() {
+        return visible;
     }
     let (ox, oy) = state.view_origin;
     for (i, links) in state.view_links.iter().enumerate() {
         let y = oy + i as u16;
         for link in links {
-            let open = format!("\x1b]8;;{}\x1b\\", link.url);
+            let open = state.caps.hyperlinks.then(|| format!("\x1b]8;;{}\x1b\\", link.url));
             let mut col = link.start;
+            let mut run_start = None;
+            let mut run_end = 0;
             while col < link.end {
                 let x = ox + col as u16;
                 let Some(cell) = frame.buffer_mut().cell_mut((x, y)) else { break };
                 let sym = cell.symbol().to_string();
                 let w = crate::markdown::display_width(&sym).max(1) as u16;
+                // An overlay replaces every modifier, including the private marker. Only a cell
+                // still owned by the transcript may inherit its URL.
+                if !cell.modifier.contains(ratatui::style::Modifier::RAPID_BLINK) {
+                    if let Some(start) = run_start.take() {
+                        visible.push(crate::app::ScreenLink {
+                            row: y,
+                            start,
+                            end: run_end,
+                            url: link.url.clone(),
+                        });
+                    }
+                    col += w as usize;
+                    continue;
+                }
+                cell.modifier.remove(ratatui::style::Modifier::RAPID_BLINK);
+                run_start.get_or_insert(x);
+                run_end = x.saturating_add(w);
                 // **The terminal owns the decoration once it owns the link.** Emulators that read
                 // OSC 8 draw their own hyperlink styling, and most of them underline it on hover ‒
                 // so the underline the renderer put on (`markdown.rs`) sat under the terminal's,
@@ -302,15 +365,45 @@ fn inject_links(frame: &mut Frame, state: &State) {
                 // It comes off **only** where the sequence goes on. A terminal we did not send
                 // OSC 8 to has nothing to style the link with, so there the underline stays and is
                 // the only sign that the text is a link at all.
-                cell.modifier.remove(ratatui::style::Modifier::UNDERLINED);
-                // Wide glyphs occupy two buffer cells (the second is an empty placeholder).
-                // Advancing by the glyph's own width skips that placeholder, so it is never
-                // written over ‒ the wide char's trailing column stays intact.
-                cell.set_symbol(&format!("{open}{sym}\x1b]8;;\x1b\\"));
-                cell.set_diff_option(CellDiffOption::ForcedWidth(
-                    NonZeroU16::new(w).expect("a glyph is at least one column wide"),
-                ));
+                if let Some(open) = &open {
+                    cell.modifier.remove(ratatui::style::Modifier::UNDERLINED);
+                    // Wide glyphs occupy two buffer cells (the second is an empty placeholder).
+                    // Advancing by the glyph's own width skips that placeholder, so it is never
+                    // written over ‒ the wide char's trailing column stays intact.
+                    cell.set_symbol(&format!("{open}{sym}\x1b]8;;\x1b\\"));
+                    cell.set_diff_option(CellDiffOption::ForcedWidth(
+                        NonZeroU16::new(w).expect("a glyph is at least one column wide"),
+                    ));
+                }
                 col += w as usize;
+            }
+            if let Some(start) = run_start {
+                visible.push(crate::app::ScreenLink {
+                    row: y,
+                    start,
+                    end: run_end,
+                    url: link.url.clone(),
+                });
+            }
+        }
+    }
+    visible
+}
+
+/// Marks transcript-owned link cells before overlays are composed. The marker never reaches the
+/// terminal: overlays erase it, and `inject_links` consumes it from every surviving cell.
+fn mark_transcript_links(frame: &mut Frame, state: &State) {
+    let (ox, oy) = state.view_origin;
+    for (i, links) in state.view_links.iter().enumerate() {
+        let y = oy + i as u16;
+        for link in links {
+            let mut col = link.start;
+            while col < link.end {
+                let x = ox + col as u16;
+                let Some(cell) = frame.buffer_mut().cell_mut((x, y)) else { break };
+                let width = crate::markdown::display_width(cell.symbol()).max(1);
+                cell.modifier.insert(ratatui::style::Modifier::RAPID_BLINK);
+                col += width;
             }
         }
     }

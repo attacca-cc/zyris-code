@@ -33,10 +33,6 @@ pub enum Frame {
         /// widens every `Action` that goes down the channel by the size of the largest plan-shaped
         /// hole, which is what clippy's `large_enum_variant` is about.
         plan: Option<Box<crate::plan::Submitted>>,
-        /// The report this event handed back from a job, if it did. **Rides along for the same
-        /// reason `plan` does**: history replays through here, so a report from a job that
-        /// finished while nobody was watching is read when the thread is opened again.
-        report: Option<Box<crate::report::Report>>,
     },
     Delta {
         kind: ZDeltaKind,
@@ -83,9 +79,20 @@ pub enum Frame {
     },
     /// A background job started. **If it is invisible the user quits the app unaware and
     /// the build dies with it** — what cannot be seen is as dangerous as what is not there.
+    ///
+    /// `session` is **which conversation asked for it**, when the server said so (`guard.rs`
+    /// reads it off the call's `meta`). A job outlives the conversation that started it — that
+    /// is what putting it in the background means — so without this a build started in one
+    /// thread is drawn as the work of whichever thread happens to be on screen, and the person
+    /// who switched threads reads it as something they did not ask for.
+    ///
+    /// **Deliberately not the frame's `Origin`.** As a tag it would make `frame_is_current`
+    /// drop the frame when it arrives for a conversation this window is not showing, and a job
+    /// that is dropped is a job nobody knows is running.
     JobStart {
         id: String,
         label: String,
+        session: Option<String>,
     },
     /// It finished. `ok` is whether the exit code was 0.
     JobEnded {
@@ -253,6 +260,15 @@ pub enum Action {
     TogglePlan,
     /// Where the mouse was pressed. Screen coordinates.
     Press(u16, u16),
+    /// Where the mouse was pressed **by the click that gave this window focus.**
+    ///
+    /// Same coordinates, same drag — the whole of the difference is that letting go without
+    /// moving is **not** a click. That is the accident the old swallow existed to prevent (an
+    /// incidental click folding a card nobody aimed at), and swallowing the press outright also
+    /// threw away the gesture: on a setup where focus follows the pointer — Hyprland's
+    /// `follow_mouse = 1` is one — the *first* press after the pointer arrives in the window
+    /// falls inside the grace, and reaching for the mouse is exactly what brings the pointer in.
+    ActivatingPress(u16, u16),
     /// A Ctrl+click landed on a link. The URL is opened by the OS (I/O side).
     OpenLink(String),
     /// Where it moved to while held.
@@ -281,14 +297,14 @@ pub enum Action {
     PickDeleteCancel,
     /// Back. From the session level to the project list; at the project level, close.
     PickBack,
+    /// **Open the note under the list, or hold it back to a line again.** A shape rather than a
+    /// choice: the cursor does not move, and nothing here reaches the server.
+    PickExpand,
     /// The new-project form. Next field / previous field / create / close.
     FormNext,
     FormPrev,
     FormConfirm,
     FormCancel,
-    /// Put the report card away (Esc or Enter). It takes the input's spot, so this gives the
-    /// input back.
-    ReportClose,
     /// Close the popup panel (Esc or Enter).
     PanelClose,
     /// Scroll the popup panel. Positive scrolls toward the top.
@@ -435,13 +451,8 @@ pub struct State {
     /// `transcript::draw` fills it from the rows cache; `widgets::draw` wraps those cells
     /// in OSC 8 so the terminal makes them Ctrl+clickable.
     pub view_links: Vec<Vec<crate::markdown::Link>>,
-    /// Links drawn by whatever is laid **over** the conversation — the enrolment window and any
-    /// other overlay with a URL in it.
-    ///
-    /// **In absolute screen cells**, unlike `view_links`, because an overlay is centred on the
-    /// screen rather than anchored to the transcript. It is rebuilt every frame by the drawing
-    /// side, the same way `view_total` and `activity_row` are, because `apply` is pure and cannot
-    /// know where anything landed.
+    /// Links visible in the final composed frame, in absolute screen cells. Rebuilt every frame
+    /// so an overlay can replace both the drawing and the hit target underneath it.
     pub screen_links: Vec<ScreenLink>,
     /// The selected range, in **screen** coordinates. **It survives releasing the mouse** — if
     /// it vanished on release there would be no moment to press Ctrl+C.
@@ -480,6 +491,10 @@ pub struct State {
     pub selection_stale: bool,
     /// Is the button held down right now? The range only grows while it is.
     pub dragging: bool,
+    /// **The press now in flight is the one that focused this window**, so letting go without
+    /// moving must not count as a click. Overwritten by the next press, read when the button
+    /// comes up (`Release`).
+    pub press_cannot_click: bool,
     /// The visible text of the last drawn frame, one `String` per screen row. Mouse selection
     /// reads from this — a drag anywhere on the screen extracts what it covers.
     pub screen: Vec<String>,
@@ -488,9 +503,6 @@ pub struct State {
     /// A question lands here on its own when it arrives — the turn is blocked waiting for
     /// the answer, so the user should not have to open it separately.
     pub asking: Option<(i64, crate::question::Answering)>,
-    /// The report a job just handed back, waiting to be read. **It takes the input's spot**, the
-    /// way a question does — see `widgets::report`.
-    pub report: Option<crate::report::Report>,
     /// The plan waiting to be approved, if one is. **Not in `asking`** — a question replaces the
     /// input because answering it *is* the message, while a plan is decided by an ordinary message
     /// and the draft has to stay reachable to say what to change.
@@ -549,24 +561,23 @@ pub struct State {
     pub usage: crate::usage::Usage,
     /// What to use as the terminal window title. Changes once the session gets a title.
     pub title: String,
-    /// Frames drawn. Blinking indicators take their phase from this.
-    ///
-    /// It is a frame count rather than a clock so that **tests do not have to wait on
-    /// time.** It keeps the drawing side pure.
-    ///
-    /// **The breath does not use it** — see [`State::breath_ms`]. A tick is a timer fire, not a
-    /// drawn frame, and the two are not the same count in either direction.
-    pub tick: u64,
     /// Where the breath is measured from.
     ///
-    /// **A clock, because a frame count is not one.** `tick` counts timer fires: the streaming
+    /// **A clock, because a frame count is not one.** A timer fire is not a draw: the streaming
     /// gate drops some of them without drawing, a keystroke and the healing repaint draw extra
-    /// frames at an unchanged tick, and a stalled loop fires several back to back. An animation
-    /// stepped by that count runs at a tempo that has nothing to do with time, which is what a
+    /// frames between two of them, and a stalled loop fires several back to back. An animation
+    /// stepped by the fire count runs at a tempo that has nothing to do with time, which is what a
     /// person sees as it stalling and then rushing.
     ///
     /// A test picks a phase by moving this back rather than by sleeping.
     pub breath_origin: Instant,
+    /// Where the blink is measured from. **Its own clock, for the same reason as
+    /// [`State::breath_origin`]** — a tempo stepped by a frame count runs at whatever rate the
+    /// frame timer happens to be set to, which is how the working dot came to blink three times
+    /// faster the day the local default went from 20fps to 60fps (2026-09-14).
+    ///
+    /// A test picks a phase by moving this back rather than by sleeping.
+    pub blink_origin: Instant,
     /// What the tools resolve relative paths against. The screen has to show it, or there is
     /// no telling which repo the `src/app.rs` on a tool line belongs to.
     pub cwd: std::path::PathBuf,
@@ -588,6 +599,11 @@ pub struct State {
     /// Jobs running in the background right now. They drop out when they end — what the user
     /// wants to know is **what is running now**, and the agent reads finished output with
     /// `wait.logs`.
+    /// **Which conversation is on screen.** A job row carries the conversation that asked for
+    /// it (`JobRow::session`), and the only way to say whether that is *this* one is to know
+    /// which one this is — the screen side cannot ask `Session`. Kept level by the loop, in one
+    /// place; `None` before anything has attached.
+    pub session_id: Option<String>,
     pub jobs: Vec<JobRow>,
     /// A slash command the user typed. `run()` picks it up and runs it — same trick as
     /// `submit_now`.
@@ -609,7 +625,18 @@ pub struct State {
     /// Self-heal while a turn is running. **Only blank cells are forced out again** —
     /// residue only ever hides on blank cells, and a space is safe to overlap with
     /// anything, so on a slow SSH link it can never show the same word twice.
+    ///
+    /// Reachable only by asking for it (`$ZYRIS_CODE_HEAL=blank`); the default heal is the
+    /// trailing-cell pass in `widgets::draw`, which is what the residue actually is.
     pub force_update_blank: bool,
+    /// **The cells that were the trailing half of a wide glyph**, as the last frame drew them.
+    ///
+    /// One flag per buffer cell, in buffer order. ratatui skips the cell after a wide character
+    /// — it trusts the terminal to paint the glyph across both — so when a wide glyph turns into
+    /// a narrow one, that cell reads as unchanged on both buffers and is never written again,
+    /// leaving the right half of the old glyph on screen. Knowing which cells those were is what
+    /// lets that be fixed where it happens, instead of re-emitting the screen on a timer.
+    pub prev_wide: Vec<bool>,
     /// The screen language. `/config lang` changes it and it moves together with `lang::current()`.
     pub lang: crate::lang::Lang,
     /// The settings `/config` shows and changes. The gate reads `dir_access` through the
@@ -645,6 +672,10 @@ pub struct JobRow {
     /// The time is not carried in the frame but **stamped where it is received** — same way
     /// as `running_exec`.
     pub since: Instant,
+    /// **The conversation that asked for it**, when the server said. `None` for an older
+    /// attacca, and then the row is treated as this conversation's — an unattributed job is
+    /// better read as ours than hidden.
+    pub session: Option<String>,
 }
 
 /// One shell the agent left open.
@@ -700,9 +731,9 @@ impl Default for State {
             frame_ms: 50,
             selection_stale: false,
             dragging: false,
+            press_cannot_click: false,
             screen: Vec::new(),
             asking: None,
-            report: None,
             plan: None,
             plan_decided: false,
             ask_area: None,
@@ -721,8 +752,8 @@ impl Default for State {
             project_out: None,
             usage: crate::usage::Usage::default(),
             title: "Zyris Code".into(),
-            tick: 0,
             breath_origin: Instant::now(),
+            blink_origin: Instant::now(),
             // Must be **the same place** the tools use. `tools::working_dir` is the one
             // definition.
             cwd: crate::tools::working_dir(),
@@ -737,6 +768,8 @@ impl Default for State {
             running_exec: None,
             force_update: false,
             force_update_blank: false,
+            prev_wide: Vec::new(),
+            session_id: None,
             lang: crate::lang::current(),
             config: crate::config::Config::default(),
             reconnecting: false,
@@ -965,6 +998,14 @@ impl State {
         self.breath_origin.elapsed().as_millis() as u64
     }
 
+    /// How far into the blink the drawing side is, in milliseconds.
+    ///
+    /// **Read at draw time, from a clock**, for the same reason as [`State::breath_ms`]: the tempo
+    /// belongs to time, not to how many frames happened to be drawn along the way.
+    pub fn blink_ms(&self) -> u64 {
+        self.blink_origin.elapsed().as_millis() as u64
+    }
+
     /// Ends the fades that have run their course, and collapses what was waiting on one.
     ///
     /// **The children are forgotten here rather than at the click.** Dropping them while the
@@ -1068,34 +1109,11 @@ impl State {
         }
     }
 
-    /// The URL of the link under the given screen coordinate, if any. `None` outside the
-    /// transcript or on a cell with no link.
-    ///
-    /// `view_links` is indexed the same way as the transcript's visible lines (line 0 is the
-    /// one at `view_origin`), and each `Link`'s columns are in that line's display columns —
-    /// so the only mapping needed is the `view_origin` offset, exactly like `inject_links`.
+    /// The URL visible under the given screen coordinate, if any.
     pub fn link_at(&self, x: u16, y: u16) -> Option<String> {
-        // **What is drawn on top is what gets clicked.** An overlay covers the transcript, so a
-        // cell it painted belongs to it — checking the transcript first would open whatever URL
-        // happens to be hidden underneath.
-        if let Some(found) = self
-            .screen_links
+        self.screen_links
             .iter()
             .find(|l| l.row == y && x >= l.start && x < l.end)
-            .map(|l| l.url.clone())
-        {
-            return Some(found);
-        }
-        let (ox, oy) = self.view_origin;
-        if x < ox || y < oy {
-            return None;
-        }
-        let line = (y - oy) as usize;
-        let col = (x - ox) as usize;
-        self.view_links
-            .get(line)?
-            .iter()
-            .find(|l| col >= l.start && col < l.end)
             .map(|l| l.url.clone())
     }
 }
@@ -1123,7 +1141,6 @@ pub struct Past {
     pub entry: Option<Entry>,
     pub todo: Option<crate::todos::Change>,
     pub plan: Option<Box<crate::plan::Submitted>>,
-    pub report: Option<Box<crate::report::Report>>,
 }
 
 /// A clickable URL somewhere on the screen, in absolute cells.
@@ -1170,15 +1187,6 @@ pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
         if !(ctrl && matches!(key.code, KeyCode::Char('c'))) {
             return ask_key(a, key, ctrl);
         }
-    }
-
-    // **A report card takes the keys while it is up.** Nothing is waiting on it — the turn is over
-    // — so one key puts it away and the input comes back. Ctrl+C is still the way out.
-    if state.report.is_some() && !(ctrl && matches!(key.code, KeyCode::Char('c'))) {
-        return match key.code {
-            KeyCode::Esc | KeyCode::Enter | KeyCode::Char(' ') => vec![Action::ReportClose],
-            _ => vec![],
-        };
     }
 
     // **The GitHub screen takes the keys the same way the new-project form does.** Ctrl+C is the
@@ -1348,6 +1356,12 @@ pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
             KeyCode::Esc => vec![Action::PickBack],
             KeyCode::Left if typing => vec![Action::Left],
             KeyCode::Right if typing => vec![Action::Right],
+            // **`Tab` opens the note under the list.** It is held to one line, so an ordinary list
+            // does not pay — on every row — for the longest description it happens to carry; the
+            // key shows that description whole (`Action::PickExpand`). **Nothing else claims `Tab`
+            // while a list is up**: the forms and the question card are handled above this and
+            // never reach here.
+            KeyCode::Tab => vec![Action::PickExpand],
             // → does nothing. Enter is the only way to confirm.
             _ => vec![],
         };
@@ -1588,9 +1602,20 @@ pub fn apply(state: &mut State, action: &Action) {
     // (press, drag, release), a plain redraw and clearing itself keep it alive — so it never
     // outlives the moment it was made. The wheel and page scroll are left to their own arms,
     // which already drop the highlight while keeping the copied text.
+    //
+    // **News from the server is not input, and a gesture in flight is not to be taken away.**
+    // `Action::Frame` used to end a selection like a keystroke did, and frames arrive
+    // constantly: the usage and title poll lands every few seconds even on an idle screen, and
+    // while a turn runs an answer streams in at the frame rate. So a drag made over exactly the
+    // output somebody wants to copy was wiped by the next frame — nothing highlighted and
+    // nothing reached the clipboard (measured on a pty: no frames, the drag works; one frame
+    // during it, the drag and the copy are gone). A highlight that rides text which has moved
+    // is what `reanchor_drag` is for; leaving the conversation is the one thing that does throw
+    // it away, and that is `clear_conversation`'s business.
     if !matches!(
         action,
         Action::Press(..)
+            | Action::ActivatingPress(..)
             | Action::DragTo(..)
             | Action::Release
             | Action::OpenLink(_)
@@ -1598,6 +1623,7 @@ pub fn apply(state: &mut State, action: &Action) {
             | Action::Page(_)
             | Action::Repaint
             | Action::ClearSelection
+            | Action::Frame(_)
     ) && (state.drag.is_some() || state.selection.is_some())
     {
         state.drag = None;
@@ -1859,7 +1885,7 @@ pub fn apply(state: &mut State, action: &Action) {
                 plan.open = !plan.open;
             }
         }
-        Action::Press(x, y) => {
+        Action::Press(x, y) | Action::ActivatingPress(x, y) => {
             // Pressing on the question screen picks that row.
             if let (Some(area), Some((_, a))) = (state.ask_area, state.asking.as_ref()) {
                 if *y >= area.y && *y < area.y + area.height {
@@ -1886,6 +1912,9 @@ pub fn apply(state: &mut State, action: &Action) {
             // nothing for an anchor there to follow.
             state.drag_anchor = state.content_at(*x, *y).map(|(row, _)| row);
             state.dragging = true;
+            // **Whether this press may still turn out to be a click.** Read when the button comes
+            // up; the next press overwrites it. See `Action::ActivatingPress`.
+            state.press_cannot_click = matches!(action, Action::ActivatingPress(..));
         }
         Action::DragTo(x, y) => {
             if !state.dragging {
@@ -1910,7 +1939,9 @@ pub fn apply(state: &mut State, action: &Action) {
             // **The range stays.** It has to be possible to see how far the selection went.
             // Exporting to the clipboard is I/O and does not happen here — `run` does it.
             let Some(drag) = state.drag else { return };
-            if drag.is_click() {
+            // **Not every press is allowed to become a click.** The one that came with the click
+            // that focused this window is a drag and nothing else (see `Action::ActivatingPress`).
+            if drag.is_click() && !state.press_cannot_click {
                 // **A click on the activity line opens or folds the todo list.** Only when there
                 // is one to show — on every other line that row is ordinary text, and taking the
                 // click would cost the ability to select it.
@@ -2022,7 +2053,13 @@ pub fn apply(state: &mut State, action: &Action) {
                 p.down();
             }
         }
-        Action::ReportClose => state.report = None,
+        // **A shape, not a selection.** Both states leave the box one height for the whole list;
+        // what the key changes is how much of the note that height holds.
+        Action::PickExpand => {
+            if let Some(p) = &mut state.picker {
+                p.expanded = !p.expanded;
+            }
+        }
         Action::PanelClose => state.panel = None,
         // **Rebuilt, not nudged.** The body is plain lines with no idea which one is the cursor,
         // so moving it is a rebuild with the new `pick` — which keeps the whole panel a pure
@@ -2225,7 +2262,7 @@ pub fn apply(state: &mut State, action: &Action) {
 
 fn apply_frame(state: &mut State, frame: &Frame) {
     match frame {
-        Frame::Event { cursor, entry, todo, plan, report } => {
+        Frame::Event { cursor, entry, todo, plan } => {
             // The cursor advances even for an event we do not render — the resume position
             // must not be lost.
             state.last_cursor = Some(*cursor);
@@ -2251,14 +2288,6 @@ fn apply_frame(state: &mut State, frame: &Frame) {
                     // how a plan mode loop goes round, and the gate has to close behind it.
                     state.plan_decided = false;
                     state.plan = Some(crate::plan::Plan::new(plan));
-                }
-            }
-            // **The report takes the input's spot, the way a question does.** The turn is over;
-            // this is the sentence the agent wrote to say what came of it. A report updated in
-            // place replaces the one on screen only when it is the same one or a newer one.
-            if let Some(report) = report {
-                if state.report.as_ref().is_none_or(|r| r.seq <= report.seq) {
-                    state.report = Some((**report).clone());
                 }
             }
             let Some(entry) = entry else { return };
@@ -2472,7 +2501,6 @@ fn apply_frame(state: &mut State, frame: &Frame) {
                     entry: past.entry.clone(),
                     todo: past.todo.clone(),
                     plan: past.plan.clone(),
-                    report: past.report.clone(),
                 };
                 apply(state, &Action::Frame(frame));
             }
@@ -2547,20 +2575,33 @@ fn apply_frame(state: &mut State, frame: &Frame) {
                 state.running_exec = None;
             }
         }
-        Frame::JobStart { id, label } => {
+        Frame::JobStart { id, label, session } => {
             // The same id arriving twice would put two rows in the list.
             if !state.jobs.iter().any(|j| j.id == *id) {
                 state.jobs.push(JobRow {
                     id: id.clone(),
                     label: label.clone(),
                     since: Instant::now(),
+                    session: session.clone(),
                 });
             }
         }
         // A finished job leaves the list and **is announced once, then gone.** Success is
         // announced too — not knowing it finished leaves the user waiting.
+        //
+        // **The row goes from every conversation; the word goes to the one that asked.** The
+        // process really is gone, so leaving the row up anywhere would be a lie. But "배경 b1
+        // 끝남" landing in a thread that never started it is news about somebody else's work, on
+        // the one line that exists to say what is happening *here*.
         Frame::JobEnded { id, ok, secs } => {
+            let owner = state.jobs.iter().find(|j| j.id == *id).and_then(|j| j.session.clone());
             state.jobs.retain(|j| j.id != *id);
+            // An unattributed job (an older attacca) is announced: saying nothing about work
+            // that has just finished leaves a person waiting for it.
+            let ours = owner.as_deref().is_none_or(|s| Some(s) == state.session_id.as_deref());
+            if !ours {
+                return;
+            }
             // A job that finished is news; a job that failed is not.
             let said = state.lang.job_ended(id, *ok, *secs);
             if *ok {
@@ -2756,7 +2797,11 @@ pub fn run_command(state: &mut State, text: &str) -> Option<crate::command::Comm
         // **Logs are not dumped on screen** — those are for the agent to read, and covering the
         // transcript hides the conversation itself. Here we only give what is running and how to
         // stop it.
-        Command::Jobs(None) => state.timeline.say(jobs_text(&state.jobs, state.lang)),
+        Command::Jobs(None) => state.timeline.say(jobs_text(
+            &state.jobs,
+            state.lang,
+            state.session_id.as_deref(),
+        )),
         Command::Jobs(Some(_)) => {}
         // Shutting the screen down is I/O. Only raise the flag.
         Command::Quit => state.quitting = true,
@@ -2842,7 +2887,12 @@ pub fn run_command(state: &mut State, text: &str) -> Option<crate::command::Comm
 }
 
 /// What `/jobs` shows.
-fn jobs_text(jobs: &[JobRow], lang: crate::lang::Lang) -> String {
+///
+/// **A job that belongs to another conversation says so.** This window runs commands for every
+/// session on the account, so a job started in a thread that is no longer on screen is perfectly
+/// ordinary — and reading `b1 verify-panels` as this conversation's work is what makes a person
+/// think the screen in front of them started something they did not ask for.
+fn jobs_text(jobs: &[JobRow], lang: crate::lang::Lang, current: Option<&str>) -> String {
     if jobs.is_empty() {
         return lang.jobs_none().to_string();
     }
@@ -2850,7 +2900,11 @@ fn jobs_text(jobs: &[JobRow], lang: crate::lang::Lang) -> String {
     let mut out = String::from(lang.jobs_header());
     for job in jobs {
         let secs = now.saturating_duration_since(job.since).as_secs();
-        out.push_str(&lang.jobs_row(&job.id, &job.label, secs));
+        let row = lang.jobs_row(&job.id, &job.label, secs);
+        match job.session.as_deref() {
+            Some(s) if Some(s) != current => out.push_str(&lang.jobs_row_elsewhere(&row)),
+            _ => out.push_str(&row),
+        }
     }
     out.push_str(lang.jobs_hint());
     out
@@ -2899,42 +2953,40 @@ use tokio::sync::mpsc;
 use zyris_attacca::{AttaccaApi, AttaccaApiClient};
 
 use crate::conn::{frame_from, Session};
-use crate::widgets;
 
 /// Minimum interval between draws. Even with deltas pouring in character by character, they
 /// are merged and drawn per frame.
 ///
-/// **On a slow link like ssh this value is exactly what breaks the screen.** Drawing at 16ms
-/// (60fps) means the link cannot carry every frame while an answer streams fast, and the next
-/// frame overprints a half-arrived screen and tears it. 20fps is smooth enough for the eye,
-/// so give the slack to the link.
+/// **On a slow link like SSH this value is exactly what breaks the screen.** Drawing at 16ms
+/// (60fps) means the link cannot carry every streaming frame, and the next frame can overprint a
+/// half-arrived one. SSH therefore keeps 20fps and batches streamed content to 10fps; a local
+/// terminal uses 60fps and batches streamed content to roughly 30fps.
 ///
-/// `ZYRIS_CODE_FPS` changes it — raise it for a smoother look on a local terminal.
-fn frame_interval() -> Duration {
-    let fps: u64 = std::env::var("ZYRIS_CODE_FPS")
-        .ok()
+/// Local terminals can afford smooth motion; SSH keeps the conservative wire budget. An explicit
+/// `ZYRIS_CODE_FPS` value wins in either place.
+fn render_cadence_from(given: Option<&str>, ssh: bool) -> (Duration, Duration) {
+    let fps: u64 = given
         .and_then(|v| v.parse().ok())
         .filter(|f| (1..=120).contains(f))
-        .unwrap_or(20);
-    Duration::from_millis(1000 / fps)
+        .unwrap_or(if ssh { 20 } else { 60 });
+    let frame = Duration::from_millis(1000 / fps);
+    (frame, frame.saturating_mul(2))
 }
 
-/// Minimum interval between redraws while a turn is running.
-///
-/// Measured, the bytes one frame puts on the wire differ **by a factor of a thousand
-/// depending on what changed** (`tests/perf.rs::measure_bytes_on_the_wire`).
-///
-/// | What | Bytes out |
-/// |---|---|
-/// | Nothing changed | 32 B |
-/// | One character typed | 64 B |
-/// | One streaming chunk | 3.4 KB |
-/// | Full redraw | 21 KB |
-///
-/// So **we do not slow everything down.** Key input draws right where it was pressed
-/// (64 B), and only the inflow of an answer is batched at this interval. Streaming is far
-/// faster than a human hand, so batching here halves the volume without being noticed.
-const STREAM_MIN_GAP: Duration = Duration::from_millis(100);
+fn render_cadence() -> (Duration, Duration) {
+    let ssh = std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some();
+    render_cadence_from(std::env::var("ZYRIS_CODE_FPS").ok().as_deref(), ssh)
+}
+
+fn frame_interval() -> Duration {
+    render_cadence().0
+}
+
+/// Whether these actions should bypass the frame timer. Wheel bursts wait for the next tick so
+/// many notches can move state while producing one terminal frame; discrete input stays immediate.
+fn draws_immediately(actions: &[Action]) -> bool {
+    actions.iter().any(|action| !matches!(action, Action::Wheel(_)))
+}
 
 /// How often usage and title are asked for again. Asking every frame would hammer the server.
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
@@ -2996,6 +3048,40 @@ fn heal_interval() -> Option<Duration> {
         .unwrap_or(2000);
     // Set too short, the gap between clearing and redrawing widens and looks like flicker.
     (ms > 0).then(|| Duration::from_millis(ms.max(50)))
+}
+
+/// What the periodic self-heal does, if anything at all.
+///
+/// **The default is nothing, because the residue is healed where it happens.** ratatui skips the
+/// cell after a wide character, so a glyph that shrank leaves its right half behind in a cell
+/// that is "unchanged" on both buffers — `widgets::draw` writes exactly those cells out again on
+/// every frame, which costs a handful of cells and catches the case the moment it occurs.
+///
+/// What that replaces was a **whole-screen overwrite, twice a second, whenever anything was
+/// being drawn** — measured on a 100×30 pty: every one of the 30 rows re-emitted with a cursor
+/// move per row, ~3.8 KB a time (≈21 KB on a full window), for cells that were already correct.
+/// That is the sweep a person reads as the screen flickering under them. The two older shapes
+/// stay reachable for a terminal that wants them:
+///
+/// - `blank` — the blank-only pass (a few KB, and a space can never corrupt or double content,
+///   which is why it was chosen for slow SSH links);
+/// - `full` — the whole-screen overwrite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Heal {
+    Wide,
+    Blank,
+    Full,
+}
+
+/// Reads `$ZYRIS_CODE_HEAL`. Anything unreadable leaves the default alone — a typo must not be
+/// the same as asking for the sweep back.
+pub fn heal_mode() -> Heal {
+    match std::env::var("ZYRIS_CODE_HEAL").unwrap_or_default().trim().to_ascii_lowercase().as_str()
+    {
+        "blank" => Heal::Blank,
+        "full" => Heal::Full,
+        _ => Heal::Wide,
+    }
 }
 
 /// The sequence that changes the terminal window title.
@@ -3254,9 +3340,22 @@ enum MouseCapture {
 impl crossterm::Command for MouseCapture {
     fn write_ansi(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
         match self {
-            // Highest mode first when enabling, so a terminal that only knows the older ones
-            // still lands somewhere useful; reverse order when disabling.
-            MouseCapture::On => write!(f, "\x1b[?1006h\x1b[?1002h\x1b[?1000h"),
+            // **Ascending, because these are levels of one setting and the last one sent wins.**
+            // `?1000`, `?1002` and `?1003` all write the *same* field: kitty's `screen.c` has
+            // `MOUSE_MODE(MOUSE_BUTTON_TRACKING, mouse_tracking_mode, BUTTON_MODE)`,
+            // `…MOTION_TRACKING…MOTION_MODE`, `…MOVE_TRACKING…ANY_MODE` — three assignments to one
+            // enum, so what the terminal ends up in is whichever was sent last. This used to be
+            // `?1006h ?1002h ?1000h` ("highest first, so a terminal that only knows the older ones
+            // still lands somewhere useful"), which leaves kitty in **button-only** mode — and
+            // kitty forwards motion-while-a-button-is-held only in its motion or any-motion mode
+            // (`should_handle_in_kitty`, `kitty/mouse.c`). Presses and releases still arrived,
+            // so clicks worked and **every drag was swallowed by the terminal** — nothing on this
+            // side could see it, which is why that bug survived several rounds of looking here.
+            //
+            // `?1002h` last is the level this app actually reads. `?1003` is deliberately not
+            // asked for: it adds motion with no button held, which nothing here reads and which
+            // is bytes on the wire for every twitch of the mouse over SSH.
+            MouseCapture::On => write!(f, "\x1b[?1000h\x1b[?1002h\x1b[?1006h"),
             MouseCapture::Off => write!(f, "\x1b[?1000l\x1b[?1002l\x1b[?1006l"),
         }
     }
@@ -3493,6 +3592,43 @@ fn api_of(rx: &ApiRx) -> Option<Arc<AttaccaApiClient>> {
 /// can be late or absent — the pty smoke test is precisely that situation, and the app
 /// really did hang.
 ///
+/// **Draws a frame the terminal presents as one picture, not as cells arriving one after another.**
+///
+/// `CSI ?2026h` and `CSI ?2026l` are DEC's synchronized update: between them the terminal keeps
+/// the frame it already has and swaps the whole new one in at the end. Without it a frame goes out
+/// cell by cell and the terminal paints what it has so far — the cursor visibly riding the writes
+/// across the screen, and a half-finished picture on every large repaint. That is the half of the
+/// "flicker" that was never about *what* this app writes.
+///
+/// **Measured, not guessed.** The two other TUIs people run in this same kitty do exactly this:
+/// `claude` and `codex` each bracket every frame in `?2026h`/`?2026l` (probed on a pty, same
+/// terminal). Neither of them enables a single mouse mode — no `?1000`, `?1002`, `?1006` — which is
+/// the other half of the answer to "why does dragging work there": their drag *is* kitty's own
+/// selection, while this app takes the mouse on purpose and has to do the gesture itself.
+///
+/// **Unconditional, because the mode is private and harmless.** A terminal that has never heard of
+/// `?2026` ignores it — there is nothing else that sequence could mean — and the `end` goes out
+/// even when the frame itself failed, so a broken frame can never leave the terminal holding a
+/// picture it will not swap. That would freeze the screen until the next frame, and on the way out
+/// of the app there is no next frame.
+fn draw_frame(terminal: &mut ratatui::DefaultTerminal, state: &mut State) -> std::io::Result<()> {
+    use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
+
+    // **The cursor is hidden while the frame is written.** A diff lays cells out across the whole
+    // screen, and the terminal's cursor rides those writes — visible, darting from row to row,
+    // which is exactly what "the cursor is jumping around" looks like while tool calls fill the
+    // transcript. Hidden here it is placed once, at the end, by whichever surface knows where the
+    // typing is (`widgets::draw`), and ratatui shows it again as part of that.
+    execute!(io::stdout(), BeginSynchronizedUpdate, crossterm::cursor::Hide)?;
+    let drawn = terminal.draw(|f| crate::widgets::draw(f, state));
+    let ended = execute!(io::stdout(), EndSynchronizedUpdate);
+    match drawn {
+        // The frame's own failure is the one worth reporting.
+        Err(why) => Err(why),
+        Ok(_) => ended,
+    }
+}
+
 /// `resize` does the same thing (clear + full redraw on the next frame) without asking
 /// anything.
 fn repaint(terminal: &mut ratatui::DefaultTerminal) {
@@ -3642,7 +3778,7 @@ async fn run_inner(
     }
     // **Read once, here.** The `/` list is built on every keystroke, and reading the plugin
     // directories from the draw loop would put disk access on the typing path.
-    state.plugin_commands = crate::plugin::commands(&crate::plugin::discover(&state.cwd));
+    state.plugin_commands = crate::plugin::commands(&crate::plugin::active(&state.cwd));
 
     // **Attach the screen first.** The enrollment code window has to reach it even before
     // the first connection — `enroll::ScreenEnroll` sends `Frame::Enroll` here.
@@ -3778,7 +3914,6 @@ async fn run_inner(
                 dirty = true;
             }
             _ = ticker.tick() => {
-                state.tick = state.tick.wrapping_add(1);
                 // With the enrollment code window up, the time left is ticking down, so
                 // keep drawing.
                 if state.enroll.is_some() {
@@ -3787,7 +3922,7 @@ async fn run_inner(
             }
         }
         if dirty {
-            terminal.draw(|f| widgets::draw(f, &mut state))?;
+            draw_frame(terminal, &mut state)?;
             dirty = false;
         }
     };
@@ -3885,7 +4020,7 @@ async fn run_inner(
     // cancelled and re-polled by a different waker.
     drop(keys);
     let mut keys = EventStream::new();
-    let frame = frame_interval();
+    let (frame, stream_min_gap) = render_cadence();
     state.frame_ms = frame.as_millis().max(1) as u64;
     let mut ticker = tokio::time::interval(frame);
     // **A missed frame is missed, not owed.** The default is to fire the skipped ticks back to
@@ -3909,6 +4044,7 @@ async fn run_inner(
     // new can have broken.
     let mut drew_since_heal = false;
     let mut last_draw = Instant::now();
+    let mut wheel_dirty = false;
     set_terminal_title(&state.title);
     let mut shown_title = state.title.clone();
     // An armed quit releases on its own once time passes. But with no input there is nothing
@@ -3973,17 +4109,25 @@ async fn run_inner(
                     TermEvent::Paste(text) => vec![Action::Paste(text)],
                     // **The click that gave the window focus back is not a click in the app.**
                     // On Windows the activating click is delivered to us as well, and a press
-                    // with no movement toggles the fold of whatever card head it lands on and
-                    // drops the selection — so alt-tabbing back could silently unfold a card
-                    // above the viewport and slide old text into view. Swallowing the press
-                    // makes the release a no-op too, since it needs a drag to act on.
+                    // with no movement toggles the fold of whatever card head it lands on — so
+                    // alt-tabbing back could silently unfold a card above the viewport and slide
+                    // old text into view.
+                    //
+                    // **But it is still a press, and a drag from it is a person asking.** This
+                    // used to swallow the event whole, and that killed the gesture: with focus
+                    // following the pointer (Hyprland `follow_mouse = 1`), the *first* press after
+                    // the pointer arrives in the window is inside this grace — and reaching for
+                    // the mouse is what brings the pointer in, pressing is what a person does
+                    // next. So the press goes through and only its click is withheld
+                    // (`Action::ActivatingPress`).
                     TermEvent::Mouse(m)
                         if matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
                             && focus_back_at
                                 .is_some_and(|t: Instant| t.elapsed() < FOCUS_CLICK_GRACE) =>
                     {
                         focus_back_at = None;
-                        vec![]
+                        trace_mouse(&trace, &state, m);
+                        vec![Action::ActivatingPress(m.column, m.row)]
                     }
                     TermEvent::Mouse(m) => {
                         trace_mouse(&trace, &state, m);
@@ -4027,6 +4171,7 @@ async fn run_inner(
                 // Whether this event asked for anything at all. The draw at the end of the arm
                 // is keyed on it — see the comment there.
                 let acted = !actions.is_empty();
+                let immediate = draws_immediately(&actions);
                 for action in actions {
                     match &action {
                         // `run` restores the screen, and **the turn running on the server is
@@ -4089,7 +4234,10 @@ async fn run_inner(
                         // whole to wipe wide-character crumbs, but now every cell has a
                         // background (`theme::bg()`) so crumbs cannot arise structurally and
                         // there is nothing to clear — clearing makes the screen flash.
-                        Action::Wheel(_) => {}
+                        Action::Wheel(_) => {
+                            dirty = true;
+                            wheel_dirty = true;
+                        }
                         _ => {}
                     }
                     apply(&mut state, &action);
@@ -4225,9 +4373,10 @@ async fn run_inner(
                     // every one of them is a full frame per mouse sample, and that is what the
                     // flicker and the sluggishness are made of. `FocusGained` and `Resize`
                     // still redraw: they set `dirty` themselves.
-                    if dirty || acted {
-                        terminal.draw(|f| widgets::draw(f, &mut state))?;
+                    if (dirty || acted) && (!acted || immediate) {
+                        draw_frame(terminal, &mut state)?;
                         dirty = false;
+                        wheel_dirty = false;
                         drew_since_heal = true;
                         last_draw = Instant::now();
                     }
@@ -4356,7 +4505,13 @@ async fn run_inner(
                 }
             }
             _ = ticker.tick() => {
-                state.tick = state.tick.wrapping_add(1);
+                // **Which conversation is on screen, kept level in one place.** A job row carries
+                // the conversation that asked for it, and every screen that draws one has to say
+                // whether it is this one — so this is the answer they read, and it is written
+                // here rather than wherever a session happens to change.
+                if state.session_id.as_deref() != session.id() {
+                    state.session_id = session.id().map(str::to_string);
+                }
                 // **What has happened since the last draw, before this tick adds to it.** The
                 // batching below is about that: a frame carrying a streaming chunk is 3.4KB,
                 // while one where only an animation moved is the handful of cells that moved.
@@ -4420,10 +4575,14 @@ async fn run_inner(
                 // it is streaming, the breath rides along at whatever rate the content is drawn.
                 // Coarser, but even — and it is the drawing that costs, not the breath, which is
                 // one span rewritten on a copy that was about to be drawn anyway.
-                let held = content && state.running && last_draw.elapsed() < STREAM_MIN_GAP;
+                let held = content
+                    && state.running
+                    && !wheel_dirty
+                    && last_draw.elapsed() < stream_min_gap;
                 if dirty && !held {
-                    terminal.draw(|f| widgets::draw(f, &mut state))?;
+                    draw_frame(terminal, &mut state)?;
                     dirty = false;
+                    wheel_dirty = false;
                     drew_since_heal = true;
                     last_draw = Instant::now();
                 }
@@ -4440,28 +4599,27 @@ async fn run_inner(
             // sitting still cannot break, and an idle session has no reason to keep pushing
             // bytes over SSH.
             _ = heal.tick(), if healing => {
-                // **While a turn runs, heal only blank cells.** Streaming already redraws
-                // the screen every frame, but its diff never touches blank cells — when a
-                // wide character turns into a narrow one, the trailing cell stays "blank on
-                // both buffers" and is never redrawn, leaving a glyph crumb on SSH screens.
-                // A full overwrite (~21KB) fixes it but overlaps a streaming frame on slow
-                // links and shows **the same word twice** (measured on Termius). Writing
-                // only blanks costs a few KB, and a space can never corrupt or double
-                // content. The diff skips the cell right after a wide character, so the
-                // blank pass never writes under one.
+                // **The residue is healed every frame, where it happens** (`widgets::draw`), so
+                // the timer has nothing left to sweep on the default: `Heal::Wide` does nothing
+                // here. What this arm used to do unconditionally was re-emit the whole screen
+                // (or every blank on it) twice a second for as long as anything was being
+                // drawn, and on a real window that is a cursor dragged across every row — the
+                // flicker this heal was reported as. The two older shapes are still here by
+                // name (`$ZYRIS_CODE_HEAL=blank|full`) for a terminal that needs them.
                 if drew_since_heal {
-                    if state.running {
-                        state.force_update_blank = true;
-                    } else {
-                        state.force_update = true;
+                    match heal_mode() {
+                        Heal::Wide => {}
+                        Heal::Blank => state.force_update_blank = true,
+                        Heal::Full => state.force_update = true,
                     }
-                    // **Force cells out again without clearing.** clear is what causes
-                    // the flicker — `AlwaysUpdate` bypasses the diff and overwrites,
-                    // wiping the residue in the trailing cell behind a wide character.
-                    // The next draw goes back to the normal diff.
-                    terminal.draw(|f| widgets::draw(f, &mut state))?;
-                    dirty = false;
-                    drew_since_heal = false;
+                    if heal_mode() != Heal::Wide {
+                        // **Force cells out again without clearing.** clear is what causes
+                        // the flicker — `AlwaysUpdate` bypasses the diff and overwrites.
+                        // The next draw goes back to the normal diff.
+                        draw_frame(terminal, &mut state)?;
+                        dirty = false;
+                        drew_since_heal = false;
+                    }
                 }
             }
         }
@@ -4497,7 +4655,7 @@ async fn run_inner(
         // cover this last line.
         state.quit_armed_at = None;
         state.set_status(state.lang.stopping_turn());
-        let _ = terminal.draw(|f| widgets::draw(f, &mut state));
+        let _ = draw_frame(terminal, &mut state);
         // **The window closes even if it cannot be stopped.** Waiting here indefinitely for
         // a server that does not answer leaves someone who wanted out in front of a screen
         // they cannot close.
@@ -4731,7 +4889,6 @@ fn history_past(events: &[zyris_attacca::ZSessionEvent]) -> Vec<Past> {
             entry: crate::event::entry_from(e),
             todo: crate::todos::change_from(e),
             plan: crate::plan::submitted_from(e).map(Box::new),
-            report: crate::report::of(e).map(Box::new),
         })
         .collect();
 
@@ -4907,11 +5064,13 @@ fn clear_conversation(state: &mut State) {
     state.todos = crate::todos::Todos::new();
     state.folds = Folds::new();
     state.asking = None;
-    // **The report goes with the conversation too.** A job's result from the thread just left is
-    // not this thread's result.
-    state.report = None;
     state.last_cursor = None;
     state.scroll = Scroll::new(); // Start from the bottom.
+                                  // **A highlight belongs to the conversation it was made on.** It is anchored to screen rows
+                                  // of text that is about to be gone, and frames no longer drop it (`apply`), so leaving a
+                                  // thread is the one thing that has to.
+    state.drag = None;
+    state.selection = None;
 }
 
 /// Switches to another session. Re-reads the past record to fill the screen and reopens the
@@ -4973,7 +5132,10 @@ async fn finish_command(
             let allowed = crate::mcp::discovery::Allowed::load();
             let found: Vec<(String, String, bool)> = crate::mcp::discovery::found(&state.cwd)
                 .into_iter()
-                .map(|f| (f.spec.slug.clone(), f.source, allowed.allows(&f.spec.slug)))
+                .map(|f| {
+                    let on = allowed.allows_found(&state.cwd, &f);
+                    (f.spec.slug.clone(), f.source, on)
+                })
                 .collect();
             state.panel = Some(crate::panel::mcp(state.lang, &bridge.mcp_report(), &found));
         }
@@ -4988,16 +5150,16 @@ async fn finish_command(
                     return;
                 }
             };
-            // **Only what was discovered can be switched.** A server written down for this app
-            // always runs, so saying "off" about one would be a promise this cannot keep.
-            let known =
-                crate::mcp::discovery::found(&state.cwd).into_iter().any(|f| f.spec.slug == slug);
-            if !known {
+            // **Only candidates can be switched.** User-level zyris-code config is already an
+            // explicit choice; repository config and discoveries are inert until this command.
+            let found =
+                crate::mcp::discovery::found(&state.cwd).into_iter().find(|f| f.spec.slug == slug);
+            let Some(found) = found else {
                 state.timeline.say(state.lang.mcp_not_found(&slug));
                 return;
-            }
+            };
             let mut allowed = crate::mcp::discovery::Allowed::load();
-            let said = if allowed.set(&slug, on) {
+            let said = if allowed.set_found(&state.cwd, &found, on) {
                 allowed.save();
                 state.lang.mcp_switched(&slug, on)
             } else {
@@ -5037,9 +5199,12 @@ async fn finish_command(
                 // The listing is a panel now — one row per plugin reads better than
                 // a paragraph of bullets.
                 P::List => {
+                    let allowed = crate::mcp::discovery::Allowed::load();
                     state.panel = Some(crate::panel::plugins(
                         state.lang,
+                        &state.cwd,
                         &crate::plugin::discover(&state.cwd),
+                        &allowed,
                     ));
                 }
                 other => {
@@ -5643,7 +5808,23 @@ async fn run_plugin(state: &mut State, what: crate::command::Plugin) -> String {
             let done = plugin::update(name.as_deref()).await;
             state.lang.plugin_update_text(&done)
         }
+        P::On(name) => switch_plugin(state, &name, true),
+        P::Off(name) => switch_plugin(state, &name, false),
         P::Unknown(why) => state.lang.plugin_unknown(&why),
+    }
+}
+
+fn switch_plugin(state: &State, name: &str, on: bool) -> String {
+    let found = crate::plugin::discover(&state.cwd)
+        .into_iter()
+        .find(|p| p.name == name && p.root.starts_with(state.cwd.join(".zyris-code/plugins")));
+    let Some(found) = found else { return state.lang.plugin_switch_not_found(name) };
+    let mut allowed = crate::mcp::discovery::Allowed::load();
+    if allowed.set_plugin(&state.cwd, &found, on) {
+        allowed.save();
+        state.lang.plugin_switched(name, on)
+    } else {
+        state.lang.plugin_already(name, on)
     }
 }
 
@@ -5863,6 +6044,29 @@ mod tests {
 
     fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, mods)
+    }
+
+    #[test]
+    fn render_cadence_defaults_are_local_60_and_ssh_20() {
+        assert_eq!(
+            render_cadence_from(None, false),
+            (Duration::from_millis(16), Duration::from_millis(32))
+        );
+        assert_eq!(
+            render_cadence_from(None, true),
+            (Duration::from_millis(50), Duration::from_millis(100))
+        );
+        assert_eq!(
+            render_cadence_from(Some("120"), true),
+            (Duration::from_millis(8), Duration::from_millis(16))
+        );
+    }
+
+    #[test]
+    fn wheel_bursts_wait_for_the_frame_tick() {
+        assert!(!draws_immediately(&[Action::Wheel(1)]));
+        assert!(!draws_immediately(&[Action::Wheel(-1), Action::Wheel(-1)]));
+        assert!(draws_immediately(&[Action::Insert('x')]));
     }
 
     /// A screen with a conversation long enough to scroll, and the viewport measurements the
@@ -7022,7 +7226,6 @@ mod tests {
             entry: Some(Entry { seq, kind: EntryKind::WorkStart(String::new()) }),
             todo: None,
             plan: None,
-            report: None,
         })
     }
 
@@ -7070,17 +7273,12 @@ mod tests {
         assert!(s.dragging, "the drag must be live even over empty cells");
     }
 
-    /// `link_at` returns the URL under a cell in the transcript. Columns are display columns
-    /// of the visible line, offset by `view_origin` — same mapping `inject_links` uses.
+    /// `link_at` returns the URL recorded under a cell in the final composed frame.
     #[test]
     fn link_at_finds_the_url_under_a_cell() {
         let mut s = state();
-        s.view_origin = (2, 1);
-        s.view_links = vec![vec![crate::markdown::Link {
-            start: 3,
-            end: 8,
-            url: "https://example.com/x".into(),
-        }]];
+        s.screen_links =
+            vec![ScreenLink { row: 1, start: 5, end: 10, url: "https://example.com/x".into() }];
         assert_eq!(
             s.link_at(2 + 3, 1),
             Some("https://example.com/x".to_string()),
@@ -7096,16 +7294,15 @@ mod tests {
         assert_eq!(s.link_at(2, 1), None, "offset column maps to no link");
     }
 
-    /// `link_at` returns `None` outside the transcript area and on lines with no links.
+    /// `link_at` returns `None` outside every visible registered link.
     #[test]
     fn link_at_is_none_outside_the_transcript() {
         let mut s = state();
-        s.view_origin = (0, 0);
-        s.view_links =
-            vec![vec![crate::markdown::Link { start: 0, end: 2, url: "https://e.com/".into() }]];
+        s.screen_links =
+            vec![ScreenLink { row: 0, start: 0, end: 2, url: "https://e.com/".into() }];
         assert_eq!(s.link_at(1, 5), None, "line beyond the transcript");
         assert_eq!(s.link_at(1, 0), Some("https://e.com/".to_string()));
-        assert_eq!(s.view_links.len(), 1);
+        assert_eq!(s.screen_links.len(), 1);
     }
 
     /// A Ctrl+click on a link becomes `Action::OpenLink`; a plain press still starts a drag.
@@ -7191,7 +7388,6 @@ mod tests {
                 }),
                 todo: None,
                 plan: None,
-                report: None,
             }),
         );
 
@@ -7491,7 +7687,6 @@ mod tests {
             entry: crate::event::entry_from(&event),
             todo: crate::todos::change_from(&event),
             plan: None,
-            report: None,
         })
     }
 
@@ -7560,13 +7755,7 @@ mod tests {
         let mut s = state();
         apply(
             &mut s,
-            &Action::Frame(Frame::Event {
-                cursor: 42,
-                entry: None,
-                todo: None,
-                plan: None,
-                report: None,
-            }),
+            &Action::Frame(Frame::Event { cursor: 42, entry: None, todo: None, plan: None }),
         );
         assert_eq!(s.last_cursor, Some(42));
     }
@@ -7680,7 +7869,6 @@ mod tests {
                 entry: None,
                 todo: None,
                 plan: Some(Box::new(plan)),
-                report: None,
             }),
         );
         assert_eq!(s.plan.as_ref().map(|p| p.seq), Some(5), "the plan never reached the screen");
@@ -7714,7 +7902,6 @@ mod tests {
                 entry: None,
                 todo: None,
                 plan: Some(Box::new(plan)),
-                report: None,
             }),
         );
         assert!(!s.plan_decided, "a new plan rode in on the last one's approval");
@@ -7743,7 +7930,6 @@ mod tests {
                 entry: None,
                 todo: None,
                 plan: Some(Box::new(settled.clone())),
-                report: None,
             }),
         );
         assert!(s.plan.is_none());
@@ -7757,7 +7943,6 @@ mod tests {
                 entry: None,
                 todo: None,
                 plan: Some(Box::new(open)),
-                report: None,
             }),
         );
         assert!(s.plan.is_some());
@@ -7768,7 +7953,6 @@ mod tests {
                 entry: None,
                 todo: None,
                 plan: Some(Box::new(settled)),
-                report: None,
             }),
         );
         assert!(s.plan.is_none(), "the panel stayed up on a plan that was already decided");
@@ -8214,7 +8398,6 @@ mod tests {
                 entry: Some(Entry { seq: 2, kind: EntryKind::Agent("먼저 볼게요".into()) }),
                 todo: None,
                 plan: None,
-                report: None,
             }),
         );
         apply(
@@ -8234,7 +8417,7 @@ mod tests {
     #[test]
     fn a_background_job_shows_up_and_leaves_when_it_ends() {
         let mut s = state();
-        let start = Frame::JobStart { id: "b1".into(), label: "cargo build".into() };
+        let start = Frame::JobStart { id: "b1".into(), label: "cargo build".into(), session: None };
         apply(&mut s, &Action::Frame(start.clone()));
         assert_eq!(s.jobs.len(), 1);
         // The same id arriving twice must not produce two rows.
@@ -8256,7 +8439,11 @@ mod tests {
         s.running = true;
         apply(
             &mut s,
-            &Action::Frame(Frame::JobStart { id: "b1".into(), label: "cargo build".into() }),
+            &Action::Frame(Frame::JobStart {
+                id: "b1".into(),
+                label: "cargo build".into(),
+                session: None,
+            }),
         );
         let (_, text, _) = crate::widgets::activity_parts_at(&s, std::time::Instant::now());
         assert!(text.contains("b1") && text.contains("cargo build"), "{text}");
@@ -8271,7 +8458,11 @@ mod tests {
     fn work_that_is_not_this_conversations_gets_no_stop_hint() {
         let mut s = state();
         s.connected = true;
-        let job = Action::Frame(Frame::JobStart { id: "b1".into(), label: "cargo build".into() });
+        let job = Action::Frame(Frame::JobStart {
+            id: "b1".into(),
+            label: "cargo build".into(),
+            session: None,
+        });
         apply(&mut s, &job);
 
         s.running = true;
@@ -8379,7 +8570,6 @@ mod tests {
                 }),
                 todo: None,
                 plan: None,
-                report: None,
             })
         };
         // Aimed at another thread: dropped at the door, so nothing is applied here.
@@ -8416,7 +8606,6 @@ mod tests {
                 }),
                 todo: None,
                 plan: None,
-                report: None,
             })
         };
         let showing = |s: &State| s.asking.as_ref().unwrap().1.current().question.clone();
@@ -8515,17 +8704,157 @@ mod tests {
         assert_eq!(s.status(), None, "{:?}", s.status());
     }
 
+    /// **A frame is not a key.** While an answer streams — or on an idle screen, where the usage
+    /// poll still lands every few seconds — a selection used to die on the next frame, which is
+    /// precisely when somebody drags over the output to copy it.
+    #[test]
+    fn news_from_the_server_does_not_take_the_selection_away() {
+        let mut s = State {
+            view_origin: (0, 0),
+            view_height: 10,
+            screen: vec!["hello world".to_string(); 12],
+            ..State::default()
+        };
+
+        apply(&mut s, &Action::Press(2, 1));
+        apply(&mut s, &Action::DragTo(8, 1));
+        assert!(s.dragging, "the button is down");
+
+        apply(&mut s, &Action::Frame(Frame::Poll { usage: None, title: None }));
+        assert!(s.drag.is_some(), "a frame took the drag the person is still making");
+
+        apply(&mut s, &Action::Release);
+        assert_eq!(s.selection.as_deref(), Some("llo wor"), "the drag copied nothing");
+
+        // What is on screen is still the last frame's text, so the words stay under it too.
+        apply(&mut s, &Action::Frame(Frame::Git(None)));
+        assert!(s.selection.is_some(), "a frame threw away what was just copied");
+
+        // **A key still ends it** — that is the rule that was always meant.
+        apply(&mut s, &Action::Insert('x'));
+        assert!(s.selection.is_none() && s.drag.is_none());
+    }
+
+    /// **Another conversation's job is not this line's news.** The line exists to say what is
+    /// happening *here*: a build somebody started in a thread nobody is looking at used to be drawn
+    /// on it as this conversation's own work, and naming it as somebody else's (which came next)
+    /// is still this conversation being told about work it did not ask for. It is not hidden —
+    /// `/jobs` lists it, marked, and quitting kills it with the rest.
+    #[test]
+    fn another_conversations_job_does_not_take_the_activity_line() {
+        let mut s = state();
+        s.connected = true;
+        s.session_id = Some("s-here".into());
+        apply(
+            &mut s,
+            &Action::Frame(Frame::JobStart {
+                id: "b1".into(),
+                label: "verify-panels".into(),
+                session: Some("s-elsewhere".into()),
+            }),
+        );
+
+        // The line says what is happening here, and nothing about that job.
+        let (_, activity, hint) = crate::widgets::activity_parts_at(&s, std::time::Instant::now());
+        assert_eq!(activity, s.lang.idle(), "another conversation's job took the activity line");
+        assert!(hint.is_empty(), "{hint}");
+
+        // `/jobs` still lists it, marked — that is where it is visible on purpose.
+        let marker = s.lang.jobs_row_elsewhere("").trim().to_string();
+        let listed = jobs_text(&s.jobs, s.lang, s.session_id.as_deref());
+        assert!(listed.contains(&marker), "{listed}");
+
+        // **This conversation's own job does take the line**, and is not marked.
+        let mut mine = state();
+        mine.connected = true;
+        mine.session_id = Some("s-here".into());
+        apply(
+            &mut mine,
+            &Action::Frame(Frame::JobStart {
+                id: "b2".into(),
+                label: "cargo build".into(),
+                session: Some("s-here".into()),
+            }),
+        );
+        let (_, activity, _) = crate::widgets::activity_parts_at(&mine, std::time::Instant::now());
+        assert_eq!(activity, mine.lang.background_job(1, "b2", "cargo build", 0));
+        let listed = jobs_text(&mine.jobs, mine.lang, mine.session_id.as_deref());
+        assert!(!listed.contains(&marker), "this conversation's own job {listed}");
+    }
+
+    /// **The click that focused the window is still a press.** It used to be swallowed whole — no
+    /// drag, no highlight, nothing copied — and with focus following the pointer (Hyprland's
+    /// `follow_mouse = 1`) the *first* press after the pointer arrives in the window falls inside
+    /// that grace, which is exactly the press a person makes after reaching for the mouse to select
+    /// something. It drags like any other press now; only its **click** is withheld, so letting go
+    /// without moving still cannot fold a card nobody aimed at.
+    #[test]
+    fn the_press_that_focused_the_window_still_drags() {
+        let mut s = State {
+            view_origin: (0, 0),
+            view_height: 10,
+            screen: vec!["hello world".to_string(); 12],
+            ..State::default()
+        };
+        // A card head on the row the press lands on: a click there folds it.
+        s.view_cards.insert(3, 42);
+
+        // Let go without moving: no fold, and nothing selected.
+        apply(&mut s, &Action::ActivatingPress(2, 3));
+        assert!(s.dragging, "the press must start a drag");
+        apply(&mut s, &Action::Release);
+        assert_ne!(s.view_open.get(&42), Some(&true), "an incidental click folded a card");
+        assert!(s.selection.is_none(), "a press that never moved selected something");
+
+        // With movement it is a drag like any other — this is the gesture that was being lost.
+        apply(&mut s, &Action::ActivatingPress(2, 3));
+        apply(&mut s, &Action::DragTo(8, 3));
+        apply(&mut s, &Action::Release);
+        assert_eq!(s.selection.as_deref(), Some("llo wor"), "the activating press could not drag");
+
+        // **And an ordinary press still clicks**, which is what the grace protects.
+        apply(&mut s, &Action::Press(2, 3));
+        apply(&mut s, &Action::Release);
+        assert_eq!(s.view_open.get(&42), Some(&true), "a plain click no longer folds");
+    }
+
+    /// **The end of it is news for the conversation that asked, and for no other.** The row goes
+    /// from every thread — the process really is gone — but the word does not: in a thread that
+    /// never started it, it is news about somebody else's work on the one line that exists to say
+    /// what is happening here.
+    #[test]
+    fn another_conversations_job_finishing_says_nothing_here() {
+        let mut s = state();
+        s.session_id = Some("s-here".into());
+        apply(
+            &mut s,
+            &Action::Frame(Frame::JobStart {
+                id: "b1".into(),
+                label: "build".into(),
+                session: Some("s-elsewhere".into()),
+            }),
+        );
+        apply(&mut s, &Action::Frame(Frame::JobEnded { id: "b1".into(), ok: true, secs: 3 }));
+
+        assert!(s.jobs.is_empty(), "the row must go from every conversation");
+        assert_eq!(s.status(), None, "another conversation's job was announced here");
+    }
+
     /// `/jobs` says **only the list and how to stop**. Dumping logs would cover the transcript.
     #[test]
     fn the_jobs_command_lists_what_runs_and_how_to_stop_it() {
         let mut s = state();
         // The words come from `lang` — hardcoding them here breaks when the screen language changes.
-        assert_eq!(jobs_text(&s.jobs, s.lang), s.lang.jobs_none());
+        assert_eq!(jobs_text(&s.jobs, s.lang, Some("s1")), s.lang.jobs_none());
         apply(
             &mut s,
-            &Action::Frame(Frame::JobStart { id: "b1".into(), label: "cargo build".into() }),
+            &Action::Frame(Frame::JobStart {
+                id: "b1".into(),
+                label: "cargo build".into(),
+                session: None,
+            }),
         );
-        let text = jobs_text(&s.jobs, s.lang);
+        let text = jobs_text(&s.jobs, s.lang, Some("s1"));
         assert!(text.contains("b1") && text.contains("cargo build"), "{text}");
         assert!(text.contains("/jobs stop"), "{text}");
     }

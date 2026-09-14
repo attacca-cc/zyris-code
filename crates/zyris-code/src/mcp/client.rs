@@ -53,7 +53,18 @@ impl McpClient {
         args: &[String],
         env: &HashMap<String, String>,
     ) -> Result<McpClient> {
-        Ok(McpClient::Stdio(Box::new(StdioClient::spawn(command, args, env).await?)))
+        Self::spawn_with_timeout(command, args, env, super::REQUEST_TIMEOUT).await
+    }
+
+    pub(crate) async fn spawn_with_timeout(
+        command: &str,
+        args: &[String],
+        env: &HashMap<String, String>,
+        request_timeout: std::time::Duration,
+    ) -> Result<McpClient> {
+        Ok(McpClient::Stdio(Box::new(
+            StdioClient::spawn_with_timeout(command, args, env, request_timeout).await?,
+        )))
     }
 
     /// Reaches a remote server over HTTP and completes the handshake.
@@ -121,6 +132,7 @@ pub struct StdioClient {
     stdin: ChildStdin,
     stdout: Lines<BufReader<ChildStdout>>,
     next_id: u64,
+    request_timeout: std::time::Duration,
 }
 
 /// Builds the command that starts an MCP server.
@@ -148,6 +160,15 @@ impl StdioClient {
         args: &[String],
         env: &HashMap<String, String>,
     ) -> Result<StdioClient> {
+        Self::spawn_with_timeout(command, args, env, super::REQUEST_TIMEOUT).await
+    }
+
+    async fn spawn_with_timeout(
+        command: &str,
+        args: &[String],
+        env: &HashMap<String, String>,
+        request_timeout: std::time::Duration,
+    ) -> Result<StdioClient> {
         let mut child = spawner(command, args)
             .envs(env)
             .stdin(Stdio::piped())
@@ -169,8 +190,13 @@ impl StdioClient {
             });
         }
 
-        let mut client =
-            StdioClient { child, stdin, stdout: BufReader::new(stdout).lines(), next_id: 0 };
+        let mut client = StdioClient {
+            child,
+            stdin,
+            stdout: BufReader::new(stdout).lines(),
+            next_id: 0,
+            request_timeout,
+        };
 
         client
             .request(
@@ -188,6 +214,13 @@ impl StdioClient {
     }
 
     pub(crate) async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
+        let request_timeout = self.request_timeout;
+        tokio::time::timeout(request_timeout, self.request_inner(method, params)).await.map_err(
+            |_| anyhow::anyhow!("MCP request '{method}' timed out after {request_timeout:?}"),
+        )?
+    }
+
+    async fn request_inner(&mut self, method: &str, params: Value) -> Result<Value> {
         self.next_id += 1;
         let id = self.next_id;
         self.write(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params})).await?;
@@ -405,6 +438,25 @@ mod tests {
         c.shutdown().await;
     }
 
+    #[tokio::test]
+    async fn a_hung_stdio_request_returns_a_timeout() {
+        if !python3_available() {
+            return;
+        }
+        let (_dir, script) = fake_server();
+        let mut c = McpClient::spawn_with_timeout(
+            "python3",
+            &[script],
+            &HashMap::new(),
+            std::time::Duration::from_millis(100),
+        )
+        .await
+        .unwrap();
+        let error = c.call("hang", json!({})).await.unwrap_err();
+        assert!(error.to_string().contains("timed out"), "{error}");
+        c.shutdown().await;
+    }
+
     /// Mistaking a notification wedged between replies for the reply shifts everything after it by one.
     #[tokio::test]
     async fn a_notification_between_replies_does_not_shift_anything() {
@@ -452,6 +504,8 @@ for line in sys.stdin:
               {"name": "get-issue", "description": "이슈를 읽는다",
                "inputSchema": {"type": "object"}}]}})
     elif m == "tools/call":
+        if r["params"]["name"] == "hang":
+            continue
         # 답 앞에 알림을 하나 끼워 보낸다. 클라이언트가 id를 보고 골라야 한다.
         send({"jsonrpc": "2.0", "method": "notifications/message",
               "params": {"level": "info", "data": "가는 중"}})

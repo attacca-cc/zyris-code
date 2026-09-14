@@ -21,10 +21,14 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 use crate::mcp::bridge::ServerSpec;
+
+const GIT_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Plugin {
@@ -240,6 +244,75 @@ pub fn discover(cwd: &Path) -> Vec<Plugin> {
     discover_in(&plugin_dirs(cwd))
 }
 
+/// Plugins whose contributions may be used in this process. User-level plugins were installed or
+/// placed in this app's own directory; repository plugins need an exact approval first.
+pub fn active(cwd: &Path) -> Vec<Plugin> {
+    let dirs = plugin_dirs(cwd);
+    let project_dir = cwd.join(".zyris-code/plugins");
+    let user_dirs: Vec<PathBuf> = dirs.into_iter().filter(|dir| *dir != project_dir).collect();
+    let mut found = discover_in(&user_dirs);
+    let allowed = crate::mcp::discovery::Allowed::load();
+    for plugin in active_project(cwd, &discover_in(&[project_dir]), &allowed) {
+        match found.iter_mut().find(|p| p.name == plugin.name) {
+            Some(slot) => *slot = plugin,
+            None => found.push(plugin),
+        }
+    }
+    found.sort_by(|a, b| a.name.cmp(&b.name));
+    found
+}
+
+pub fn active_project(
+    cwd: &Path,
+    plugins: &[Plugin],
+    allowed: &crate::mcp::discovery::Allowed,
+) -> Vec<Plugin> {
+    plugins.iter().filter(|p| allowed.allows_plugin(cwd, p)).cloned().collect()
+}
+
+pub fn enabled(cwd: &Path, plugin: &Plugin, allowed: &crate::mcp::discovery::Allowed) -> bool {
+    !plugin.root.starts_with(cwd.join(".zyris-code/plugins")) || allowed.allows_plugin(cwd, plugin)
+}
+
+/// The complete contribution is approved as one unit. Hashing its files is both smaller and safer
+/// than trying to parse shell commands to guess which hook scripts they might reach.
+pub fn fingerprint(plugin: &Plugin) -> String {
+    fn visit(at: &Path, files: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(at) else { return };
+        for entry in entries.flatten() {
+            if entry.file_name() == ".git" {
+                continue;
+            }
+            let path = entry.path();
+            match entry.file_type() {
+                Ok(kind) if kind.is_dir() => visit(&path, files),
+                Ok(_) => files.push(path),
+                Err(_) => files.push(path),
+            }
+        }
+    }
+
+    let mut files = Vec::new();
+    visit(&plugin.root, &mut files);
+    files.sort();
+    let mut hash = Sha256::new();
+    for path in files {
+        let relative = path.strip_prefix(&plugin.root).unwrap_or(&path);
+        hash.update(relative.to_string_lossy().as_bytes());
+        hash.update(b"\0");
+        if let Ok(target) = std::fs::read_link(&path) {
+            hash.update(b"link\0");
+            hash.update(target.to_string_lossy().as_bytes());
+        } else if let Ok(bytes) = std::fs::read(&path) {
+            hash.update(&bytes);
+        } else {
+            hash.update(b"unreadable");
+        }
+        hash.update(b"\0");
+    }
+    format!("{:x}", hash.finalize())
+}
+
 /// Where fetched plugins live. **Only the home side** — fetching someone else's code into a project
 /// would mix it into that repo's commits.
 pub fn install_dir() -> PathBuf {
@@ -255,15 +328,27 @@ pub fn install_dir() -> PathBuf {
 /// Runs `git` once. On failure it passes git's words through verbatim — if we rewrote them,
 /// "no such repo" would get crushed into "installation failed".
 async fn git(args: &[&str], at: Option<&Path>) -> Result<String, String> {
+    git_with_timeout(args, at, GIT_TIMEOUT).await
+}
+
+async fn git_with_timeout(
+    args: &[&str],
+    at: Option<&Path>,
+    within: Duration,
+) -> Result<String, String> {
     let mut cmd = tokio::process::Command::new("git");
     cmd.args(args);
     if let Some(at) = at {
         cmd.current_dir(at);
     }
-    let out = cmd.output().await.map_err(|e| match e.kind() {
-        std::io::ErrorKind::NotFound => crate::lang::current().plugin_no_git().to_string(),
-        _ => crate::lang::current().plugin_git_error(&e.to_string()),
-    })?;
+    cmd.kill_on_drop(true);
+    let out = tokio::time::timeout(within, cmd.output())
+        .await
+        .map_err(|_| format!("git timed out after {within:?}"))?
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => crate::lang::current().plugin_no_git().to_string(),
+            _ => crate::lang::current().plugin_git_error(&e.to_string()),
+        })?;
     if out.status.success() {
         return Ok(String::from_utf8_lossy(&out.stdout).trim().to_string());
     }
@@ -364,7 +449,7 @@ pub fn installed_in(dir: &Path) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
     let mut out: Vec<String> = entries
         .flatten()
-        .filter(|e| e.path().join("plugin.json").exists())
+        .filter(|e| manifest_text(&e.path()).is_some())
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .collect();
     out.sort();
@@ -381,7 +466,7 @@ fn installed_path(dir: &Path, name: &str) -> Result<PathBuf, String> {
     let slug = sanitize(name);
     if !slug.is_empty() {
         let at = dir.join(&slug);
-        if at.join("plugin.json").exists() {
+        if manifest_text(&at).is_some() {
             return Ok(at);
         }
     }
@@ -570,9 +655,11 @@ mod tests {
 
     /// The origin to fetch from. **It must be a real git repo** — a mock clone wouldn't exercise
     /// shallow cloning or `git pull`.
-    fn origin(body: &str) -> tempfile::TempDir {
+    fn origin_at(manifest_path: &str, body: &str) -> tempfile::TempDir {
         let d = tempfile::tempdir().unwrap();
-        std::fs::write(d.path().join("plugin.json"), body).unwrap();
+        let manifest = d.path().join(manifest_path);
+        std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        std::fs::write(manifest, body).unwrap();
         let run = |args: &[&str]| {
             let out = std::process::Command::new("git")
                 .args(args)
@@ -589,6 +676,10 @@ mod tests {
         run(&["add", "-A"]);
         run(&["commit", "-qm", "first"]);
         d
+    }
+
+    fn origin(body: &str) -> tempfile::TempDir {
+        origin_at("plugin.json", body)
     }
 
     const MANIFEST: &str = r#"{"name":"깃허브","description":"이슈를 본다",
@@ -798,6 +889,33 @@ mod tests {
         assert_eq!(discover_in(&[into.to_path_buf()])[0].description, "바뀐 설명");
     }
 
+    #[tokio::test]
+    async fn bulk_update_finds_claude_plugin_manifest() {
+        let into = scoped();
+        let from = origin_at(".claude-plugin/plugin.json", MANIFEST);
+        install_into(into.path(), &from.path().to_string_lossy()).await.unwrap();
+
+        let done = update_in(into.path(), None).await;
+        assert_eq!(done.len(), 1, "canonical plugin was omitted from bulk update: {done:?}");
+        assert!(done[0].1.is_ok(), "canonical plugin was found but not updated: {done:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hung_git_returns_timeout() {
+        let started = std::time::Instant::now();
+        let why = git_with_timeout(
+            &["-c", "alias.hang=!sleep 60", "hang"],
+            None,
+            std::time::Duration::from_millis(100),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(why.contains("timed out"), "{why}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
     /// **It must be removable by the name shown on screen.** That's what a person types.
     #[tokio::test]
     async fn removing_works_by_the_name_that_is_shown() {
@@ -900,5 +1018,26 @@ mod tests {
     #[test]
     fn no_plugins_at_all_is_fine() {
         assert!(discover_in(&[PathBuf::from("/이런건/없다")]).is_empty());
+    }
+
+    #[test]
+    fn project_plugin_is_disabled_until_approved() {
+        let dir = tempfile::tempdir().unwrap();
+        let plugins_dir = dir.path().join(".zyris-code/plugins");
+        write_plugin(&plugins_dir, "local", r#"{"name":"local"}"#);
+        let plugins = discover_in(&[plugins_dir]);
+        let mut allowed = crate::mcp::discovery::Allowed::default();
+
+        assert!(active_project(dir.path(), &plugins, &allowed).is_empty());
+        assert!(allowed.set_plugin(dir.path(), &plugins[0], true));
+        assert_eq!(active_project(dir.path(), &plugins, &allowed).len(), 1);
+
+        std::fs::write(
+            dir.path().join(".zyris-code/plugins/local/plugin.json"),
+            r#"{"name":"local","description":"changed"}"#,
+        )
+        .unwrap();
+        let changed = discover_in(&[dir.path().join(".zyris-code/plugins")]);
+        assert!(active_project(dir.path(), &changed, &allowed).is_empty());
     }
 }

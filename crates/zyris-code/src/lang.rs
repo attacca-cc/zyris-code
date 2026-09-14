@@ -250,8 +250,8 @@ impl Lang {
             },
         }
     }
-    /// The head of a job's report card. **A failure says so in words as well as in colour** —
-    /// colour alone is not a message.
+    /// The head of a report row. **A failure says so in words as well as in colour** — colour
+    /// alone is not a message.
     pub fn report_head(self, ok: bool) -> &'static str {
         match (self, ok) {
             (Lang::Ko, true) => "작업 결과 ∙ 성공",
@@ -259,10 +259,6 @@ impl Lang {
             (Lang::En, true) => "Job result ∙ ok",
             (Lang::En, false) => "Job result ∙ failed",
         }
-    }
-    /// The hint line of the report card — the one key it answers to.
-    pub fn report_keys(self) -> &'static str {
-        self.pick("Esc 닫기", "Esc close")
     }
     /// What to show in the activity line while a command runs.
     pub fn running_command(self, command: &str, secs: u64) -> String {
@@ -289,6 +285,16 @@ impl Lang {
             (Lang::En, n) => format!("background ×{n}"),
         };
         format!("{head}  {id} {label}  ∙  {}", self.duration(secs))
+    }
+    /// One row of `/jobs`, when that job belongs to a conversation other than the one on screen.
+    ///
+    /// `∙` rather than `·`: the middle dot is ambiguous width, so a terminal set up for CJK draws
+    /// it two columns wide and shoves the rest of the row along (`tests/width.rs`).
+    pub fn jobs_row_elsewhere(self, row: &str) -> String {
+        match self {
+            Lang::Ko => format!("{row}  ∙  다른 대화"),
+            Lang::En => format!("{row}  ∙  another conversation"),
+        }
     }
     pub fn jobs_none(self) -> &'static str {
         self.pick("배경에서 도는 것이 없습니다.", "Nothing running in the background.")
@@ -1056,14 +1062,48 @@ impl Lang {
                 "`/plugin {why}`\n\n             - `/plugin` ‒ 받아 둔 것 보기\n\
                  \x20            - `/plugin add owner/repo` ‒ 받기\n\
                  \x20            - `/plugin remove 이름` ‒ 지우기\n\
-                 \x20            - `/plugin update [이름]` ‒ 갱신"
+                 \x20            - `/plugin update [이름]` ‒ 갱신\n\
+                 \x20            - `/plugin on|off 이름` ‒ 프로젝트 플러그인 켜기·끄기"
             ),
             Lang::En => format!(
                 "`/plugin {why}`\n\n             - `/plugin` ‒ list what's fetched\n\
                  \x20            - `/plugin add owner/repo` ‒ install\n\
                  \x20            - `/plugin remove name` ‒ remove\n\
-                 \x20            - `/plugin update [name]` ‒ update"
+                 \x20            - `/plugin update [name]` ‒ update\n\
+                 \x20            - `/plugin on|off name` ‒ switch a project plugin"
             ),
+        }
+    }
+    pub fn plugin_project_state(self, on: bool) -> &'static str {
+        match (self, on) {
+            (Lang::Ko, true) => " (프로젝트 ∙ 다음 실행에 켬)",
+            (Lang::Ko, false) => " (프로젝트 ∙ 꺼짐)",
+            (Lang::En, true) => " (project ∙ on next launch)",
+            (Lang::En, false) => " (project ∙ off)",
+        }
+    }
+    pub fn plugin_switched(self, name: &str, on: bool) -> String {
+        match (self, on) {
+            (Lang::Ko, true) => format!("`{name}`을 켰습니다. 다시 띄우면 적용됩니다."),
+            (Lang::Ko, false) => format!("`{name}`을 껐습니다. 다시 띄우면 빠집니다."),
+            (Lang::En, true) => format!("`{name}` is on. Restart to apply it."),
+            (Lang::En, false) => format!("`{name}` is off. Restart and it goes."),
+        }
+    }
+    pub fn plugin_already(self, name: &str, on: bool) -> String {
+        match (self, on) {
+            (Lang::Ko, true) => format!("`{name}`은 이미 켜져 있습니다."),
+            (Lang::Ko, false) => format!("`{name}`은 이미 꺼져 있습니다."),
+            (Lang::En, true) => format!("`{name}` is already on."),
+            (Lang::En, false) => format!("`{name}` is already off."),
+        }
+    }
+    pub fn plugin_switch_not_found(self, name: &str) -> String {
+        match self {
+            Lang::Ko => format!(
+                "`{name}` 프로젝트 플러그인을 찾지 못했습니다. `/plugin`으로 확인해 주세요."
+            ),
+            Lang::En => format!("Project plugin `{name}` was not found. Check `/plugin`."),
         }
     }
     pub fn plugin_no_git(self) -> &'static str {
@@ -1812,9 +1852,9 @@ impl Lang {
             "Write in `.mcp.json` or `~/.config/zyris-code/mcp.json`.",
         )
     }
-    /// Heading over the servers other clients already have set up.
+    /// Heading over repository and external-client servers that need approval.
     pub fn mcp_found_heading(self) -> &'static str {
-        self.pick("다른 프로그램의 설정에서 찾은 것", "Found in another program's settings")
+        self.pick("승인이 필요한 서버", "Servers requiring approval")
     }
     /// Where one was found, and whether this machine said yes to it.
     pub fn mcp_found_from(self, source: &str, on: bool) -> String {
@@ -1844,13 +1884,11 @@ impl Lang {
     pub fn mcp_not_found(self, slug: &str) -> String {
         match self {
             Lang::Ko => format!(
-                "`{slug}`은 찾은 목록에 없습니다. `/mcp`로 이름을 확인해 주세요 ‒ \
-                 직접 적어 둔 서버는 언제나 돌기 때문에 켜고 끌 것이 없습니다."
+                "`{slug}`은 켜고 끌 수 있는 목록에 없습니다. `/mcp`로 이름을 확인해 주세요."
             ),
-            Lang::En => format!(
-                "`{slug}` is not in the found list. Check the name with `/mcp` ‒ a server you \
-                 wrote down yourself always runs, so there is nothing to switch."
-            ),
+            Lang::En => {
+                format!("`{slug}` is not in the switchable list. Check the name with `/mcp`.")
+            }
         }
     }
     /// Nothing changed, because it already was that way.
@@ -2017,7 +2055,8 @@ impl Lang {
         self.pick("모두 건너뛰었습니다.", "Skipped them all.")
     }
     /// The marker that flags a typed-in answer. **Must match between the composed answer
-    /// (`question::answer_text`) and the timeline's detection (`rows`)** — both use the same lang.
+    /// (`question::answer_text`) and the reading of that answer back (`question::answer_picks`)**
+    /// — both use the same lang.
     pub fn free_mark(self) -> &'static str {
         self.pick("직접 입력:", "Typed:")
     }
@@ -2140,10 +2179,15 @@ impl Lang {
     pub fn picker_esc_close(self) -> &'static str {
         self.pick("Esc 닫기", "Esc close")
     }
-    pub fn picker_keys(self, back: &str) -> String {
-        match self {
-            Lang::Ko => format!("↑↓ 이동 ∙ Enter 고르기 ∙ {back}"),
-            Lang::En => format!("↑↓ move ∙ Enter choose ∙ {back}"),
+    /// The keys a list answers to. **`Tab` is named only where it does something** — a list whose
+    /// rows carry no note draws no note area at all, and promising a key that does nothing is the
+    /// same lie as an overflow mark on a list that was never cut.
+    pub fn picker_keys(self, back: &str, opens_note: bool) -> String {
+        match (self, opens_note) {
+            (Lang::Ko, true) => format!("↑↓ 이동 ∙ Enter 고르기 ∙ Tab 설명 ∙ {back}"),
+            (Lang::Ko, false) => format!("↑↓ 이동 ∙ Enter 고르기 ∙ {back}"),
+            (Lang::En, true) => format!("↑↓ move ∙ Enter choose ∙ Tab detail ∙ {back}"),
+            (Lang::En, false) => format!("↑↓ move ∙ Enter choose ∙ {back}"),
         }
     }
     pub fn cannot_choose(self) -> &'static str {
@@ -2643,7 +2687,8 @@ mod tests {
             en.tool_count(3),
             en.diff_skip(2),
             en.pick_more(true, 3),
-            en.picker_keys("← close"),
+            en.picker_keys("← close", true),
+            en.picker_keys("← close", false),
             en.changes_text(&[], std::path::Path::new("/")),
             en.mcp_report_text(&[]),
             en.rules_text(&[]),
@@ -2701,7 +2746,6 @@ mod tests {
             en.jobs_row("b1", "build", 7325),
             en.report_head(true).to_string(),
             en.report_head(false).to_string(),
-            en.report_keys().to_string(),
         ] {
             assert!(!text.chars().any(|c| ('가'..='힣').contains(&c)), "Hangul in {text:?}");
         }

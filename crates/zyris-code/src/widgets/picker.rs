@@ -15,28 +15,58 @@ pub fn draw(
     area: Rect,
     picker: &mut Picker,
     lang: crate::lang::Lang,
-    tick: u64,
+    // How far into the blink we are, in milliseconds — see `activity::blink_on`.
+    blink_ms: u64,
 ) {
     // The centered box. Sized to the list, but never taller than the screen.
     // The two separator lines take a row each, so they must be counted for everything to fit.
     let rule = picker.is_create(0) && picker.rows.len() > 1;
     // **The box is as wide as its widest row, capped by the screen.** A fixed 64 cut a command's
-    // description with an `…` on a screen three times that wide, and a description cut in half is
-    // worth less than either showing it whole or not showing it at all.
+    // name with an `…` on a screen three times that wide. The rows carry names only — every
+    // description lives under the list (`detail_of`), so a long one no longer stretches the box.
     let widest = picker.rows.iter().map(row_need).max().unwrap_or(0);
     let w = ((widest as u16 + 4).max(64)).min(area.width.saturating_sub(4)).max(20);
     let inner_w = w.saturating_sub(2) as usize;
     // **The note area keeps room for every row's note, not only this one's.** Counted over all
     // rows, so the box is one height whichever row the cursor is on — a list whose box jumps up
     // and down as `↑↓` walks it is the same fault the panel's foot exists to prevent.
-    let detail_rows = picker
-        .rows
-        .iter()
-        .filter_map(|row| detail_of(row, inner_w))
-        .map(|note| note.len())
-        .max()
-        .unwrap_or(0);
-    let detail = cursor_detail(picker, inner_w);
+    //
+    // **Held to one line until it is asked for.** The reserve is the *longest* note in the list, so
+    // a list carrying one paragraph pays for it under every other row: on the `/` list two notes
+    // wrap onto a second line at this width and all nineteen rows carried two (measured 2026-09-14).
+    // One line still says what the row is, and `Tab` opens the whole of it (`Picker::expanded`) —
+    // which is the shape this box had all along.
+    let shows_note = picker.rows.iter().any(has_note);
+    let detail_rows = if picker.expanded {
+        picker
+            .rows
+            .iter()
+            .filter_map(|row| detail_of(row, inner_w))
+            .map(|note| note.len())
+            .max()
+            .unwrap_or(0)
+    } else {
+        // **One row, not the cursor's own count.** A height that followed the cursor is the very
+        // thing this area is built to avoid; this way every row of the list gets the same box.
+        shows_note as usize
+    };
+    // **A long note must not squeeze the list out of the box.** A project description is arbitrary
+    // text and a paragraph of it is normal, while the note area comes out of the same box as the
+    // rows, the rule and the key hints. It is capped at what the screen can spare once one list row
+    // and the hints have their own — the cursor must never be what gets cut off. Only a note longer
+    // than the screen bites this; an ordinary one is drawn whole.
+    let detail_rows = detail_rows.min(area.height.saturating_sub(7) as usize);
+    let mut detail = cursor_detail(picker, inner_w);
+    // **What is left out is marked.** `…` is this app's word for "there is more", and with the note
+    // held to a line it is also the only sign that `Tab` has something to open. Unmarked, a
+    // description would lose its own ending — the fault this area was reshaped to fix.
+    let cut = detail.len() > detail_rows;
+    detail.truncate(detail_rows);
+    if cut {
+        if let Some(last) = detail.last_mut() {
+            *last = mark_more(last, inner_w.saturating_sub(2));
+        }
+    }
     let want_h =
         (picker.rows.len() as u16).saturating_add(5 + rule as u16 + detail_rows as u16).max(6);
     let h = want_h.min(area.height.saturating_sub(2)).max(3);
@@ -92,7 +122,7 @@ pub fn draw(
     for slot in laid {
         lines.push(match slot {
             Slot::Row(i) => {
-                row_line(&picker.rows[i], i == picker.cursor, picker.is_create(i), width, tick)
+                row_line(&picker.rows[i], i == picker.cursor, picker.is_create(i), width, blink_ms)
             }
             Slot::Rule => {
                 Line::from(Span::styled("─".repeat(width), Style::default().fg(theme::border())))
@@ -108,8 +138,9 @@ pub fn draw(
     // the last entry and the hints run together and the hints read as one more thing to pick.
     lines.push(Line::from(Span::styled("─".repeat(width), Style::default().fg(theme::border()))));
 
-    // **The note in full, for the row the cursor is on.** It left its row because it did not fit;
-    // it is here because it is the sentence saying what that row does.
+    // **The note in full, for the row the cursor is on.** Every note is down here, short or long:
+    // a list whose descriptions sat beside short rows and under long ones changed shape as the
+    // eye walked it, and where a description is belongs to the window, not to its length.
     for row in &detail {
         lines.push(Line::from(Span::styled(
             format!("  {row}"),
@@ -142,7 +173,10 @@ pub fn draw(
             Style::default().fg(theme::danger()),
         ))),
         None => lines.push(Line::from(Span::styled(
-            lang.picker_keys(back),
+            // **`Tab` is only promised where it does something.** A list whose rows carry no note
+            // draws no note area, and a key that does nothing reads as broken — the same reason a
+            // list that was not cut shows no overflow mark.
+            lang.picker_keys(back, shows_note),
             Style::default().fg(theme::text_muted()),
         ))),
     }
@@ -159,7 +193,7 @@ fn row_line(
     on: bool,
     create: bool,
     width: usize,
-    tick: u64,
+    blink_ms: u64,
 ) -> Line<'static> {
     use crate::picker::ThreadStatus;
     let fg = match (row.enabled, create, on) {
@@ -177,14 +211,16 @@ fn row_line(
     let status_span = row.status.map(|s| {
         let colour = match s {
             ThreadStatus::Unknown => theme::border_light(),
-            ThreadStatus::Running if crate::widgets::activity::blink_on(tick) => theme::accent(),
+            ThreadStatus::Running if crate::widgets::activity::blink_on(blink_ms) => {
+                theme::accent()
+            }
             ThreadStatus::Running => theme::text_muted(),
             ThreadStatus::Success => theme::success(),
             ThreadStatus::Failed => theme::danger(),
         };
         Span::styled("●", Style::default().fg(colour))
     });
-    let (label, note) = split(width, &row.label, row.note.as_deref(), row.status.is_some());
+    let label = label_to_fit(width, &row.label, row.status.is_some());
     let mut spans =
         vec![Span::styled(if on { "❯ " } else { "  " }, Style::default().fg(theme::accent()))];
     // The status dot sits at the left, right after the cursor marker — a thread's state is
@@ -193,72 +229,79 @@ fn row_line(
         spans.push(dot);
         spans.push(Span::styled(" ", Style::default().fg(theme::text_muted())));
     }
-    spans.push(Span::styled(label.clone(), Style::default().fg(fg)));
-    if let Some(note) = note {
-        let used = 2 + (row.status.is_some() as usize) * 2 + display_width(&label);
-        let pad = width.saturating_sub(used + display_width(&note));
-        spans.push(Span::styled(" ".repeat(pad), Style::default().fg(theme::text_muted())));
-        spans.push(Span::styled(note, Style::default().fg(theme::text_muted())));
-    }
+    // **The name, and nothing else.** The note is under the list (`cursor_detail`), so the row
+    // ends where the name does whatever the length of that name's sentence.
+    spans.push(Span::styled(label, Style::default().fg(fg)));
     Line::from(spans)
 }
 
-/// However short the note is, it's worth showing at least this much. Narrower than this, drop it entirely.
-const NOTE_MIN: usize = 8;
-
-/// How wide a row wants to be: the caret, the status dot, the name, a gap and the note.
+/// How wide a row wants to be: the caret, the status dot and the name.
+///
+/// **The note is not counted**, because no row draws one any more — it is under the list.
 fn row_need(row: &crate::picker::Row) -> usize {
-    2 + (row.status.is_some() as usize) * 2
-        + display_width(&row.label)
-        + row.note.as_deref().map_or(0, |note| 2 + display_width(note))
+    2 + (row.status.is_some() as usize) * 2 + display_width(&row.label)
 }
 
-/// The note `row` would put under the list **if the cursor were on it** — `None` when the row
-/// holds its own note, or has none.
+/// The note `row` puts under the list — its description, wrapped to the box, or `None` when the
+/// row has none.
+///
+/// **Every note goes here, and it goes here for every row, not only the cursor's.** A note short
+/// enough to sit beside its name used to stay on the row, so the list had descriptions in two
+/// places at once and a row's shape depended on how long its sentence happened to be. One place
+/// is the point; `/mode` puts its sentences under the list for the same reason.
 ///
 /// The caller counts these over every row, which is how the note area comes to have one size
 /// whatever the cursor is on.
 fn detail_of(row: &crate::picker::Row, width: usize) -> Option<Vec<String>> {
-    let note = row.note.as_deref()?;
-    if split(width, &row.label, Some(note), row.status.is_some()).1.is_some() {
-        // The row already says it, and saying it twice is not a feature.
+    if !has_note(row) {
         return None;
     }
+    let note = row.note.as_deref().unwrap_or_default();
     // Two columns of indent, so it reads as a note about the row above rather than another row.
     Some(crate::wrap::words(note, width.saturating_sub(2)))
 }
 
-/// The note the cursor's row could not show inline, wrapped to the box — empty when the row held
-/// it, or has none.
+/// Whether this row has a note to put under the list.
+///
+/// **A note of spaces is no note.** It would otherwise keep a row of the box for something that
+/// draws nothing, and the hint would promise `Tab` for it.
+fn has_note(row: &crate::picker::Row) -> bool {
+    row.note.as_deref().is_some_and(|note| !note.trim().is_empty())
+}
+
+/// `line` with a `…` on the end, cut to `limit` columns so that the mark fits inside the box.
+///
+/// **Unconditional, unlike [`truncate`].** These lines came out of the wrapper already fitting the
+/// box, so `truncate` would hand one back untouched and say nothing about what the note lost.
+fn mark_more(line: &str, limit: usize) -> String {
+    let limit = limit.max(1);
+    let mut out = String::new();
+    for ch in line.chars() {
+        if display_width(&out) + display_width(&ch.to_string()) > limit.saturating_sub(1) {
+            break;
+        }
+        out.push(ch);
+    }
+    out.push('…');
+    out
+}
+
+/// The note under the list: the cursor's row's, wrapped to the box — empty when it has none.
+///
+/// Only the cursor's is drawn, and that is what keeps the note area a fixed number of rows
+/// (`detail_of` is what sizes it) while the keys move: every row's sentence would be a wall.
 fn cursor_detail(picker: &Picker, width: usize) -> Vec<String> {
     picker.rows.get(picker.cursor).and_then(|row| detail_of(row, width)).unwrap_or_default()
 }
 
-/// Splits one line into (name, note). **The name comes first.**
+/// The name, cut to fit the row.
 ///
-/// Give the note the room first and the name gets cut — `/agent` actually got truncated to
-/// `/a…`, and you couldn't tell what command it was in the list. **The name is identity and the
-/// note is garnish**: when the name is cut, the reason to pick that line disappears, but without the note you can still guess from the name.
-///
-/// Still, the name must always be truncated — session titles have arbitrary lengths, and left
-/// alone they'd punch through the box and collapse the screen.
-fn split(width: usize, label: &str, note: Option<&str>, status: bool) -> (String, Option<String>) {
+/// **A name is never left to run long.** Session titles have arbitrary lengths, and left alone
+/// they'd punch through the box and collapse the screen.
+fn label_to_fit(width: usize, label: &str, status: bool) -> String {
     // The status dot and its trailing space take two columns on the left, before the label.
     let dot = if status { 2 } else { 0 };
-    let label = truncate(label, width.saturating_sub(2 + dot));
-    let Some(note) = note else {
-        return (label, None);
-    };
-    // Leave at least two columns between the name and the note. Stuck together, they read as one word.
-    let room = width.saturating_sub(2 + dot + display_width(&label) + 2);
-    if room < NOTE_MIN || display_width(note) > room {
-        // **A note that does not fit is left off the row rather than cut.** `…` keeps the beginning
-        // of a sentence and throws the end away — and on a description the end is the part that
-        // says what the thing does. The whole note goes under the list for the row the cursor is
-        // on, where the keys are acting (`cursor_detail`).
-        return (label, None);
-    }
-    (label, Some(note.to_string()))
+    truncate(label, width.saturating_sub(2 + dot))
 }
 
 /// Truncates to fit the column count. When cut, appends `…` to show it was cut.
@@ -381,16 +424,111 @@ mod tests {
     }
 
     /// **The name never gets shaved.** `/agent` actually got truncated to `/a…` and you couldn't
-    /// tell what command it was — the reason was a long note.
+    /// tell what command it was — the reason was a long note. The note is not on the row any more,
+    /// and this is the rule that keeps it from coming back.
     #[test]
-    fn a_long_note_never_eats_into_the_name() {
-        let (label, _) = split(
-            62,
-            "/agent",
-            Some("에이전트를 고릅니다. 다음 메시지에서 새 thread가 열립니다"),
-            false,
+    fn a_name_is_never_cut_by_a_note() {
+        let row = crate::picker::Row {
+            id: Some("c1".into()),
+            label: "/agent".into(),
+            note: Some("에이전트를 고릅니다. 다음 메시지에서 새 thread가 열립니다".into()),
+            enabled: true,
+            status: None,
+        };
+        let line = row_line(&row, false, false, 62, 0);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "  /agent", "the row carries more than the name: {text:?}");
+    }
+
+    /// **Every note is under the list, however short it is.** A description beside its name only
+    /// when it happened to fit left the list with two shapes at once.
+    #[test]
+    fn a_note_that_would_fit_beside_its_name_still_goes_under_the_list() {
+        let row = crate::picker::Row {
+            id: Some("c1".into()),
+            label: "/cwd".into(),
+            note: Some("도구가 도는 자리".into()),
+            enabled: true,
+            status: None,
+        };
+        let text: String =
+            row_line(&row, false, false, 62, 0).spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(!text.contains("도구가"), "the note is still on the row: {text:?}");
+        let under = detail_of(&row, 62).expect("the note is nowhere");
+        assert_eq!(under.concat(), "도구가 도는 자리");
+    }
+
+    /// A row with no note puts nothing under the list — the area belongs to the rows that have
+    /// something to say.
+    #[test]
+    fn a_row_without_a_note_puts_nothing_under_the_list() {
+        let row = crate::picker::Row {
+            id: Some("c1".into()),
+            label: "/clear".into(),
+            note: None,
+            enabled: true,
+            status: None,
+        };
+        assert!(detail_of(&row, 62).is_none());
+    }
+
+    /// **A project's description reaches the screen, under the list.** That is the whole point of
+    /// the note area for this list: the row is a bare name, so a project you can't place by name
+    /// had nothing to read. Reported from the app on 2026-09-13.
+    #[test]
+    fn a_projects_description_is_drawn_under_the_list() {
+        let mut picker = Picker::projects(
+            vec![
+                ("p1".into(), "기본".into(), Some("계정의 기본 프로젝트".into()), true),
+                ("p2".into(), "zyris".into(), Some("zyris 코드 개발".into()), false),
+            ],
+            crate::lang::Lang::Ko,
         );
-        assert_eq!(label, "/agent");
+        picker.cursor = 2;
+        let rows = screen(&mut picker, 60, 20);
+        let joined = rows.join("\n");
+        assert!(joined.contains("zyris 코드 개발"), "{joined}");
+        // The row under the cursor is still a bare name — the description is a line of its own.
+        let cursor_row = rows.iter().find(|r| r.contains('❯')).expect("no cursor row");
+        assert!(
+            !cursor_row.contains("코드 개발"),
+            "the description rode along on the row: {cursor_row:?}"
+        );
+        // And the default marker is on screen when that row is the cursor's.
+        picker.cursor = 1;
+        let joined = screen(&mut picker, 60, 20).join("\n");
+        assert!(joined.contains("기본 ∙ 계정의 기본 프로젝트"), "{joined}");
+    }
+
+    /// **A description longer than the screen is cut, not allowed to take the list with it.** The
+    /// note area is drawn out of the same box as the rows: left unbounded, a paragraph of project
+    /// description would push the list and the key hints off the bottom, and the cursor with them.
+    #[test]
+    fn a_note_longer_than_the_screen_does_not_push_the_list_out_of_the_box() {
+        let long = "아주 긴 설명 ".repeat(40);
+        let mut picker = Picker::projects(
+            (0..8)
+                .map(|i| (format!("p{i}"), format!("프로젝트 {i}"), Some(long.clone()), false))
+                .collect(),
+            crate::lang::Lang::Ko,
+        );
+        picker.cursor = 8;
+        let rows = screen(&mut picker, 80, 20);
+        let joined = rows.join("\n");
+        assert!(joined.contains("프로젝트 7"), "the cursor row is off screen:\n{joined}");
+        assert!(
+            rows.iter().any(|r| r.contains("이동") || r.contains("Enter")),
+            "the key hints were pushed out:\n{joined}"
+        );
+        assert!(rows.iter().all(|r| r.matches('│').count() == 2 || !r.contains('│')), "{joined}");
+    }
+
+    /// Still, the name is cut — a session title punching through the box would collapse the screen.
+    #[test]
+    fn a_very_long_name_is_still_cut_to_fit() {
+        let label = label_to_fit(20, &"가".repeat(40), false);
+        assert!(display_width(&label) <= 18, "{} columns: {label}", display_width(&label));
+        assert!(label.ends_with('…'), "no marker saying it was cut: {label}");
     }
 
     /// A thread's status is drawn as a coloured dot at the left, before the title — running
@@ -405,14 +543,14 @@ mod tests {
             enabled: true,
             status: Some(ThreadStatus::Running),
         };
-        let line = row_line(&row, false, false, 20, 8);
+        let line = row_line(&row, false, false, 20, crate::widgets::activity::BLINK_HALF_MS);
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("●"), "no status dot: {text:?}");
         // The dot sits before the title — the cursor marker, then the dot, then the label.
         let dot_pos = line.spans.iter().position(|s| s.content.as_ref() == "●").unwrap();
         let label_pos = line.spans.iter().position(|s| s.content.as_ref() == "대화").unwrap();
         assert!(dot_pos < label_pos, "status dot must precede the title: {text:?}");
-        // A finished thread holds its colour, a running one blinks (tick on/off).
+        // A finished thread holds its colour, a running one blinks on and off.
         let ok_row = crate::picker::Row {
             id: Some("s1".into()),
             label: "대화".into(),
@@ -444,7 +582,7 @@ mod tests {
         assert_eq!(failed_col, Some(theme::danger()));
     }
 
-    fn dot(status: crate::picker::ThreadStatus, tick: u64) -> Line<'static> {
+    fn dot(status: crate::picker::ThreadStatus, blink_ms: u64) -> Line<'static> {
         let row = crate::picker::Row {
             id: Some("s1".into()),
             label: "대화".into(),
@@ -452,7 +590,7 @@ mod tests {
             enabled: true,
             status: Some(status),
         };
-        row_line(&row, false, false, 20, tick)
+        row_line(&row, false, false, 20, blink_ms)
     }
 
     /// **A dot that lands must change the colour and nothing else.** The outcomes are derived one
@@ -479,19 +617,19 @@ mod tests {
     #[test]
     fn every_dot_colour_says_something_different() {
         use crate::picker::ThreadStatus;
-        let colour = |status, tick| {
-            dot(status, tick)
+        let colour = |status, blink_ms| {
+            dot(status, blink_ms)
                 .spans
                 .iter()
                 .find(|s| s.content.as_ref() == "●")
                 .and_then(|s| s.style.fg)
                 .expect("no dot was drawn")
         };
-        // Tick 0 and 8 are the two halves of the blink.
+        // 0ms and the half-period are the two halves of the blink.
         let seen = [
             colour(ThreadStatus::Unknown, 0),
             colour(ThreadStatus::Running, 0),
-            colour(ThreadStatus::Running, 8),
+            colour(ThreadStatus::Running, crate::widgets::activity::BLINK_HALF_MS),
             colour(ThreadStatus::Success, 0),
             colour(ThreadStatus::Failed, 0),
         ];
@@ -500,33 +638,6 @@ mod tests {
                 assert_ne!(a, b, "two dots wear the same colour: {seen:?}");
             }
         }
-    }
-
-    /// If there's no room for the note, drop the note. A half-cut note is unreadable.
-    #[test]
-    fn a_note_is_dropped_rather_than_squeezed_to_nothing() {
-        // A width where the name fits exactly and no room is left for the note.
-        let (label, note) = split(14, "가나다라마", Some("설명"), false);
-        assert_eq!(label, "가나다라마", "the name was truncated");
-        assert!(note.is_none(), "{note:?}");
-    }
-
-    /// Still, the name is cut — a session title punching through the box would collapse the screen.
-    #[test]
-    fn a_very_long_name_is_still_cut_to_fit() {
-        let (label, _) = split(20, &"가".repeat(40), None, false);
-        assert!(display_width(&label) <= 18, "{} columns: {label}", display_width(&label));
-        assert!(label.ends_with('…'), "no marker saying it was cut: {label}");
-    }
-
-    /// **A note too long for its row is left off, not cut.** `…` keeps the beginning of a sentence
-    /// and throws the end away — and on a description the end is the part that says what it does.
-    #[test]
-    fn a_note_too_long_for_the_row_is_left_off_rather_than_cut() {
-        let long = "에이전트를 고릅니다. 다음 메시지에서 새 쓰레드가 열립니다";
-        let (label, note) = split(62, "/agent", Some(long), false);
-        assert_eq!(label, "/agent");
-        assert!(note.is_none(), "a half-sentence was drawn: {note:?}");
     }
 
     /// Every row of the screen, wide characters not double-counted.
@@ -551,19 +662,19 @@ mod tests {
             .collect()
     }
 
-    /// **The box grows with the window.** A fixed 64 cut `/github`'s description with an `…` on a
-    /// screen three times that wide. The box is now as wide as its widest row, so the whole note
-    /// sits beside its command.
+    /// **The list is one shape from top to bottom.** No row carries a note, so the cursor walking
+    /// the list never changes what a row looks like.
     #[test]
-    fn a_wider_terminal_shows_a_command_note_whole() {
-        let mut picker = Picker::commands(crate::lang::Lang::Ko, &[]);
-        let rows = screen(&mut picker, 120, 24);
-        assert!(!rows.iter().any(|r| r.contains('…')), "{rows:#?}");
-        assert!(
-            rows.iter().any(|r| r.contains("/github") && r.contains("login reviewer")),
-            "the note was not beside its command:\n{}",
-            rows.join("\n")
-        );
+    fn no_row_carries_its_note_beside_the_name() {
+        let picker = Picker::commands(crate::lang::Lang::Ko, &[]);
+        for row in &picker.rows {
+            let text: String = row_line(row, false, false, 62, 0)
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect();
+            assert_eq!(text.trim(), row.label, "a note rode along on {:?}: {text:?}", row.label);
+        }
     }
 
     /// **A note that does not fit goes under the list, whole, for the row the cursor is on.**
@@ -573,12 +684,35 @@ mod tests {
         let mut picker = Picker::commands(crate::lang::Lang::Ko, &[]);
         let at = picker.rows.iter().position(|r| r.label == "/agent").expect("no /agent row");
         picker.cursor = at;
+        // **Opened.** Held to a line by default, so the whole of it takes `Tab` (`Picker::expanded`).
+        picker.expanded = true;
         let rows = screen(&mut picker, 60, 24);
         let joined = rows.join("\n");
         assert!(!joined.contains('…'), "{joined}");
         // The note is wider than the box, so it is here on two lines — and whole.
         assert!(joined.contains("에이전트를 고릅니다"), "{joined}");
         assert!(joined.contains("열립니다"), "the end of the note was lost: {joined}");
+    }
+
+    /// **Every row's note, whichever one is cursor'd, is under the list.** The box was wide enough
+    /// for `/github`'s description on a 120-column screen, and it used to be drawn beside the
+    /// command there while sitting under it on a narrow one — the same list, two shapes.
+    #[test]
+    fn a_wide_terminal_still_puts_the_note_under_the_list() {
+        let mut picker = Picker::commands(crate::lang::Lang::Ko, &[]);
+        let at = picker.rows.iter().position(|r| r.label == "/github").expect("no /github row");
+        picker.cursor = at;
+        let rows = screen(&mut picker, 120, 24);
+        assert!(
+            !rows.iter().any(|r| r.contains("/github") && r.contains("login")),
+            "the note is still beside the command:\n{}",
+            rows.join("\n")
+        );
+        assert!(
+            rows.iter().any(|r| r.contains("login reviewer")),
+            "the note is not under the list:\n{}",
+            rows.join("\n")
+        );
     }
 
     /// The box the widget drew: its top and bottom row, and its left and right column.
@@ -604,11 +738,49 @@ mod tests {
         assert!(rects.windows(2).all(|w| w[0] == w[1]), "the box moved: {rects:?}");
     }
 
-    /// When both fit, both show.
+    /// **The note is held to a line until it is asked for.** The reserve used to be the longest note
+    /// in the list, so one paragraph of description cost every other row a line of box — on the `/`
+    /// list two notes wrap onto a second line and all nineteen rows carried two (measured
+    /// 2026-09-14). One line, marked `…`; `Picker::expanded` (the `Tab` key) is what shows the rest.
     #[test]
-    fn both_fit_when_there_is_room() {
-        let (label, note) = split(40, "/cwd", Some("도구가 도는 자리"), false);
-        assert_eq!(label, "/cwd");
-        assert_eq!(note.as_deref(), Some("도구가 도는 자리"));
+    fn a_long_note_is_held_to_one_line_until_it_is_opened() {
+        let long = "이 프로젝트는 TUI를 다룹니다. 그리고 마지막에만 나오는 표식 ZZZ";
+        let mut picker = Picker::projects(
+            vec![("p1".into(), "zyris".into(), Some(long.into()), false)],
+            crate::lang::Lang::Ko,
+        );
+        let held = screen(&mut picker, 80, 24).join("\n");
+        assert!(held.contains('…'), "nothing says the note was cut:\n{held}");
+        assert!(!held.contains("ZZZ"), "the whole note was drawn anyway:\n{held}");
+        picker.expanded = true;
+        let opened = screen(&mut picker, 80, 24).join("\n");
+        assert!(opened.contains("ZZZ"), "the rest of the note is nowhere:\n{opened}");
+        // And the box is still one height for the list, so opening it does not move the rows.
+        let rects = [false, true].map(|expanded| {
+            picker.expanded = expanded;
+            box_rect(&screen(&mut picker, 80, 24))
+        });
+        assert_eq!(rects[0].0, rects[1].0, "opening the note moved the top edge: {rects:?}");
+    }
+
+    /// **`Tab` is promised only where there is something to open.** A list whose rows carry no note
+    /// keeps no row of the box for one, and its hint must not offer a key that does nothing — the
+    /// same reason a list that was not cut shows no overflow mark.
+    #[test]
+    fn the_hint_promises_tab_only_for_a_list_that_carries_a_note() {
+        let mut commands = Picker::commands(crate::lang::Lang::Ko, &[]);
+        assert!(
+            screen(&mut commands, 80, 24).join("\n").contains("Tab 설명"),
+            "the list has notes but says nothing about the key"
+        );
+        let mut sessions = Picker::sessions(
+            "p1".into(),
+            "zyris".into(),
+            vec![("s1".into(), "지난 대화".into(), crate::picker::ThreadStatus::Unknown)],
+            crate::lang::Lang::Ko,
+        );
+        let joined = screen(&mut sessions, 80, 24).join("\n");
+        assert!(joined.contains("Enter 고르기"), "no hint at all:\n{joined}");
+        assert!(!joined.contains("Tab"), "a key that does nothing was promised:\n{joined}");
     }
 }

@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use zyris_code::update::stage_downloaded_installer;
+
 /// Long enough for a debug binary to start twice on a loaded runner, short enough that a process
 /// which will never end is still a test result rather than a hung suite.
 const PATIENCE: Duration = Duration::from_secs(60);
@@ -109,6 +111,7 @@ fn an_update_asked_for_by_name_installs_once() {
     let times = ran.lines().filter(|line| !line.trim().is_empty()).count();
     assert_eq!(times, 1, "the installer ran {times} times, not once:\n{ran}");
     assert_eq!(ran.lines().next().unwrap_or_default().trim(), "v99.0.0", "the wrong release");
+    assert!(script.exists(), "the caller-owned installer was removed");
 
     // And the process that came back says where it ended up rather than claiming to be current —
     // if the install went somewhere PATH cannot reach, "already the newest" would be a lie told by
@@ -146,4 +149,29 @@ fn print_mode_never_updates() {
     assert!(!marker.exists(), "print mode installed a release on its way to answering");
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn downloaded_installer_uses_private_storage() {
+    let staged = stage_downloaded_installer(b"#!/bin/sh\nexit 0\n")
+        .expect("could not stage a downloaded installer");
+    let path = staged.path().to_path_buf();
+    let directory = path.parent().expect("staged installer has no parent").to_path_buf();
+
+    assert_ne!(directory, std::env::temp_dir(), "installer was placed directly in shared temp");
+    assert!(path.exists(), "installer was not created");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir_mode = std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777;
+        let file_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700, "staging directory is not private");
+        assert_eq!(file_mode, 0o600, "installer is readable by another user");
+    }
+
+    drop(staged);
+    assert!(!path.exists(), "installer survived its cleanup handle");
+    assert!(!directory.exists(), "private staging directory survived cleanup");
 }

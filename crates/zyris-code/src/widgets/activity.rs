@@ -14,12 +14,20 @@ use crate::app::State;
 use crate::markdown::display_width;
 use crate::theme;
 
-/// Whether the dot is lit. Flips every eight frames (0.4s) at 20fps.
+/// How long each half of the blink lasts. **A duration, not a number of frames.**
 ///
-/// The blink is set by frame count rather than a clock so that **tests do not have to wait
-/// on time**. The drawing side stays pure.
-pub fn blink_on(tick: u64) -> bool {
-    (tick / 8).is_multiple_of(2)
+/// Eight frames used to mean this, which was 0.4s at 20fps — and 0.13s the day the local default
+/// became 60fps (`render_cadence`). A blink is a tempo, and a frame count is not one: the dot was
+/// reported as flickering the same afternoon (2026-09-14).
+pub const BLINK_HALF_MS: u64 = 400;
+
+/// Whether the dot is lit, given how long it has been blinking.
+///
+/// **Milliseconds, so tests still never wait on time.** The caller reads the clock
+/// (`State::blink_ms`); this stays a pure function of a number, and the same number lights the
+/// dot at any frame rate.
+pub fn blink_on(elapsed_ms: u64) -> bool {
+    (elapsed_ms / BLINK_HALF_MS).is_multiple_of(2)
 }
 
 /// What appears on this line: (dot color, text, hint). Pure — tests look at this.
@@ -89,9 +97,21 @@ pub fn parts_at(
     // **What runs in the background is more specific than "working…".** It is shown even while a
     // turn is running — that turn is usually waiting on this job, and what a person wants to know
     // is what has been running and for how long. Unseen, they quit the app and kill the build.
-    if let Some(job) = state.jobs.first() {
+    // **Other conversations' jobs are not this line's news.** A job outlives the thread that
+    // started it, and this window runs commands for every session on the account — so a row from a
+    // conversation nobody is looking at used to sit here, describing work this conversation never
+    // asked for. Naming it as somebody else's (which this did next) is still this conversation
+    // being told about work that is not happening here: the line's one job is to say what is going
+    // on *now*, and a build that belongs to another thread is not an answer to that. It is not
+    // hidden — `/jobs` lists it, marked, and quitting the app still kills it with the rest.
+    let ours: Vec<_> = state
+        .jobs
+        .iter()
+        .filter(|j| j.session.as_deref().is_none_or(|s| Some(s) == state.session_id.as_deref()))
+        .collect();
+    if let Some(job) = ours.first() {
         let secs = now.saturating_duration_since(job.since).as_secs();
-        let text = lang.background_job(state.jobs.len(), &job.id, &job.label, secs);
+        let text = lang.background_job(ours.len(), &job.id, &job.label, secs);
         return (colour, text + &plan, stop);
     }
     if state.running {
@@ -121,7 +141,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &State) {
     let (colour, label, hint) = parts(state);
 
     // The dot blinks only while working. A still dot does not say "it is running".
-    let lit = !state.running || blink_on(state.tick);
+    let lit = !state.running || blink_on(state.blink_ms());
     let dot = Style::default().fg(if lit { colour } else { theme::border_light() });
 
     // **The dot goes at the far left.** It does not align with the conversation's margin —
@@ -141,4 +161,35 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &State) {
     }
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **The blink keeps its tempo whatever the frame rate is.** One second of frames stepped
+    /// three ways has to turn the dot the same number of times: eight frames was 0.4s at 20fps and
+    /// 0.13s at 60fps, which is what a person saw as a flicker (2026-09-14).
+    #[test]
+    fn the_blink_keeps_its_tempo_at_any_frame_rate() {
+        for frame_ms in [50u64, 33, 16] {
+            let states: Vec<bool> = (0..1000u64).step_by(frame_ms as usize).map(blink_on).collect();
+            // 1000ms over a 400ms half-period is lit, dark, lit — two turns, never more.
+            let turns = states.windows(2).filter(|pair| pair[0] != pair[1]).count();
+            assert_eq!(
+                turns, 2,
+                "the blink ran at another tempo on {frame_ms}ms frames: {states:?}"
+            );
+        }
+    }
+
+    /// Both halves last the same, and the first one starts lit — 400ms on, 400ms off.
+    #[test]
+    fn a_half_period_is_four_hundred_milliseconds() {
+        assert!(blink_on(0), "the dot starts dark");
+        assert!(blink_on(BLINK_HALF_MS - 1), "the lit half ended early");
+        assert!(!blink_on(BLINK_HALF_MS), "the dark half did not start");
+        assert!(!blink_on(BLINK_HALF_MS * 2 - 1), "the dark half ended early");
+        assert!(blink_on(BLINK_HALF_MS * 2), "the second half did not close");
+    }
 }
