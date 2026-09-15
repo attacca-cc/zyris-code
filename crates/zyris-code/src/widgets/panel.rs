@@ -21,7 +21,10 @@ pub fn draw(frame: &mut Frame, area: Rect, panel: &mut Panel, lang: crate::lang:
     // here, before the width, because the hint is a line the box must be wide enough for.
     // **A manager says what its own keys are.** They are not scroll-and-close — `d` takes
     // something away — and the hint is the only place that says so.
+    // **An open form has its own keys again.** While it is up, letters go into a field, so the
+    // list's hint would be a lie.
     let keys = match panel.manager.as_ref() {
+        Some(manager) if manager.form.is_some() => lang.add_keys(),
         Some(manager) => lang.manager_keys(manager.kind),
         None => match (
             panel.form.map(|f| f.lang),

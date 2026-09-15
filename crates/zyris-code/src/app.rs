@@ -65,7 +65,14 @@ pub enum Frame {
     /// since it stopped being cut at a minute (`guard::exec_ceiling`) can be a long while.
     ExecStart {
         id: u64,
-        command: String,
+        /// **The tool's name — `exec` — not the command it was given.**
+        ///
+        /// The activity line does not print the command any more: it is as long as the agent
+        /// wrote it, and one heredoc filled the line end to end and pushed the `Esc 정지` hint
+        /// off it (2026-09-15). What the line shows is this name and the run's own subtitle, so
+        /// the command is not carried here at all — a string nobody draws goes stale and reads
+        /// as if something used it.
+        tool: String,
         /// **Which conversation asked for it**, when the server said. This node runs one account's
         /// tools for every session on it at once, so without this the activity line narrates work
         /// another window asked for as though it were this one's.
@@ -342,6 +349,17 @@ pub enum Action {
     ManagerUpdate,
     /// Read the disk again — another window or another client may have changed it.
     ManagerReload,
+    /// Open the add form (`a`).
+    ManagerAdd,
+    /// Put the form away without adding anything (Esc while it is open).
+    ManagerFormClose,
+    /// Move between the form's fields. Positive is down.
+    ManagerFormMove(i32),
+    /// Walk the value in the form's field. Positive is right — a choice cycles, text moves its
+    /// caret.
+    ManagerFormShift(i32),
+    /// Enter: the next field, and on the last one it adds.
+    ManagerFormNext,
     CycleMode,
     /// From the start of the draft up to the cursor (`Ctrl+U`). With the cursor at the end —
     /// where it nearly always is — that is the whole draft, which is what this used to be.
@@ -643,9 +661,17 @@ pub struct State {
     /// Closing with Esc puts it back to `None` — enrollment itself keeps running in the
     /// background, and `EnrollDone` closes it once approved.
     pub enroll: Option<EnrollView>,
-    /// The command running right now — (id, command, when it started). The activity line
-    /// shows this.
-    pub running_exec: Option<(u64, String, Instant)>,
+    /// The tool call running right now — (id, the tool's name, when it started). The activity
+    /// line shows this, beside the run's subtitle and how long it has been going.
+    pub running_tool: Option<(u64, String, Instant)>,
+    /// **The newest `work_summary` of the run on screen** — the server's own one-line answer to
+    /// "what is being done", and the very words the work card's head is wearing.
+    ///
+    /// The activity line wears it while a command runs, in place of the command's text. It is
+    /// kept **off the entry stream** rather than read out of the timeline: `Timeline::items`
+    /// needs `&mut` and rebuilds lazily, while the activity line is drawn from `&State`
+    /// (`widgets::activity::parts`). Empty until a run writes one.
+    pub work_summary: String,
     /// Set by the self-healing tick. The next draw **forces every cell out again** —
     /// the `AlwaysUpdate` flag bypasses the diff and overwrites. It does not clear, so it
     /// does not flicker.
@@ -698,7 +724,7 @@ pub struct JobRow {
     pub id: String,
     pub label: String,
     /// The time is not carried in the frame but **stamped where it is received** — same way
-    /// as `running_exec`.
+    /// as `running_tool`.
     pub since: Instant,
     /// **The conversation that asked for it**, when the server said. `None` for an older
     /// attacca, and then the row is treated as this conversation's — an unattributed job is
@@ -797,7 +823,8 @@ impl Default for State {
             jobs: Vec::new(),
             command_out: None,
             enroll: None,
-            running_exec: None,
+            running_tool: None,
+            work_summary: String::new(),
             force_update: false,
             force_update_blank: false,
             prev_wide: Vec::new(),
@@ -1326,15 +1353,47 @@ pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
                 _ => vec![],
             };
         }
+        // **An open form takes the characters.** Typing is what it is for, so the editing keys go
+        // into the field under the caret — the same actions the draft at the bottom uses, with a
+        // different destination. ↑↓·Tab move between fields, ←→ walk a value or the caret, Enter
+        // goes on (and adds, on the last field), Esc puts the form away.
+        if state
+            .panel
+            .as_ref()
+            .is_some_and(|p| p.manager.as_ref().is_some_and(|m| m.form.is_some()))
+        {
+            return match key.code {
+                KeyCode::Esc => vec![Action::ManagerFormClose],
+                KeyCode::Enter => vec![Action::ManagerFormNext],
+                KeyCode::Up | KeyCode::BackTab => vec![Action::ManagerFormMove(-1)],
+                KeyCode::Down | KeyCode::Tab => vec![Action::ManagerFormMove(1)],
+                KeyCode::Left => vec![Action::ManagerFormShift(-1)],
+                KeyCode::Right => vec![Action::ManagerFormShift(1)],
+                KeyCode::Backspace => vec![Action::Backspace],
+                KeyCode::Delete => vec![Action::Delete],
+                KeyCode::Home => vec![Action::Home],
+                KeyCode::End => vec![Action::End],
+                // The same editing keys as every other field in this app.
+                KeyCode::Char('u') if ctrl => vec![Action::KillToStart],
+                KeyCode::Char('k') if ctrl => vec![Action::KillToEnd],
+                KeyCode::Char('w') if ctrl => vec![Action::DeleteWord],
+                KeyCode::Char('y') if ctrl => vec![Action::Yank],
+                KeyCode::Char('a') if ctrl => vec![Action::Home],
+                KeyCode::Char('e') if ctrl => vec![Action::End],
+                KeyCode::Char(c) if !ctrl => vec![Action::Insert(c)],
+                _ => vec![],
+            };
+        }
         // **A manager acts on the row under its cursor.** ↑↓ walk it, Enter/Space switches it,
-        // `d` takes it away (asking first), `u` fetches a fetched plugin's update, `r` reads the
-        // disk again. Nothing here scrolls: a list built to fit is not scrolled with ↓.
+        // `a` adds one, `d` takes it away (asking first), `u` fetches a fetched plugin's update,
+        // `r` reads the disk again. Nothing here scrolls: a list built to fit is not scrolled with ↓.
         if state.panel.as_ref().is_some_and(|p| p.manager.is_some()) {
             return match key.code {
                 KeyCode::Esc => vec![Action::PanelClose],
                 KeyCode::Up | KeyCode::Char('k') => vec![Action::ManagerMove(-1)],
                 KeyCode::Down | KeyCode::Char('j') => vec![Action::ManagerMove(1)],
                 KeyCode::Enter | KeyCode::Char(' ') => vec![Action::ManagerAct],
+                KeyCode::Char('a') => vec![Action::ManagerAdd],
                 KeyCode::Char('d') | KeyCode::Delete => vec![Action::ManagerRemove],
                 KeyCode::Char('u') => vec![Action::ManagerUpdate],
                 KeyCode::Char('r') => vec![Action::ManagerReload],
@@ -1786,6 +1845,83 @@ pub fn apply(state: &mut State, action: &Action) {
     // `last_cursor` advancing, so resuming picks up from the wrong place. It is also how the
     // GitHub screen's own device code failed to reach it — sent as a frame, eaten by the screen
     // it was meant for.
+    // **An open form takes the editing keys.** The same actions the draft at the bottom answers to,
+    // with a different destination — the field under the caret. `Frame` is left out for the reason
+    // below: a form is a place for keys, not for the server's news, and swallowing frames while one
+    // is open would lose timeline events.
+    if state.panel.as_ref().is_some_and(|p| p.manager.as_ref().is_some_and(|m| m.form.is_some()))
+        && !matches!(action, Action::Frame(_))
+    {
+        let mut handled = true;
+        match action {
+            Action::Insert(c) => {
+                if let Some(field) = manager_form(state).and_then(|f| f.editor()) {
+                    field.insert(*c);
+                }
+            }
+            Action::Paste(text) => {
+                if let Some(field) = manager_form(state).and_then(|f| f.editor()) {
+                    field.insert_str(text);
+                }
+            }
+            Action::Backspace => {
+                if let Some(field) = manager_form(state).and_then(|f| f.editor()) {
+                    field.backspace();
+                }
+            }
+            Action::Delete => {
+                if let Some(field) = manager_form(state).and_then(|f| f.editor()) {
+                    field.delete();
+                }
+            }
+            Action::DeleteWord => {
+                if let Some(field) = manager_form(state).and_then(|f| f.editor()) {
+                    field.delete_word();
+                }
+            }
+            Action::KillToStart => {
+                if let Some(field) = manager_form(state).and_then(|f| f.editor()) {
+                    field.kill_to_start();
+                }
+            }
+            Action::KillToEnd => {
+                if let Some(field) = manager_form(state).and_then(|f| f.editor()) {
+                    field.kill_to_end();
+                }
+            }
+            Action::Yank => {
+                if let Some(field) = manager_form(state).and_then(|f| f.editor()) {
+                    field.yank();
+                }
+            }
+            Action::Left => {
+                if let Some(field) = manager_form(state).and_then(|f| f.editor()) {
+                    field.left();
+                }
+            }
+            Action::Right => {
+                if let Some(field) = manager_form(state).and_then(|f| f.editor()) {
+                    field.right();
+                }
+            }
+            Action::Home => {
+                if let Some(field) = manager_form(state).and_then(|f| f.editor()) {
+                    field.home();
+                }
+            }
+            Action::End => {
+                if let Some(field) = manager_form(state).and_then(|f| f.editor()) {
+                    field.end();
+                }
+            }
+            _ => handled = false,
+        }
+        if handled {
+            refresh_the_manager_body(state);
+            return;
+        }
+    }
+
     if state.new_project.is_some() && !matches!(action, Action::Frame(_)) {
         match action {
             Action::Insert(c) => {
@@ -2273,6 +2409,101 @@ pub fn apply(state: &mut State, action: &Action) {
             }
             state.manager_out = Some(ManagerAsk::Reload);
         }
+        // **`a` opens the form**, and the list is left exactly as it was: the form is a place on
+        // top of it, not a different screen.
+        Action::ManagerAdd => {
+            let lang = state.lang;
+            if let Some(manager) = state.panel.as_mut().and_then(|p| p.manager.as_mut()) {
+                manager.note = None;
+                manager.confirm = None;
+                manager.form = Some(match manager.kind {
+                    crate::panel::ManagerKind::Mcp => crate::panel::ManagerForm::mcp(lang),
+                    crate::panel::ManagerKind::Plugins => crate::panel::ManagerForm::plugin(lang),
+                });
+            }
+            refresh_the_manager_body(state);
+        }
+        Action::ManagerFormClose => {
+            if let Some(manager) = state.panel.as_mut().and_then(|p| p.manager.as_mut()) {
+                manager.form = None;
+            }
+            refresh_the_manager_body(state);
+        }
+        Action::ManagerFormMove(by) => {
+            if let Some(form) = manager_form(state) {
+                form.move_cursor(*by);
+            }
+            refresh_the_manager_body(state);
+        }
+        Action::ManagerFormShift(by) => {
+            let lang = state.lang;
+            if let Some(form) = manager_form(state) {
+                let was_remote = form.chosen("kind") == Some(1);
+                form.shift(*by);
+                // **The third row is a different question depending on the second.** A remote
+                // server has an address where a local one has a command, and the label has to say
+                // which — the field keeps its key either way, so the form's shape never changes.
+                let remote = form.chosen("kind") == Some(1);
+                if remote != was_remote {
+                    if let Some(field) = form.fields.iter_mut().find(|f| f.key == "command") {
+                        field.label = if remote {
+                            lang.f_url().to_string()
+                        } else {
+                            lang.f_command().to_string()
+                        };
+                    }
+                }
+            }
+            refresh_the_manager_body(state);
+        }
+        // **Enter goes on, and on the last field it adds.** The form is filled in from the top, so
+        // refusing to move until a field is complete would make going back to fix one impossible;
+        // what is missing is said when the last field is reached.
+        Action::ManagerFormNext => {
+            let lang = state.lang;
+            let at_end =
+                manager_form(state).is_some_and(|form| form.cursor + 1 >= form.fields.len());
+            if !at_end {
+                if let Some(form) = manager_form(state) {
+                    form.move_cursor(1);
+                }
+                refresh_the_manager_body(state);
+                return;
+            }
+            let outcome = {
+                let lang = state.lang;
+                let Some(manager) = state.panel.as_ref().and_then(|p| p.manager.as_ref()) else {
+                    return;
+                };
+                let Some(form) = manager.form.as_ref() else { return };
+                match ask_from_form(form, lang) {
+                    Ok(ask) => Ok(ask),
+                    Err(problem) => Err(problem),
+                }
+            };
+            let _ = lang;
+            match outcome {
+                Ok(ask) => {
+                    state.manager_out = Some(ask);
+                    if let Some(manager) = state.panel.as_mut().and_then(|p| p.manager.as_mut()) {
+                        manager.form = None;
+                    }
+                }
+                Err(FormProblem::Missing(key)) => {
+                    let said = state.lang.f_needs(&key);
+                    if let Some(form) = manager_form(state) {
+                        form.focus(key);
+                        form.complaint = Some(said);
+                    }
+                }
+                Err(FormProblem::Said(why)) => {
+                    if let Some(form) = manager_form(state) {
+                        form.complaint = Some(why);
+                    }
+                }
+            }
+            refresh_the_manager_body(state);
+        }
         // **Rebuilt, not nudged.** The body is plain lines with no idea which one is the cursor,
         // so moving it is a rebuild with the new `pick` — which keeps the whole panel a pure
         // function of (current mode, cursor).
@@ -2503,8 +2734,15 @@ fn apply_frame(state: &mut State, frame: &Frame) {
                 }
             }
             let Some(entry) = entry else { return };
-            if let EntryKind::WorkStart(_) = entry.kind {
+            if let EntryKind::WorkStart(title) = &entry.kind {
                 state.folds.entry(entry.seq).or_default();
+                // The run's subtitle, for the activity line to wear while a command runs.
+                // **An empty title is skipped**: the server opens the event at run start and
+                // fills the title in place afterwards, so writing down what arrives empty would
+                // blank the words that did land.
+                if !title.trim().is_empty() {
+                    state.work_summary = title.clone();
+                }
             }
             // A question awaiting an answer puts us straight into answering mode. The turn
             // is blocked, so there is no reason to make the user open it. A question that
@@ -2544,11 +2782,26 @@ fn apply_frame(state: &mut State, frame: &Frame) {
             if state.running && !*running && !state.queued.is_empty() {
                 state.flush_queue = true;
             }
+            // **A turn that ends because somebody asked it to is not one that finished.** `Esc`
+            // asks (`Action::Cancel`) and the server ends the turn exactly as it ends one that ran
+            // its course, so nothing in the stream tells the two apart — and the card over the
+            // reasoning that was just cut would read `완료`/`Done` like every other. Read here,
+            // **before `stopping` is released just below**: that clearing is what loses the fact.
+            if state.running && !*running && state.stopping {
+                state.timeline.mark_stopped();
+            }
             // The request to stop lasts only for that turn. **Release it only on a change** —
             // the same state arrives many times while running, and releasing every time would
             // make Esc repeat the cancel forever.
             if state.running != *running {
                 state.stopping = false;
+            }
+            // **A finished run's subtitle goes with the run.** Nothing reads it while no command
+            // is running, but the next turn's first command can beat its own `work_summary`, and
+            // the words of the run before would then sit beside it describing work nobody is
+            // doing.
+            if !*running {
+                state.work_summary.clear();
             }
             state.running = *running;
         }
@@ -2757,7 +3010,7 @@ fn apply_frame(state: &mut State, frame: &Frame) {
         }
         // The time is not carried in the frame but stamped where it is received — same way
         // as `status_at`.
-        Frame::ExecStart { id, command, session } => {
+        Frame::ExecStart { id, tool, session } => {
             // **Only what this conversation asked for.** This window runs commands for every
             // session on the account, including ones open in another window, so drawn without
             // asking the activity line narrates somebody else's work as this conversation's.
@@ -2777,14 +3030,14 @@ fn apply_frame(state: &mut State, frame: &Frame) {
             // process: hiding one leaves the person quitting the app unaware and taking a build
             // down with it.
             if session.is_some() || state.running {
-                state.running_exec = Some((*id, command.clone(), Instant::now()));
+                state.running_tool = Some((*id, tool.clone(), Instant::now()));
             }
         }
         // **Only clear the one that finished.** With overlapping runs, a later one clearing
         // an earlier one makes the screen lie.
         Frame::ExecDone { id } => {
-            if state.running_exec.as_ref().is_some_and(|(at, _, _)| at == id) {
-                state.running_exec = None;
+            if state.running_tool.as_ref().is_some_and(|(at, _, _)| at == id) {
+                state.running_tool = None;
             }
         }
         Frame::JobStart { id, label, session } => {
@@ -3194,10 +3447,20 @@ fn frame_interval() -> Duration {
     render_cadence().0
 }
 
-/// Whether these actions should bypass the frame timer. Wheel bursts wait for the next tick so
-/// many notches can move state while producing one terminal frame; discrete input stays immediate.
+/// Whether these actions should bypass the frame timer.
+///
+/// **A burst that moves the same thing again and again waits for the next tick.** Wheel notches and
+/// pointer motion are that: many events move the state once each, and what a person sees is one
+/// picture either way. Drawn once per event instead, a drag costs a full frame per sample the hand
+/// makes — measured under a pty on a 58x211 screen in a debug build, 11 motion events answered in
+/// 7-12ms each, while a mouse reports hundreds of times a second. The events then arrive faster than
+/// they can be drawn and pile up in the terminal's input queue, so the highlight runs seconds behind
+/// the hand and stops short of the pointer. Waiting for the tick leaves one state update per event
+/// and one frame per tick, so nothing piles up.
+///
+/// Discrete input — a press, a release, a key — stays immediate.
 fn draws_immediately(actions: &[Action]) -> bool {
-    actions.iter().any(|action| !matches!(action, Action::Wheel(_)))
+    actions.iter().any(|action| !matches!(action, Action::Wheel(_) | Action::DragTo(..)))
 }
 
 /// How often usage and title are asked for again. Asking every frame would hammer the server.
@@ -4031,6 +4294,14 @@ async fn run_inner(
     // and nobody sees them; what a person does see is the pause that came before.
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_size: Option<(u16, u16)> = None;
+    // **A gesture is waiting to be drawn.** Set by the wheel and by pointer motion — both of which
+    // are drawn by the frame tick rather than once per event (`draws_immediately`) — and read by
+    // the two loops below: the tick draws while it is set, and the streaming batch in the main
+    // loop is kept off it so a gesture somebody is making is never held back.
+    //
+    // Declared out here because **both loops need it**. The wait for the first connection draws a
+    // screen too, and dragging across the enrollment code is how that code gets copied out.
+    let mut gesture_dirty = false;
     let mut dirty = true;
 
     // **Wait for the first handle while drawing the screen.** This stretch is the first
@@ -4063,6 +4334,9 @@ async fn run_inner(
             }
             Some(Ok(ev)) = keys.next() => {
                 let mut quit = false;
+                // Whether this event's own frame waits for the tick. Only a burst does — the wheel
+                // and pointer motion arrived many to the frame regardless (`draws_immediately`).
+                let mut deferred = false;
                 match ev {
                     TermEvent::Key(k) => {
                         if trace.wants(crate::trace::What::Keys) {
@@ -4084,7 +4358,16 @@ async fn run_inner(
                     // across, while every other screen in the app could be.
                     TermEvent::Mouse(m) => {
                         trace_mouse(&trace, &state, m);
-                        for action in mouse_actions(&state, m) {
+                        // **A drag waits for the tick here too.** One frame per motion sample is
+                        // what puts the highlight seconds behind the hand, and this screen is
+                        // where the enrollment code gets dragged across; the rule itself lives in
+                        // `draws_immediately`, the same one the main loop uses.
+                        let actions = mouse_actions(&state, m);
+                        deferred = !actions.is_empty() && !draws_immediately(&actions);
+                        if deferred {
+                            gesture_dirty = true;
+                        }
+                        for action in actions {
                             apply(&mut state, &action);
                         }
                         // Releasing exports what was selected, the same as in the main loop.
@@ -4123,13 +4406,18 @@ async fn run_inner(
                     crate::theme::set(state.config.theme.resolve());
                 }
                 bridge.sync(state.mode, &state.config, state.plan_decided);
-                dirty = true;
+                // A gesture is drawn by the tick it is waiting for; everything else draws here,
+                // where it happened.
+                if !deferred {
+                    dirty = true;
+                }
             }
             _ = ticker.tick() => {
                 // With the enrollment code window up, the time left is ticking down, so
-                // keep drawing.
-                if state.enroll.is_some() {
+                // keep drawing. A gesture waiting for a frame is the other reason.
+                if state.enroll.is_some() || gesture_dirty {
                     dirty = true;
+                    gesture_dirty = false;
                 }
             }
         }
@@ -4256,7 +4544,6 @@ async fn run_inner(
     // new can have broken.
     let mut drew_since_heal = false;
     let mut last_draw = Instant::now();
-    let mut wheel_dirty = false;
     set_terminal_title(&state.title);
     let mut shown_title = state.title.clone();
     // An armed quit releases on its own once time passes. But with no input there is nothing
@@ -4442,13 +4729,23 @@ async fn run_inner(
                         Action::Repaint => {
                             repaint(terminal);
                         }
-                        // **Scrolling is drawn by the diff.** This used to clear and redraw
+                        // **A gesture is drawn by the frame tick, not once per event.** The wheel
+                        // and the pointer both arrive in bursts — dozens of notches, hundreds of
+                        // motion samples — and each one only moves the screen a little. Drawn per
+                        // event they cost a frame apiece, which is what puts a drag seconds behind
+                        // the hand (`draws_immediately` carries the measurement); drawn by the tick
+                        // they cost nothing but the state update `apply` makes just below.
+                        //
+                        // `dirty` is what the tick reads; `gesture_dirty` is what keeps the
+                        // streaming batch off it, so a gesture in flight is never held back.
+                        //
+                        // The scroll itself is drawn by the diff. This used to clear and redraw
                         // whole to wipe wide-character crumbs, but now every cell has a
                         // background (`theme::bg()`) so crumbs cannot arise structurally and
                         // there is nothing to clear — clearing makes the screen flash.
-                        Action::Wheel(_) => {
+                        Action::Wheel(_) | Action::DragTo(..) => {
                             dirty = true;
-                            wheel_dirty = true;
+                            gesture_dirty = true;
                         }
                         _ => {}
                     }
@@ -4600,7 +4897,7 @@ async fn run_inner(
                     if (dirty || acted) && (!acted || immediate) {
                         draw_frame(terminal, &mut state)?;
                         dirty = false;
-                        wheel_dirty = false;
+                        gesture_dirty = false;
                         drew_since_heal = true;
                         last_draw = Instant::now();
                     }
@@ -4799,14 +5096,16 @@ async fn run_inner(
                 // it is streaming, the breath rides along at whatever rate the content is drawn.
                 // Coarser, but even — and it is the drawing that costs, not the breath, which is
                 // one span rewritten on a copy that was about to be drawn anyway.
+                // **A gesture is never held.** The wheel and a drag in flight draw as often as the
+                // tick allows, whatever an answer streaming in costs.
                 let held = content
                     && state.running
-                    && !wheel_dirty
+                    && !gesture_dirty
                     && last_draw.elapsed() < stream_min_gap;
                 if dirty && !held {
                     draw_frame(terminal, &mut state)?;
                     dirty = false;
-                    wheel_dirty = false;
+                    gesture_dirty = false;
                     drew_since_heal = true;
                     last_draw = Instant::now();
                 }
@@ -5287,6 +5586,8 @@ fn clear_conversation(state: &mut State) {
     state.timeline = Timeline::new();
     state.todos = crate::todos::Todos::new();
     state.folds = Folds::new();
+    // The words belonged to the run that was on screen; the conversation arriving has its own.
+    state.work_summary.clear();
     state.asking = None;
     state.last_cursor = None;
     state.scroll = Scroll::new(); // Start from the bottom.
@@ -6026,6 +6327,17 @@ pub enum ManagerAsk {
     UpdatePlugin {
         name: String,
     },
+    /// Write a new MCP server into one of our two config files.
+    AddMcp {
+        name: String,
+        transport: crate::mcp::bridge::Transport,
+        to: crate::mcp::bridge::Where,
+    },
+    /// Fetch a plugin from somewhere.
+    InstallPlugin {
+        source: String,
+        project: bool,
+    },
     /// Read the disk again.
     Reload,
 }
@@ -6036,6 +6348,73 @@ enum Verb {
     Switch,
     Remove,
     Update,
+}
+
+/// The form of the manager that is up, if one is open.
+fn manager_form(state: &mut State) -> Option<&mut crate::panel::ManagerForm> {
+    state.panel.as_mut()?.manager.as_mut()?.form.as_mut()
+}
+
+/// Why a filled-in form was refused.
+#[derive(Debug)]
+enum FormProblem {
+    /// A field has to be answered — the key says which, so the caret can go there.
+    Missing(&'static str),
+    /// A sentence already written for the screen.
+    Said(String),
+}
+
+/// Turns a filled-in form into what to ask the I/O side for.
+///
+/// **The only place a form becomes an act.** Which field is required, what an address has to look
+/// like, and which file the answer goes into all live here — so the drawing side and the writing
+/// side cannot drift apart.
+fn ask_from_form(
+    form: &crate::panel::ManagerForm,
+    lang: crate::lang::Lang,
+) -> Result<ManagerAsk, FormProblem> {
+    use crate::mcp::bridge::{Transport, Where};
+    use crate::panel::ManagerKind;
+    match form.kind {
+        ManagerKind::Mcp => {
+            let name = form.get("name").unwrap_or_default();
+            if name.is_empty() {
+                return Err(FormProblem::Missing("name"));
+            }
+            // **A name with a space in it is not a name here.** It becomes the capability name the
+            // agent calls (`mcp_<name>`), and `sanitize` would wash the space out — the row would
+            // then say one thing and the wire another.
+            if name.contains(char::is_whitespace) {
+                return Err(FormProblem::Said(lang.f_no_space("name")));
+            }
+            let remote = form.chosen("kind") == Some(1);
+            let target = form.get("command").unwrap_or_default();
+            if target.is_empty() {
+                return Err(FormProblem::Missing(if remote { "url" } else { "command" }));
+            }
+            let handed = form.get("env").unwrap_or_default();
+            let transport = if remote {
+                if !(target.starts_with("http://") || target.starts_with("https://")) {
+                    return Err(FormProblem::Said(lang.f_bad_url().to_string()));
+                }
+                Transport::http(&target, &handed)
+                    .map_err(|token| FormProblem::Said(lang.f_bad_pair(&token)))?
+            } else {
+                let args = form.get("args").unwrap_or_default();
+                Transport::stdio(&target, &args, &handed)
+                    .map_err(|token| FormProblem::Said(lang.f_bad_pair(&token)))?
+            };
+            let to = if form.chosen("where") == Some(1) { Where::Project } else { Where::User };
+            Ok(ManagerAsk::AddMcp { name, transport, to })
+        }
+        ManagerKind::Plugins => {
+            let source = form.get("source").unwrap_or_default();
+            if source.is_empty() {
+                return Err(FormProblem::Missing("source"));
+            }
+            Ok(ManagerAsk::InstallPlugin { source, project: form.chosen("where") == Some(1) })
+        }
+    }
 }
 
 /// Turns the row under the cursor into what to ask for. `None` when the row will not take that key
@@ -6396,6 +6775,34 @@ async fn carry_out_manager_ask(state: &mut State, ask: ManagerAsk) -> Option<Str
             let done = crate::plugin::update(Some(&name)).await;
             Some(state.lang.plugin_update_text(&done))
         }
+        A::AddMcp { name, transport, to } => {
+            let at = to.path(&state.cwd);
+            Some(match at {
+                Some(path) => match crate::mcp::bridge::put_server(&path, &name, &transport) {
+                    Ok(()) => state.lang.f_mcp_added(&name, &path.display().to_string()),
+                    Err(why) => why,
+                },
+                // **The machine tier has nowhere to go without a config directory.** Said rather
+                // than quietly writing into the repository instead, which is a different promise.
+                None => "there is no config directory; set ZYRIS_CONFIG_DIR".to_string(),
+            })
+        }
+        A::InstallPlugin { source, project } => {
+            // **The same two destinations `/plugin add` asks about** — and the same install, so a
+            // plugin fetched from the panel is fetched exactly the way the command fetches it.
+            let into = if project {
+                state.cwd.join(".zyris-code/plugins")
+            } else {
+                crate::plugin::install_dir()
+            };
+            Some(match crate::plugin::install_into(&into, &source).await {
+                Ok(plugin) => {
+                    let contents = state.lang.plugin_contents_text(&plugin);
+                    state.lang.f_plugin_added(&plugin.name, &contents)
+                }
+                Err(why) => why,
+            })
+        }
         // Nothing said: re-reading the disk is not news, and the panel redrawing is the answer.
         A::Reload => None,
     }
@@ -6692,6 +7099,24 @@ mod tests {
         assert!(!draws_immediately(&[Action::Wheel(1)]));
         assert!(!draws_immediately(&[Action::Wheel(-1), Action::Wheel(-1)]));
         assert!(draws_immediately(&[Action::Insert('x')]));
+    }
+
+    /// **A drag waits for the tick like a wheel burst, and the reason is measured.**
+    ///
+    /// A mouse reports at the rate the hand moves — hundreds of events a second on a real desk —
+    /// while one frame of this app on a 58x211 terminal costs about 10ms in a debug build
+    /// (measured under a pty: 11 motion events, each answered in 7-12ms, one frame apiece). Drawn
+    /// per event, the pointer's events arrive faster than they can be drawn and pile up in the
+    /// terminal's input queue; deferred to the tick, a motion event costs one state update and the
+    /// highlight is never more than a frame behind.
+    #[test]
+    fn a_drag_waits_for_the_frame_tick_too() {
+        assert!(!draws_immediately(&[Action::DragTo(4, 9)]));
+        assert!(!draws_immediately(&[Action::Wheel(1), Action::DragTo(4, 9)]));
+        // The two ends of the gesture are discrete and asked for once: the press begins a
+        // selection and the release ends it, and both are drawn where they happen.
+        assert!(draws_immediately(&[Action::Press(4, 9)]));
+        assert!(draws_immediately(&[Action::Release]));
     }
 
     /// A screen with a conversation long enough to scroll, and the viewport measurements the
@@ -8734,6 +9159,47 @@ mod tests {
         assert!(!s.stopping, "it should release once the turn ends");
     }
 
+    /// **A turn stopped with `Esc` must not be recorded as one that finished.** The card left on
+    /// screen is the one the reasoning was cut in, and a head saying `완료`/`Done` over it is the
+    /// opposite of what the person just did (2026-09-15 user report).
+    ///
+    /// What the head then draws is `rows`'s half; this is the wire. The stop has to be recorded
+    /// **before `stopping` is released** — that clearing is the only thing that knows the turn was
+    /// cut rather than finished, and it happens in this same frame.
+    #[test]
+    fn stopping_a_turn_marks_the_card_it_was_cut_in() {
+        let work = |seq: i64| {
+            Action::Frame(Frame::Event {
+                cursor: seq,
+                entry: Some(Entry { seq, kind: EntryKind::WorkStart("빌드 중".into()) }),
+                todo: None,
+                plan: None,
+            })
+        };
+        let marked = |s: &mut State| {
+            let items = s.timeline.items();
+            let crate::timeline::Item::Work { stopped, .. } = &items[0] else {
+                panic!("no card: {items:?}")
+            };
+            *stopped
+        };
+
+        let mut s = state();
+        apply(&mut s, &work(1));
+        apply(&mut s, &Action::Frame(Frame::Status { running: true }));
+        apply(&mut s, &Action::Cancel);
+        apply(&mut s, &Action::Frame(Frame::Status { running: false }));
+        assert!(marked(&mut s), "the card that was cut still reads as done");
+
+        // **A turn that ran its course is not marked.** Otherwise every finished turn would say
+        // somebody had stopped it.
+        let mut s = state();
+        apply(&mut s, &work(1));
+        apply(&mut s, &Action::Frame(Frame::Status { running: true }));
+        apply(&mut s, &Action::Frame(Frame::Status { running: false }));
+        assert!(!marked(&mut s), "a turn that finished says it was stopped");
+    }
+
     /// One press arms, the second quits. One accidental press must not quit.
     #[test]
     fn ctrl_c_needs_two_presses_to_quit() {
@@ -9104,6 +9570,53 @@ mod tests {
         assert!(text.contains("b1") && text.contains("cargo build"), "{text}");
     }
 
+    /// **The line names the tool and the run's own words — never the command.**
+    ///
+    /// A command is as long as the agent wrote it: one heredoc filled this line end to end and
+    /// took the `Esc 정지` hint off the end of it. The subtitle is the newest `work_summary` —
+    /// the very words the work card's head is wearing — and it is the only thing on this line
+    /// that says what the work is *for* (user decision, 2026-09-15).
+    #[test]
+    fn the_activity_line_names_the_tool_and_the_runs_own_words() {
+        let mut s = state();
+        s.connected = true;
+        apply(&mut s, &Action::Frame(Frame::Status { running: true }));
+        apply(
+            &mut s,
+            &Action::Frame(Frame::ExecStart { id: 1, tool: "exec".into(), session: None }),
+        );
+
+        // Before the run has said anything about itself: the tool alone — no dangling separator.
+        let (_, text, hint) = crate::widgets::activity_parts_at(&s, std::time::Instant::now());
+        assert!(text.contains("exec"), "{text}");
+        assert_eq!(hint, s.lang.esc_stops());
+
+        // The run's first `work_summary` lands, and rides the line.
+        apply(
+            &mut s,
+            &Action::Frame(Frame::Event {
+                cursor: 1,
+                entry: Some(Entry {
+                    seq: 1,
+                    kind: EntryKind::WorkStart("위젯 picker 테스트를 배경에서 실행".into()),
+                }),
+                todo: None,
+                plan: None,
+            }),
+        );
+        let (_, text, _) = crate::widgets::activity_parts_at(&s, std::time::Instant::now());
+        assert!(text.contains("exec"), "{text}");
+        assert!(text.contains("위젯 picker 테스트를"), "{text}");
+
+        // **The end of the run takes its words with it.** The next turn's first command can beat
+        // its own summary, and the finished run's words beside it would describe work nobody is
+        // doing.
+        apply(&mut s, &Action::Frame(Frame::Status { running: false }));
+        apply(&mut s, &Action::Frame(Frame::Status { running: true }));
+        let (_, text, _) = crate::widgets::activity_parts_at(&s, std::time::Instant::now());
+        assert!(!text.contains("위젯"), "a finished run's words were still up: {text}");
+    }
+
     /// **`Esc 정지` stops this session's turn and nothing else.** A tool call reaches this node
     /// with no session on it — attacca sends `zyris__node__cap__tool` and nothing more — and
     /// another window on the same directory shares the node besides. So work running here while
@@ -9147,20 +9660,20 @@ mod tests {
         s.connected = true;
         apply(
             &mut s,
-            &Action::Frame(Frame::ExecStart { id: 1, command: "sleep 30".into(), session: None }),
+            &Action::Frame(Frame::ExecStart { id: 1, tool: "exec".into(), session: None }),
         );
         let (_, text, hint) = crate::widgets::activity_parts_at(&s, std::time::Instant::now());
-        assert!(!text.contains("sleep 30"), "somebody else's command was narrated: {text}");
+        assert!(!text.contains("exec"), "somebody else's command was named: {text}");
         assert_eq!(hint, "", "this session has no turn to stop");
 
         // Ours, though, is exactly what this line is for.
         apply(&mut s, &Action::Frame(Frame::Status { running: true }));
         apply(
             &mut s,
-            &Action::Frame(Frame::ExecStart { id: 2, command: "cargo test".into(), session: None }),
+            &Action::Frame(Frame::ExecStart { id: 2, tool: "exec".into(), session: None }),
         );
         let (_, text, hint) = crate::widgets::activity_parts_at(&s, std::time::Instant::now());
-        assert!(text.contains("cargo test"), "{text}");
+        assert!(text.contains("exec"), "{text}");
         assert_eq!(hint, s.lang.esc_stops());
     }
 
@@ -9184,17 +9697,16 @@ mod tests {
         let on_screen = Some("ours");
 
         // Ours, and no turn of ours is running: the fact wins over the guess.
-        let mine =
-            Frame::ExecStart { id: 1, command: "cargo test".into(), session: Some("ours".into()) };
+        let mine = Frame::ExecStart { id: 1, tool: "exec".into(), session: Some("ours".into()) };
         assert!(frame_is_current(&mine.session().map(Origin::asked), on_screen, 0));
         apply(&mut s, &Action::Frame(mine));
         let (_, text, _) = crate::widgets::activity_parts_at(&s, std::time::Instant::now());
-        assert!(text.contains("cargo test"), "our own command was withheld: {text}");
+        assert!(text.contains("exec"), "our own command was withheld: {text}");
 
         // Another conversation's, while our turn is running: the guess would have shown it.
         apply(&mut s, &Action::Frame(Frame::Status { running: true }));
         let theirs =
-            Frame::ExecStart { id: 2, command: "rm -rf /".into(), session: Some("theirs".into()) };
+            Frame::ExecStart { id: 2, tool: "exec".into(), session: Some("theirs".into()) };
         assert!(
             !frame_is_current(&theirs.session().map(Origin::asked), on_screen, 0),
             "a command another conversation asked for reached this screen"
@@ -9375,6 +9887,71 @@ mod tests {
             toggle,
             remove,
         }
+    }
+
+    /// **The form becomes an act, and it says what is missing.** The only place a filled-in form is
+    /// turned into a write, so it is where the required fields and the address rule live.
+    #[test]
+    fn the_add_forms_become_acts_and_say_what_is_missing() {
+        use crate::lang::Lang;
+        use crate::mcp::bridge::Where;
+        let lang = Lang::En;
+        let type_into = |form: &mut crate::panel::ManagerForm, key: &str, text: &str| {
+            let field = form
+                .fields
+                .iter_mut()
+                .find(|f| f.key == key)
+                .unwrap_or_else(|| panic!("no {key} row"))
+                .editor()
+                .unwrap_or_else(|| panic!("{key} is not a text row"));
+            // **Replaced, not appended to.** A test that types a second value into a field is
+            // asking what the form does with that value, not with the two stuck together.
+            field.take();
+            field.insert_str(text);
+        };
+
+        let mut form = crate::panel::ManagerForm::mcp(lang);
+        assert!(matches!(ask_from_form(&form, lang), Err(FormProblem::Missing("name"))));
+        type_into(&mut form, "name", "github");
+        assert!(matches!(ask_from_form(&form, lang), Err(FormProblem::Missing("command"))));
+        type_into(&mut form, "command", "npx");
+        match ask_from_form(&form, lang).expect("a name and a command is enough") {
+            ManagerAsk::AddMcp { name, transport, to } => {
+                assert_eq!(name, "github");
+                assert_eq!(to, Where::User, "this machine is the default tier");
+                assert_eq!(transport.summary(), "npx");
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // **The tier the form is on is the file that gets written.**
+        let mut project = form.clone();
+        project.cursor = project.fields.iter().position(|f| f.key == "where").expect("a where row");
+        project.shift(1);
+        assert!(matches!(
+            ask_from_form(&project, lang),
+            Ok(ManagerAsk::AddMcp { to: Where::Project, .. })
+        ));
+
+        // **A remote server needs an address**, not whatever was typed in the command row.
+        let mut remote = form.clone();
+        remote.fields.iter_mut().find(|f| f.key == "kind").expect("a kind row").shift(1);
+        assert_eq!(remote.chosen("kind"), Some(1));
+        assert!(
+            matches!(ask_from_form(&remote, lang), Err(FormProblem::Said(_))),
+            "a bare word was taken as an address"
+        );
+        type_into(&mut remote, "command", "https://x.test/mcp");
+        assert!(matches!(ask_from_form(&remote, lang), Ok(ManagerAsk::AddMcp { .. })));
+
+        // And a plugin form only needs the place to fetch from.
+        let mut plugins = crate::panel::ManagerForm::plugin(lang);
+        assert!(matches!(ask_from_form(&plugins, lang), Err(FormProblem::Missing("source"))));
+        type_into(&mut plugins, "source", "owner/repo");
+        assert_eq!(
+            ask_from_form(&plugins, lang).expect("a source is enough"),
+            ManagerAsk::InstallPlugin { source: "owner/repo".into(), project: false }
+        );
     }
 
     /// **The keys of `/mcp` become acts, and the acts become writes.** `apply` is pure, so what it

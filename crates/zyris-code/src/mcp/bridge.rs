@@ -41,6 +41,50 @@ pub enum Transport {
 }
 
 impl Transport {
+    /// A stdio server, from what the three form fields hold.
+    ///
+    /// **Args are split on whitespace**, and the field says so: the schema for what a person types
+    /// here cannot carry quoting, and silently inventing shell rules for one line of a form would
+    /// be worse than telling them to keep a path without spaces.
+    pub fn stdio(command: &str, args: &str, env: &str) -> Result<Transport, String> {
+        Ok(Transport::Stdio {
+            command: command.trim().to_string(),
+            args: args.split_whitespace().map(str::to_string).collect(),
+            env: parse_env(env)?,
+        })
+    }
+
+    /// A remote server, from the two fields that describe one.
+    pub fn http(url: &str, headers: &str) -> Result<Transport, String> {
+        Ok(Transport::Http { url: url.trim().to_string(), headers: parse_env(headers)? })
+    }
+
+    /// How it is written into a config file — the shape every client reads.
+    pub fn as_entry(&self) -> Value {
+        let mut obj = serde_json::Map::new();
+        match self {
+            Transport::Stdio { command, args, env } => {
+                obj.insert("command".into(), Value::String(command.clone()));
+                if !args.is_empty() {
+                    obj.insert("args".into(), json!(args));
+                }
+                if !env.is_empty() {
+                    obj.insert("env".into(), json!(env));
+                }
+            }
+            Transport::Http { url, headers } => {
+                // `type` is written even though a `url` alone says it, because some clients refuse
+                // an entry without one and there is no cost to saying it.
+                obj.insert("type".into(), Value::String("http".into()));
+                obj.insert("url".into(), Value::String(url.clone()));
+                if !headers.is_empty() {
+                    obj.insert("headers".into(), json!(headers));
+                }
+            }
+        }
+        Value::Object(obj)
+    }
+
     /// A one-line description for `/mcp`. **The command or the host, never the whole thing** —
     /// an args list runs off the screen and a URL can carry a token in its query.
     pub fn summary(&self) -> String {
@@ -259,6 +303,73 @@ fn write_json(path: &Path, value: &Value) -> Result<(), String> {
     std::fs::rename(&temp, path).map_err(|e| e.to_string())
 }
 
+/// Reads `KEY=value` pairs out of what was typed into an env or header field.
+///
+/// **A token with no `=` is refused rather than dropped.** A server that starts without the variable
+/// it was meant to be given fails later and somewhere else — in a child process, in somebody else's
+/// logs — which is the kind of failure this form exists to avoid.
+pub fn parse_env(text: &str) -> Result<HashMap<String, String>, String> {
+    let mut out = HashMap::new();
+    for token in text.split_whitespace() {
+        match token.split_once('=') {
+            Some((key, value)) if !key.is_empty() => {
+                out.insert(key.to_string(), value.to_string());
+            }
+            _ => return Err(token.to_string()),
+        }
+    }
+    Ok(out)
+}
+
+/// Which of our two config files a server is written to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Where {
+    /// `~/.config/zyris-code/mcp.json` — for every project on this machine.
+    User,
+    /// `./.mcp.json` — travels with the repository.
+    Project,
+}
+
+impl Where {
+    /// The file itself. `None` for the user tier when there is no config directory at all.
+    pub fn path(self, cwd: &Path) -> Option<PathBuf> {
+        match self {
+            Where::User => crate::conn::app_dir().map(|dir| dir.join("mcp.json")),
+            Where::Project => Some(cwd.join(".mcp.json")),
+        }
+    }
+}
+
+/// Writes one server into a config file, leaving everything else in that file alone.
+///
+/// **The same read-edit-write as `remove_server`**, for the same reason: these files are shared with
+/// other clients, and rebuilding one from this app's idea of its shape would drop every key it does
+/// not know about. A file that is not there yet is created with the `mcpServers` wrapper.
+///
+/// An entry of the same name is replaced — the form refuses a collision before it gets here, so a
+/// replacement only happens when something outside this app has changed in between.
+pub fn put_server(path: &Path, slug: &str, transport: &Transport) -> Result<(), String> {
+    let mut value: Value = match std::fs::read_to_string(path) {
+        Ok(text) => serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => json!({}),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    if !value.is_object() {
+        return Err(format!("{}: not a JSON object", path.display()));
+    }
+    // **`servers` is kept if that is what the file already uses** — VS Code writes that name, and a
+    // file carrying both wrappers would have one of them read and the other ignored.
+    let wrapper =
+        if value.get("servers").is_some_and(Value::is_object) { "servers" } else { "mcpServers" };
+    let obj = value.as_object_mut().expect("checked just above");
+    let map = obj.entry(wrapper).or_insert_with(|| json!({}));
+    let Some(map) = map.as_object_mut() else {
+        return Err(format!("{}: `{wrapper}` is not an object", path.display()));
+    };
+    map.insert(slug.to_string(), transport.as_entry());
+    write_json(path, &value)
+}
+
 /// Two places to read config from. **The later one wins** — the project is more specific than home.
 pub fn config_paths(cwd: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
@@ -384,6 +495,65 @@ fn unique_names(names: Vec<String>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A token with no `=` is refused, not dropped.** A server that starts without the variable it
+    /// was given fails later and somewhere else.
+    #[test]
+    fn env_pairs_are_read_and_a_bad_one_is_refused() {
+        let got = parse_env("A=1 B=two").expect("both are pairs");
+        assert_eq!(got.get("A").map(String::as_str), Some("1"));
+        assert_eq!(got.get("B").map(String::as_str), Some("two"));
+        assert_eq!(parse_env("NOEQUALS"), Err("NOEQUALS".to_string()));
+        assert_eq!(parse_env("=value"), Err("=value".to_string()));
+        assert!(parse_env("").expect("nothing to read").is_empty());
+    }
+
+    /// **The file is edited, not rebuilt.** What the form writes has to read back as the server it
+    /// was, and everything else in that file has to survive — other servers, and keys this app has
+    /// never heard of.
+    #[test]
+    fn a_new_server_is_written_into_the_file_and_reads_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        let stdio = Transport::stdio("npx", "-y @playwright/mcp", "TOKEN=x").unwrap();
+        put_server(&path, "playwright", &stdio).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\"mcpServers\""), "{text}");
+        let found = load_paths(&[path.clone()]);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].slug, "playwright");
+        match &found[0].transport {
+            Transport::Stdio { command, args, env } => {
+                assert_eq!(command, "npx");
+                assert_eq!(args, &vec!["-y".to_string(), "@playwright/mcp".to_string()]);
+                assert_eq!(env.get("TOKEN").map(String::as_str), Some("x"));
+            }
+            other => panic!("it came back as {other:?}"),
+        }
+
+        let keep = dir.path().join("kept.json");
+        std::fs::write(&keep, r#"{"mcpServers":{"a":{"command":"x"}},"other":1}"#).unwrap();
+        put_server(&keep, "b", &stdio).unwrap();
+        let text = std::fs::read_to_string(&keep).unwrap();
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["other"], json!(1), "a key we do not know was dropped: {text}");
+        assert!(value["mcpServers"]["a"]["command"] == json!("x"), "{text}");
+        assert!(value["mcpServers"]["b"].is_object(), "{text}");
+    }
+
+    /// A remote server is written as `type: http` with its address — the shape other clients read.
+    #[test]
+    fn a_remote_server_is_written_the_way_other_clients_read_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        let remote = Transport::http("https://x.test/mcp", "K=v").unwrap();
+        put_server(&path, "docs", &remote).unwrap();
+        let value: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(value["mcpServers"]["docs"]["type"], json!("http"));
+        assert_eq!(value["mcpServers"]["docs"]["url"], json!("https://x.test/mcp"));
+        assert_eq!(value["mcpServers"]["docs"]["headers"]["K"], json!("v"));
+    }
 
     fn tool(name: &str) -> McpTool {
         McpTool {

@@ -2030,21 +2030,21 @@ fn an_expanded_edit_shows_the_diff_instead_of_the_raw_json() {
 }
 /// While a command runs, **what is running** must be shown. Since `exec` only reports once at completion,
 /// without this the person waits up to 55 seconds in the dark.
+///
+/// **The tool, never the command.** A command is as long as the agent wrote it — one heredoc or one
+/// `sed`-and-`awk` pipeline filled this line end to end and took the `Esc 정지` hint off it. What the
+/// line names is the tool, and the run's own subtitle carries the "what for" (2026-09-15).
 #[test]
-fn a_running_command_is_named_in_the_activity_line() {
+fn a_running_command_is_named_by_its_tool_and_not_by_its_command() {
     let mut s = State::new();
     s.connected = true;
     s.running = true;
     apply(
         &mut s,
-        &Action::Frame(AppFrame::ExecStart {
-            id: 1,
-            command: "cargo build -j2".into(),
-            session: None,
-        }),
+        &Action::Frame(AppFrame::ExecStart { id: 1, tool: "exec".into(), session: None }),
     );
     let screen = dump(&mut s, 80, 12);
-    assert!(screen.contains("cargo build -j2"), "what is running is not visible:\n{screen}");
+    assert!(screen.contains("exec"), "what is running is not visible:\n{screen}");
     assert!(
         !screen.contains("작업 중…"),
         "it generalised even though a specific reason was known:\n{screen}"
@@ -2060,11 +2060,11 @@ fn a_finished_command_leaves_the_activity_line() {
     s.running = true;
     apply(
         &mut s,
-        &Action::Frame(AppFrame::ExecStart { id: 1, command: "cargo build".into(), session: None }),
+        &Action::Frame(AppFrame::ExecStart { id: 1, tool: "exec".into(), session: None }),
     );
     apply(&mut s, &Action::Frame(AppFrame::ExecDone { id: 1 }));
     let screen = dump(&mut s, 80, 12);
-    assert!(!screen.contains("cargo build"), "a finished command is still shown:\n{screen}");
+    assert!(!screen.contains("exec"), "a finished command is still shown:\n{screen}");
     assert!(
         screen.contains("작업 중…"),
         "the turn is still running but nothing is said:\n{screen}"
@@ -2079,11 +2079,14 @@ fn finishing_another_command_does_not_clear_the_running_one() {
     s.running = true;
     apply(
         &mut s,
-        &Action::Frame(AppFrame::ExecStart { id: 2, command: "cargo test".into(), session: None }),
+        &Action::Frame(AppFrame::ExecStart { id: 2, tool: "exec".into(), session: None }),
     );
     apply(&mut s, &Action::Frame(AppFrame::ExecDone { id: 1 }));
+    // **Judged on the state, because the two calls can no longer be told apart by their words** —
+    // both tool names are `exec`. Which one is left is exactly what this test is about.
+    assert_eq!(s.running_tool.as_ref().map(|(id, _, _)| *id), Some(2), "the wrong id was cleared");
     let screen = dump(&mut s, 80, 12);
-    assert!(screen.contains("cargo test"), "the wrong id was cleared:\n{screen}");
+    assert!(screen.contains("exec"), "the running call left the line:\n{screen}");
 }
 
 /// The elapsed time must show so you know it's still running. The test controls the clock.
@@ -2096,9 +2099,9 @@ fn the_activity_line_counts_the_seconds() {
     s.running = true;
     apply(
         &mut s,
-        &Action::Frame(AppFrame::ExecStart { id: 1, command: "sleep 30".into(), session: None }),
+        &Action::Frame(AppFrame::ExecStart { id: 1, tool: "exec".into(), session: None }),
     );
-    let start = s.running_exec.as_ref().unwrap().2;
+    let start = s.running_tool.as_ref().unwrap().2;
     let (_, label, _) = zyris_code::widgets::activity_parts_at(&s, start + Duration::from_secs(12));
     assert!(label.contains("12초"), "{label}");
     let _ = Instant::now();

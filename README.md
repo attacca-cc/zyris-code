@@ -330,7 +330,9 @@ Plugins are loaded at startup, so restart to pick up a newly installed one.
 `/help` prints the bindings your build actually has. What follows is only the handful
 whose behaviour is worth explaining rather than listing.
 
-`Ctrl+C` cancels a running turn; pressing it again arms quitting, and once more quits.
+`Esc` stops a running turn — it is the only key that does, and the card it was
+cut in then reads `Stopped` rather than `Done`. `Ctrl+C` does not cancel:
+pressing it arms quitting, and the next press quits.
 **The second press arms quitting even while a turn is still running**, so a server that
 has stopped answering cannot trap you in the window.
 
@@ -343,8 +345,9 @@ seconds the window closes anyway.
 **A work card is one stretch of working — everything the agent thought and did
 between two things it said to you.** Its head keeps rewriting itself to say what
 is happening ("retrying the node" → "writing the report"), and reads `Done` once
-the stretch is over. What the agent says to you stands outside the card, so a
-folded card never hides an answer.
+the stretch is over — or `Stopped` when you ended it with `Esc`, since a run
+somebody cut is not one that finished. What the agent says to you stands outside
+the card, so a folded card never hides an answer.
 
 A running card is open; a finished one folds itself into that one line. `Ctrl+O`
 folds and unfolds the latest card, and from then on that card is yours — it stops

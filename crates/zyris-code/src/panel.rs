@@ -11,6 +11,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::config::DirAccess;
+use crate::input::Input;
 use crate::lang::Lang;
 use crate::markdown::display_width;
 use crate::mode::{Mode, Route};
@@ -481,12 +482,22 @@ pub struct ManagerRow {
 }
 
 /// The list a manager draws and acts on.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Manager {
     pub kind: ManagerKind,
     pub rows: Vec<ManagerRow>,
     /// Where the cursor is. Kept inside `rows` by [`Manager::move_cursor`].
     pub cursor: usize,
+    /// The add form, when one is open. **It takes the panel's keys** — characters go into it, not
+    /// into the list — and closing it leaves the list exactly as it was.
+    pub form: Option<ManagerForm>,
+    /// What to say when there is nothing to list. **Held here rather than drawn from `lang`**, so
+    /// the widget stays a pure function of the panel: the builder puts the sentence in, in the
+    /// screen's language.
+    ///
+    /// It is also why an empty list is still a manager: `a` is how the first server gets added,
+    /// and a list that cannot be added to until it is non-empty is a trap.
+    pub empty: Option<String>,
     /// What the last key said, when it has something to say — the question asked before something
     /// is taken away, or why the key does nothing on this row.
     ///
@@ -501,11 +512,24 @@ pub struct Manager {
     /// The widest sentence this panel can put in `note`. **Part of the sizing**, so asking a
     /// question does not resize the box under the eye.
     pub note_room: usize,
+    /// The screen's language, for the two parts of a manager that are drawn from it: the sentence
+    /// under an open form, and the line an empty list says.
+    pub lang: Lang,
 }
 
 impl Manager {
-    pub fn new(kind: ManagerKind, rows: Vec<ManagerRow>, note_room: usize) -> Manager {
-        Manager { kind, rows, cursor: 0, note: None, confirm: None, note_room }
+    pub fn new(kind: ManagerKind, rows: Vec<ManagerRow>, note_room: usize, lang: Lang) -> Manager {
+        Manager {
+            kind,
+            rows,
+            cursor: 0,
+            form: None,
+            empty: None,
+            note: None,
+            confirm: None,
+            note_room,
+            lang,
+        }
     }
 
     /// The row the cursor is on, if there is one.
@@ -524,6 +548,250 @@ impl Manager {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// The add form
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One field of a manager's form.
+///
+/// **A field knows its own name, not just its label.** The label is in the screen's language; the
+/// key is what the caller looks a field up by when it turns the form into an act.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Field {
+    pub key: &'static str,
+    pub label: String,
+    pub kind: FieldKind,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum FieldKind {
+    /// Free text, with a caret the person moves.
+    Text { value: Input },
+    /// One of a few answers, walked with ←→ so no typo can be made.
+    Choice { options: Vec<String>, chosen: usize },
+}
+
+impl Field {
+    pub fn text(key: &'static str, label: &str, start: &str) -> Field {
+        let mut value = Input::new();
+        value.insert_str(start);
+        Field { key, label: label.to_string(), kind: FieldKind::Text { value } }
+    }
+
+    /// A row that walks a short list. **The first option is where it starts**, so an untouched form
+    /// is already the answer most people want.
+    pub fn choice(key: &'static str, label: &str, options: &[&str]) -> Field {
+        Field {
+            key,
+            label: label.to_string(),
+            kind: FieldKind::Choice {
+                options: options.iter().map(|o| o.to_string()).collect(),
+                chosen: 0,
+            },
+        }
+    }
+
+    /// What this field holds, as it will be used. Text is trimmed — a trailing space in a name is a
+    /// different name to every other program.
+    pub fn value(&self) -> String {
+        match &self.kind {
+            FieldKind::Text { value } => value.text.trim().to_string(),
+            FieldKind::Choice { options, chosen } => {
+                options.get(*chosen).cloned().unwrap_or_default()
+            }
+        }
+    }
+
+    pub fn editor(&mut self) -> Option<&mut Input> {
+        match &mut self.kind {
+            FieldKind::Text { value } => Some(value),
+            FieldKind::Choice { .. } => None,
+        }
+    }
+
+    /// Walks a choice. Positive is right, and it wraps — with two answers there is nothing to aim
+    /// at. A text field ignores this; its ←→ move the caret.
+    pub fn shift(&mut self, by: i32) {
+        if let FieldKind::Choice { options, chosen } = &mut self.kind {
+            if !options.is_empty() {
+                *chosen = step(*chosen, by, options.len());
+            }
+        }
+    }
+}
+
+/// A manager's add form: the fields, where the cursor is, and what Enter last said about it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ManagerForm {
+    pub kind: ManagerKind,
+    pub fields: Vec<Field>,
+    /// Which field the caret is in.
+    pub cursor: usize,
+    /// What Enter refused, if it did — one sentence, drawn under the fields.
+    pub complaint: Option<String>,
+}
+
+impl ManagerForm {
+    /// The `/mcp` form: what to call it, how to reach it, and which file to write it into.
+    ///
+    /// **The order is the order people answer in** — a name, then the kind of thing it is, then
+    /// what it runs — and `where` is last because it is the one with a default worth having.
+    pub fn mcp(lang: Lang) -> ManagerForm {
+        ManagerForm {
+            kind: ManagerKind::Mcp,
+            fields: vec![
+                Field::text("name", lang.f_name(), ""),
+                Field::choice("kind", lang.f_kind(), &["stdio", "http"]),
+                Field::text("command", lang.f_command(), ""),
+                Field::text("args", lang.f_args(), ""),
+                Field::text("env", lang.f_env(), ""),
+                Field::choice("where", lang.f_where(), &[lang.f_machine(), lang.f_project()]),
+            ],
+            cursor: 0,
+            complaint: None,
+        }
+    }
+
+    /// The `/plugin` form: a place to fetch from, and where to put it.
+    pub fn plugin(lang: Lang) -> ManagerForm {
+        ManagerForm {
+            kind: ManagerKind::Plugins,
+            fields: vec![
+                Field::text("source", lang.f_source(), ""),
+                Field::choice("where", lang.f_where(), &[lang.f_machine(), lang.f_project()]),
+            ],
+            cursor: 0,
+            complaint: None,
+        }
+    }
+
+    pub fn field(&self) -> Option<&Field> {
+        self.fields.get(self.cursor)
+    }
+
+    /// The value of the field with this key, or `None` when the form has no such field — which is
+    /// how the caller tells a `stdio` form from an `http` one.
+    pub fn get(&self, key: &str) -> Option<String> {
+        self.fields.iter().find(|f| f.key == key).map(Field::value)
+    }
+
+    /// Which option the field with this key is on, as an index.
+    pub fn chosen(&self, key: &str) -> Option<usize> {
+        self.fields.iter().find(|f| f.key == key).and_then(|f| match &f.kind {
+            FieldKind::Choice { chosen, .. } => Some(*chosen),
+            FieldKind::Text { .. } => None,
+        })
+    }
+
+    /// Moves between fields. Positive is down, and it stops at the ends — a form has a top and a
+    /// bottom, and Enter is what takes it.
+    pub fn move_cursor(&mut self, by: i32) {
+        let last = self.fields.len().saturating_sub(1) as i32;
+        self.cursor = (self.cursor as i32 + by).clamp(0, last) as usize;
+        self.complaint = None;
+    }
+
+    /// Walks the value in the field under the caret. Positive is right — a choice goes round its
+    /// options, a text field moves its caret.
+    pub fn shift(&mut self, by: i32) {
+        if let Some(field) = self.fields.get_mut(self.cursor) {
+            field.shift(by);
+        }
+        self.complaint = None;
+    }
+
+    /// Puts the caret on the field with this key — what a refusal does, so the missing answer is
+    /// the one being typed into.
+    pub fn focus(&mut self, key: &str) {
+        if let Some(at) = self.fields.iter().position(|f| f.key == key) {
+            self.cursor = at;
+        }
+    }
+
+    /// The text field the caret is in, if it is in one.
+    pub fn editor(&mut self) -> Option<&mut Input> {
+        self.fields.get_mut(self.cursor).and_then(Field::editor)
+    }
+
+    /// The sentence under the fields: what Enter refused, or what the field under the caret is for.
+    pub fn sentence(&self, lang: Lang) -> String {
+        match &self.complaint {
+            Some(why) => why.clone(),
+            None => match self.field() {
+                Some(field) => lang.f_hint(field.key),
+                None => String::new(),
+            },
+        }
+    }
+}
+
+/// Draws the form: one row per field, the caret's row marked, and the sentence under them.
+///
+/// **Not `form_lines`** — that name belongs to the `/config` form, which is a different shape for a
+/// different job. Colliding on it compiled into a call to the wrong one.
+fn manager_form_lines(form: &ManagerForm, lang: Lang) -> Vec<Line<'static>> {
+    let label_w = form.fields.iter().map(|f| display_width(&f.label)).max().unwrap_or(0);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (at, field) in form.fields.iter().enumerate() {
+        let on = at == form.cursor;
+        let mut spans = vec![
+            Span::styled(if on { "❯ " } else { "  " }, Style::default().fg(theme::accent())),
+            Span::styled(
+                format!(
+                    "{}{:pad$}",
+                    field.label,
+                    "",
+                    pad = label_w - display_width(&field.label) + 2
+                ),
+                if on {
+                    Style::default().fg(theme::text_heading()).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(theme::text_muted())
+                },
+            ),
+        ];
+        let value = if on {
+            Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme::text())
+        };
+        match &field.kind {
+            FieldKind::Text { value: input } => {
+                let chars: Vec<char> = input.text.chars().collect();
+                let caret = input.cursor.min(chars.len());
+                let before: String = chars[..caret].iter().collect();
+                let after: String = chars[caret..].iter().collect();
+                spans.push(Span::styled("[ ", Style::default().fg(theme::border_light())));
+                spans.push(Span::styled(before, value));
+                // **The caret is drawn, not parked in the terminal.** `|` is narrow and every font
+                // has it, where the block glyphs a caret would want are East Asian Ambiguous
+                // (`tests/width.rs`).
+                if on {
+                    spans.push(Span::styled("|", Style::default().fg(theme::accent())));
+                }
+                spans.push(Span::styled(after, value));
+                spans.push(Span::styled(" ]", Style::default().fg(theme::border_light())));
+            }
+            FieldKind::Choice { options, chosen } => {
+                spans.push(Span::styled("< ", Style::default().fg(theme::border_light())));
+                spans.push(Span::styled(options.get(*chosen).cloned().unwrap_or_default(), value));
+                spans.push(Span::styled(" >", Style::default().fg(theme::border_light())));
+            }
+        }
+        lines.push(Line::from(spans));
+    }
+    lines.push(blank());
+    lines.push(Line::from(Span::styled(
+        form.sentence(lang),
+        if form.complaint.is_some() {
+            Style::default().fg(theme::warning())
+        } else {
+            Style::default().fg(theme::text_muted())
+        },
+    )));
+    lines
+}
+
 /// What a row draws before its name: the cursor, and whether the thing is on.
 const ROW_MARK: usize = 4;
 /// The gap between a detail's label and its value.
@@ -538,8 +806,22 @@ const DETAIL_INDENT: &str = "    ";
 /// grew and shrank as the cursor moved is what `/mode` and `/config` were both fixed for, and the
 /// same rule holds here.
 fn manager_lines(manager: &Manager) -> Vec<Line<'static>> {
+    let lang = manager.lang;
+    // **An open form replaces the list.** Its keys are the form's — characters go into a field —
+    // and drawing the rows underneath would say the arrows still move a cursor that is now inside
+    // the form.
+    if let Some(form) = &manager.form {
+        let lines = manager_form_lines(form, lang);
+        let width = lines
+            .iter()
+            .map(|line| line.spans.iter().map(|s| display_width(&s.content)).sum::<usize>())
+            .max()
+            .unwrap_or(0)
+            .max(manager.note_room);
+        return lines.into_iter().map(|line| pad_to(line, width)).collect();
+    }
     if manager.rows.is_empty() {
-        return Vec::new();
+        return vec![muted(manager.empty.clone().unwrap_or_default())];
     }
     let label_w = manager
         .rows
@@ -633,27 +915,24 @@ fn pad_to(line: Line<'static>, width: usize) -> Line<'static> {
 /// cursor could only ever act on one of them. One row per server carries both: its state, where it
 /// came from, and what the keys mean there.
 pub fn mcp_manager(lang: Lang, rows: Vec<ManagerRow>) -> Panel {
-    if rows.is_empty() {
-        return Panel::new(lang.title_mcp().into(), vec![muted(lang.mcp_empty().to_string())]);
-    }
+    // **Empty is still a manager.** `a` is how the first server gets added, and a list that cannot
+    // be added to until it has something in it is a trap.
     let room = room_for(lang, &rows);
     let mut panel = Panel::new(lang.title_mcp().into(), Vec::new());
-    panel.manager = Some(Manager::new(ManagerKind::Mcp, rows, room));
+    let mut manager = Manager::new(ManagerKind::Mcp, rows, room, lang);
+    manager.empty = Some(lang.mcp_empty().to_string());
+    panel.manager = Some(manager);
     panel.refresh();
     panel
 }
 
 /// The `/plugin` panel: every plugin, what it contributes, and what can be done with it.
 pub fn plugin_manager(lang: Lang, rows: Vec<ManagerRow>) -> Panel {
-    if rows.is_empty() {
-        return Panel::new(
-            lang.title_plugins().into(),
-            vec![muted(lang.plugins_empty().to_string())],
-        );
-    }
     let room = room_for(lang, &rows);
     let mut panel = Panel::new(lang.title_plugins().into(), Vec::new());
-    panel.manager = Some(Manager::new(ManagerKind::Plugins, rows, room));
+    let mut manager = Manager::new(ManagerKind::Plugins, rows, room, lang);
+    manager.empty = Some(lang.plugins_empty().to_string());
+    panel.manager = Some(manager);
     panel.refresh();
     panel
 }
@@ -1030,11 +1309,15 @@ mod tests {
         let p = mcp_manager(Lang::Ko, Vec::new());
         assert!(text(&p)[0].contains("없습니다"), "{:?}", text(&p));
         assert!(p.title.contains("MCP"), "{}", p.title);
-        // Nothing to act on, so the panel keeps its ordinary keys instead of a manager's.
-        assert!(p.manager.is_none(), "an empty list became something to act on");
+        // **Still a manager, so `a` can add the first one.** A list that cannot be added to until
+        // it has something in it is a trap, and the key hint has to be the manager's.
+        let manager = p.manager.as_ref().expect("an empty list is still something to act on");
+        assert!(manager.rows.is_empty());
+        assert!(manager.empty.is_some(), "it does not say there are none");
 
         let p = plugin_manager(Lang::Ko, Vec::new());
         assert!(text(&p)[0].contains("없습니다"), "{:?}", text(&p));
+        assert!(p.manager.is_some(), "there would be no way to install the first one");
     }
 
     /// **The cursor decides which block is shown**, which is the whole reason the detail is drawn
@@ -1118,7 +1401,7 @@ mod tests {
             row("a", "", Origin::Fetched, Some(true), &[]),
             row("b", "", Origin::Fetched, Some(true), &[]),
         ];
-        let mut manager = Manager::new(ManagerKind::Plugins, rows, 0);
+        let mut manager = Manager::new(ManagerKind::Plugins, rows, 0, Lang::Ko);
         manager.confirm = Some("a".into());
         manager.move_cursor(1);
         assert_eq!(manager.confirm, None, "the question outlived the row it named");

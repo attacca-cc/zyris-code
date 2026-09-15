@@ -118,6 +118,12 @@ pub enum Item {
         seq: i64,
         /// The latest `work_summary` title. Empty until one arrives.
         title: String,
+        /// **A person stopped this run with `Esc`** — it did not end by itself.
+        ///
+        /// It rides on the item because the head is drawn from the item (`rows::make`), and it is
+        /// stamped on after the build rather than during it: the stop is this side's knowledge and
+        /// not the server's, so `Timeline::stopped` holds it and `items` lays it on once.
+        stopped: bool,
         parts: Vec<Part>,
     },
     Error {
@@ -201,6 +207,10 @@ pub struct Timeline {
     said: Vec<Said>,
     /// The seq for the next app item. **It's negative** — see the explanation below.
     next_said: i64,
+    /// The card whose run a person stopped with `Esc`. **Not the server's knowledge** — a stopped
+    /// turn and one that ran its course end the same way on the wire, so the one fact that tells
+    /// them apart lives here until `items` stamps it onto the card (`mark_stopped`).
+    stopped: Option<i64>,
 }
 
 /// A snippet of answer text that streamed in.
@@ -285,7 +295,31 @@ impl Timeline {
         self.said.clear();
         self.live_text.clear();
         self.live_reasoning.clear();
+        // The card it was said about is gone with the rest of the conversation.
+        self.stopped = None;
         self.dirty = true;
+    }
+
+    /// **The turn was cut short, not finished.** Marks the card that was open when the stop landed.
+    ///
+    /// `Esc` asks the server to stop (`Action::Cancel`) and the server ends the turn exactly the
+    /// way it ends one that ran its course, so nothing in the stream says which of the two
+    /// happened. Left unsaid, the head over the reasoning that was just cut reads `완료`/`Done`
+    /// like every turn that got there by itself — the opposite of what the person did
+    /// (2026-09-15 user report).
+    ///
+    /// **The card that was open is the last one.** A turn's working gathers into one card
+    /// (`merge_adjacent_cards`) and the live one is at the end (`rows::live_card`), so the last
+    /// card is the stretch the stop landed on.
+    pub fn mark_stopped(&mut self) {
+        let card = self.items().iter().rev().find_map(|item| match item {
+            Item::Work { seq, .. } => Some(*seq),
+            _ => None,
+        });
+        if let Some(seq) = card {
+            self.stopped = Some(seq);
+            self.dirty = true;
+        }
     }
 
     pub fn upsert(&mut self, entry: Entry) {
@@ -355,6 +389,18 @@ impl Timeline {
     pub fn items(&mut self) -> &[Item] {
         if self.dirty {
             self.cache = self.build();
+            // **The stop is laid on here, and only here.** A card is opened in several places
+            // inside the build, and one added later must not be able to forget the mark — see
+            // `mark_stopped` for what it means.
+            if let Some(card) = self.stopped {
+                for item in &mut self.cache {
+                    if let Item::Work { seq, stopped, .. } = item {
+                        if *seq == card {
+                            *stopped = true;
+                        }
+                    }
+                }
+            }
             self.dirty = false;
             self.rebuilds += 1;
         }
@@ -435,7 +481,12 @@ impl Timeline {
                         }
                         None => {
                             open_work = Some(out.len());
-                            out.push(Item::Work { seq, title: title.clone(), parts: Vec::new() });
+                            out.push(Item::Work {
+                                seq,
+                                title: title.clone(),
+                                stopped: false,
+                                parts: Vec::new(),
+                            });
                         }
                     }
                 }
@@ -646,20 +697,24 @@ fn said_card_seq(saying: i64) -> i64 {
 fn merge_adjacent_cards(items: Vec<Item>) -> Vec<Item> {
     let mut out: Vec<Item> = Vec::with_capacity(items.len());
     for item in items {
-        let Item::Work { seq, title, parts } = item else {
+        let Item::Work { seq, title, stopped, parts } = item else {
             out.push(item);
             continue;
         };
         match out.last_mut() {
-            Some(Item::Work { title: head, parts: had, .. }) => {
+            Some(Item::Work { title: head, parts: had, stopped: was, .. }) => {
                 had.extend(parts);
                 if !title.is_empty() {
                     *head = title;
                 }
+                // **A stop is true of the turn, not of one stretch of it**, so it rides across
+                // the join the way the title does. The identity is the only thing the first card
+                // keeps.
+                *was |= stopped;
                 // `seq` is dropped on purpose — the first card keeps its identity, and with it the
                 // fold the person set.
             }
-            _ => out.push(Item::Work { seq, title, parts }),
+            _ => out.push(Item::Work { seq, title, stopped, parts }),
         }
     }
     out
@@ -700,6 +755,7 @@ fn fold_older_sayings(items: Vec<Item>) -> Vec<Item> {
             _ => out.push(Item::Work {
                 seq: said_card_seq(seq),
                 title: String::new(),
+                stopped: false,
                 parts: vec![said],
             }),
         }
@@ -757,7 +813,12 @@ fn card_for(out: &mut Vec<Item>, open_work: &mut Option<usize>, seq: i64) -> usi
     // **Make the implicit card's fold key not collide with the first part's seq.** If they collided,
     // expanding the card would also expand the first tool's detail under the same key (it actually
     // looked that way — in tool-only turns with no reasoning, pressing the card opened the first tool's args and result).
-    out.push(Item::Work { seq: implicit_seq(seq), title: String::new(), parts: Vec::new() });
+    out.push(Item::Work {
+        seq: implicit_seq(seq),
+        title: String::new(),
+        stopped: false,
+        parts: Vec::new(),
+    });
     *open_work = Some(at);
     at
 }
@@ -945,6 +1006,46 @@ mod tests {
     /// A reasoning chip as the server would produce it, title and all.
     fn think_at(seq: i64, text: &str) -> Part {
         Part::Think(Think { seq, title: None, text: text.into() })
+    }
+
+    /// **A run that was stopped did not finish.** The card that was open when the stop landed
+    /// carries the mark, and it comes back with the items — they are thrown away and rebuilt from
+    /// the entries whenever an event arrives, so a mark held anywhere else would be lost by the
+    /// next delta.
+    #[test]
+    fn a_stopped_run_is_marked_on_the_card_that_was_open() {
+        let mut t = Timeline::new();
+        t.upsert(e(1, EntryKind::WorkStart("빌드 중".into())));
+        t.upsert(e(2, EntryKind::Thinking { title: None, text: "무엇부터 볼까".into() }));
+        t.mark_stopped();
+        let Item::Work { stopped, .. } = &t.items()[0] else { panic!("no card") };
+        assert!(*stopped, "the card that was cut is not marked");
+
+        // The next event rebuilds the items. The mark has to survive it.
+        t.upsert(e(3, EntryKind::Thinking { title: None, text: "그 다음".into() }));
+        let Item::Work { stopped, .. } = &t.items()[0] else { panic!("no card") };
+        assert!(*stopped, "the mark did not survive a rebuild");
+    }
+
+    /// **Only the card the stop landed on.** A later turn is not tarred with it — the mark is
+    /// keyed by the card's seq, not held as "the last turn was stopped".
+    #[test]
+    fn a_later_card_is_not_marked_by_an_earlier_stop() {
+        let mut t = Timeline::new();
+        t.upsert(e(1, EntryKind::WorkStart("빌드 중".into())));
+        t.mark_stopped();
+        t.upsert(e(2, EntryKind::User("다시".into())));
+        t.upsert(e(3, EntryKind::WorkStart("고치는 중".into())));
+
+        let cards: Vec<bool> = t
+            .items()
+            .iter()
+            .filter_map(|i| match i {
+                Item::Work { stopped, .. } => Some(*stopped),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(cards, vec![true, false], "the stop followed the wrong card");
     }
 
     /// An updated event comes again with the same seq. Appending would make two cards.

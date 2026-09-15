@@ -262,9 +262,22 @@ impl Lang {
             (Lang::En, false) => "Job result ∙ failed",
         }
     }
-    /// What to show in the activity line while a command runs.
-    pub fn running_command(self, command: &str, secs: u64) -> String {
-        format!("▶ {command}  ∙  {}", self.duration(secs))
+    /// What to show in the activity line while a command runs: **the tool that is running, and
+    /// the run's own subtitle — never the command.**
+    ///
+    /// The command is as long as the agent wrote it. One `python3 -c`, one heredoc or one
+    /// `sed -n '1,200p' …` fills the line right to its edge, pushes the `Esc 정지` hint off the
+    /// end of it, and still does not say what the work is for. `tool` (`exec`) is what is
+    /// running; `what` is the newest `work_summary` of the run — the very words the work card's
+    /// head is wearing, and the server's own one-line answer to "what is being done". Both are
+    /// short by construction (user decision, 2026-09-15).
+    pub fn running_tool(self, tool: &str, what: &str, secs: u64) -> String {
+        let took = self.duration(secs);
+        let what = clip_columns(what.trim(), ACTIVITY_WIDTH);
+        match what.is_empty() {
+            true => format!("▶ {tool}  ∙  {took}"),
+            false => format!("▶ {tool}  ∙  {what}  ∙  {took}"),
+        }
     }
     /// Says once, on the status line, that a background job finished. **It says so on success
     /// too** — not knowing it is done leaves a person waiting.
@@ -286,6 +299,10 @@ impl Lang {
             (Lang::En, 1) => "background".to_string(),
             (Lang::En, n) => format!("background ×{n}"),
         };
+        // **Clipped for the same reason a command is not shown at all.** The label defaults to
+        // the job's own command (`jobs.rs`), so a backgrounded build would otherwise sprawl
+        // across this line exactly the way a running one used to.
+        let label = clip_columns(label.trim(), ACTIVITY_WIDTH);
         format!("{head}  {id} {label}  ∙  {}", self.duration(secs))
     }
     /// One row of `/jobs`, when that job belongs to a conversation other than the one on screen.
@@ -1959,13 +1976,14 @@ impl Lang {
         use crate::panel::ManagerKind;
         match (self, kind) {
             (Lang::Ko, ManagerKind::Mcp) => {
-                "↑↓ 고르기 ‒ Enter 켜기/끄기 ‒ d 지우기 ‒ r 다시 읽기 ‒ Esc 닫기".to_string()
+                "↑↓ 고르기 ‒ Enter 켜기/끄기 ‒ a 추가 ‒ d 지우기 ‒ r 다시 읽기 ‒ Esc 닫기"
+                    .to_string()
             }
             (Lang::En, ManagerKind::Mcp) => {
-                "↑↓ pick ‒ Enter on/off ‒ d remove ‒ r re-read ‒ Esc close".to_string()
+                "↑↓ pick ‒ Enter on/off ‒ a add ‒ d remove ‒ r re-read ‒ Esc close".to_string()
             }
             (Lang::Ko, ManagerKind::Plugins) => {
-                "↑↓ 고르기 ‒ Enter 켜기/끄기 ‒ u 갱신 ‒ d 지우기 ‒ r 다시 읽기 ‒ Esc 닫기"
+                "↑↓ 고르기 ‒ Enter 켜기/끄기 ‒ a 받기 ‒ u 갱신 ‒ d 지우기 ‒ r 다시 읽기 ‒ Esc 닫기"
                     .to_string()
             }
             (Lang::En, ManagerKind::Plugins) => {
@@ -2104,6 +2122,168 @@ impl Lang {
             return self.pick("얹는 것이 없습니다", "adds nothing").to_string();
         }
         parts.join(" ‒ ")
+    }
+
+    // ── The add forms (`/mcp` a · `/plugin` a)
+
+    /// The key hint under an open form.
+    pub fn add_keys(self) -> String {
+        match self {
+            Lang::Ko => {
+                "글자 입력 ‒ ↑↓·Tab 칸 이동 ‒ ←→ 값 고르기 ‒ Enter 다음·추가 ‒ Esc 취소".to_string()
+            }
+            Lang::En => {
+                "type ‒ ↑↓·Tab move ‒ ←→ pick a value ‒ Enter next/add ‒ Esc cancel".to_string()
+            }
+        }
+    }
+
+    // The field labels. **Short, because they are a column** — the value is the answer.
+    pub fn f_name(self) -> &'static str {
+        self.pick("이름", "name")
+    }
+    pub fn f_kind(self) -> &'static str {
+        self.pick("방식", "kind")
+    }
+    pub fn f_command(self) -> &'static str {
+        self.pick("명령", "command")
+    }
+    pub fn f_url(self) -> &'static str {
+        self.pick("주소", "url")
+    }
+    pub fn f_args(self) -> &'static str {
+        self.pick("인자", "args")
+    }
+    pub fn f_env(self) -> &'static str {
+        self.pick("환경변수", "env")
+    }
+    pub fn f_where(self) -> &'static str {
+        self.pick("어디에", "where")
+    }
+    pub fn f_source(self) -> &'static str {
+        self.pick("받아 올 곳", "source")
+    }
+    /// The two answers the `where` row walks. **`stdio` and `http` are protocol names**, not words
+    /// to translate, so they are not here.
+    pub fn f_machine(self) -> &'static str {
+        self.pick("이 컴퓨터", "this machine")
+    }
+    pub fn f_project(self) -> &'static str {
+        self.pick("이 저장소", "this repository")
+    }
+
+    /// What a field is for, under the form. **One per field**, so the box is one height on every
+    /// row of it.
+    pub fn f_hint(self, field: &str) -> String {
+        let (ko, en) = match field {
+            "name" => (
+                "서버 이름 ‒ 띄어쓰기 없이. 에이전트는 `mcp_<이름>`으로 봅니다",
+                "the server's name, no spaces ‒ the agent sees it as `mcp_<name>`",
+            ),
+            "kind" => (
+                "이 컴퓨터에서 프로그램으로 돌릴지(stdio), 원격 서버에 붙을지(http)",
+                "run a program here (stdio), or talk to a remote server (http)",
+            ),
+            "command" => (
+                "실행할 프로그램. `npx`처럼 이름만 적으면 PATH에서 찾습니다",
+                "the program to run; a bare name like `npx` is looked up on PATH",
+            ),
+            "args" => (
+                "프로그램에 넘길 인자 ‒ 띄어쓰기로 나눕니다 (따옴표는 못 씁니다)",
+                "arguments, split on spaces (this form cannot carry quotes)",
+            ),
+            "env" => (
+                "`키=값` 꼴로, 띄어쓰기로 구분. 적은 값은 설정 파일에 그대로 남습니다",
+                "`KEY=value` pairs, space-separated. What you type is written to the file",
+            ),
+            "where" => (
+                "이 컴퓨터에 두면 모든 프로젝트에서 쓰고, 저장소에 두면 git에 잡힙니다",
+                "this machine: every project · this repository: it shows up in git",
+            ),
+            "url" => (
+                "`http://` 또는 `https://`로 시작하는 주소",
+                "an address starting with `http://` or `https://`",
+            ),
+            "source" => (
+                "`owner/repo`·`https://…`·`git@…`·로컬 경로 ‒ git으로 받습니다",
+                "`owner/repo`, `https://…`, `git@…` or a local path ‒ fetched with git",
+            ),
+            _ => ("", ""),
+        };
+        match self {
+            Lang::Ko => ko.to_string(),
+            Lang::En => en.to_string(),
+        }
+    }
+
+    /// The label a field key is shown by. **The key is what the code says, the label is what the
+    /// screen says** — a refusal has to name the field in the reader's language.
+    fn f_label(self, key: &str) -> &'static str {
+        match key {
+            "name" => self.f_name(),
+            "kind" => self.f_kind(),
+            "command" => self.f_command(),
+            "url" => self.f_url(),
+            "args" => self.f_args(),
+            "env" => self.f_env(),
+            "where" => self.f_where(),
+            "source" => self.f_source(),
+            _ => self.pick("칸", "field"),
+        }
+    }
+
+    /// The sentence under an open form when Enter was refused, and which field it is about.
+    pub fn f_needs(self, key: &str) -> String {
+        let label = self.f_label(key);
+        match self {
+            Lang::Ko => format!("`{label}`을(를) 채워 주세요."),
+            Lang::En => format!("`{label}` is needed."),
+        }
+    }
+    /// A value that cannot hold a space: a server's name becomes part of the tool name the agent
+    /// calls (`mcp_<name>`), where a space would be washed out and the two would stop matching.
+    pub fn f_no_space(self, key: &str) -> String {
+        let label = self.f_label(key);
+        match self {
+            Lang::Ko => format!("`{label}`에는 띄어쓰기를 넣을 수 없습니다."),
+            Lang::En => format!("`{label}` cannot have a space in it."),
+        }
+    }
+    pub fn f_bad_url(self) -> &'static str {
+        self.pick(
+            "주소는 http:// 나 https://로 시작해야 합니다.",
+            "the address has to start with http:// or https://",
+        )
+    }
+    pub fn f_bad_pair(self, token: &str) -> String {
+        match self {
+            Lang::Ko => format!("`{token}`은(는) `키=값` 꼴이 아닙니다."),
+            Lang::En => format!("`{token}` is not a `KEY=value` pair."),
+        }
+    }
+    pub fn f_name_taken(self, name: &str) -> String {
+        match self {
+            Lang::Ko => format!("`{name}`은(는) 이미 있습니다. `r`로 다시 읽어 보세요."),
+            Lang::En => format!("`{name}` already exists. Press `r` to read the list again."),
+        }
+    }
+    /// A server written into one of our files. **Says that it takes effect on the next launch** —
+    /// servers are started once, at announce time.
+    pub fn f_mcp_added(self, name: &str, at: &str) -> String {
+        match self {
+            Lang::Ko => {
+                format!("`{name}`을 `{at}`에 적었습니다. 다시 띄우면 도구가 붙습니다.")
+            }
+            Lang::En => format!("`{name}` is written into `{at}`. Restart and its tools attach."),
+        }
+    }
+    pub fn f_plugin_added(self, name: &str, contents: &str) -> String {
+        match self {
+            Lang::Ko => format!("**{name}**을 받았습니다.\n\n{contents}\n\n다시 띄우면 붙습니다."),
+            Lang::En => {
+                format!("Installed **{name}**.\n\n{contents}\n\nIt attaches on the next launch.")
+            }
+        }
     }
 
     // ── Skills panel
@@ -2326,6 +2506,16 @@ impl Lang {
     pub fn run_done(self) -> &'static str {
         self.pick("완료", "Done")
     }
+    /// The head of a stretch of working **a person stopped with `Esc`**.
+    ///
+    /// **Not `run_done`.** The run was cut short, and the head over the reasoning it was cut in is
+    /// the one line on screen that would tell the person it finished — the opposite of what they
+    /// just did. `rows::make` draws it for the one card the stop landed on; the server cannot say
+    /// which, because a stopped turn and a finished one end the same way on the wire
+    /// (`Timeline::mark_stopped`).
+    pub fn run_stopped(self) -> &'static str {
+        self.pick("중단됨", "Stopped")
+    }
     pub fn detail_no_output(self) -> &'static str {
         self.pick("(출력 없음)", "(no output)")
     }
@@ -2535,8 +2725,60 @@ impl Lang {
     }
 }
 
+/// How wide the run's own words may get on the activity line. Long enough for a sentence the
+/// server wrote, short enough to leave the line's hint room — the point of the line is that a
+/// person takes it in at a glance.
+const ACTIVITY_WIDTH: usize = 48;
+
+/// Cuts text to a column budget, **counting a wide character as the two columns it takes up**.
+///
+/// `chars().take(n)` is wrong here for the same reason it is wrong everywhere in this app: a
+/// Hangul syllable is one `char` and two columns, so counting characters buys twice the line.
+fn clip_columns(text: &str, width: usize) -> String {
+    if crate::markdown::display_width(text) <= width {
+        return text.to_string();
+    }
+    let mut out = String::new();
+    let mut used = 0;
+    // One column is kept for the ellipsis, so the result never reads as if it ended there.
+    for ch in text.chars() {
+        let w = crate::markdown::display_width(&ch.to_string()).max(1);
+        if used + w > width.saturating_sub(1) {
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    out.push('…');
+    out
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// **The run's own words are cut to fit, by columns and not by characters.** A Hangul syllable
+    /// is one `char` and two columns, so a character count would hand back twice the line — and this
+    /// is the line whose whole reason for changing was that it got too long.
+    #[test]
+    fn the_activity_line_clips_the_runs_words_by_columns() {
+        let long = "가".repeat(80);
+        let text = Lang::Ko.running_tool("exec", &long, 0);
+        let label = text.trim_start_matches("▶ exec  ∙  ").trim_end_matches("  ∙  0초");
+        assert_ne!(label, long, "the words were not clipped: {text}");
+        assert_eq!(label.chars().last(), Some('…'), "{text}");
+        assert!(
+            crate::markdown::display_width(label) <= ACTIVITY_WIDTH,
+            "{} columns: {label}",
+            crate::markdown::display_width(label)
+        );
+        // Nothing to clip is left exactly as it was, ellipsis and all.
+        assert_eq!(
+            Lang::En.running_tool("exec", "running the tests", 0),
+            "▶ exec  ∙  running the tests  ∙  0s"
+        );
+        // And no words at all is the tool alone, not a dangling separator.
+        assert_eq!(Lang::Ko.running_tool("exec", "", 12), "▶ exec  ∙  12초");
+    }
 
     /// Found against a real session: a card that used one tool said "1 tools".
     #[test]
@@ -2581,8 +2823,8 @@ mod tests {
     /// kind of drift a shared helper prevents.
     #[test]
     fn every_span_shown_uses_the_same_units() {
-        assert!(Lang::Ko.running_command("cargo build", 110).contains("1분 50초"));
-        assert!(Lang::En.running_command("cargo build", 110).contains("1m 50s"));
+        assert!(Lang::Ko.running_tool("exec", "", 110).contains("1분 50초"));
+        assert!(Lang::En.running_tool("exec", "", 110).contains("1m 50s"));
         assert!(Lang::Ko.job_ended("b1", true, 3600).contains("1시간 0분"));
         assert!(Lang::En.job_ended("b1", true, 3600).contains("1h 0m"));
         assert!(Lang::Ko.background_job(1, "b1", "build", 110).contains("1분 50초"));
@@ -2647,6 +2889,8 @@ mod tests {
             (ko.working(), en.working()),
             (ko.idle(), en.idle()),
             (ko.stopping(), en.stopping()),
+            (ko.run_done(), en.run_done()),
+            (ko.run_stopped(), en.run_stopped()),
             (ko.connected(), en.connected()),
             (ko.waiting_answer(), en.waiting_answer()),
             (ko.new_thread(), en.new_thread()),
@@ -2721,6 +2965,7 @@ mod tests {
             en.mode_work(),
             en.mode_job(),
             en.esc_stops(),
+            en.run_stopped(),
             en.quit_armed(),
             en.lang_changed(),
             en.enroll_title(),
@@ -2866,7 +3111,7 @@ mod tests {
             assert!(!text.chars().any(|c| ('가'..='힣').contains(&c)), "Hangul in {text:?}");
         }
         for text in [
-            en.running_command("cargo build", 110),
+            en.running_tool("exec", "", 110),
             en.job_ended("b1", true, 110),
             en.job_ended("b1", false, 3660),
             en.background_job(2, "b1", "build", 110),

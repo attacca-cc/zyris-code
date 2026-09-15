@@ -31,7 +31,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 async-trait = "0.1.91"
 
 ratatui = "0.30"
-crossterm = { version = "0.29", features = ["event-stream"] }
+crossterm = { version = "0.29", features = ["event-stream", "use-dev-tty"] }
 # `process` and `io-util` are used to spawn the MCP server as a child process and exchange lines with it.
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "process", "io-util", "net"] }
 unicode-width = "0.2"
