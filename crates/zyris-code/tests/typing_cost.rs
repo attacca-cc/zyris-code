@@ -164,7 +164,7 @@ fn what_a_frame_costs_at_211x58() {
     let mut breath_total = 0;
     let mut breath_ms = 0.0;
     for _ in 0..20 {
-        state.breath_origin = state.breath_origin - std::time::Duration::from_millis(16);
+        state.breath_origin -= std::time::Duration::from_millis(16);
         let (n, ms) = draw_bytes(&mut term, &wire, &mut state);
         breath_total += n;
         breath_ms += ms;

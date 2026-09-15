@@ -116,8 +116,7 @@ impl Drop for Session {
     }
 }
 
-/// How many rows the frame touched and how many bytes it took — a newline in the draft moves the
-/// whole screen up one row, so it is the shape of the answer rather than its size.
+/// How many rows the frame touched and how many bytes it took.
 fn describe(label: &str, blob: &[u8]) {
     let mut rows = std::collections::BTreeSet::new();
     let mut i = 0;
@@ -143,12 +142,16 @@ fn describe(label: &str, blob: &[u8]) {
     println!("{label:<34} bytes={:>7}  rows-touched={:>3}", blob.len(), rows.len());
 }
 
-/// **A syllable committed by the input method and the Enter arrive together.**
+/// **What a keystroke and an Enter cost on a real pty** — the shape of the answer, not a
+/// pass/fail.
 ///
-/// That is what the pty sees when fcitx hands over `녕` as `Enter` is pressed: one write, two key
-/// events, no gap between them. With the old rule — "the previous key was less than 25ms ago" —
-/// the Enter became a newline, and the message only went out on the second press; with a run
-/// required, it sends.
+/// **What this does *not* reach.** With the server refusing, the app never leaves its
+/// pre-connection loop — the one that waits for the first connection — and that loop calls
+/// `on_key` directly: the paste-burst rule (`PasteBurst`) is not on that path at all. So nothing
+/// here says anything about `enter_becomes_newline`; the Enter cases are locked in `app::tests`,
+/// where the decision is a pure function. What this shows is that the *screen* takes an Enter in
+/// one write with a character without a newline appearing in the draft — and the byte cost of a
+/// tick at the geometry the two reports came from.
 #[test]
 #[ignore = "numbers to look at, not a pass/fail"]
 fn an_enter_in_the_same_read_as_a_character() {
@@ -156,12 +159,11 @@ fn an_enter_in_the_same_read_as_a_character() {
     app.wait_ready();
     app.collect(Duration::from_millis(400), Duration::from_secs(2));
 
-    // `hi` and the Enter in one write: a commit and an Enter with no gap. A newline in the draft
-    // grows the input box by a row, which moves every row on the screen.
+    // `hi` and the Enter in one write: a commit and an Enter with no gap.
     app.send(b"hi\r");
     describe("hi + Enter in one write", &app.collect(Duration::from_millis(600), Duration::from_secs(3)));
 
-    // A long paste with an Enter inside it must still become a newline.
+    // What a paste looks like to the pty: one write, many keys, an Enter inside it.
     app.send(b"aaaaaa\rbbbbbb");
     describe("paste with an Enter inside", &app.collect(Duration::from_millis(600), Duration::from_secs(3)));
 
