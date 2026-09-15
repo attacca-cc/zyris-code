@@ -871,6 +871,49 @@ const PAST_THE_RIGHT_EDGE: usize = u16::MAX as usize;
 /// as keys arriving a few ms apart — a speed no human can type at.
 const PASTE_BURST: Duration = Duration::from_millis(25);
 
+/// How many keys have to arrive at that speed, one after another, before an Enter among them is
+/// read as a paste's newline rather than as a person's Enter.
+///
+/// **One key is not a paste, and taking it for one cost every message.** The rule used to be "the
+/// key before this Enter was less than `PASTE_BURST` ago", which an input method satisfies on its
+/// own: fcitx commits the syllable still being composed **as Enter is pressed**, so the app is
+/// handed the committed character and the Enter in one read, microseconds apart — and the first
+/// Enter after any Korean word became a newline, with the message going out only on the second
+/// (reported 2026-09-15). A paste is not one key beside an Enter, it is a run of them: a word's
+/// end commits one or two characters, a pasted line is many.
+const PASTE_RUN: usize = 3;
+
+/// Keys arriving at paste speed, and how many of them have done so in a row.
+///
+/// **A press only.** Windows sends a press and a release for every key, and a release is not
+/// something anyone typed — counted, it would make a burst out of half as many presses.
+#[derive(Debug, Default)]
+struct PasteBurst {
+    last: Option<Instant>,
+    run: usize,
+}
+
+impl PasteBurst {
+    /// Records one key press and answers whether it landed inside a **sustained** run of
+    /// paste-speed keys — itself included.
+    fn press(&mut self, at: Instant) -> bool {
+        let rapid = self.last.is_some_and(|prev| at.duration_since(prev) < PASTE_BURST);
+        let before = self.run;
+        self.run = if rapid { before + 1 } else { 0 };
+        self.last = Some(at);
+        rapid && before >= PASTE_RUN
+    }
+
+    /// The same for a whole key event. A release is never part of a burst — and never breaks one
+    /// either, because it is not a key.
+    fn key(&mut self, key: &KeyEvent, at: Instant) -> bool {
+        if key.kind == KeyEventKind::Release {
+            return false;
+        }
+        self.press(at)
+    }
+}
+
 /// How long a notice stays on screen. Plenty to read one sentence.
 pub const STATUS_WINDOW: Duration = Duration::from_secs(6);
 
@@ -3463,6 +3506,31 @@ fn draws_immediately(actions: &[Action]) -> bool {
     actions.iter().any(|action| !matches!(action, Action::Wheel(_) | Action::DragTo(..)))
 }
 
+/// Whether this tick owes a frame for the breath — the one thing a running turn puts on the
+/// screen by itself.
+///
+/// **A tempo, not a frame count.** The breath is a 1.6s fade, so every frame carries a slightly
+/// different colour and every frame is a different picture — which is why a running turn used to
+/// ask for one on every tick, sixty a second for as long as the turn lasted. A frame is not free,
+/// though: measured at 211×58 in a debug build it is 12-20ms against a tick of 16ms, so the loop
+/// was saturated for the whole of a turn, on a four-thread box that is also rendering the
+/// terminal. That is what "it flickers while I type with the agent working" was (2026-09-15). The
+/// frame is asked for when the breath steps instead — see `transcript::BREATH_STEPS`.
+fn tick_draws_for_the_breath(state: &State, last_step: u64) -> bool {
+    state.running && crate::widgets::transcript::breath_step(state.breath_ms()) != last_step
+}
+
+/// Whether the picker's dot has moved — the only animated thing left when no turn is running.
+///
+/// It is a tempo as well: it changes twice an 800ms (`activity::BLINK_HALF_MS`), so it is drawn
+/// then and not on the fifty-nine ticks in between.
+fn picker_dot_moved(state: &State, last_blink: bool) -> bool {
+    crate::widgets::activity::blink_on(state.blink_ms()) != last_blink
+        && state.picker.as_ref().is_some_and(|p| {
+            p.rows.iter().any(|r| r.status == Some(crate::picker::ThreadStatus::Running))
+        })
+}
+
 /// How often usage and title are asked for again. Asking every frame would hammer the server.
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
 
@@ -4531,9 +4599,9 @@ async fn run_inner(
     let mut poll = tokio::time::interval(POLL_INTERVAL);
     let mut git = tokio::time::interval(git_every.unwrap_or(Duration::from_secs(86400)));
     let mut pull = tokio::time::interval(pull_every.unwrap_or(Duration::from_secs(86400)));
-    // When the last key event happened — the basis for detecting a paste burst on a
-    // terminal without bracketed paste.
-    let mut last_key_at: Option<Instant> = None;
+    // Keys arriving at paste speed — the basis for detecting a paste burst on a terminal
+    // without bracketed paste (`PasteBurst`).
+    let mut burst = PasteBurst::default();
     // When focus last came back. The click that restored it must not act on the transcript.
     let mut focus_back_at: Option<Instant> = None;
     // When off, leave it as a timer that never fires. The point is not to add another
@@ -4551,6 +4619,11 @@ async fn run_inner(
     // draw once more.
     let mut last_quit_pending = false;
     let mut last_had_status = false;
+    // **The tempo of the two things that move on their own** — the breath's step and the dot's
+    // phase as the last frame drew them. Both are clocks, not frame counts: see
+    // `tick_draws_for_the_breath` and `picker_dot_moved`.
+    let mut last_breath_step = crate::widgets::transcript::breath_step(state.breath_ms());
+    let mut last_blink = crate::widgets::activity::blink_on(state.blink_ms());
     let mut shutdown = shutdown_signals();
     // **If the loop stalls, nobody finds out.** An await on a dead connection is released by
     // its deadline, but other blocking (a stuck terminal write, say) can remain. Then keys
@@ -4587,14 +4660,12 @@ async fn run_inner(
                         }
                         // **Rescue a paste burst as newlines.** A terminal without
                         // bracketed paste (mobile Termius and the like) lets a paste
-                        // through as keys arriving in rapid succession. When keys arrive
-                        // at an interval no human can type at (< PASTE_BURST), an Enter
-                        // among them is a newline, not a submit — otherwise the first line
-                        // of a multi-line prompt goes out on its own.
-                        let now = Instant::now();
-                        let in_burst = last_key_at
-                            .is_some_and(|t| now.duration_since(t) < PASTE_BURST);
-                        last_key_at = Some(now);
+                        // through as keys arriving in rapid succession. A *run* of them,
+                        // at an interval no human can type at, is what an Enter inside it
+                        // is read from — one key beside it is a person typing, or an input
+                        // method committing a syllable, and both of those send
+                        // (`PasteBurst`).
+                        let in_burst = burst.key(&k, Instant::now());
                         if enter_becomes_newline(&state, &k, in_burst) {
                             // An Enter that arrived mid-burst is a newline — and the
                             // decision is `enter_becomes_newline`'s, so an approval,
@@ -5061,9 +5132,15 @@ async fn run_inner(
                     dirty = true;
                     content = true;
                 }
-                // While working the dot has to blink, so keep redrawing. One frame is around
-                // 0.2ms, so it is no burden — before, this was not possible.
-                if state.running {
+                // **What moves on its own, and when it is drawn.** A running turn owes a frame
+                // when the breath steps; a list with a thread running in it owes one when its dot
+                // moves. Neither is a reason to draw on every tick — the measurements are on
+                // `tick_draws_for_the_breath`.
+                let breath_moved = tick_draws_for_the_breath(&state, last_breath_step);
+                last_breath_step = crate::widgets::transcript::breath_step(state.breath_ms());
+                let dot_moved = picker_dot_moved(&state, last_blink);
+                last_blink = crate::widgets::activity::blink_on(state.blink_ms());
+                if breath_moved || dot_moved {
                     dirty = true;
                 }
                 // Something is still fading in, so the next frame is a different picture even
@@ -5071,15 +5148,6 @@ async fn run_inner(
                 // few hundred milliseconds after a fold was opened, so an idle screen goes back to
                 // being drawn only when it changes.
                 if state.opening() {
-                    dirty = true;
-                }
-                // A running thread's status dot in the picker blinks too, so the list must be
-                // redrawn each frame while one is on screen.
-                if state
-                    .picker
-                    .as_ref()
-                    .is_some_and(|p| p.rows.iter().any(|r| r.status == Some(crate::picker::ThreadStatus::Running)))
-                {
                     dirty = true;
                 }
                 // With the enrollment code window up, the time left is ticking down, so keep
@@ -10319,6 +10387,140 @@ mod tests {
         let release =
             KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::NONE, KeyEventKind::Release);
         assert!(!enter_becomes_newline(&s, &release, true));
+    }
+
+    /// **The input method's commit is not a paste.** fcitx hands the app the syllable it was
+    /// composing and the Enter in the same read, microseconds apart — the case reported as "the
+    /// first Enter after a word goes to the next line": with one key counted as a burst, the
+    /// message only left on the second Enter.
+    #[test]
+    fn a_committed_syllable_does_not_turn_the_enter_into_a_newline() {
+        let mut s = state();
+        for c in "안녕".chars() {
+            apply(&mut s, &Action::Insert(c));
+        }
+        let mut burst = PasteBurst::default();
+        let now = Instant::now();
+        // The syllable still being composed, committed by the Enter, and then the Enter.
+        assert!(!burst.key(&key(KeyCode::Char('녕'), KeyModifiers::NONE), now));
+        let in_burst = burst.key(&key(KeyCode::Enter, KeyModifiers::NONE), now);
+        assert!(!in_burst, "one committed character is not a paste");
+        // Which is what decides it: not a burst, so this Enter sends.
+        assert!(!enter_becomes_newline(&s, &key(KeyCode::Enter, KeyModifiers::NONE), in_burst));
+    }
+
+    /// **A run is what a paste looks like.** Five keys in a row at paste speed, and the Enter
+    /// among them is a newline — the protection this rule was written for.
+    #[test]
+    fn a_run_of_keys_at_paste_speed_is_a_burst() {
+        let mut burst = PasteBurst::default();
+        let mut now = Instant::now();
+        for (i, c) in "hello".chars().enumerate() {
+            let in_run = burst.key(&key(KeyCode::Char(c), KeyModifiers::NONE), now);
+            // Three keys have to arrive at paste speed before the next one is inside a run: the
+            // first one can't be, and each of the other two has fewer than three behind it.
+            assert_eq!(in_run, i > PASTE_RUN, "key {i}");
+            now += Duration::from_millis(1);
+        }
+        assert!(
+            burst.key(&key(KeyCode::Enter, KeyModifiers::NONE), now),
+            "an Enter inside a paste is a newline"
+        );
+    }
+
+    /// Two keys a person typed, however close together, are not a paste either — and neither is
+    /// a key they held down until it repeated.
+    #[test]
+    fn keys_at_a_hand_s_speed_are_never_a_burst() {
+        let mut burst = PasteBurst::default();
+        let mut now = Instant::now();
+        for c in "안녕하세요".chars() {
+            now += Duration::from_millis(120);
+            assert!(!burst.key(&key(KeyCode::Char(c), KeyModifiers::NONE), now));
+        }
+        now += Duration::from_millis(120);
+        assert!(!burst.key(&key(KeyCode::Enter, KeyModifiers::NONE), now));
+    }
+
+    /// **A release is not a key.** Windows sends a press and a release for each one; counted as
+    /// keystrokes they would halve the interval a burst is measured over.
+    #[test]
+    fn a_key_release_neither_makes_nor_breaks_a_burst() {
+        let mut burst = PasteBurst::default();
+        let mut now = Instant::now();
+        for _ in 0..5 {
+            assert!(!burst.key(&key(KeyCode::Char('a'), KeyModifiers::NONE), now));
+            let release = KeyEvent::new_with_kind(
+                KeyCode::Char('a'),
+                KeyModifiers::NONE,
+                KeyEventKind::Release,
+            );
+            assert!(!burst.key(&release, now + Duration::from_millis(5)));
+            now += Duration::from_millis(40);
+        }
+        let release =
+            KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::NONE, KeyEventKind::Release);
+        assert!(!burst.key(&release, now));
+        assert!(
+            !burst.key(&key(KeyCode::Enter, KeyModifiers::NONE), now + Duration::from_millis(5)),
+            "five slow presses are not a paste, however many releases came with them"
+        );
+    }
+
+    /// **A running turn owes a frame when the breath steps, not on every tick.** Sixty frames a
+    /// second for the whole of a turn is what the loop used to spend, and a frame is 12-20ms at
+    /// this size in a debug build — the flicker reported while typing into a running turn.
+    #[test]
+    fn a_running_turn_owes_a_frame_when_the_breath_steps() {
+        let mut s = state();
+        s.running = true;
+        let step = crate::widgets::transcript::breath_step(s.breath_ms());
+        assert!(!tick_draws_for_the_breath(&s, step), "the breath had not stepped");
+        // Fifty ticks inside one step: not one of them is a reason to draw.
+        for _ in 0..50 {
+            assert!(!tick_draws_for_the_breath(&s, step));
+        }
+        assert!(
+            tick_draws_for_the_breath(&s, step + 1),
+            "the breath stepped and nothing asked for a frame"
+        );
+        // Nothing running: there is no breath on the screen to draw.
+        s.running = false;
+        assert!(!tick_draws_for_the_breath(&s, step + 1));
+    }
+
+    /// **A turn costs twenty frames over the breath's period, not one per tick.** This is the
+    /// whole of what the fix is worth: at 60fps a 1.6s period held ninety-six frames.
+    #[test]
+    fn the_breath_is_drawn_twenty_times_over_its_period() {
+        use crate::widgets::transcript::{breath_step, BREATH_PERIOD_MS};
+        let mut s = state();
+        s.running = true;
+        let mut asked = 0;
+        let mut last = breath_step(0);
+        for ms in (0..=BREATH_PERIOD_MS).step_by(16) {
+            // The loop reads its own clock; this is that clock walked a tick at a time.
+            s.breath_origin = std::time::Instant::now() - std::time::Duration::from_millis(ms);
+            if tick_draws_for_the_breath(&s, last) {
+                asked += 1;
+            }
+            last = breath_step(s.breath_ms());
+        }
+        assert_eq!(asked, 20, "a 1.6s period at 60fps asked for {asked} frames");
+    }
+
+    /// The picker's dot is a tempo too — the only animated thing left when no turn runs.
+    #[test]
+    fn the_pickers_dot_is_drawn_when_it_moves() {
+        let mut s = state();
+        let phase = crate::widgets::activity::blink_on(s.blink_ms());
+        // No list up: nothing to move, however the clock turns.
+        assert!(!picker_dot_moved(&s, phase));
+        assert!(!picker_dot_moved(&s, !phase));
+        // A list that is up, with nothing running in it, is not animated either —
+        // `loading_projects` has no rows yet.
+        s.picker = Some(crate::picker::Picker::loading_projects());
+        assert!(!picker_dot_moved(&s, !phase));
     }
 
     /// With the command picker open, Enter is a pick. A burst must not swallow it — the

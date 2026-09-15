@@ -1,4 +1,5 @@
-//! What one keystroke costs on the wire, and what Enter does — measured on a real pty.
+//! What Enter does when a character lands in the same read as it — the input method's commit —
+//! and what one keystroke costs on the wire.
 //!
 //! ```bash
 //! cargo test -j2 -p zyris-code --test typing -- --nocapture --ignored
@@ -115,10 +116,9 @@ impl Drop for Session {
     }
 }
 
-/// Counts what a blob of terminal output contains.
+/// How many rows the frame touched and how many bytes it took.
 fn describe(label: &str, blob: &[u8]) {
     let mut rows = std::collections::BTreeSet::new();
-    let mut csi = 0usize;
     let mut i = 0;
     while i < blob.len() {
         if blob[i] == 0x1b && blob.get(i + 1) == Some(&b'[') {
@@ -134,76 +134,62 @@ fn describe(label: &str, blob: &[u8]) {
                     }
                 }
             }
-            csi += 1;
             i = j + 1;
             continue;
         }
         i += 1;
     }
-    println!(
-        "{label:<28} bytes={:>7}  csi={csi:>5}  rows-touched={:>3}  clear={}",
-        blob.len(),
-        rows.len(),
-        if blob.windows(4).any(|w| w == b"\x1b[2J") { "YES" } else { "no" }
-    );
+    println!("{label:<34} bytes={:>7}  rows-touched={:>3}", blob.len(), rows.len());
 }
 
+/// **What a keystroke and an Enter cost on a real pty** — the shape of the answer, not a
+/// pass/fail.
+///
+/// **What this does *not* reach.** With the server refusing, the app never leaves its
+/// pre-connection loop — the one that waits for the first connection — and that loop calls
+/// `on_key` directly: the paste-burst rule (`PasteBurst`) is not on that path at all. So nothing
+/// here says anything about `enter_becomes_newline`; the Enter cases are locked in `app::tests`,
+/// where the decision is a pure function. What this shows is that the *screen* takes an Enter in
+/// one write with a character without a newline appearing in the draft — and the byte cost of a
+/// tick at the geometry the two reports came from.
 #[test]
 #[ignore = "numbers to look at, not a pass/fail"]
-fn what_typing_costs() {
+fn an_enter_in_the_same_read_as_a_character() {
     let mut app = Session::start();
     app.wait_ready();
     app.collect(Duration::from_millis(400), Duration::from_secs(2));
 
-    println!("\n== one keystroke at a time ==");
-    for ch in "abcdefgh".chars() {
-        app.send(ch.to_string().as_bytes());
-        let blob = app.collect(Duration::from_millis(250), Duration::from_secs(2));
-        describe(&format!("keystroke {ch:?}"), &blob);
-    }
+    // `hi` and the Enter in one write: a commit and an Enter with no gap.
+    app.send(b"hi\r");
+    describe(
+        "hi + Enter in one write",
+        &app.collect(Duration::from_millis(600), Duration::from_secs(3)),
+    );
 
-    println!("\n== Ctrl+L (a full repaint, for scale) ==");
-    app.send(b"\x0c");
-    let blob = app.collect(Duration::from_millis(400), Duration::from_secs(2));
-    describe("ctrl+L", &blob);
+    // What a paste looks like to the pty: one write, many keys, an Enter inside it.
+    app.send(b"aaaaaa\rbbbbbb");
+    describe(
+        "paste with an Enter inside",
+        &app.collect(Duration::from_millis(600), Duration::from_secs(3)),
+    );
 
-    println!("\n== ten characters at once ==");
-    app.send(b"0123456789");
-    let blob = app.collect(Duration::from_millis(400), Duration::from_secs(2));
-    describe("burst of 10", &blob);
+    // And one keystroke at a time, for scale.
+    app.send(b"x");
+    describe("one keystroke", &app.collect(Duration::from_millis(250), Duration::from_secs(2)));
 
-    println!("\n== one Enter, 300ms after the last letter ==");
-    app.send(b"hi");
-    std::thread::sleep(Duration::from_millis(300));
-    app.send(b"\r");
-    let blob = app.collect(Duration::from_millis(600), Duration::from_secs(3));
-    describe("hi + Enter", &blob);
-    println!("--- raw, escaped ---");
-    println!("{}", escape(&blob));
-    println!("--- every byte seen so far, escaped (tail) ---");
+    println!("\n--- the last screen, escaped (tail) ---");
     let all = app.text();
     let bytes = all.as_bytes();
-    let tail = &bytes[bytes.len().saturating_sub(1500)..];
-    println!("{}", escape(tail));
-    assert!(
-        !app.text().contains("에이전트를 찾지 못해") || !app.text().contains("No agent"),
-        "nothing to say about that"
-    );
-}
-
-/// Prints control characters so the diff can be read.
-fn escape(bytes: &[u8]) -> String {
-    let mut out = String::new();
-    for &b in bytes {
+    let tail = &bytes[bytes.len().saturating_sub(800)..];
+    let mut escaped = String::new();
+    for &b in tail {
         match b {
-            0x1b => out.push_str("\\e"),
-            b'\r' => out.push_str("\\r"),
-            b'\n' => out.push_str("\\n\n"),
-            b'\t' => out.push_str("\\t"),
-            0x07 => out.push_str("\\a"),
-            b if b < 0x20 => out.push_str(&format!("\\x{b:02x}")),
-            b => out.push(b as char),
+            0x1b => escaped.push_str("\\e"),
+            b'\r' => escaped.push_str("\\r"),
+            b'\n' => escaped.push_str("\\n\n"),
+            b if b < 0x20 => escaped.push_str(&format!("\\x{b:02x}")),
+            b => escaped.push(b as char),
         }
     }
-    out
+    println!("{escaped}");
 }

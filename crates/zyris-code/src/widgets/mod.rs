@@ -41,7 +41,9 @@ pub mod status;
 /// Public because `lines` is the pure seam the todo list is read through — the same reason
 /// `activity` and `status` are.
 pub mod todos;
-mod transcript;
+/// Public because `breath_step` is the pure seam the frame loop reads the breath's tempo through
+/// — the same reason `activity`, `status` and `todos` are.
+pub mod transcript;
 
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::Frame;
