@@ -72,7 +72,9 @@ fn full_screen() -> State {
             &mut state,
             &Action::Frame(AppFrame::Event {
                 cursor: seq,
-                entry: Some(Entry { seq, kind: EntryKind::User(format!("{i}번째 질문입니다")) }),
+                entry: Some(Entry {
+                    seq, kind: EntryKind::User(format!("{i}번째 질문입니다"))
+                }),
                 todo: None,
                 plan: None,
             }),

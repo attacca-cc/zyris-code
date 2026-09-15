@@ -161,11 +161,17 @@ fn an_enter_in_the_same_read_as_a_character() {
 
     // `hi` and the Enter in one write: a commit and an Enter with no gap.
     app.send(b"hi\r");
-    describe("hi + Enter in one write", &app.collect(Duration::from_millis(600), Duration::from_secs(3)));
+    describe(
+        "hi + Enter in one write",
+        &app.collect(Duration::from_millis(600), Duration::from_secs(3)),
+    );
 
     // What a paste looks like to the pty: one write, many keys, an Enter inside it.
     app.send(b"aaaaaa\rbbbbbb");
-    describe("paste with an Enter inside", &app.collect(Duration::from_millis(600), Duration::from_secs(3)));
+    describe(
+        "paste with an Enter inside",
+        &app.collect(Duration::from_millis(600), Duration::from_secs(3)),
+    );
 
     // And one keystroke at a time, for scale.
     app.send(b"x");
