@@ -520,7 +520,7 @@ mod tests {
 
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("\"mcpServers\""), "{text}");
-        let found = load_paths(&[path.clone()]);
+        let found = load_paths(std::slice::from_ref(&path));
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(found[0].slug, "playwright");
         match &found[0].transport {

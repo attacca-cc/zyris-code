@@ -2519,10 +2519,7 @@ pub fn apply(state: &mut State, action: &Action) {
                     return;
                 };
                 let Some(form) = manager.form.as_ref() else { return };
-                match ask_from_form(form, lang) {
-                    Ok(ask) => Ok(ask),
-                    Err(problem) => Err(problem),
-                }
+                ask_from_form(form, lang)
             };
             let _ = lang;
             match outcome {
@@ -2533,7 +2530,7 @@ pub fn apply(state: &mut State, action: &Action) {
                     }
                 }
                 Err(FormProblem::Missing(key)) => {
-                    let said = state.lang.f_needs(&key);
+                    let said = state.lang.f_needs(key);
                     if let Some(form) = manager_form(state) {
                         form.focus(key);
                         form.complaint = Some(said);
