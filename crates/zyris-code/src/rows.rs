@@ -769,7 +769,7 @@ fn make(item: &Item, width: u16, folds: &Folds, turn: Turn, lang: crate::lang::L
                 body.push(text_start(prefix_w, &md, li));
             }
         }
-        Item::Work { seq, title, parts } => {
+        Item::Work { seq, title, parts, stopped } => {
             // ── Card head ────────────────────────────────────────────────────────────────────
             // The run's title, the whole card's tool count, and everything it changed. It folds
             // the card away entirely, so it carries a marker of its own.
@@ -778,10 +778,18 @@ fn make(item: &Item, width: u16, folds: &Folds, turn: Turn, lang: crate::lang::L
             // it carries the server's latest `work_summary` — the line that keeps rewriting itself
             // to say what is happening — and once the agent has spoken it is simply done. Holding
             // the last title there would leave a stale "writing the report" above a finished turn.
-            let head = match (running, title.is_empty()) {
-                (false, _) => lang.run_done(),
-                (true, true) => lang.thinking(),
-                (true, false) => title.as_str(),
+            //
+            // **A run somebody stopped is not done** (`Item::Work::stopped`), and this head over
+            // the reasoning it was cut in is the one line that would tell them it finished. It ends
+            // the same way on the wire as a turn that ran its course, so the server is not the one
+            // that can say so.
+            let head = match (running, title.is_empty(), *stopped) {
+                // Stopped first: a run a person cut is not one that finished, and it is the only
+                // one of the four that is about what happened to the run rather than to the title.
+                (false, _, true) => lang.run_stopped(),
+                (false, _, false) => lang.run_done(),
+                (true, true, _) => lang.thinking(),
+                (true, false, _) => title.as_str(),
             };
             let steps = || {
                 parts.iter().filter_map(|p| match p {
@@ -1471,6 +1479,7 @@ mod tests {
         Item::Work {
             seq,
             title: "스크롤 계산 위치를 찾는 중".into(),
+            stopped: false,
             parts: vec![
                 think_at(seq * 10, "먼저 구조를 본다", "rows.rs가 정본이므로 거기부터 본다"),
                 Part::Step(step_at(seq * 100, "grep")),
@@ -1569,6 +1578,7 @@ mod tests {
         let json = Item::Work {
             seq: 1,
             title: "working".into(),
+            stopped: false,
             parts: vec![Part::Step(step(
                 7,
                 "code_edit",
@@ -1590,6 +1600,7 @@ mod tests {
         let body = Item::Work {
             seq: 2,
             title: "working".into(),
+            stopped: false,
             parts: vec![Part::Step(step(
                 8,
                 "read",
@@ -1650,7 +1661,10 @@ mod tests {
     /// drawn copy, which is what lets it move on a frame that rebuilt nothing.
     #[test]
     fn the_running_head_is_one_span_and_is_named_as_breathing() {
-        let items = [Item::Work { seq: 1, title: "생각하는 중".into(), parts: vec![] }];
+        let items =
+            [Item::Work {
+                seq: 1, title: "생각하는 중".into(), stopped: false, parts: vec![]
+            }];
         let out = live(&items, 40, &Folds::new(), crate::lang::Lang::Ko);
         let line = &out.lines[0];
         assert_eq!(
@@ -1680,8 +1694,12 @@ mod tests {
         let waiting = |state| {
             let mut step = step_at(100, "exec");
             step.state = state;
-            let item =
-                Item::Work { seq: 1, title: "빌드 중".into(), parts: vec![Part::Step(step)] };
+            let item = Item::Work {
+                seq: 1,
+                title: "빌드 중".into(),
+                stopped: false,
+                parts: vec![Part::Step(step)],
+            };
             let out = live(&[item], 60, &Folds::new(), crate::lang::Lang::Ko);
             // Which row the tool landed on, so the assertion does not depend on the layout.
             let row = plain(&out).iter().position(|l| l.contains("exec")).expect("the tool row");
@@ -1792,6 +1810,7 @@ mod tests {
         let item = Item::Work {
             seq: 1,
             title: "빌드하는 중".into(),
+            stopped: false,
             parts: vec![Part::Said(crate::timeline::Think {
                 seq: 7,
                 title: None,
@@ -1888,6 +1907,7 @@ mod tests {
         let items = [Item::Work {
             seq: 1,
             title: "고치는 중".into(),
+            stopped: false,
             parts: vec![Part::Step(Step {
                 seq: 100,
                 name: "edit".into(),
@@ -2257,6 +2277,7 @@ mod tests {
             Item::Work {
                 seq: 1,
                 title: "커밋하는 중".into(),
+                stopped: false,
                 parts: vec![Part::Step(step_at(100, "exec"))],
             },
             Item::Agent { seq: 2, text: "이제 커밋합니다".into() },
@@ -2414,6 +2435,7 @@ mod tests {
         let item = Item::Work {
             seq: 1,
             title: "런".into(),
+            stopped: false,
             parts: vec![Part::Step(Step {
                 seq: 100,
                 name: "todo".into(),
@@ -2456,7 +2478,7 @@ mod tests {
     /// first `work_summary` a moment after the run starts.
     #[test]
     fn a_work_card_without_a_title_yet_says_it_is_thinking() {
-        let items = [Item::Work { seq: 1, title: String::new(), parts: vec![] }];
+        let items = [Item::Work { seq: 1, title: String::new(), stopped: false, parts: vec![] }];
         let out = plain(&live(&items, 40, &Folds::new(), crate::lang::Lang::Ko));
         assert!(out[0].contains(crate::lang::Lang::Ko.thinking()), "{out:?}");
     }
@@ -2494,6 +2516,7 @@ mod tests {
         let item = Item::Work {
             seq: 1,
             title: "런".into(),
+            stopped: false,
             parts: vec![Part::Think(crate::timeline::Think {
                 seq: 2,
                 title: None,
@@ -2512,6 +2535,7 @@ mod tests {
         let item = Item::Work {
             seq: 1,
             title: "런".into(),
+            stopped: false,
             parts: vec![Part::Think(crate::timeline::Think {
                 seq: 2,
                 title: Some("파일을 훑는 중".into()),
@@ -2533,6 +2557,7 @@ mod tests {
             Item::Work {
                 seq: 1,
                 title: "카반 데이터를 모으는 중".into(),
+                stopped: false,
                 parts: vec![
                     think_at(2, "먼저 보드를 센다", "보드가 셋이다"),
                     Part::Step(step_at(3, "exec")),
@@ -2569,7 +2594,10 @@ mod tests {
     /// stale "writing the report" standing above a turn that finished minutes ago.
     #[test]
     fn a_finished_stretch_of_working_reads_as_done_not_as_its_last_title() {
-        let items = [Item::Work { seq: 1, title: "보고서 작성 중".into(), parts: vec![] }];
+        let items =
+            [Item::Work {
+                seq: 1, title: "보고서 작성 중".into(), stopped: false, parts: vec![]
+            }];
         let head = plain(&rows(&items, 78, &Folds::new(), crate::lang::Lang::Ko)).remove(0);
         assert!(head.contains(crate::lang::Lang::Ko.run_done()), "{head:?}");
         assert!(!head.contains("보고서"), "the head kept a title from the middle of it: {head:?}");
@@ -2584,6 +2612,19 @@ mod tests {
         ))
         .remove(0);
         assert!(running.contains("보고서 작성 중"), "{running:?}");
+    }
+
+    /// **A run a person stopped did not finish.** The head over the reasoning they just cut has to
+    /// say so — `완료`/`Done` there is the one line on screen telling them the opposite of what
+    /// they did (2026-09-15 user report).
+    #[test]
+    fn a_card_that_was_stopped_says_so_instead_of_done() {
+        let mut item = work();
+        let Item::Work { stopped, .. } = &mut item else { panic!("not a work item") };
+        *stopped = true;
+        let head = plain(&rows(&[item], 78, &Folds::new(), crate::lang::Lang::Ko)).remove(0);
+        assert!(head.contains(crate::lang::Lang::Ko.run_stopped()), "{head:?}");
+        assert!(!head.contains(crate::lang::Lang::Ko.run_done()), "{head:?}");
     }
 
     /// **Every `work_summary` of a turn is one card, not one each.** The server writes one whenever

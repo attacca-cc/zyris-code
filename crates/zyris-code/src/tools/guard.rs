@@ -99,7 +99,7 @@ impl<C: ServeCapability> ServeCapability for Gate<C> {
         // both announcements — the command about to run, and the job that does the running after
         // it — need this.
         let session = asking_session(&call);
-        let running = self.tell_the_screen_it_started(&gated, &args, session.clone());
+        let running = self.tell_the_screen_it_started(&gated, session.clone());
         let out = self.inner.dispatch(call).await;
         if let Some(id) = running {
             self.bridge.frame(crate::app::Frame::ExecDone { id });
@@ -128,18 +128,17 @@ impl<C: ServeCapability> Gate<C> {
     ///
     /// What's returned is the number to clear when done. **Only `exec`** — the other tools finish
     /// quickly, so announcing each one would just make the activity line flicker.
-    fn tell_the_screen_it_started(
-        &self,
-        call: &Call,
-        args: &Value,
-        session: Option<String>,
-    ) -> Option<u64> {
+    ///
+    /// **The tool's name goes, not the command.** The command is as long as the agent wrote it,
+    /// and the activity line used to be filled edge to edge with it — a heredoc, or a
+    /// `sed`-and-`awk` pipeline, and nothing else on the line survived. The line says `exec` and
+    /// the run's own subtitle now (user decision, 2026-09-15), so this is all the screen needs.
+    fn tell_the_screen_it_started(&self, call: &Call, session: Option<String>) -> Option<u64> {
         if (call.capability.as_str(), call.tool.as_str()) != ("terminal", "exec") {
             return None;
         }
-        let command = args.get("command").and_then(Value::as_str)?.to_string();
         let id = self.bridge.next_id();
-        self.bridge.frame(crate::app::Frame::ExecStart { id, command, session });
+        self.bridge.frame(crate::app::Frame::ExecStart { id, tool: call.tool.clone(), session });
         Some(id)
     }
 

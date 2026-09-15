@@ -91,9 +91,13 @@ pub fn parts_at(
     // **`Esc 정지` stops this session's turn and nothing else.** Beside work that belongs to
     // another conversation it is a lie, and pressing it would look broken.
     let stop = if ours { lang.esc_stops() } else { "" };
-    if let Some((_, command, since)) = &state.running_exec {
+    // **What is running, never the command it was given.** The command is as long as the agent
+    // wrote it — one heredoc filled this line edge to edge and took the `Esc 정지` hint off the
+    // end — while the tool's name and the run's own subtitle say what is happening in the space
+    // the line has (user decision, 2026-09-15).
+    if let Some((_, tool, since)) = &state.running_tool {
         let secs = now.saturating_duration_since(*since).as_secs();
-        return (colour, lang.running_command(command, secs) + &plan, stop);
+        return (colour, lang.running_tool(tool, &state.work_summary, secs) + &plan, stop);
     }
     // **What runs in the background is more specific than "working…".** It is shown even while a
     // turn is running — that turn is usually waiting on this job, and what a person wants to know

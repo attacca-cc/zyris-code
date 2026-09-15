@@ -5,7 +5,7 @@
 
 use crate::markdown::display_width;
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Input {
     pub text: String,
     /// Position in characters.
