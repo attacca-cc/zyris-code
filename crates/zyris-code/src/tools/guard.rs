@@ -11,8 +11,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::Value;
 use zyris::{
-    CallLimit, CapabilityDescriptor, IncomingCall, Outgoing, Payload, Result, ServeCapability,
-    WireError,
+    CapabilityDescriptor, IncomingCall, Outgoing, Payload, Result, ServeCapability, WireError,
 };
 
 use crate::app::Frame;
@@ -42,10 +41,13 @@ impl<C: ServeCapability> ServeCapability for Gate<C> {
         // the description, so trimming here only touches what gets announced.
         let mut descriptor = self.inner.descriptor();
         crate::tools::trim::trim_descriptor(&mut descriptor);
-        // **And says how long a caller should be willing to wait.** Every announced capability
-        // passes here, upstream's and this crate's alike, so this is the one place that can say it
-        // for tools whose descriptor is generated somewhere else (`terminal.exec` is exactly that).
-        declare_limits(&mut descriptor, exec_ceiling());
+        // **Nothing here declares how long a caller should wait.** This node used to attach a
+        // `CallLimit` to `terminal.exec` — half an hour by default — which handed this machine the
+        // right to decide how long somebody else's call would be held open, and, with
+        // `ZYRIS_CODE_EXEC_MAX_SECS=0`, to ask for no limit at all. A node that can ask for an
+        // unbounded wait is a node that can hang a turn, so the declaration is gone and the
+        // caller's own clock is the only one (user decision, 2026-09-14). What this node still
+        // decides is how long a process **it** started may run: `exec_ceiling`, below.
         descriptor
     }
 
@@ -179,14 +181,15 @@ impl<C: ServeCapability> Gate<C> {
     /// way to take it back. Something has to fill that in, and this is the only place every call
     /// passes.
     ///
-    /// And **what this node waits for is what it asked the caller to wait for**
-    /// (`declare_limits`). A run allowed past the ceiling would outlive the declaration, and the
-    /// caller would give up on an answer that was still coming — the failure this whole thing
-    /// exists to stop, arrived at from the other direction.
+    /// And **a run that outlives its caller is a run nobody is left to read.** This node declares
+    /// nothing, so the wait is the caller's own clock — attacca's `ZYRIS_CALL_TIMEOUT_SECS`, unless
+    /// that is raised — while the ceiling below is what this node lets a command actually run for.
+    /// The two numbers are known to different people and not to each other, so the ceiling is kept
+    /// generous (half an hour, the default) and the caller's number is the one to raise when a
+    /// build needs longer.
     ///
-    /// This used to clamp to the *wire* deadline instead, because attacca cut every node call at
-    /// 60 seconds no matter what the tool was. It does not any more: the limit declared above is
-    /// what it waits for (attacca#122).
+    /// This used to clamp to the *wire* deadline, then to a declared limit this node asked callers
+    /// to honour. Both are gone: nothing here now pretends to know how long a caller will wait.
     fn clamp_exec(
         &self,
         call: IncomingCall,
@@ -226,7 +229,7 @@ impl<C: ServeCapability> Gate<C> {
                     .get("shell")
                     .and_then(Value::as_str)
                     .filter(|s| !s.is_empty())
-                    .unwrap_or("기본 셸")
+                    .unwrap_or("default shell")
                     .to_string();
                 self.bridge.frame(Frame::ShellOpened { id, name });
             }
@@ -296,56 +299,34 @@ fn note_the_cut(out: Outgoing, ceiling: Duration) -> Outgoing {
     Outgoing::Response(Payload::from_json(v))
 }
 
-/// Added to the ceiling when it is declared, never when it is enforced. A run stopped exactly at
-/// the ceiling still has to have its output gathered and sent, and a caller that gave up one
-/// instant before that answer arrived would be the very failure this is here to prevent.
-const REPLY_HEADROOM: Duration = Duration::from_secs(10);
-
 /// The longest `terminal.exec` may run on this node before the process tree is killed.
 ///
-/// **This is the node's number, not the wire's.** It used to be neither — `exec` was cut to fit
-/// inside whatever attacca would wait, which was 60 seconds for every tool alike, and so a build
-/// could not be run at all. Now the wait is what the tool asks for (`declare_limits`), and this is
-/// what it asks for.
+/// **This is the node's own guard, and it is not announced to anybody.** It used to be both: the
+/// node declared it as the `CallLimit` a caller should wait for, which handed this machine the
+/// right to decide how long somebody else's call would be held open. That declaration is gone
+/// (user decision, 2026-09-14); what is left is the only thing this node is entitled to decide —
+/// how long a process **it** started may keep running.
 ///
-/// `ZYRIS_CODE_EXEC_MAX_SECS`, default half an hour. **`0` lifts the ceiling**, and then the
-/// declaration says `Unlimited` — the agent's own `timeout_ms` is the only bound left, and a call
-/// that omits it can hang until the connection dies. That is the point of it being off by default.
+/// `ZYRIS_CODE_EXEC_MAX_SECS`, default half an hour. **`0` lifts the ceiling** and a command then
+/// runs until the agent's own `timeout_ms` says otherwise — and a call that omits `timeout_ms` has
+/// no clock at all then, so leaving this at the default is how a node is meant to be run.
 pub(crate) fn exec_ceiling() -> Option<Duration> {
     let secs: u64 =
         std::env::var("ZYRIS_CODE_EXEC_MAX_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(1800);
     (secs > 0).then(|| Duration::from_secs(secs))
 }
 
-/// **What this node asks of a caller's clock, tool by tool.**
-///
-/// A caller cannot tell from a schema whether a tool answers in a millisecond or builds a
-/// workspace, so the node holding the tool says which (`zyris::CallLimit`, attacca#122). Saying
-/// nothing asks for the caller's own default, and that is right for everything here but one:
-/// every other tool answers well inside a minute, and `terminal.exec` is the one that cannot.
-///
-/// **What is declared is what is enforced.** The number is `clamp_exec`'s ceiling and the time to
-/// send an answer back, so the two cannot drift: declare longer and a caller waits for something
-/// this node already killed, declare shorter and it gives up on an answer that is on its way.
-pub(crate) fn declare_limits(descriptor: &mut CapabilityDescriptor, ceiling: Option<Duration>) {
-    if descriptor.name != "terminal" {
-        return;
-    }
-    let limit = match ceiling {
-        // Saturating rather than adding: `Duration + Duration` panics on overflow, and the number
-        // comes from the environment, where anything at all can be written.
-        Some(ceiling) => {
-            let secs = ceiling.as_secs().saturating_add(REPLY_HEADROOM.as_secs());
-            CallLimit::Secs(secs.min(u64::from(u32::MAX)) as u32)
-        }
-        None => CallLimit::Unlimited,
-    };
-    for tool in &mut descriptor.tools {
-        if tool.name == "exec" {
-            tool.call_limit = Some(limit);
-        }
-    }
-}
+// **What this node asks of a caller's clock, tool by tool — which is now nothing.**
+//
+// This used to attach a `zyris::CallLimit` to `terminal.exec`, so a caller would hold the call
+// open for as long as this node said. The trouble with that: a limit is a claim about somebody
+// else's wait, and this node has no way to know how long its caller can afford — while a node
+// that can say `Unlimited` can hang a turn that nobody can take back. It was removed on
+// 2026-09-14: the caller's clock is the caller's, and this node's business is only how long it
+// lets its own process run (`exec_ceiling`).
+//
+// **A comment where a function used to be, rather than a gap.** The next person looking for where
+// the limit was announced finds the answer here, and the test below holds the descriptor to it.
 
 /// A deadline that only applies to the wire. **Not the tool's deadline.**
 ///
@@ -353,8 +334,9 @@ pub(crate) fn declare_limits(descriptor: &mut CapabilityDescriptor, ceiling: Opt
 /// `ZYRIS_CALL_TIMEOUT_SECS` (60) and cannot be read from here. So `wait.until` answers in time
 /// within it — with success, saying to call again — rather than being cut off mid-wait.
 ///
-/// **`terminal.exec` no longer reads this.** It declares a limit of its own (`declare_limits`)
-/// and is held to that instead; this is what is left for the tools that declare nothing.
+/// **Every tool reads this now**, `terminal.exec` included: nothing declares a limit any more, so
+/// what is left for each of them is answering inside the window a caller brings rather than
+/// guessing at it.
 pub(crate) fn wire_deadline() -> Option<Duration> {
     let secs: u64 = std::env::var("ZYRIS_CODE_WIRE_DEADLINE_SECS")
         .ok()
@@ -498,7 +480,7 @@ mod tests {
             panic!("it left the tree with the policy set to deny")
         };
         assert!(!ran.load(Ordering::SeqCst), "the tool ran anyway");
-        assert!(e.message.contains("작업 디렉터리 밖"), "{}", e.message);
+        assert!(e.message.contains("outside the working directory"), "{}", e.message);
     }
 
     /// **`allow` runs it** — that is the whole point of the setting. No window, no waiting.
@@ -545,7 +527,7 @@ mod tests {
             panic!("it passed in plan mode")
         };
         assert!(!ran.load(Ordering::SeqCst));
-        assert!(e.message.contains("계획"), "{}", e.message);
+        assert!(e.message.contains("Plan mode"), "{}", e.message);
     }
 
     /// Reading is never blocked in any mode — without reading, nothing can start.
@@ -639,61 +621,31 @@ mod tests {
         assert_eq!(call.params.to_json().unwrap().get("timeout_ms"), None);
     }
 
-    /// **And the gate is what says it.** `declare_limits` being right is half of it — the
-    /// descriptor that goes out is the one `Gate` builds, and a limit computed but never attached
-    /// leaves every caller on its own sixty seconds with nothing to show that anything was meant.
-    /// This is the half that a change to `Gate::descriptor` breaks, and the other test cannot see.
+    /// **And nothing is declared, on purpose.** This node used to attach a `CallLimit` to
+    /// `terminal.exec` — half an hour by default, and `Unlimited` with `ZYRIS_CODE_EXEC_MAX_SECS=0`
+    /// — which meant a node could decide how long a caller would be held open, or that it would be
+    /// held open forever. The declared limit is gone (2026-09-14): the caller's clock is the
+    /// caller's, and the descriptor must go out saying nothing about it.
+    ///
+    /// **This is the test a change to `Gate::descriptor` breaks**, and nothing else can see it —
+    /// the descriptor the agent is handed is the one built there.
     #[test]
-    fn the_gate_announces_the_limit_it_declares() {
+    fn the_gate_declares_no_limit_on_any_tool() {
         let gate = Gate::new(
             zyris_caps::TerminalServer(zyris_terminal::PtyTerminal::default()),
             Bridge::new(),
         );
         let announced = gate.descriptor();
-        let exec = announced.tools.iter().find(|t| t.name == "exec").expect("exec is announced");
-        // Which limit is the environment's business; that there is one is this one's.
         assert!(
-            exec.call_limit.is_some(),
-            "the gate announced exec with nothing said about its clock",
+            announced.tools.iter().all(|t| t.call_limit.is_none()),
+            "a limit was declared on {:?}",
+            announced
+                .tools
+                .iter()
+                .filter(|t| t.call_limit.is_some())
+                .map(|t| t.name.clone())
+                .collect::<Vec<_>>(),
         );
-    }
-
-    /// **What is declared is what is enforced.** A caller is asked to wait for exactly as long as
-    /// this node will let the command run, plus the time to send an answer back. Drift either way
-    /// is a bug with a face: declared short, the caller gives up on an answer that is coming;
-    /// declared long, it waits on one this node already killed.
-    #[test]
-    fn what_exec_declares_is_what_this_node_enforces() {
-        let terminal = |ceiling| {
-            let mut d = zyris::ServeCapability::descriptor(&zyris_caps::TerminalServer(
-                zyris_terminal::PtyTerminal::default(),
-            ));
-            declare_limits(&mut d, ceiling);
-            d
-        };
-        let limit = |d: &CapabilityDescriptor, tool: &str| {
-            d.tools.iter().find(|t| t.name == tool).expect("the tool is announced").call_limit
-        };
-
-        let d = terminal(Some(Duration::from_secs(1800)));
-        assert_eq!(
-            limit(&d, "exec"),
-            Some(CallLimit::Secs(1810)),
-            "the declaration must cover the ceiling and the answer",
-        );
-        // **Only `exec`.** Everything else here answers well inside a caller's own default, and
-        // saying so for them would be asking a caller to wait on tools that never need it.
-        assert_eq!(limit(&d, "read"), None, "only exec has anything to declare");
-
-        // Lifted, it says so rather than naming a number nothing holds it to.
-        let lifted = terminal(None);
-        assert_eq!(limit(&lifted, "exec"), Some(CallLimit::Unlimited));
-
-        // And nothing outside `terminal` is touched.
-        let (fake, _) = Fake::new("file_io");
-        let mut other = zyris::ServeCapability::descriptor(&fake);
-        declare_limits(&mut other, Some(Duration::from_secs(1800)));
-        assert_eq!(other.tools[0].call_limit, None, "another capability is not exec's business");
     }
 
     /// Cut because time ran out, **the result says so.** Cut silently, the agent

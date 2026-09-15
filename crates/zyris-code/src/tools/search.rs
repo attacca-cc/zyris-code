@@ -104,8 +104,8 @@ impl LocalSearch {
 /// exactly the implementation ripgrep uses.
 fn matcher(root: &Path, pattern: &str) -> Result<ignore::overrides::Override, WireError> {
     let mut b = ignore::overrides::OverrideBuilder::new(root);
-    b.add(pattern).map_err(|e| WireError::invalid_params(format!("패턴이 잘못됐습니다: {e}")))?;
-    b.build().map_err(|e| WireError::invalid_params(format!("패턴이 잘못됐습니다: {e}")))
+    b.add(pattern).map_err(|e| WireError::invalid_params(format!("bad pattern: {e}")))?;
+    b.build().map_err(|e| WireError::invalid_params(format!("bad pattern: {e}")))
 }
 
 /// Builds the walk.
@@ -180,7 +180,7 @@ impl LocalSearch {
     ) -> Result<Found, WireError> {
         let re = regex::Regex::new(pattern)
             // **Must be a sentence the agent can read and fix.**
-            .map_err(|e| WireError::invalid_params(format!("정규식이 잘못됐습니다: {e}")))?;
+            .map_err(|e| WireError::invalid_params(format!("bad regular expression: {e}")))?;
         let at = self.at(path);
         let only = glob.map(|g| matcher(&at, g)).transpose()?;
 
@@ -244,7 +244,7 @@ impl Search for LocalSearch {
         let limit = limit.unwrap_or(GLOB_LIMIT).max(1);
         tokio::task::spawn_blocking(move || me.glob_now(&pattern, path.as_deref(), limit))
             .await
-            .map_err(|e| WireError::internal(format!("검색이 끝나지 못했습니다: {e}")))?
+            .map_err(|e| WireError::internal(format!("the search did not finish: {e}")))?
     }
 
     async fn grep(
@@ -260,7 +260,7 @@ impl Search for LocalSearch {
             me.grep_now(&pattern, path.as_deref(), glob.as_deref(), limit)
         })
         .await
-        .map_err(|e| WireError::internal(format!("검색이 끝나지 못했습니다: {e}")))?
+        .map_err(|e| WireError::internal(format!("the search did not finish: {e}")))?
     }
 }
 

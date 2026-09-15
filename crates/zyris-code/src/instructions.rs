@@ -97,7 +97,7 @@ fn clip(text: String, limit: usize) -> String {
     if text.len() <= limit {
         return text;
     }
-    const NOTICE: &str = "\n\n… (길어서 여기까지만 실었습니다)";
+    const NOTICE: &str = "\n\n… (clipped here ‒ the rest was too long)";
     let mut cut = limit.saturating_sub(NOTICE.len());
     while cut > 0 && !text.is_char_boundary(cut) {
         cut -= 1;
@@ -233,7 +233,7 @@ mod tests {
         write(d.path(), "CLAUDE.md", &"가".repeat(ONE_LIMIT));
         let found = collect(d.path());
         assert!(found[0].text.len() <= ONE_LIMIT, "{} bytes", found[0].text.len());
-        assert!(found[0].text.contains("여기까지만"), "it doesn't say it was clipped");
+        assert!(found[0].text.contains("clipped here"), "it doesn't say it was clipped");
     }
 
     /// Korean must not be cut in half — cutting by bytes is how that happens.

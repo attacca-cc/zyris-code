@@ -88,9 +88,9 @@ impl Skills {
         match self.found.iter().find(|(i, _)| i.name == name) {
             Some((_, path)) => std::fs::read_to_string(path)
                 .map(|body| strip_front_matter(&body).to_string())
-                .map_err(|e| WireError::internal(format!("스킬을 읽지 못했습니다: {e}"))),
+                .map_err(|e| WireError::internal(format!("could not read the skill: {e}"))),
             None => Err(WireError::invalid_params(format!(
-                "'{name}' 스킬이 없습니다. 있는 것: {}",
+                "there is no skill '{name}'. Available: {}",
                 self.found.iter().map(|(i, _)| i.name.as_str()).collect::<Vec<_>>().join(", ")
             ))),
         }

@@ -9323,19 +9323,13 @@ mod tests {
         s.manager_out = None;
         apply(&mut s, &Action::ManagerMove(1));
         apply(&mut s, &Action::ManagerUpdate);
-        assert_eq!(
-            s.manager_out,
-            Some(ManagerAsk::UpdatePlugin { name: "fetched-one".into() })
-        );
+        assert_eq!(s.manager_out, Some(ManagerAsk::UpdatePlugin { name: "fetched-one".into() }));
 
         // Removing is offered on a fetched plugin and nowhere else.
         s.manager_out = None;
         apply(&mut s, &Action::ManagerRemove);
         apply(&mut s, &Action::ManagerRemove);
-        assert_eq!(
-            s.manager_out,
-            Some(ManagerAsk::RemovePlugin { name: "fetched-one".into() })
-        );
+        assert_eq!(s.manager_out, Some(ManagerAsk::RemovePlugin { name: "fetched-one".into() }));
     }
 
     /// **A frame is not a key.** While an answer streams — or on an idle screen, where the usage

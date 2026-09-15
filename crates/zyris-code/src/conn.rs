@@ -432,17 +432,27 @@ const SUFFIX: &str = "zyris-code";
 /// cannot know whether that happened. The display name goes over the wire unchanged.
 ///
 /// `cwd` is passed rather than read so a test does not have to move the process.
+///
+/// The preamble that tells an agent which computer it is holding.
+///
+/// **English, like everything else a tool returns.** The agent is the reader, and the machine this
+/// node is on happens to be Korean — a preamble in Korean is a preamble half the models in the
+/// world read as noise (user decision, 2026-09-14).
+///
+/// The person at the keyboard reads this too, through `/rules`, so it is written to be read by
+/// either.
 pub fn node_preamble(cwd: &std::path::Path) -> String {
     format!(
-        "이 대화는 아래 노드에서 오고 있습니다. 말을 거는 사람은 지금 이 컴퓨터 앞에 \
-         있습니다.\n\n\
-         - 이름: {name}\n\
-         - 작업 디렉터리: {cwd}\n\
-         - 플랫폼: {platform}\n\n\
-         도구 설명 맨 앞의 대괄호가 그 도구가 어느 노드의 것인지 말해 줍니다. 위 이름과 \
-         같은 것이 이 컴퓨터의 도구이고(도구 이름으로는 대개 `zyris__{slug}__…`), 파일을 \
-         읽고 고치는 것도 셸을 돌리는 것도 전부 그쪽입니다. 다른 노드의 도구는 다른 \
-         컴퓨터를 만집니다 ‒ 그 컴퓨터 이야기가 아니면 쓰지 마세요.",
+        "This conversation is coming from the node below. The person talking to you is at \
+         that computer right now.\n\n\
+         - name: {name}\n\
+         - working directory: {cwd}\n\
+         - platform: {platform}\n\n\
+         The bracketed word at the front of a tool's description says which node the tool \
+         belongs to. The node named above is this computer ‒ its tools are usually named \
+         `zyris__{slug}__…` ‒ and reading and editing files, running a shell and everything \
+         else here happens there. Another node's tools touch a different computer: do not use \
+         them unless that computer is what the conversation is about.",
         name = node_name(),
         cwd = cwd.display(),
         platform = std::env::consts::OS,

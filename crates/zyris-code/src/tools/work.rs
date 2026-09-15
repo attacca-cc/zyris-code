@@ -132,7 +132,7 @@ impl Works {
 
     fn api(&self) -> Result<Arc<AttaccaApiClient>, WireError> {
         self.api.borrow().clone().ok_or_else(|| {
-            WireError::internal("아직 attacca에 붙지 않았습니다. 잠시 뒤에 다시 불러 주세요.")
+            WireError::internal("Not attached to attacca yet. Call again in a moment.")
         })
     }
 }
@@ -146,7 +146,7 @@ impl Work for Works {
         agent_id: Option<String>,
     ) -> zyris::Result<WorkView> {
         if goal.trim().is_empty() {
-            return Err(WireError::invalid_params("goal이 비어 있습니다."));
+            return Err(WireError::invalid_params("`goal` is empty"));
         }
         let work =
             self.api()?.create_work(ZNewWork { message: goal, agent_id, project_id }).await?;

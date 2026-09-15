@@ -245,7 +245,7 @@ pub fn remove_server(path: &Path, slug: &str) -> Result<(), String> {
         }
     }
     if !removed {
-        return Err(crate::lang::current().mcp_not_in_file(slug));
+        return Err(format!("`{slug}` is not in {}", path.display()));
     }
     write_json(path, &value)
 }

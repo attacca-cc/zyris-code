@@ -36,7 +36,9 @@ impl Rules {
         let here = crate::conn::node_preamble(&self.cwd);
         match self.load() {
             Some(rules) => format!("{here}\n\n{rules}"),
-            None => format!("{here}\n\n(이 작업 디렉터리에는 CLAUDE.md∙AGENTS.md 지침이 없습니다)"),
+            None => {
+                format!("{here}\n\n(no CLAUDE.md or AGENTS.md rules in this working directory)")
+            }
         }
     }
 }
@@ -83,7 +85,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let r = Rules::new(d.path().to_path_buf());
         let out = RulesCap::load(&r).await.unwrap();
-        assert!(out.contains("없습니다"), "{out}");
+        assert!(out.contains("no CLAUDE.md or AGENTS.md rules"), "{out}");
     }
 
     /// **Which node this is comes back even from a directory with no conventions.** A job or a

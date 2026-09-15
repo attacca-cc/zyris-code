@@ -155,32 +155,38 @@ impl LocalEdit {
                     Ok(v) => v,
                     Err(e) => e.to_string(),
                 };
-                return Err(WireError::invalid_params(
-                    crate::lang::current().edit_changed_after_read(&clip(path), base, &now_s),
-                ));
+                return Err(WireError::invalid_params(format!(
+                    "'{}' changed after it was read (base_version {base} != current {now_s}). \
+                     Re-read the current content with file_io.read and retry with the new \
+                     version token as base_version.",
+                    clip(path)
+                )));
             }
         }
         // Whole-file writes default to new files only — to overwrite an existing file you must
         // present proof via base_version that you've seen the file.
         if require_base_for_existing && existed && base_version.is_none() {
-            return Err(WireError::invalid_params(
-                crate::lang::current().edit_exists_no_base(&clip(path)),
-            ));
+            return Err(WireError::invalid_params(format!(
+                "'{}' already exists ‒ pass base_version to overwrite it. Use the \
+                 stat.modified_unix_ms:stat.size of the read response, or code_edit.version's \
+                 version, as-is.",
+                clip(path)
+            )));
         }
 
         let new = change(&old)?;
         if let Some(parent) = full.parent() {
             tokio::fs::create_dir_all(parent).await.map_err(|e| {
-                WireError::internal(crate::lang::current().edit_mkdir_error(&e.to_string()))
+                WireError::internal(format!("couldn't create the parent directory: {e}"))
             })?;
         }
         // **Snapshot right before writing.** All three tools meet here, so there's a single spot.
         // A failure doesn't block the edit — if a missing safety net stopped work,
         // you'd end up with files that can't be fixed (see `undo::snapshot`'s comment).
         self.undo.snapshot(&full);
-        atomic_write(&full, new.as_bytes()).await.map_err(|e| {
-            WireError::internal(crate::lang::current().edit_write_error(&e.to_string()))
-        })?;
+        atomic_write(&full, new.as_bytes())
+            .await
+            .map_err(|e| WireError::internal(format!("couldn't write: {e}")))?;
         let shown = full.to_string_lossy().to_string();
         let d = diff(&old, &new, &shown);
         let version = current_version(&full).unwrap_or_else(|_| "?".into());
@@ -245,12 +251,16 @@ async fn atomic_write(full: &Path, content: &[u8]) -> std::io::Result<()> {
 fn substitute(body: &str, spec: &EditSpec) -> Result<String, WireError> {
     let hits = body.matches(&spec.old_string).count();
     match hits {
-        0 => Err(WireError::invalid_params(
-            crate::lang::current().edit_not_found(&clip(&spec.old_string)),
-        )),
+        0 => Err(WireError::invalid_params(format!(
+            "'{}' wasn't found in the file. Read the current content with file_io.read.",
+            clip(&spec.old_string)
+        ))),
         1 => Ok(body.replacen(&spec.old_string, &spec.new_string, 1)),
         _ if spec.replace_all => Ok(body.replace(&spec.old_string, &spec.new_string)),
-        n => Err(WireError::invalid_params(crate::lang::current().edit_ambiguous(n))),
+        n => Err(WireError::invalid_params(format!(
+            "add more context to point at one spot, or turn replace_all on. \
+             (it appears {n} times in the file)"
+        ))),
     }
 }
 
@@ -297,14 +307,10 @@ impl CodeEdit for LocalEdit {
     async fn version(&self, path: String) -> zyris::Result<FileVersion> {
         let full = resolve_under(&self.root, &path);
         let content = tokio::fs::read(&full).await.map_err(|e| {
-            WireError::invalid_params(
-                crate::lang::current().edit_read_error(&clip(&path), &e.to_string()),
-            )
+            WireError::invalid_params(format!("couldn't read '{}': {e}", clip(&path)))
         })?;
         let md = tokio::fs::metadata(&full).await.map_err(|e| {
-            WireError::invalid_params(
-                crate::lang::current().edit_stat_error(&clip(&path), &e.to_string()),
-            )
+            WireError::invalid_params(format!("couldn't stat '{}': {e}", clip(&path)))
         })?;
         let mtime_ms = mtime_ms(&md);
         let size = md.len();
@@ -557,12 +563,17 @@ mod tests {
         assert_eq!(e.message, stale_message(&dir, &good));
     }
 
-    /// The stale-version message **in whatever language is set.** These assertions used to hold a
-    /// Korean fragment and only passed because another test had set the global language to Korean
-    /// first — the process default is English.
+    /// The stale-version message. **One sentence, in English, whatever the screen's language is**
+    /// — this is a tool's answer, and the reader is the agent. It used to be built from
+    /// `lang::current()` and only passed because another test had set the global language to
+    /// Korean first; the process default is English.
     fn stale_message(dir: &tempfile::TempDir, base: &str) -> String {
         let now = current_version(&dir.path().join("a.txt")).unwrap();
-        crate::lang::current().edit_changed_after_read("a.txt", base, &now)
+        format!(
+            "'a.txt' changed after it was read (base_version {base} != current {now}). \
+             Re-read the current content with file_io.read and retry with the new version \
+             token as base_version."
+        )
     }
 
     /// Overwriting an existing file without base_version must be refused — it's the prime source of silent overwrites.

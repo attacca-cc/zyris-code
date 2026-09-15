@@ -8,8 +8,10 @@
 //!
 //! - `State.lang` — used by the drawing side. Since `apply` must stay pure, it has to be carried as
 //!   state, and screen tests being able to fix a language and look at it is thanks to this too.
-//! - `lang::current()` — used where there is no screen (the shell notice in `notice.rs`, errors the
-//!   tools return). Carrying it as an argument that far would string a `lang` through functions that aren't even pure.
+//! - `lang::current()` — used where there is no screen: the shell notice in `notice.rs`, which
+//!   goes to the terminal a person is looking at. **Not for anything a tool returns** — the agent
+//!   is what reads a tool's answer, and it does not read Korean (2026-09-14, user decision: the
+//!   tools answered in Korean on a Korean machine, which is the wrong reader).
 //!
 //! `/config lang` sets both together. If they diverged, the conversation window would be English while only the shell notice stayed Korean.
 //!
@@ -1891,15 +1893,6 @@ impl Lang {
             }
         }
     }
-    /// Asked to take out a server the file does not name. **The file may have been edited since
-    /// the panel was drawn** — saying so beats reporting a success nobody can see.
-    pub fn mcp_not_in_file(self, slug: &str) -> String {
-        match self {
-            Lang::Ko => format!("`{slug}`이 그 파일에 없습니다. `r`로 다시 읽어 보세요."),
-            Lang::En => format!("`{slug}` is not in that file. Press `r` to read it again."),
-        }
-    }
-
     /// Nothing changed, because it already was that way.
     pub fn mcp_already(self, slug: &str, on: bool) -> String {
         match (self, on) {
@@ -2540,80 +2533,6 @@ impl Lang {
     pub fn untitled(self) -> &'static str {
         self.pick("제목 없음", "untitled")
     }
-
-    // ── Edit tool errors (returned to the agent, shown in the timeline)
-    pub fn edit_mkdir_error(self, e: &str) -> String {
-        match self {
-            Lang::Ko => format!("상위 디렉터리를 만들지 못했습니다: {e}"),
-            Lang::En => format!("Couldn't create the parent directory: {e}"),
-        }
-    }
-    pub fn edit_changed_after_read(self, path: &str, base: &str, now: &str) -> String {
-        match self {
-            Lang::Ko => format!(
-                "'{path}'이(가) 읽은 뒤 바뀌었습니다 (base_version {base} != 지금 {now}). \
-                 file_io.read로 지금 내용을 다시 읽고, 새 버전 토큰을 base_version으로 다시 시도하세요."
-            ),
-            Lang::En => format!(
-                "'{path}' changed after it was read (base_version {base} != current {now}). \
-                 Re-read the current content with file_io.read and retry with the new version \
-                 token as base_version."
-            ),
-        }
-    }
-    pub fn edit_exists_no_base(self, path: &str) -> String {
-        match self {
-            Lang::Ko => format!(
-                "'{path}'은(는) 이미 있는 파일입니다 ‒ 덮어쓰려면 base_version을 주세요. \
-                 읽은 응답의 stat.modified_unix_ms:stat.size 또는 code_edit.version의 version을 \
-                 그대로 넘기세요."
-            ),
-            Lang::En => format!(
-                "'{path}' already exists ‒ pass base_version to overwrite it. Use the \
-                 stat.modified_unix_ms:stat.size of the read response or code_edit.version's \
-                 version as-is."
-            ),
-        }
-    }
-    pub fn edit_write_error(self, e: &str) -> String {
-        match self {
-            Lang::Ko => format!("쓰지 못했습니다: {e}"),
-            Lang::En => format!("Couldn't write: {e}"),
-        }
-    }
-    pub fn edit_not_found(self, needle: &str) -> String {
-        match self {
-            Lang::Ko => format!(
-                "'{needle}'을(를) 파일에서 찾지 못했습니다. file_io.read로 지금 내용을 다시 읽으세요."
-            ),
-            Lang::En => format!(
-                "'{needle}' wasn't found in the file. Read the current content with file_io.read."
-            ),
-        }
-    }
-    pub fn edit_ambiguous(self, n: usize) -> String {
-        match self {
-            Lang::Ko => format!(
-                "앞뒤를 더 붙여 한 곳만 가리키거나 replace_all을 켜세요. (파일에 {n}번 나옵니다)"
-            ),
-            Lang::En => format!(
-                "Add more context to point at one spot, or turn replace_all on. (It appears \
-                 {n} times in the file)"
-            ),
-        }
-    }
-    pub fn edit_read_error(self, path: &str, e: &str) -> String {
-        match self {
-            Lang::Ko => format!("'{path}'을(를) 읽지 못했습니다: {e}"),
-            Lang::En => format!("Couldn't read '{path}': {e}"),
-        }
-    }
-    pub fn edit_stat_error(self, path: &str, e: &str) -> String {
-        match self {
-            Lang::Ko => format!("'{path}'을(를) 확인하지 못했습니다: {e}"),
-            Lang::En => format!("Couldn't stat '{path}': {e}"),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -2884,12 +2803,6 @@ mod tests {
             en.project_list_error("x"),
             en.thread_list_error("x"),
             en.history_error("x"),
-            en.edit_mkdir_error("x"),
-            en.edit_write_error("x"),
-            en.edit_not_found("abc"),
-            en.edit_ambiguous(3),
-            en.edit_read_error("p", "x"),
-            en.edit_stat_error("p", "x"),
             en.plugin_removed("x"),
             en.plugin_unknown("x"),
             en.detail_exit_code(1),
