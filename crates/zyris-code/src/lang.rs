@@ -2130,10 +2130,10 @@ impl Lang {
     pub fn add_keys(self) -> String {
         match self {
             Lang::Ko => {
-                "글자 입력 ‒ ↑↓·Tab 칸 이동 ‒ ←→ 값 고르기 ‒ Enter 다음·추가 ‒ Esc 취소".to_string()
+                "글자 입력 ‒ ↑↓∙Tab 칸 이동 ‒ ←→ 값 고르기 ‒ Enter 다음∙추가 ‒ Esc 취소".to_string()
             }
             Lang::En => {
-                "type ‒ ↑↓·Tab move ‒ ←→ pick a value ‒ Enter next/add ‒ Esc cancel".to_string()
+                "type ‒ ↑↓∙Tab move ‒ ←→ pick a value ‒ Enter next/add ‒ Esc cancel".to_string()
             }
         }
     }
@@ -2198,14 +2198,14 @@ impl Lang {
             ),
             "where" => (
                 "이 컴퓨터에 두면 모든 프로젝트에서 쓰고, 저장소에 두면 git에 잡힙니다",
-                "this machine: every project · this repository: it shows up in git",
+                "this machine: every project ∙ this repository: it shows up in git",
             ),
             "url" => (
                 "`http://` 또는 `https://`로 시작하는 주소",
                 "an address starting with `http://` or `https://`",
             ),
             "source" => (
-                "`owner/repo`·`https://…`·`git@…`·로컬 경로 ‒ git으로 받습니다",
+                "`owner/repo`∙`https://…`∙`git@…`∙로컬 경로 ‒ git으로 받습니다",
                 "`owner/repo`, `https://…`, `git@…` or a local path ‒ fetched with git",
             ),
             _ => ("", ""),
