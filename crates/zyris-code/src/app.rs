@@ -410,10 +410,10 @@ pub struct State {
     pub update_wanted: bool,
     /// Have we already asked for this turn to stop?
     ///
-    /// **Without this there is no way to close the window when the server hangs.** Ctrl+C
-    /// goes to cancel while a turn runs, and if the cancel does not take so `running` stays
-    /// true, every press just sends the same request again. Once asked, the next Ctrl+C is
-    /// handed over to quitting.
+    /// **What says the turn is on its way out.** Esc asks for it (`Action::Cancel`), and until
+    /// the server answers, the activity line says so rather than looking frozen. **Ctrl+C never
+    /// sets this** — ending the window and ending the turn are two different things, and only one
+    /// of them can be taken back (2026-09-15).
     pub stopping: bool,
     /// Text selected in the transcript area. **It goes to the system clipboard on release.**
     pub selection: Option<String>,
@@ -462,6 +462,10 @@ pub struct State {
     /// `transcript::draw` fills it from the rows cache; `widgets::draw` wraps those cells
     /// in OSC 8 so the terminal makes them Ctrl+clickable.
     pub view_links: Vec<Vec<crate::markdown::Link>>,
+    /// **Where each drawn conversation line's own text starts**, parallel to the lines the
+    /// transcript last drew. `transcript::draw` fills it from the rows cache; the selection starts
+    /// where the text does, so a drag never picks the margin up (`rows::furniture_width`).
+    pub view_body: Vec<u16>,
     /// Links visible in the final composed frame, in absolute screen cells. Rebuilt every frame
     /// so an overlay can replace both the drawing and the hit target underneath it.
     pub screen_links: Vec<ScreenLink>,
@@ -506,6 +510,12 @@ pub struct State {
     /// moving must not count as a click. Overwritten by the next press, read when the button
     /// comes up (`Release`).
     pub press_cannot_click: bool,
+    /// When the last press landed and where — a second one on the same row within [`DOUBLE_CLICK`]
+    /// is a double click, and it takes that row.
+    pub last_press: Option<(Instant, u16, u16)>,
+    /// **The fold a single click just toggled**, if it toggled one, so the double click that may
+    /// follow can put it back. A double click asks for the line, not for a card to open.
+    pub click_flipped: Option<i64>,
     /// The visible text of the last drawn frame, one `String` per screen row. Mouse selection
     /// reads from this — a drag anywhere on the screen extracts what it covers.
     pub screen: Vec<String>,
@@ -741,6 +751,7 @@ impl Default for State {
             view_cards: std::collections::HashMap::new(),
             view_open: std::collections::HashMap::new(),
             view_links: Vec::new(),
+            view_body: Vec::new(),
             screen_links: Vec::new(),
             drag: None,
             drag_top: 0,
@@ -750,6 +761,8 @@ impl Default for State {
             selection_stale: false,
             dragging: false,
             press_cannot_click: false,
+            last_press: None,
+            click_flipped: None,
             screen: Vec::new(),
             asking: None,
             plan: None,
@@ -801,6 +814,9 @@ impl Default for State {
 
 /// After one Ctrl+C, pressing again within this window quits.
 pub const QUIT_WINDOW: Duration = Duration::from_millis(1500);
+
+/// Two presses on the same row within this window are a double click, and the row is selected.
+pub const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
 /// A fold on the move, on its way in.
 #[derive(Debug, Clone, Copy)]
@@ -957,6 +973,32 @@ impl State {
             let ((r0, _), (r1, _)) = drag.ordered();
             r0 >= top && r1 < top + self.view_height
         })
+    }
+
+    /// **What the highlight covers, as text.** One place, because the colour on the cells and the
+    /// words on the clipboard have to agree — reading the margins off the screen twice is how they
+    /// drift apart.
+    pub fn selected_text(&self, drag: &crate::selection::Drag) -> String {
+        crate::selection::extract(&self.screen, &self.screen_body(), drag)
+    }
+
+    /// **Where each row of the screen's own text starts**, one entry per drawn row.
+    ///
+    /// The conversation's rows are the layout's answer (`view_body`) — the layout is the only thing
+    /// that knows what it drew in a line's margin. Everything else (the bars, the input, an overlay,
+    /// a screen drawn before the first layout) has no such record, and there the text heuristic
+    /// stands in.
+    pub fn screen_body(&self) -> Vec<u16> {
+        (0..self.screen.len()).map(|row| self.body_of(row)).collect()
+    }
+
+    /// Where row `row` of the screen's own text starts — the conversation's record where it has one.
+    pub fn body_of(&self, row: usize) -> u16 {
+        let top = self.view_origin.1 as usize;
+        if row >= top && row - top < self.view_body.len() {
+            return self.view_body[row - top];
+        }
+        self.screen.get(row).map_or(0, |line| crate::selection::body_start(line) as u16)
     }
 
     /// Lets go of a highlight the conversation cannot carry. Called wherever it scrolls.
@@ -1402,16 +1444,16 @@ pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
     }
 
     match key.code {
-        // **Ctrl+C is the key that stops or quits.** Copy is not here — with three meanings
-        // overlapping there is no telling what happens when it matters. Selected text goes
-        // to the clipboard on release.
+        // **Ctrl+C quits and nothing else.** It used to stop the running turn first and quit on
+        // the second press, which made one key mean two things — and the one a person did not
+        // intend is the one that cannot be taken back. **Esc is the key that stops a turn, and it
+        // is the only one** (2026-09-15). Copy is not here either: the selected text goes to the
+        // clipboard the moment the mouse is released.
         KeyCode::Char('c') if ctrl => {
-            // **Once it cancels, after that it quits.** There is a case where the cancel
-            // does not take and `running` stays true — when the server hangs. The window
-            // must still be closable then.
-            if state.running && !state.stopping {
-                vec![Action::Cancel]
-            } else if state.quit_pending() {
+            // **Two presses, so one accident does not close the window.** A turn running, or a
+            // stop that never took because the server hung, no longer stands between the press
+            // and the quit — this is the way out whatever the session is doing.
+            if state.quit_pending() {
                 vec![Action::Quit]
             } else {
                 vec![Action::ArmQuit]
@@ -1463,10 +1505,9 @@ pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
         KeyCode::Char('b') if alt => vec![Action::WordLeft],
         KeyCode::Char('f') if alt => vec![Action::WordRight],
         KeyCode::Char('d') if alt => vec![Action::DeleteWordAfter],
-        // **`Ctrl+D` deletes forward and never quits.** In a shell it ends the session on an
-        // empty line; here `Ctrl+C` is the one key that stops or quits, and a second way out —
-        // reachable by one keystroke on an empty draft — is exactly the accident that rule
-        // exists to prevent.
+        // **Esc is the only key that stops a turn.** In a shell `Ctrl+D` ends the session on an
+        // empty line; here a second way out — reachable by one keystroke on an empty draft — is
+        // exactly the accident that rule exists to prevent.
         KeyCode::Char('d') if ctrl => vec![Action::Delete],
         // History, same rules as the arrows. In a shell these always reach for history, but
         // here that would throw away a draft in progress, so they follow `↑`/`↓` exactly rather
@@ -1482,6 +1523,8 @@ pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
         // With a selection up, Esc clears it. This comes before cancelling a running turn —
         // what is in front of you comes first.
         KeyCode::Esc if state.selection.is_some() => vec![Action::ClearSelection],
+        // **The one key that stops a turn.** Ctrl+C is the way out of the app (2026-09-15),
+        // so there is no second key here to be pressed by mistake.
         KeyCode::Esc if state.running => vec![Action::Cancel],
         // **Shift+Enter and Alt+Enter are newlines.** With the kitty keyboard protocol on
         // (`PushKeyboardEnhancementFlags` in `run()` below) Shift+Enter arrives separately as
@@ -1932,6 +1975,44 @@ pub fn apply(state: &mut State, action: &Action) {
                     return;
                 }
             }
+            // **A second press on the same row is a double click, and the row is taken.** Nothing
+            // moves the pointer between the two, so the row is the one under it. The first press
+            // went through `Release`, where a click folds whatever it landed on — and that has to
+            // be put back: the person asked for the line, not for a card to open.
+            let now = Instant::now();
+            let double = matches!(action, Action::Press(..))
+                && state.last_press.is_some_and(|(at, px, py)| {
+                    now.duration_since(at) < DOUBLE_CLICK && py == *y && px.abs_diff(*x) <= 1
+                });
+            // **Only a press that could become a click opens the sequence.** The press that
+            // brought the window its focus is not one (it never folds, never selects) — counting
+            // it would make the next ordinary click look like the second half of a double click.
+            if matches!(action, Action::Press(..)) {
+                state.last_press = Some((now, *x, *y));
+            }
+            if double {
+                if let Some(seq) = state.click_flipped.take() {
+                    state.flip_fold(seq);
+                }
+                // **The whole row, in screen columns.** Past the last character there is nothing
+                // to aim at, so an end off the right of the terminal is exactly "to the end of the
+                // line" — `extract` clamps it to the row.
+                let drag = crate::selection::Drag {
+                    from: (*y as usize, 0),
+                    to: (*y as usize, u16::MAX as usize),
+                };
+                state.drag = Some(drag);
+                state.drag_top = state.view_top;
+                state.drag_anchor = state.content_at(*x, *y).map(|(row, _)| row);
+                // **Not a drag.** The row itself is what was asked for, so a pointer moving
+                // afterwards does not stretch the selection over the lines below.
+                state.dragging = false;
+                state.press_cannot_click = true;
+                let text = state.selected_text(&drag);
+                state.selection = (!text.trim().is_empty()).then_some(text);
+                return;
+            }
+            state.click_flipped = None;
             // A new press discards the previous selection.
             state.selection = None;
             // **The whole screen is selectable — blank space included.** A drag that starts
@@ -1963,7 +2044,7 @@ pub fn apply(state: &mut State, action: &Action) {
                     // heavier in proportion to the screen — a drag runs at hand speed,
                     // so building it then is enough. The text comes from the last drawn
                     // frame, so any visible text — even the enrollment code — is copyable.
-                    let text = crate::selection::extract(&state.screen, &drag);
+                    let text = state.selected_text(&drag);
                     state.selection = (!text.trim().is_empty()).then_some(text);
                 }
             }
@@ -1992,6 +2073,10 @@ pub fn apply(state: &mut State, action: &Action) {
                 let content = state.content_at(drag.from.1 as u16, drag.from.0 as u16);
                 if let Some(&seq) = content.and_then(|(r, _)| state.view_cards.get(&r)) {
                     state.flip_fold(seq);
+                    // **Remembered for one double-click window.** The press that may arrive right
+                    // after is the second half of a double click, and it puts this back — taking a
+                    // line is not opening a card.
+                    state.click_flipped = Some(seq);
                 }
             }
         }
@@ -2460,8 +2545,8 @@ fn apply_frame(state: &mut State, frame: &Frame) {
                 state.flush_queue = true;
             }
             // The request to stop lasts only for that turn. **Release it only on a change** —
-            // the same state arrives many times while running, and releasing every time
-            // would make Ctrl+C repeat the cancel forever.
+            // the same state arrives many times while running, and releasing every time would
+            // make Esc repeat the cancel forever.
             if state.running != *running {
                 state.stopping = false;
             }
@@ -4370,8 +4455,9 @@ async fn run_inner(
                     apply(&mut state, &action);
 
                     // **Selected text goes to the clipboard the moment the mouse is
-                    // released.** There is no key to press — leaving Ctrl+C as the one stop
-                    // key is less confusing when it matters. `apply` sets the range, so
+                    // released.** There is no key to press — copy on a key would have to share it
+                    // with something else, and the something else is quitting. `apply` sets the
+                    // range, so
                     // this has to come after it. Exporting is I/O, hence here. A terminal
                     // that does not know OSC 52 ignores it quietly, at no cost — but one that
                     // was never going to read it is not asked at all (`caps.osc52`), because a
@@ -6667,6 +6753,30 @@ mod tests {
         );
     }
 
+    /// **A double click takes the row.** Nothing moves the pointer between the two presses, so the
+    /// second one names the row under it. The first press went through `Release`, which folds
+    /// whatever a click lands on — and that has to be put back: the person asked for the line, not
+    /// for a card to open (2026-09-15).
+    #[test]
+    fn a_double_click_selects_the_row_and_leaves_the_fold_alone() {
+        let mut s = state();
+        s.view_height = 24;
+        s.view_cards.insert(0, 7);
+        s.view_open.insert(0, false);
+        s.screen = vec!["  ◆ 지난 답".to_string()];
+
+        // One click: the card head on that row folds, which is what a click is for.
+        apply(&mut s, &Action::Press(4, 0));
+        apply(&mut s, &Action::Release);
+        assert_eq!(s.folds.get(&7).map(|f| f.open), Some(true), "the click did not fold it");
+
+        // The second press takes the row instead, and puts the fold back where it was.
+        apply(&mut s, &Action::Press(4, 0));
+        assert_eq!(s.folds.get(&7).map(|f| f.open), Some(false), "the fold was left flipped");
+        assert_eq!(s.selection.as_deref(), Some("지난 답"), "{:?}", s.selection);
+        assert!(s.drag.is_some_and(|d| !d.is_click()), "nothing was left selected");
+    }
+
     /// **Every screen is draggable, overlays included.** The mapping lives in one function so the
     /// two loops in `run_inner` cannot drift — the waiting one dropped mouse events entirely,
     /// which made the enrolment window the one screen whose text could not be selected, and it is
@@ -8557,8 +8667,9 @@ mod tests {
         assert_eq!(s.scroll.top, 87);
     }
 
-    /// **Ctrl+C never copies, even with a selection.** It is the one key that stops or quits —
-    /// with meanings overlapping there is no telling what happens when it matters.
+    /// **Ctrl+C never copies, even with a selection.** It is the key that closes the window —
+    /// copy is not on a key at all, because the selection goes to the clipboard when the mouse is
+    /// released, and one key with several meanings is how the wrong thing happens.
     #[test]
     fn ctrl_c_never_copies_even_with_a_selection() {
         let mut s = state();
@@ -8566,42 +8677,47 @@ mod tests {
         s.running = true;
         assert_eq!(
             on_key(&s, key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
-            vec![Action::Cancel]
+            vec![Action::ArmQuit]
         );
     }
 
+    /// **Esc is the only key that stops a turn.** Ctrl+C used to stop it first and quit on the
+    /// second press, so one press could mean two things and the one a person did not intend is the
+    /// one that cannot be taken back (2026-09-15).
     #[test]
-    fn ctrl_c_cancels_the_turn_when_nothing_is_selected() {
+    fn ctrl_c_does_not_stop_the_running_turn() {
         let mut s = state();
         s.running = true;
-        assert_eq!(
-            on_key(&s, key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
-            vec![Action::Cancel]
-        );
+        let c = key(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(on_key(&s, c), vec![Action::ArmQuit], "Ctrl+C stopped the turn");
+        apply(&mut s, &Action::ArmQuit);
+        assert_eq!(on_key(&s, c), vec![Action::Quit], "the second press must still quit");
+
+        // The same turn, stopped the way it can be stopped.
+        let mut s = state();
+        s.running = true;
+        assert_eq!(on_key(&s, key(KeyCode::Esc, KeyModifiers::NONE)), vec![Action::Cancel]);
     }
 
-    /// **The window has to be closable even when the cancel does not take.**
+    /// **The window has to be closable even when the turn will not stop.**
     ///
-    /// When the server hangs, `running` stays true. If Ctrl+C only ever went to cancel then,
-    /// every press would just send the same request again and never reach quitting.
+    /// When the server hangs, `running` stays true and the turn never ends. Ctrl+C does not wait
+    /// on that: the first press arms the quit and the second closes the window, whatever the
+    /// session is doing.
     #[test]
-    fn ctrl_c_after_a_cancel_goes_to_quitting() {
+    fn ctrl_c_reaches_the_quit_while_a_turn_is_running() {
         let mut s = state();
         s.running = true;
         let k = key(KeyCode::Char('c'), KeyModifiers::CONTROL);
 
         let first = on_key(&s, k);
-        assert_eq!(first, vec![Action::Cancel], "the first should be a cancel");
+        assert_eq!(first, vec![Action::ArmQuit], "the first press arms the quit");
         apply(&mut s, &first[0]);
 
-        let second = on_key(&s, k);
-        assert_eq!(second, vec![Action::ArmQuit], "the second arms the quit even while running");
-        apply(&mut s, &second[0]);
-
-        assert_eq!(on_key(&s, k), vec![Action::Quit]);
+        assert_eq!(on_key(&s, k), vec![Action::Quit], "the second press quits the window");
     }
 
-    /// The request to stop lasts only for that turn. On the next turn Ctrl+C has to go back
+    /// The request to stop lasts only for that turn. On the next turn Esc has to go back
     /// to cancelling.
     #[test]
     fn asking_to_stop_lasts_only_for_that_turn() {

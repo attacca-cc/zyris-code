@@ -165,6 +165,10 @@ pub struct Turn {
 #[derive(Debug, Default)]
 pub struct Rendered {
     pub lines: Vec<Line<'static>>,
+    /// **Where each line's own text starts**, one entry per line of `lines`. The screen's margins
+    /// are drawn, not written, and only the renderer knows which is which — so it says so here and
+    /// the selection starts where the text does (`selection::extract`).
+    pub body: Vec<u16>,
     /// Row index → the seq of the card that clicking that row folds and unfolds.
     pub cards: HashMap<usize, i64>,
     /// The links on each line, in that line's display columns.
@@ -207,6 +211,7 @@ pub fn rows_with(
     let total = cache.total();
     Rendered {
         lines: cache.window(0, total),
+        body: cache.window_body(0, total),
         cards: cache.cards().clone(),
         links: cache.window_links(0, total),
         breathing: cache.breathing().to_vec(),
@@ -217,6 +222,10 @@ pub fn rows_with(
 #[derive(Debug, Clone)]
 struct Made {
     lines: Vec<Line<'static>>,
+    /// **Where each line's own text begins**, parallel to `lines` — see [`furniture_width`]. The
+    /// layout is the only thing that knows what it drew in a line's margin, so the selection is
+    /// told rather than left to read it back off the characters.
+    body: Vec<u16>,
     /// The links on each line, in that line's display columns. Parallel to `lines`.
     links: Vec<Vec<crate::markdown::Link>>,
     /// The lines that fold/unfold when clicked. (which line within this item, which seq).
@@ -535,6 +544,37 @@ impl Cache {
         out
     }
 
+    /// Where the text of each line `window` returns starts, in the same order.
+    ///
+    /// **Parallel to `window`**, and read by the selection: a highlight may not cover what the
+    /// screen drew in a line's margin. The blank separator between items has no text at all, so it
+    /// reports zero.
+    pub fn window_body(&self, from: usize, to: usize) -> Vec<u16> {
+        let to = to.min(self.total);
+        if from >= to {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(to - from);
+        for slot in &self.slots {
+            if slot.end() <= from {
+                continue;
+            }
+            if slot.begin >= to {
+                break;
+            }
+            let made = &self.made[&slot.seq].2;
+            for i in slot.begin.max(from)..slot.end().min(to) {
+                let inner = i - slot.begin;
+                out.push(match (slot.lead_blank, inner) {
+                    (true, 0) => 0,
+                    (true, n) => made.body[n - 1],
+                    (false, n) => made.body[n],
+                });
+            }
+        }
+        out
+    }
+
     /// Plain text of all lines. **Only called when copying a selection** — never per frame.
     pub fn plain(&self) -> Vec<String> {
         self.window(0, self.total)
@@ -542,6 +582,29 @@ impl Cache {
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect()
     }
+}
+
+/// How much of a line's front is drawn rather than written.
+///
+/// **The layout knows; the text does not.** `    ⎿ ok` and a line that genuinely starts with four
+/// spaces and a `⎿` are the same characters on screen — and the first is a tool's detail, where the
+/// indent belongs to the screen, while the second is text somebody wrote. Reading the margin back
+/// out of the drawn characters cannot tell them apart, which is what a drag over a report's body or
+/// an opened tool came back with: the readability indent, copied (2026-09-15 user report). So every
+/// line records how much of its front is furniture (`selection::FURNITURE`) and the selection starts
+/// there.
+///
+/// **The first span holding anything else ends the count.** What comes after is the line's own,
+/// indentation included: a code block's leading spaces are inside its own span, so they are code.
+fn furniture_width(line: &Line<'static>) -> u16 {
+    let mut width = 0u16;
+    for span in &line.spans {
+        if span.content.chars().any(|c| !crate::selection::FURNITURE.contains(&c)) {
+            break;
+        }
+        width = width.saturating_add(markdown::display_width(&span.content) as u16);
+    }
+    width
 }
 
 fn blank() -> Line<'static> {
@@ -728,7 +791,8 @@ fn make(item: &Item, width: u16, folds: &Folds, turn: Turn, lang: crate::lang::L
             out.push(Line::from(card));
             links.push(Vec::new());
             if !card_open {
-                return Made { lines: out, links, heads, breathing };
+                let body = out.iter().map(furniture_width).collect();
+                return Made { lines: out, links, body, heads, breathing };
             }
 
             // ── Children, in arrival order ───────────────────────────────────────────────────
@@ -829,7 +893,8 @@ fn make(item: &Item, width: u16, folds: &Folds, turn: Turn, lang: crate::lang::L
             }
         }
     }
-    Made { lines: out, links, heads, breathing }
+    let body = out.iter().map(furniture_width).collect();
+    Made { lines: out, links, body, heads, breathing }
 }
 
 /// One tool row: the status dot, the short name, what it was run against, how much it changed,
@@ -1363,6 +1428,44 @@ mod tests {
     /// about, since a finished stretch folds itself away.
     fn live(items: &[Item], width: u16, folds: &Folds, lang: crate::lang::Lang) -> Rendered {
         rows_with(items, width, folds, None, lang, Turn { running: true })
+    }
+
+    /// **The margin is recorded, not guessed.** A card's head is drawn one margin in, a tool row
+    /// two (its dot stands in a margin of its own), and an opened detail two more plus its `⎿` —
+    /// characters a reader takes for layout and which are indistinguishable from text somebody
+    /// indented by hand. `body` says where each line's own text starts, so a drag over any of them
+    /// starts at the text (2026-09-15 user report).
+    #[test]
+    fn each_line_records_where_its_own_text_starts() {
+        let item = work();
+        let Item::Work { seq, parts, .. } = &item else {
+            panic!("not a work item");
+        };
+        // The card, every tool in it — a detail is only drawn when its row is open.
+        let mut folds = Folds::new();
+        folds.insert(*seq, Fold { open: true, user_touched: true });
+        for part in parts {
+            if let Part::Step(s) = part {
+                folds.insert(s.seq, Fold { open: true, user_touched: true });
+            }
+        }
+        let r = live(&[item], 60, &folds, crate::lang::Lang::Ko);
+        let rows = r.plain();
+        let at = |needle: &str| {
+            rows.iter()
+                .position(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("no {needle} in {rows:?}"))
+        };
+
+        // The card's head: the marker and the space after it.
+        assert_eq!(r.body[0], 2, "{:?}", rows[0]);
+        // A tool row: the padding and the dot that stands in the second margin.
+        let tool = at("grep");
+        assert_eq!(r.body[tool], 4, "{:?}", rows[tool]);
+        // Its opened detail: the four-column indent and the `⎿ ` after it.
+        let detail = at("⎿");
+        assert_eq!(r.body[detail], 6, "{:?}", rows[detail]);
+        assert_eq!(r.body.len(), rows.len(), "one body per line");
     }
 
     /// The first chip's fold key, so a test can open a single chip.

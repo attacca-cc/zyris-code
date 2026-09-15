@@ -66,7 +66,8 @@ pub fn parts_at(
     // we say here what is running, people wait it out blind — and a command is no longer cut at a
     // minute, so that wait is as long as the command is.
     // **Saying you asked to stop comes first.** Until the server answers, "working" stays up,
-    // and while it keeps showing, people think Ctrl+C did not work and press again.
+    // and while it keeps showing, people think the key they pressed did not work and press it
+    // again — the hint at the end of this line says which key that is (Esc).
     // **Fetching a thread's history is something happening**, and on a long one it takes a
     // while. Unsaid, the window looks stuck on the thread the person just left.
     if state.loading_history {

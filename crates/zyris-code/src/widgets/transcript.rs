@@ -148,6 +148,10 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut State) {
     state.scroll.on_content(total, height);
     let (start, end) = state.scroll.window(total, height);
     state.view_top = start;
+    // **Where each drawn line's own text starts.** The layout is the only thing that knows what it
+    // put in a line's margin, so the record rides along with the lines `window` just handed out and
+    // the selection starts there instead of guessing from the characters (`rows::furniture_width`).
+    state.view_body = state.rows_cache.window_body(start, end);
 
     // **Build only the visible lines.** Building all of them would grow with the conversation length and blow the frame budget.
     let mut shown = state.rows_cache.window(start, end);
