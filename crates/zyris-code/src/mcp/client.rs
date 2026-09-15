@@ -176,10 +176,10 @@ impl StdioClient {
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
-            .with_context(|| format!("MCP 서버를 띄우지 못했습니다: {command}"))?;
+            .with_context(|| format!("could not start the MCP server: {command}"))?;
 
-        let stdin = child.stdin.take().context("stdin이 없습니다")?;
-        let stdout = child.stdout.take().context("stdout이 없습니다")?;
+        let stdin = child.stdin.take().context("no stdin")?;
+        let stdout = child.stdout.take().context("no stdout")?;
         if let Some(stderr) = child.stderr.take() {
             let name = command.to_string();
             tokio::spawn(async move {
@@ -229,7 +229,7 @@ impl StdioClient {
         // between replies, and mistaking one for the reply shifts everything after it by one.
         loop {
             let Some(line) = self.stdout.next_line().await? else {
-                bail!("MCP 서버가 답하기 전에 끊었습니다: {method}");
+                bail!("the MCP server hung up before answering: {method}");
             };
             if line.trim().is_empty() {
                 continue;
@@ -242,7 +242,7 @@ impl StdioClient {
                 continue;
             }
             if let Some(e) = msg.get("error") {
-                let message = e.get("message").and_then(Value::as_str).unwrap_or("알 수 없는 오류");
+                let message = e.get("message").and_then(Value::as_str).unwrap_or("unknown error");
                 bail!("{method}: {message}");
             }
             return Ok(msg.get("result").cloned().unwrap_or(Value::Null));
@@ -335,7 +335,9 @@ fn flatten_content(result: &Value) -> String {
         }
         match kind {
             "text" => out.push_str(block.get("text").and_then(Value::as_str).unwrap_or_default()),
-            other => out.push_str(&format!("[{other}는 글자로 옮길 수 없어 생략했습니다]")),
+            other => {
+                out.push_str(&format!("[{other} content omitted: it cannot be turned into text]"))
+            }
         }
     }
     out

@@ -225,7 +225,7 @@ impl Waits {
 
     pub(crate) fn api(&self) -> Result<Arc<AttaccaApiClient>, WireError> {
         self.api.borrow().clone().ok_or_else(|| {
-            WireError::internal("아직 attacca에 붙지 않았습니다. 잠시 뒤에 다시 불러 주세요.")
+            WireError::internal("Not attached to attacca yet. Call again in a moment.")
         })
     }
 
@@ -234,7 +234,7 @@ impl Waits {
     fn known(&self, id: &str) -> Result<Snapshot, WireError> {
         self.jobs.snapshot(id).ok_or_else(|| {
             WireError::invalid_params(format!(
-                "`{id}`이라는 배경 작업이 없습니다. wait.list로 확인해 주세요."
+                "there is no background job `{id}`. Check `wait.list`."
             ))
         })
     }
@@ -269,7 +269,7 @@ impl Wait for Waits {
         Ok(Started {
             id: id.clone(),
             label: snap.label,
-            next: format!("걸었습니다. `wait.until`을 `job: \"{id}\"`로 불러 끝나기를 기다리세요."),
+            next: format!("Started. Call `wait.until` with `job: \"{id}\"` to wait for it."),
         })
     }
 
@@ -305,7 +305,9 @@ impl Wait for Waits {
     ) -> zyris::Result<Outcome> {
         let chosen = [job.is_some(), command.is_some(), work.is_some()];
         if chosen.iter().filter(|c| **c).count() != 1 {
-            return Err(WireError::invalid_params("job∙command∙work 중 정확히 하나를 주세요."));
+            return Err(WireError::invalid_params(
+                "give exactly one of `job`, `command` or `work`",
+            ));
         }
         let budget = budget(crate::tools::guard::wire_deadline(), timeout_ms);
         let at = std::time::Instant::now();
@@ -361,11 +363,11 @@ impl Waits {
         Ok(Outcome {
             done: false,
             why: format!(
-                "`{id}`({})이 아직 돌고 있습니다. {}초째입니다.",
+                "`{id}` ({}) is still running ‒ {}s so far.",
                 snap.label,
                 snap.elapsed_ms / 1000
             ),
-            next: format!("같은 인자로 `wait.until`을 다시 부르세요 ‒ `job: \"{id}\"`."),
+            next: format!("Call `wait.until` again with the same arguments ‒ `job: \"{id}\"`."),
             elapsed_ms: at.elapsed().as_millis() as u64,
             tail: self.jobs.tail(id, TAIL_BYTES),
             exit_code: None,
@@ -388,7 +390,7 @@ impl Waits {
         let re = matches
             .map(|p| {
                 regex::Regex::new(p).map_err(|e| {
-                    WireError::invalid_params(format!("matches가 정규식이 아닙니다: {e}"))
+                    WireError::invalid_params(format!("`matches` is not a regular expression: {e}"))
                 })
             })
             .transpose()?;
@@ -410,8 +412,8 @@ impl Waits {
             if hit {
                 return Ok(Outcome {
                     done: true,
-                    why: format!("{rounds}번째 확인에서 조건이 참이 되었습니다."),
-                    next: "끝났습니다. 다음 일을 하세요.".into(),
+                    why: format!("the condition became true on round {rounds}."),
+                    next: "Done. Carry on.".into(),
                     elapsed_ms: at.elapsed().as_millis() as u64,
                     tail: tail_of(&last),
                     exit_code: None,
@@ -425,8 +427,8 @@ impl Waits {
         }
         Ok(Outcome {
             done: false,
-            why: format!("{rounds}번 확인했지만 아직 조건이 참이 아닙니다."),
-            next: "같은 인자로 `wait.until`을 다시 부르세요.".into(),
+            why: format!("checked {rounds} times and the condition is still not true."),
+            next: "Call `wait.until` again with the same arguments.".into(),
             elapsed_ms: at.elapsed().as_millis() as u64,
             tail: tail_of(&last),
             exit_code: None,
@@ -453,10 +455,10 @@ impl Waits {
                 let name = crate::tools::work::state_name(format!("{state:?}"));
                 return Ok(Outcome {
                     done: true,
-                    why: format!("work `{work_id}`이 `{name}`에 닿았습니다."),
+                    why: format!("work `{work_id}` has reached `{name}`."),
                     next: format!(
-                        "`work.status`로 `work_id: \"{work_id}\"`를 읽고 다음에 무엇이 \
-                         필요한지 사람에게 말하세요."
+                        "Read it with `work.status` (`work_id: \"{work_id}\"`) and tell the \
+                         person what it needs next."
                     ),
                     elapsed_ms: at.elapsed().as_millis() as u64,
                     tail: String::new(),
@@ -471,8 +473,10 @@ impl Waits {
         let name = crate::tools::work::state_name(format!("{state:?}"));
         Ok(Outcome {
             done: false,
-            why: format!("work `{work_id}`이 아직 `{name}`입니다."),
-            next: format!("같은 인자로 `wait.until`을 다시 부르세요 ‒ `work: \"{work_id}\"`."),
+            why: format!("work `{work_id}` is still `{name}`."),
+            next: format!(
+                "Call `wait.until` again with the same arguments ‒ `work: \"{work_id}\"`."
+            ),
             elapsed_ms: at.elapsed().as_millis() as u64,
             tail: String::new(),
             exit_code: None,
@@ -484,15 +488,15 @@ impl Waits {
         Outcome {
             done: true,
             why: format!(
-                "`{id}`({})이 {}초 만에 끝났습니다. 종료 코드 {}.",
+                "`{id}` ({}) finished in {}s ‒ exit code {}.",
                 snap.label,
                 snap.elapsed_ms / 1000,
                 snap.exit_code.unwrap_or(-1)
             ),
             next: if ok {
-                "끝났습니다. 전문이 필요하면 `wait.logs`로 가져오세요.".into()
+                "Done. Read the whole output with `wait.logs` if you need it.".into()
             } else {
-                format!("실패했습니다. `wait.logs`로 `job: \"{id}\"`의 출력을 읽어 원인을 보세요.")
+                format!("It failed. Read `job: \"{id}\"`'s output with `wait.logs` to see why.")
             },
             elapsed_ms: at.elapsed().as_millis() as u64,
             tail: self.jobs.tail(id, TAIL_BYTES),
@@ -536,8 +540,8 @@ async fn probe_once(
         }
         // **Over the limit or unable to spawn means that round is false.** Not an error —
         // waiting on a server that is not up yet is a normal use of this tool.
-        Ok(Err(e)) => (false, format!("되묻기를 띄우지 못했습니다: {e}")),
-        Err(_) => (false, format!("되묻기가 {}초를 넘겨 끊었습니다.", limit.as_secs())),
+        Ok(Err(e)) => (false, format!("could not run the probe: {e}")),
+        Err(_) => (false, format!("the probe ran past {}s and was cut.", limit.as_secs())),
     }
 }
 

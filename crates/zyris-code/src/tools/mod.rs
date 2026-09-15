@@ -172,7 +172,7 @@ pub fn start_mcp(caps: zyris::Capabilities, cwd: PathBuf, bridge: Bridge) {
             // disappears after 6 seconds, so we note it separately so `/mcp` can still show it later.
             bridge.note_mcp(slug, Err(why.clone()));
             bridge.frame(crate::app::Frame::Notice(format!(
-                "MCP 서버 '{slug}'를 띄우지 못했습니다: {why}"
+                "MCP server '{slug}' did not start: {why}"
             )));
         }
         for cap in started {

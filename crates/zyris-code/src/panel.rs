@@ -14,7 +14,6 @@ use crate::config::DirAccess;
 use crate::lang::Lang;
 use crate::markdown::display_width;
 use crate::mode::{Mode, Route};
-use crate::plugin::Plugin;
 use crate::theme;
 use crate::tools::skill::SkillInfo;
 
@@ -35,6 +34,13 @@ pub struct Panel {
     /// The editable settings, when this panel is the `/config` form. The other panels
     /// only show, so they carry `None` and their keys stay scroll-and-close.
     pub form: Option<Form>,
+    /// The list that is *acted on*, when this panel is `/mcp` or `/plugin`. A cursor over rows,
+    /// keys that do something to the row under it, and a sentence saying what the last key did.
+    ///
+    /// **Held here rather than in `app.rs` for the same reason `Form` is** — `refresh` rebuilds
+    /// the body from it, so moving the cursor is a rebuild of the one thing the widget draws
+    /// instead of a second copy of the layout living in the key handler.
+    pub manager: Option<Manager>,
     /// The mode `Enter` applies, when this panel is the `/mode` list.
     ///
     /// **It is also what says the arrows mean "choose", not "scroll".** `/mode` lists four
@@ -266,6 +272,7 @@ impl Panel {
             button: None,
             button_focused: false,
             form: None,
+            manager: None,
             mode_pick: None,
             foot: Vec::new(),
         }
@@ -280,6 +287,9 @@ impl Panel {
             self.title = form.lang.title_config().to_string();
             self.lines = form_lines(&form);
             self.foot = config_foot(&form);
+        }
+        if let Some(manager) = &self.manager {
+            self.lines = manager_lines(manager);
         }
     }
 
@@ -388,65 +398,279 @@ fn bold_spans(text: &'static str) -> Vec<Span<'static>> {
     spans
 }
 
-/// The `/mcp` panel — every attached server and how many tools it brought.
-/// The `/mcp` panel: what is running, and **what could be**.
-///
-/// `found` is what other clients already have set up (`mcp::discovery`), with whether this machine
-/// has said yes. Showing it is the whole point of discovering it — a list nobody sees may as well
-/// not have been read.
-pub fn mcp(
-    lang: Lang,
-    report: &[(String, Result<usize, String>)],
-    found: &[(String, String, bool)],
-) -> Panel {
-    if report.is_empty() && found.is_empty() {
-        return Panel::new(lang.title_mcp().into(), vec![muted(lang.mcp_empty().to_string())]);
+// ─────────────────────────────────────────────────────────────────────────────
+// The managers — `/mcp` and `/plugin`
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Which list a manager is showing. The two differ in what a row is and in what a key does to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagerKind {
+    Mcp,
+    Plugins,
+}
+
+impl ManagerKind {
+    /// The heading in the box's top border.
+    pub fn title(self, lang: Lang) -> &'static str {
+        match self {
+            ManagerKind::Mcp => lang.title_mcp(),
+            ManagerKind::Plugins => lang.title_plugins(),
+        }
     }
-    let mut lines = Vec::new();
-    for (name, outcome) in report {
-        let (text, color) = match outcome {
-            Ok(n) => (lang.mcp_tools(*n), theme::success()),
-            Err(why) => (lang.mcp_failed(why), theme::danger()),
-        };
+}
+
+/// Where a server or a plugin came from — **which is also what may be done to it.**
+///
+/// Shown because it is the whole basis for trusting the thing, and read by the keys because the
+/// same act means different things in different places: switching a repository server on is an
+/// approval to run somebody else's program, while switching one written in this app's own config
+/// on is nothing (it is already on — it starts itself). Removing a fetched plugin deletes a
+/// directory; removing a discovered server only forgets a yes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Origin {
+    /// `~/.config/zyris-code/mcp.json` — written by this person, for this app.
+    User,
+    /// `./.mcp.json` — written in the repository.
+    Project,
+    /// Another program's config file. Read, never written.
+    Elsewhere,
+    /// A plugin ships it.
+    Plugin(String),
+    /// Fetched into this app's own plugin directory.
+    Fetched,
+    /// Placed in the repository's `.zyris-code/plugins/` by hand.
+    InProject,
+    /// Put somewhere on this machine by hand.
+    HandPlaced,
+}
+
+impl Origin {
+    /// Whether the entry lives in a file this app may write.
+    pub fn ours(&self) -> bool {
+        matches!(self, Origin::User | Origin::Project)
+    }
+}
+
+/// What the key that takes something away means here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Removal {
+    /// Take the entry out of one of our own config files.
+    FromFile,
+    /// Forget that this machine said yes to something another program set up.
+    Approval,
+    /// Delete a fetched plugin's directory, `git` clone and all.
+    Directory,
+}
+
+/// One row, and everything the block under the list says about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagerRow {
+    /// What the keys act on — a server's slug, or a plugin's name.
+    pub id: String,
+    /// The row itself.
+    pub title: String,
+    /// The muted sentence at its right.
+    pub subtitle: String,
+    /// `label value` pairs, drawn under the list only while the cursor is on this row.
+    pub detail: Vec<(String, String)>,
+    pub origin: Origin,
+    /// Whether it can be switched, and which way it is now. `None` — there is nothing to switch.
+    pub toggle: Option<bool>,
+    /// Whether it can be removed, and what removing it means.
+    pub remove: Option<Removal>,
+}
+
+/// The list a manager draws and acts on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Manager {
+    pub kind: ManagerKind,
+    pub rows: Vec<ManagerRow>,
+    /// Where the cursor is. Kept inside `rows` by [`Manager::move_cursor`].
+    pub cursor: usize,
+    /// What the last key said, when it has something to say — the question asked before something
+    /// is taken away, or why the key does nothing on this row.
+    ///
+    /// **What an act *did* is not said here.** That goes to the conversation, the way every other
+    /// command's answer does, and the row itself shows the new state — a sentence inside the box
+    /// would have to be a sentence the box was already sized for (`note_room`).
+    pub note: Option<String>,
+    /// A destructive act waiting to be confirmed, **naming the row it is about.** By the time the
+    /// second press arrives the cursor may have moved, and deleting whatever the cursor happens to
+    /// be on is the accident this exists to prevent.
+    pub confirm: Option<String>,
+    /// The widest sentence this panel can put in `note`. **Part of the sizing**, so asking a
+    /// question does not resize the box under the eye.
+    pub note_room: usize,
+}
+
+impl Manager {
+    pub fn new(kind: ManagerKind, rows: Vec<ManagerRow>, note_room: usize) -> Manager {
+        Manager { kind, rows, cursor: 0, note: None, confirm: None, note_room }
+    }
+
+    /// The row the cursor is on, if there is one.
+    pub fn row(&self) -> Option<&ManagerRow> {
+        self.rows.get(self.cursor)
+    }
+
+    /// Moves the cursor. Positive is down. **It stops at the ends** rather than wrapping — a list
+    /// has a top and a bottom, unlike the four modes `/mode` walks round.
+    pub fn move_cursor(&mut self, by: i32) {
+        let last = self.rows.len().saturating_sub(1) as i32;
+        self.cursor = (self.cursor as i32 + by).clamp(0, last) as usize;
+        // **A moved cursor takes the question down.** Confirming a name the cursor has left is
+        // exactly the accident `confirm` exists to prevent.
+        self.confirm = None;
+    }
+}
+
+/// What a row draws before its name: the cursor, and whether the thing is on.
+const ROW_MARK: usize = 4;
+/// The gap between a detail's label and its value.
+const DETAIL_GAP: usize = 2;
+/// How far a detail block is indented, under the row it belongs to.
+const DETAIL_INDENT: &str = "    ";
+
+/// Draws a manager: the rows with the cursor marked, the block under it, and the sentence.
+///
+/// **The box is one size on every row.** A detail block is a different shape for each row, so the
+/// drawn block is padded to the tallest of them and every line to the widest of them. A box that
+/// grew and shrank as the cursor moved is what `/mode` and `/config` were both fixed for, and the
+/// same rule holds here.
+fn manager_lines(manager: &Manager) -> Vec<Line<'static>> {
+    if manager.rows.is_empty() {
+        return Vec::new();
+    }
+    let label_w = manager
+        .rows
+        .iter()
+        .flat_map(|row| row.detail.iter().map(|(label, _)| display_width(label)))
+        .max()
+        .unwrap_or(0);
+    let width = manager
+        .rows
+        .iter()
+        .flat_map(|row| {
+            let head = ROW_MARK + display_width(&row.title) + 3 + display_width(&row.subtitle);
+            let details: Vec<usize> = row
+                .detail
+                .iter()
+                .map(|(_label, value)| {
+                    display_width(DETAIL_INDENT) + label_w + DETAIL_GAP + display_width(value)
+                })
+                .collect();
+            std::iter::once(head).chain(details)
+        })
+        .max()
+        .unwrap_or(0)
+        .max(manager.note_room);
+    let height = manager.rows.iter().map(|row| row.detail.len()).max().unwrap_or(0);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (i, row) in manager.rows.iter().enumerate() {
+        let on_cursor = i == manager.cursor;
+        let on = row.toggle == Some(true);
         lines.push(Line::from(vec![
-            Span::styled("● ", Style::default().fg(theme::accent())),
+            Span::styled(if on_cursor { "❯ " } else { "  " }, Style::default().fg(theme::accent())),
+            // **The dot is the state.** Filled and green is running or enabled; hollow is not.
             Span::styled(
-                name.clone(),
+                if on { "● " } else { "○ " },
+                Style::default().fg(if on { theme::success() } else { theme::text_muted() }),
+            ),
+            Span::styled(
+                row.title.clone(),
                 Style::default().fg(theme::text_heading()).add_modifier(Modifier::BOLD),
             ),
             Span::styled(" ‒ ", Style::default().fg(theme::border_light())),
-            Span::styled(text, Style::default().fg(color)),
+            Span::styled(row.subtitle.clone(), Style::default().fg(theme::text_muted())),
         ]));
     }
-    if !found.is_empty() {
-        if !lines.is_empty() {
-            lines.push(blank());
-        }
-        lines.push(muted(lang.mcp_found_heading().to_string()));
-        for (slug, source, on) in found {
-            // **The dot says whether it will start**, because that is the only thing about a
-            // discovered entry a person has to decide.
-            let (mark, colour) =
-                if *on { ("● ", theme::success()) } else { ("○ ", theme::text_muted()) };
+    lines.push(blank());
+    if let Some(row) = manager.row() {
+        for (label, value) in &row.detail {
             lines.push(Line::from(vec![
-                Span::styled(mark, Style::default().fg(colour)),
+                Span::styled(DETAIL_INDENT.to_string(), Style::default()),
                 Span::styled(
-                    slug.clone(),
-                    Style::default().fg(theme::text_heading()).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(" ‒ ", Style::default().fg(theme::border_light())),
-                Span::styled(
-                    lang.mcp_found_from(source, *on),
+                    format!(
+                        "{label}{:gap$}",
+                        "",
+                        gap = label_w - display_width(label) + DETAIL_GAP
+                    ),
                     Style::default().fg(theme::text_muted()),
                 ),
+                Span::styled(value.clone(), Style::default().fg(theme::text())),
             ]));
         }
-        lines.push(blank());
-        lines.push(muted(lang.mcp_switch_hint().to_string()));
+        // Blank rows rather than a shorter box — the tallest block decides for all of them.
+        for _ in row.detail.len()..height {
+            lines.push(blank());
+        }
     }
     lines.push(blank());
-    lines.push(muted(lang.mcp_config_hint().to_string()));
-    Panel::new(lang.title_mcp().into(), lines)
+    lines.push(match &manager.note {
+        Some(note) => Line::from(Span::styled(note.clone(), Style::default().fg(theme::warning()))),
+        None => blank(),
+    });
+    lines.into_iter().map(|line| pad_to(line, width)).collect()
+}
+
+/// Pads a line with spaces to `width` columns. **Trailing spaces are invisible**; what they buy is
+/// a box that keeps one width while the cursor moves between rows of different lengths.
+fn pad_to(line: Line<'static>, width: usize) -> Line<'static> {
+    let have: usize = line.spans.iter().map(|s| display_width(&s.content)).sum();
+    if have >= width {
+        return line;
+    }
+    let mut spans = line.spans;
+    spans.push(Span::raw(" ".repeat(width - have)));
+    Line::from(spans)
+}
+
+/// The `/mcp` panel: every server this machine knows about, and what can be done with each.
+///
+/// **What is running and what could be are one list.** Two sections meant the same server appeared
+/// twice — once as something that failed to start and once as the candidate it came from — and the
+/// cursor could only ever act on one of them. One row per server carries both: its state, where it
+/// came from, and what the keys mean there.
+pub fn mcp_manager(lang: Lang, rows: Vec<ManagerRow>) -> Panel {
+    if rows.is_empty() {
+        return Panel::new(lang.title_mcp().into(), vec![muted(lang.mcp_empty().to_string())]);
+    }
+    let room = room_for(lang, &rows);
+    let mut panel = Panel::new(lang.title_mcp().into(), Vec::new());
+    panel.manager = Some(Manager::new(ManagerKind::Mcp, rows, room));
+    panel.refresh();
+    panel
+}
+
+/// The `/plugin` panel: every plugin, what it contributes, and what can be done with it.
+pub fn plugin_manager(lang: Lang, rows: Vec<ManagerRow>) -> Panel {
+    if rows.is_empty() {
+        return Panel::new(
+            lang.title_plugins().into(),
+            vec![muted(lang.plugins_empty().to_string())],
+        );
+    }
+    let room = room_for(lang, &rows);
+    let mut panel = Panel::new(lang.title_plugins().into(), Vec::new());
+    panel.manager = Some(Manager::new(ManagerKind::Plugins, rows, room));
+    panel.refresh();
+    panel
+}
+
+/// The widest sentence this panel can put under its list — **every question it can ask, over every
+/// row it can ask about.** Sized from the one being shown, the box would grow the moment a key was
+/// pressed, which is the resizing all of this exists to prevent.
+fn room_for(lang: Lang, rows: &[ManagerRow]) -> usize {
+    rows.iter()
+        .flat_map(|row| {
+            [
+                display_width(&lang.manager_confirm(&row.id)),
+                display_width(&lang.manager_cannot(&row.id)),
+            ]
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 /// The `/skills` panel — one entry per skill: its name, and the sentence under it saying when to
@@ -483,67 +707,6 @@ pub fn skills(lang: Lang, skills: &[SkillInfo]) -> Panel {
         }
     }
     Panel::new(lang.title_skills().into(), lines)
-}
-
-/// The `/plugin` panel — every fetched plugin, what it ships underneath.
-pub fn plugins(
-    lang: Lang,
-    cwd: &std::path::Path,
-    found: &[Plugin],
-    allowed: &crate::mcp::discovery::Allowed,
-) -> Panel {
-    if found.is_empty() {
-        return Panel::new(
-            lang.title_plugins().into(),
-            vec![muted(lang.plugins_empty().to_string())],
-        );
-    }
-    let mut lines = Vec::new();
-    for p in found {
-        let mut spans = vec![
-            Span::styled("∙ ", Style::default().fg(theme::accent())),
-            Span::styled(
-                p.name.clone(),
-                Style::default().fg(theme::text_heading()).add_modifier(Modifier::BOLD),
-            ),
-        ];
-        let project = p.root.starts_with(cwd.join(".zyris-code/plugins"));
-        if project {
-            spans.push(Span::styled(
-                lang.plugin_project_state(crate::plugin::enabled(cwd, p, allowed)),
-                Style::default().fg(theme::text_muted()),
-            ));
-        } else if !p.fetched() {
-            spans.push(Span::styled(
-                lang.plugin_hand_placed(),
-                Style::default().fg(theme::text_muted()),
-            ));
-        }
-        lines.push(Line::from(spans));
-        if !p.description.is_empty() {
-            // **Under the name, not beside it.** The same rule as `/skills` — a description is a
-            // sentence about the thing above it, and the panel reads as a list of names otherwise.
-            lines.push(Line::from(Span::styled(
-                format!("    {}", p.description),
-                Style::default().fg(theme::text()),
-            )));
-        }
-        for spec in &p.mcp {
-            lines.push(muted(format!(
-                "    {}",
-                lang.plugin_mcp_line(&spec.slug, &spec.transport.summary())
-            )));
-        }
-        if p.skills.is_some() {
-            lines.push(muted(format!("    {}", lang.plugin_skills_line())));
-        }
-        lines.push(blank());
-    }
-    // A trailing blank after the last plugin reads as empty space.
-    if lines.last().is_some_and(|l| l.spans.is_empty()) {
-        lines.pop();
-    }
-    Panel::new(lang.title_plugins().into(), lines)
 }
 
 /// The `/account` panel — who this node is attached as. Carries a logout button
@@ -842,47 +1005,152 @@ mod tests {
         assert!(foot.is_some(), "no sentence was shown");
     }
 
+    /// One row of a manager, so these tests say what the panel draws rather than repeating the
+    /// shape. **Every field is given**, so adding one to `ManagerRow` breaks this in one place.
+    fn row(
+        id: &str,
+        subtitle: &str,
+        origin: Origin,
+        toggle: Option<bool>,
+        detail: &[(&str, &str)],
+    ) -> ManagerRow {
+        ManagerRow {
+            id: id.into(),
+            title: id.into(),
+            subtitle: subtitle.into(),
+            detail: detail.iter().map(|(l, v)| (l.to_string(), v.to_string())).collect(),
+            origin,
+            toggle,
+            remove: None,
+        }
+    }
+
     #[test]
-    fn an_empty_mcp_report_says_there_are_none_and_where_to_write_them() {
-        let p = mcp(Lang::Ko, &[], &[]);
+    fn an_empty_manager_says_there_are_none_and_where_to_write_them() {
+        let p = mcp_manager(Lang::Ko, Vec::new());
         assert!(text(&p)[0].contains("없습니다"), "{:?}", text(&p));
         assert!(p.title.contains("MCP"), "{}", p.title);
+        // Nothing to act on, so the panel keeps its ordinary keys instead of a manager's.
+        assert!(p.manager.is_none(), "an empty list became something to act on");
+
+        let p = plugin_manager(Lang::Ko, Vec::new());
+        assert!(text(&p)[0].contains("없습니다"), "{:?}", text(&p));
     }
 
+    /// **The cursor decides which block is shown**, which is the whole reason the detail is drawn
+    /// under the list rather than beside each row, where it made the list ragged.
     #[test]
-    fn a_mcp_report_lists_servers_with_their_outcome() {
-        let report = vec![("files".into(), Ok(3)), ("broken".into(), Err("없는 명령".into()))];
-        let p = mcp(Lang::Ko, &report, &[]);
+    fn the_block_under_the_list_follows_the_cursor() {
+        let rows = vec![
+            row("github", "돌고 있습니다", Origin::User, None, &[("실행", "npx -y gh")]),
+            row(
+                "playwright",
+                "Cursor ‒ 꺼짐",
+                Origin::Elsewhere,
+                Some(false),
+                &[("실행", "npx -y @playwright/mcp")],
+            ),
+        ];
+        let mut p = mcp_manager(Lang::Ko, rows);
+        let first = text(&p).join("\n");
+        assert!(first.contains("npx -y gh"), "{first}");
+        assert!(!first.contains("@playwright/mcp"), "both blocks were drawn: {first}");
+
+        p.manager.as_mut().expect("a manager").move_cursor(1);
+        p.refresh();
+        let second = text(&p).join("\n");
+        assert!(second.contains("@playwright/mcp"), "{second}");
+        assert!(!second.contains("npx -y gh"), "the old block stayed: {second}");
+    }
+
+    /// **The box is one size on every row.** A detail block is a different shape for each row, and
+    /// a box that grew as the cursor moved would move as well — a panel is centred.
+    #[test]
+    fn the_manager_box_is_one_size_on_every_row() {
+        let rows = vec![
+            row("a", "짧음", Origin::User, None, &[("실행", "x")]),
+            row(
+                "b",
+                "아주 길고 긴 설명입니다",
+                Origin::Elsewhere,
+                Some(true),
+                &[
+                    ("실행", "npx -y @playwright/mcp --with-a-long-argument"),
+                    ("환경변수", "GITHUB_TOKEN, ANOTHER_ONE"),
+                    ("도구", "12개"),
+                ],
+            ),
+        ];
+        let mut p = mcp_manager(Lang::Ko, rows);
+        let shape = |p: &Panel| {
+            (
+                p.lines.len(),
+                p.lines.iter().map(|l| display_width(&l.to_string())).collect::<Vec<_>>(),
+            )
+        };
+        let want = shape(&p);
+        for at in 0..p.manager.as_ref().expect("a manager").rows.len() {
+            p.manager.as_mut().expect("a manager").cursor = at;
+            p.refresh();
+            assert_eq!(shape(&p), want, "the box changed shape on row {at}");
+        }
+    }
+
+    /// **Asking a question does not resize the box.** The sentence under the list is measured
+    /// against every question the panel can ask (`room_for`), so pressing `d` does not move it.
+    #[test]
+    fn asking_before_a_removal_does_not_resize_the_box() {
+        let rows = vec![row("x", "받아 둔 것", Origin::Fetched, Some(true), &[("자리", "/tmp/x")])];
+        let mut p = plugin_manager(Lang::Ko, rows);
+        let before = p.lines.len();
+        p.manager.as_mut().expect("a manager").note = Some(Lang::Ko.manager_confirm("x"));
+        p.refresh();
         let joined = text(&p).join("\n");
-        assert!(joined.contains("files"), "{joined}");
-        assert!(joined.contains("도구 3개"), "{joined}");
-        assert!(joined.contains("못 띄웠습니다"), "{joined}");
+        assert!(joined.contains("한 번 더"), "{joined}");
+        assert_eq!(p.lines.len(), before, "the question changed the box's height");
     }
 
-    /// **What was found is shown even when nothing is running.** A list nobody sees may as well
-    /// not have been read, and with no servers of our own the panel used to say only "there are
-    /// none" while three sat in another client's config.
+    /// **A moved cursor takes the question down**, and it stops at the ends rather than wrapping —
+    /// confirming a name the cursor has left is the accident the name exists to prevent.
     #[test]
-    fn servers_found_in_another_program_are_offered_with_a_way_to_turn_them_on() {
-        let found = vec![("playwright".to_string(), "Cursor".to_string(), false)];
-        let p = mcp(Lang::Ko, &[], &found);
-        let joined = text(&p).join("\n");
-        assert!(joined.contains("playwright"), "{joined}");
-        assert!(
-            joined.contains("Cursor"),
-            "where it came from is the basis for trusting it: {joined}"
-        );
-        assert!(joined.contains("/mcp on"), "no way to turn it on: {joined}");
-        assert!(!joined.contains("없습니다"), "it said there were none: {joined}");
+    fn the_cursor_stops_at_the_ends_and_drops_the_question() {
+        let rows = vec![
+            row("a", "", Origin::Fetched, Some(true), &[]),
+            row("b", "", Origin::Fetched, Some(true), &[]),
+        ];
+        let mut manager = Manager::new(ManagerKind::Plugins, rows, 0);
+        manager.confirm = Some("a".into());
+        manager.move_cursor(1);
+        assert_eq!(manager.confirm, None, "the question outlived the row it named");
+        assert_eq!(manager.row().expect("a row").id, "b");
+        manager.move_cursor(5);
+        assert_eq!(manager.row().expect("a row").id, "b", "it wrapped at the bottom");
+        manager.move_cursor(-5);
+        assert_eq!(manager.row().expect("a row").id, "a", "it wrapped at the top");
     }
 
-    /// On and off must not read the same. The dot carries it, so the words have to as well.
+    /// A plugin row carries what its manifest says. **The panel used to show a name and a sentence
+    /// and nothing else** — this is the "too little information" it was asked for.
     #[test]
-    fn a_server_that_is_on_reads_differently_from_one_that_is_off() {
-        let on = text(&mcp(Lang::Ko, &[], &[("a".into(), "Cursor".into(), true)])).join("\n");
-        let off = text(&mcp(Lang::Ko, &[], &[("a".into(), "Cursor".into(), false)])).join("\n");
-        assert_ne!(on, off);
-        assert!(on.contains("켭니다"), "{on}");
+    fn a_plugin_row_carries_what_its_manifest_says() {
+        let rows = vec![ManagerRow {
+            id: "superpowers".into(),
+            title: "superpowers".into(),
+            subtitle: "받아 둔 것".into(),
+            detail: vec![
+                ("판".into(), "1.2.3".into()),
+                ("설명".into(), "무엇을 하는지".into()),
+                ("주는 것".into(), "명령 2개 ‒ 스킬 1개".into()),
+            ],
+            origin: Origin::Fetched,
+            toggle: Some(true),
+            remove: Some(Removal::Directory),
+        }];
+        let joined = text(&plugin_manager(Lang::Ko, rows)).join("\n");
+        assert!(joined.contains("superpowers"), "{joined}");
+        assert!(joined.contains("1.2.3"), "{joined}");
+        assert!(joined.contains("무엇을 하는지"), "{joined}");
+        assert!(joined.contains("명령 2개"), "{joined}");
     }
 
     #[test]
@@ -926,51 +1194,28 @@ mod tests {
         );
     }
 
-    /// The same rule on `/plugin`: a name, then the sentence about it.
+    /// **A row that cannot be switched says so by having nothing to switch.** The dot, the keys and
+    /// the detail all come from the row, so the panel is honest about what it does not know how to
+    /// change rather than offering a key that would fail.
     #[test]
-    fn a_plugins_description_goes_under_its_name_too() {
-        let p = plugins(
-            Lang::Ko,
-            std::path::Path::new("/repo"),
-            &[Plugin {
-                name: "그것".into(),
-                description: "무엇을 하는지".into(),
-                mcp: Vec::new(),
-                skills: None,
-                agents: None,
-                commands: Vec::new(),
-                hooks: Vec::new(),
-                // Not under the install directory, so it reads as hand-placed — the name row then
-                // carries a note of its own, which the description must not be part of.
-                root: std::path::PathBuf::from("/tmp/plugins/그것"),
-            }],
-            &crate::mcp::discovery::Allowed::default(),
-        );
-        let lines = text(&p);
-        let name = lines.iter().position(|l| l.contains("그것")).expect("no plugin row");
-        assert!(!lines[name].contains("무엇을"), "the description is beside the name: {lines:?}");
-        assert!(
-            lines.get(name + 1).is_some_and(|l| l.contains("무엇을")),
-            "the description is not under it: {lines:?}"
-        );
-    }
-
-    #[test]
-    fn a_project_plugin_is_shown_as_off_before_approval() {
-        let cwd = tempfile::tempdir().unwrap();
-        let plugin = Plugin {
-            name: "local".into(),
-            description: String::new(),
-            mcp: Vec::new(),
-            skills: None,
-            agents: None,
-            commands: Vec::new(),
-            hooks: Vec::new(),
-            root: cwd.path().join(".zyris-code/plugins/local"),
-        };
-        let panel =
-            plugins(Lang::Ko, cwd.path(), &[plugin], &crate::mcp::discovery::Allowed::default());
-        assert!(text(&panel).join("\n").contains("꺼짐"));
+    fn a_row_that_cannot_be_switched_offers_nothing() {
+        let rows = vec![ManagerRow {
+            id: "local".into(),
+            title: "local".into(),
+            subtitle: "직접 둔 것".into(),
+            detail: vec![("자리".into(), "/tmp/plugins/local".into())],
+            origin: Origin::HandPlaced,
+            toggle: None,
+            remove: None,
+        }];
+        let p = plugin_manager(Lang::Ko, rows);
+        let manager = p.manager.as_ref().expect("a manager");
+        let row = manager.row().expect("a row");
+        assert_eq!(row.toggle, None, "it claims to be switchable");
+        assert_eq!(row.remove, None, "it claims to be removable");
+        // The dot is hollow, because nothing is on as far as this panel can say.
+        let joined = text(&p).join("\n");
+        assert!(joined.contains('○'), "{joined}");
     }
 
     #[test]

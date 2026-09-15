@@ -39,7 +39,13 @@ impl Drag {
 /// column has one added to it: without that, letting go on a character left that character out and
 /// a line ending in `)` came back without its `)` (reported 2026-08-17). Nobody drags one past what
 /// they mean to take, because there is nothing there to aim at.
-pub fn extract(rows: &[String], drag: &Drag) -> String {
+///
+/// `body` is **where each row's own text starts**, one entry per entry of `rows`, as the layout
+/// recorded it while it drew (`rows::Rendered::body`). It is not read back out of the text: a row
+/// drawn as `    ⎿ ok` and a row whose text genuinely begins with four spaces look identical on
+/// screen, and the question is not what the row looks like but what the screen drew. A row with no
+/// entry — a bar, an overlay, a screen that was never laid out — starts at column zero.
+pub fn extract(rows: &[String], body: &[u16], drag: &Drag) -> String {
     if rows.is_empty() {
         return String::new();
     }
@@ -49,14 +55,14 @@ pub fn extract(rows: &[String], drag: &Drag) -> String {
 
     // **A selection starts at the text, never in the margin.** Reaching left past the words — which
     // is what selecting whole lines looks like — used to take the markers with it.
-    let from = |row: &str, at: usize| at.max(body_start(row));
+    let from = |row: usize, at: usize| at.max(start_of(body, row));
 
     if r0 == r1 {
         if is_code_fence(&rows[r0]) {
             return String::new();
         }
         let (a, b) = (c0.min(c1), c0.max(c1) + 1);
-        return slice_cols(&rows[r0], from(&rows[r0], a), b);
+        return slice_cols(&rows[r0], from(r0, a), b);
     }
 
     // **A fence is not a line of the text, so it does not leave one behind.** Dropping it rather
@@ -64,17 +70,22 @@ pub fn extract(rows: &[String], drag: &Drag) -> String {
     // blank line top and bottom.
     let mut out = Vec::new();
     if !is_code_fence(&rows[r0]) {
-        out.push(slice_cols(&rows[r0], from(&rows[r0], c0), usize::MAX));
+        out.push(slice_cols(&rows[r0], from(r0, c0), usize::MAX));
     }
-    for row in &rows[r0 + 1..r1] {
+    for (i, row) in rows.iter().enumerate().take(r1).skip(r0 + 1) {
         if !is_code_fence(row) {
-            out.push(slice_cols(row, body_start(row), usize::MAX));
+            out.push(slice_cols(row, start_of(body, i), usize::MAX));
         }
     }
     if !is_code_fence(&rows[r1]) {
-        out.push(slice_cols(&rows[r1], body_start(&rows[r1]), c1 + 1));
+        out.push(slice_cols(&rows[r1], start_of(body, r1), c1 + 1));
     }
     out.join("\n")
+}
+
+/// Where row `row`'s own text starts, from the layout's record — column zero when there is none.
+pub fn start_of(body: &[u16], row: usize) -> usize {
+    body.get(row).copied().unwrap_or(0) as usize
 }
 
 /// Is this row the top or bottom edge the screen draws around a code block?
@@ -156,10 +167,14 @@ pub fn row_spans(
     out
 }
 
-/// The glyphs the screen draws in a row's left margin, which are furniture rather than text.
+/// The glyphs a row's left margin can hold: `▌` marks what a person said, `✻` a stretch of
+/// working, `▸`/`▾` a fold, `●` a tool row and `◆` an answer; `│` runs down the left of a code
+/// block and `┊` down an opened reasoning body.
 ///
-/// `▌` marks what a person said, `✻` a stretch of working, `▸`/`▾` a fold, `●` a tool row and `◆`
-/// an answer; `│` runs down the left of a code block and `┊` down an opened reasoning body.
+/// **This is what a row with no record is read with** (`body_start`) — the bars, the input, an
+/// overlay, a screen drawn before the first layout. Everything the conversation's layout drew is
+/// counted as it is drawn (`rows::text_start`), which cannot be fooled by a line of text that
+/// merely looks like a margin (2026-09-15 report).
 const MARGIN_GLYPHS: [char; 8] = ['▌', '✻', '▸', '▾', '●', '◆', '│', '┊'];
 
 /// The column a row's own text starts at, past whatever the screen drew in its margin.
@@ -225,6 +240,43 @@ mod tests {
         ]
     }
 
+    /// `extract` over rows whose margins are what the text heuristic finds — the shape every test
+    /// below is about. Where the layout's own record matters, the body vector is spelled out.
+    fn pick(rows: &[String], drag: &Drag) -> String {
+        let body: Vec<u16> = rows.iter().map(|r| body_start(r) as u16).collect();
+        extract(rows, &body, drag)
+    }
+
+    /// **The record beats reading the text.** A report's body and an opened tool's detail are
+    /// indented two levels deep for the eye's sake (`  ` + `◆ `, `    ` + `⎿ `) — text that looks
+    /// exactly like content someone typed four spaces in front of. Dragging one used to bring the
+    /// indent along, because the margin was guessed from the characters instead of known.
+    #[test]
+    fn a_row_starts_where_the_layout_drew_its_text() {
+        let rows = vec!["    ⎿ ok".to_string(), "      output".to_string()];
+        // What the layout recorded for those two rows: four columns of indent and `⎿ `, six for
+        // the bare indent of the line under it.
+        let body = vec![6u16, 6u16];
+        let d = Drag { from: (0, 0), to: (1, 20) };
+        assert_eq!(extract(&rows, &body, &d), "ok\noutput");
+        // The same rows with no record at all start at column zero — nothing is guessed.
+        let none = vec![0u16, 0u16];
+        assert_eq!(extract(&rows, &none, &d), "    ⎿ ok\n      output");
+    }
+
+    /// A row the layout said nothing about — a bar, an overlay, a screen drawn before the first
+    /// layout — is selectable from its first column. Guessing a margin there is what made the left
+    /// two columns undraggable on a screen with nothing in it.
+    #[test]
+    fn a_row_with_no_record_starts_at_the_first_column() {
+        let rows = vec!["  plain".to_string()];
+        let d = Drag { from: (0, 0), to: (0, 8) };
+        // As drawn: the spaces are the row's own when nobody recorded a margin.
+        assert_eq!(extract(&rows, &[], &d), "  plain");
+        assert_eq!(extract(&rows, &[0], &d), "  plain");
+        assert_eq!(extract(&rows, &[2], &d), "plain");
+    }
+
     #[test]
     fn a_drag_that_never_moved_is_a_click() {
         assert!(Drag::new((2, 3)).is_click());
@@ -238,21 +290,21 @@ mod tests {
     #[test]
     fn selecting_within_one_line_takes_that_span() {
         let d = Drag { from: (0, 0), to: (0, 4) };
-        assert_eq!(extract(&rows(), &d), "안녕하");
+        assert_eq!(pick(&rows(), &d), "안녕하");
     }
 
     #[test]
     fn selecting_backwards_gives_the_same_text() {
         let forward = Drag { from: (0, 0), to: (0, 4) };
         let backward = Drag { from: (0, 4), to: (0, 0) };
-        assert_eq!(extract(&rows(), &forward), extract(&rows(), &backward));
+        assert_eq!(pick(&rows(), &forward), pick(&rows(), &backward));
     }
 
     /// Selecting across lines keeps the middle rows whole and clips the two ends.
     #[test]
     fn selecting_across_lines_keeps_the_middle_whole() {
         let d = Drag { from: (0, 10), to: (2, 4) };
-        let got = extract(&rows(), &d);
+        let got = pick(&rows(), &d);
         let lines: Vec<&str> = got.lines().collect();
         assert_eq!(lines.len(), 3, "{got:?}");
         assert_eq!(lines[1], "second line", "a middle line must be selected whole");
@@ -264,7 +316,7 @@ mod tests {
     #[test]
     fn dragging_past_the_end_is_clamped() {
         let d = Drag { from: (0, 0), to: (99, 999) };
-        let got = extract(&rows(), &d);
+        let got = pick(&rows(), &d);
         assert!(got.ends_with("세 번째 줄"), "{got:?}");
     }
 
@@ -358,10 +410,10 @@ mod tests {
         let rows = vec!["do_it(x)".to_string()];
         // Column 7 is the `)`.
         let d = Drag { from: (0, 0), to: (0, 7) };
-        assert_eq!(extract(&rows, &d), "do_it(x)");
+        assert_eq!(pick(&rows, &d), "do_it(x)");
         // And backwards over the same cells.
         let back = Drag { from: (0, 7), to: (0, 0) };
-        assert_eq!(extract(&rows, &back), "do_it(x)");
+        assert_eq!(pick(&rows, &back), "do_it(x)");
     }
 
     /// The same on the last line of a selection that runs over several.
@@ -369,7 +421,7 @@ mod tests {
     fn the_last_line_keeps_the_character_the_drag_stopped_on() {
         let rows = vec!["first".to_string(), "do_it(x)".to_string()];
         let d = Drag { from: (0, 0), to: (1, 7) };
-        assert_eq!(extract(&rows, &d), "first\ndo_it(x)");
+        assert_eq!(pick(&rows, &d), "first\ndo_it(x)");
     }
 
     /// **What is highlighted is what is copied.** The two are read off different functions, so
@@ -382,12 +434,8 @@ mod tests {
         let spans = row_spans(&d, 80, 0..24, 0);
         assert_eq!(spans.len(), 1);
         let (_, from, to) = spans[0];
-        assert_eq!(extract(&rows, &d), "_it(x)");
-        assert_eq!(
-            (to - from) as usize,
-            extract(&rows, &d).chars().count(),
-            "colour and text differ"
-        );
+        assert_eq!(pick(&rows, &d), "_it(x)");
+        assert_eq!((to - from) as usize, pick(&rows, &d).chars().count(), "colour and text differ");
     }
 
     /// **The margin is furniture, not text.** Dragging a code block came back with `  │ ` on the
@@ -414,7 +462,7 @@ mod tests {
             "  │         return 1;".to_string(),
         ];
         let d = Drag { from: (0, 0), to: (2, 30) };
-        let got = extract(&rows, &d);
+        let got = pick(&rows, &d);
         assert_eq!(got, "    ret = call();\n    if (ret != 0) {\n        return 1;");
         assert!(!got.contains('│'), "the rule came along:\n{got}");
     }
@@ -426,12 +474,12 @@ mod tests {
         // Two spaces, the rule, five more spaces, then `ret = call();` — so columns 10 to 12 are
         // the end of `ret` and the `=` after it.
         let d = Drag { from: (0, 10), to: (0, 12) };
-        assert_eq!(extract(&rows, &d), "t =".to_string());
+        assert_eq!(pick(&rows, &d), "t =".to_string());
     }
 
     #[test]
     fn selecting_nothing_gives_an_empty_string() {
-        assert_eq!(extract(&[], &Drag::new((0, 0))), "");
+        assert_eq!(pick(&[], &Drag::new((0, 0))), "");
     }
 
     /// **The frame around a code block is not part of the code.** Dragging over a block came back
@@ -447,14 +495,14 @@ mod tests {
             "  └─".to_string(),
         ];
         let d = Drag { from: (0, 0), to: (3, 20) };
-        assert_eq!(extract(&rows, &d), "Get-Date\nexit 0");
+        assert_eq!(pick(&rows, &d), "Get-Date\nexit 0");
     }
 
     /// Landing entirely on a fence selects nothing, rather than a line of drawing.
     #[test]
     fn a_drag_that_covers_only_the_fence_takes_nothing() {
         let rows = vec!["  ┌─ sh ".to_string()];
-        assert_eq!(extract(&rows, &Drag { from: (0, 0), to: (0, 7) }), "");
+        assert_eq!(pick(&rows, &Drag { from: (0, 0), to: (0, 7) }), "");
     }
 
     /// **A table keeps its border.** The corners are the same characters, but a table's border
@@ -468,7 +516,7 @@ mod tests {
             "  └────┴────┘".to_string(),
         ];
         let d = Drag { from: (0, 0), to: (2, 20) };
-        let got = extract(&rows, &d);
+        let got = pick(&rows, &d);
         assert!(got.contains('┌'), "the table lost its top:\n{got}");
         assert!(got.contains('┘'), "the table lost its bottom:\n{got}");
     }

@@ -11,6 +11,33 @@ use crate::app::State;
 use crate::markdown::display_width;
 use std::collections::HashMap;
 
+/// How long one out-and-back of the breath takes.
+///
+/// **A period, and the drawing side reads it as a clock** (`breath_at` is handed `state.breath_ms`,
+/// not a frame number): a tempo stepped by frames runs at whatever rate the frame timer happens to
+/// be set to.
+pub const BREATH_PERIOD_MS: u64 = 1600;
+
+/// How many steps the breath is drawn in over that period.
+///
+/// **A tempo, not a frame count** — the same lesson as the activity dot's blink
+/// (`activity::BLINK_HALF_MS`), learned from the other end. The fade itself is continuous, so
+/// every frame carries a slightly different colour and every frame is a *different picture*: drawn
+/// on every tick that is sixty frames a second spent on a 1.6s fade, and a frame is not free —
+/// measured at 211×58 in a debug build, 12-20ms against a 16ms tick, so the loop was saturated for
+/// as long as a turn ran. Twenty steps over the period is a step every 80ms, which the eye reads as
+/// the same fade, at a fifth of the frames.
+pub const BREATH_STEPS: u64 = 20;
+
+/// Which step of the breath `ms` falls in — the clock rounded to what the eye is shown.
+///
+/// Read by the frame loop to decide whether a tick owes a frame (`tick_draws_for_the_breath`).
+/// **`breath_at` keeps taking the continuous time**: a frame drawn for another reason should carry
+/// the breath where it actually is, not where the last step left it.
+pub fn breath_step(ms: u64) -> u64 {
+    (ms % BREATH_PERIOD_MS) / (BREATH_PERIOD_MS / BREATH_STEPS)
+}
+
 /// How far toward the background the breath has gone at `ms` — `0.0` at full colour, [`DEEPEST`]
 /// at its faintest.
 ///
@@ -30,11 +57,10 @@ use std::collections::HashMap;
 ///
 /// Pure and taking its own clock, so a test can walk it rather than sleep through it.
 pub fn breath_at(ms: u64) -> f64 {
-    const PERIOD_MS: u64 = 1600;
-    let half = PERIOD_MS / 2;
-    let into = ms % PERIOD_MS;
+    let half = BREATH_PERIOD_MS / 2;
+    let into = ms % BREATH_PERIOD_MS;
     // Out for the first half of the period, back for the second.
-    let travelled = if into < half { into } else { PERIOD_MS - into };
+    let travelled = if into < half { into } else { BREATH_PERIOD_MS - into };
     travelled as f64 / half as f64 * DEEPEST
 }
 
@@ -148,6 +174,10 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut State) {
     state.scroll.on_content(total, height);
     let (start, end) = state.scroll.window(total, height);
     state.view_top = start;
+    // **Where each drawn line's own text starts.** The layout is the only thing that knows what it
+    // put in a line's margin, so the record rides along with the lines `window` just handed out and
+    // the selection starts there instead of guessing from the characters (`rows::furniture_width`).
+    state.view_body = state.rows_cache.window_body(start, end);
 
     // **Build only the visible lines.** Building all of them would grow with the conversation length and blow the frame budget.
     let mut shown = state.rows_cache.window(start, end);

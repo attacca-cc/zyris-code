@@ -52,6 +52,40 @@ impl Transport {
             }
         }
     }
+
+    /// The whole invocation, for a manager row's detail block.
+    ///
+    /// **Args are shown and a URL's query is not.** Args are part of what the server will run and
+    /// somebody deciding whether to trust it needs them; a query string is where a token lives,
+    /// which is the same reason `summary` keeps only the host.
+    pub fn detail(&self) -> String {
+        match self {
+            Transport::Stdio { command, args, .. } => {
+                if args.is_empty() {
+                    command.clone()
+                } else {
+                    format!("{command} {}", args.join(" "))
+                }
+            }
+            Transport::Http { url, .. } => url.split('?').next().unwrap_or(url).to_string(),
+        }
+    }
+
+    /// The **names** of what it is handed — env vars for a child process, headers for a remote
+    /// one.
+    ///
+    /// **Names only. The values are where the secrets are**, and a panel is a thing people
+    /// screenshot and paste into issues. That a token is being passed is the fact worth showing;
+    /// which token it is is not.
+    pub fn handed_names(&self) -> Vec<String> {
+        let map = match self {
+            Transport::Stdio { env, .. } => env,
+            Transport::Http { headers, .. } => headers,
+        };
+        let mut names: Vec<String> = map.keys().cloned().collect();
+        names.sort();
+        names
+    }
 }
 
 /// The file shape, as written by hand or by another client.
@@ -184,6 +218,45 @@ impl ServeCapability for McpCapability {
             .map_err(|e| WireError::internal(e.to_string()))?;
         encode_response(&out)
     }
+}
+
+/// Takes one server out of the file it is written in, leaving everything else in that file alone.
+///
+/// **Read, edited, written back — not parsed into a struct and re-serialized.** These files are
+/// shared with other clients, and rebuilding one from this app's idea of its shape would drop every
+/// key this app does not know about: `inputs`, `disabled`, a whole per-project block. The same
+/// reason `merge_configs` reads three different wrapper names instead of one.
+///
+/// Both wrapper names and the bare top-level shape are tried, because a plugin's `.mcp.json` puts
+/// its servers at the top level with no wrapper at all.
+pub fn remove_server(path: &Path, slug: &str) -> Result<(), String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut value: Value =
+        serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut removed = false;
+    for key in ["mcpServers", "servers"] {
+        if let Some(map) = value.get_mut(key).and_then(Value::as_object_mut) {
+            removed |= map.remove(slug).is_some();
+        }
+    }
+    if !removed {
+        if let Some(map) = value.as_object_mut() {
+            removed = map.remove(slug).is_some();
+        }
+    }
+    if !removed {
+        return Err(format!("`{slug}` is not in {}", path.display()));
+    }
+    write_json(path, &value)
+}
+
+/// Writes a config file the way everything else here writes one: **a temp file, then a rename**, so
+/// a crash halfway leaves the old file rather than half of a new one.
+fn write_json(path: &Path, value: &Value) -> Result<(), String> {
+    let text = serde_json::to_string_pretty(value).map_err(|e| e.to_string())?;
+    let temp = path.with_extension(format!("{}.tmp", std::process::id()));
+    std::fs::write(&temp, format!("{text}\n")).map_err(|e| e.to_string())?;
+    std::fs::rename(&temp, path).map_err(|e| e.to_string())
 }
 
 /// Two places to read config from. **The later one wins** — the project is more specific than home.

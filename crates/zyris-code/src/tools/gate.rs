@@ -121,14 +121,12 @@ pub fn decide(mode: Mode, config: &Config, call: &Call, plan_decided: bool) -> D
     // Plan mode comes first. Refusing over something immutable is wasted effort.
     if mode == Mode::Plan && !plan_decided && !only_reads(call) {
         return Decision::Refuse(
-            "계획 모드입니다. 지금은 파일을 바꾸거나 명령을 돌릴 수 없습니다. \
-             무엇을 할지 먼저 말해 주세요."
-                .into(),
+            "Plan mode: nothing may be written or run yet. Say what you mean to do first.".into(),
         );
     }
     if let Some(path) = &call.dangling {
         return Decision::Refuse(format!(
-            "`{}`은(는) 대상이 없는 심볼릭 링크라 쓸 수 없습니다.",
+            "`{}` is a dangling symbolic link, so it cannot be written.",
             path.display()
         ));
     }
@@ -145,8 +143,8 @@ pub fn decide(mode: Mode, config: &Config, call: &Call, plan_decided: bool) -> D
     // sandboxing to the operating system, which is where it belongs.
     if let Some(path) = &call.secret {
         return Decision::Refuse(format!(
-            "`{}`은(는) 이 앱의 자격 파일이라 도구로는 읽거나 바꿀 수 없습니다. \
-             설정과 무관하게 언제나 막힙니다.",
+            "`{}` is this app's credential file: no tool may read or write it, \
+             whatever the settings say.",
             path.display()
         ));
     }
@@ -156,9 +154,9 @@ pub fn decide(mode: Mode, config: &Config, call: &Call, plan_decided: bool) -> D
     if let Some(path) = &call.outside {
         if config.dir_access == DirAccess::Deny {
             return Decision::Refuse(format!(
-                "`{}`은(는) 작업 디렉터리 밖이라 만질 수 없습니다 ‒ 설정의 \
-                 '다른 디렉토리 접근'이 거부로 되어 있습니다. `/config dir allow`로 \
-                 허용하거나, 작업 디렉터리 안에서 할 수 있는 길을 찾아 주세요.",
+                "`{}` is outside the working directory and 'other directory access' is \
+                 set to deny. Set `/config dir allow`, or find a way that stays inside the \
+                 working directory.",
                 path.display()
             ));
         }
@@ -427,7 +425,7 @@ pub fn target_of(capability: &str, tool: &str, args: &Value) -> String {
         ("terminal", "open") | ("terminal", "open_stream") => {
             let shell = s("shell");
             if shell.is_empty() {
-                "기본 셸".into()
+                "default shell".into()
             } else {
                 shell
             }
@@ -898,7 +896,7 @@ mod tests {
         let Decision::Refuse(why) = decide(Mode::Plan, &Config::default(), &call, false) else {
             panic!("it passed in plan mode");
         };
-        assert!(why.contains("계획"), "{why}");
+        assert!(why.contains("Plan mode"), "{why}");
     }
 
     /// Reading passes in plan mode too — but the directory policy still applies outside.

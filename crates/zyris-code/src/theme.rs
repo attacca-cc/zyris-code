@@ -125,7 +125,12 @@ impl Palette {
     }
 
     pub fn selection_bg(self) -> Color {
-        self.pick((0x3f, 0x2e, 0x22), (0xef, 0xdc, 0xca))
+        // **Not the person's band.** The drag wash is the only background in this app that is not
+        // the brand's warm brown, and that is the point: the person's own message wears that brown
+        // (`user_bg`), and the wash has to be told apart from it — often on the same line, when a
+        // selection is dragged over something they wrote. The two were the same colour to the eye
+        // (reported 2026-09-15), so the wash is the cool one now and a test locks the hue apart.
+        self.pick((0x1e, 0x35, 0x4a), (0xc3, 0xd8, 0xec))
     }
 
     pub fn border(self) -> Color {
@@ -628,6 +633,30 @@ mod tests {
         for (theme, palette) in palettes() {
             let ratio = contrast(palette.text(), palette.selection_bg());
             assert!(ratio >= 4.5, "{theme:?} text on the selection is {ratio:.2}:1");
+        }
+    }
+
+    /// **The drag wash is not the person's band.** Both are backgrounds in the same conversation,
+    /// often on the same line — a selection dragged over a message they wrote — and telling
+    /// "I wrote this" from "I selected this" apart is the whole job of the two. **They are
+    /// separated by hue, not by brightness**: the person's band is warm and the wash is cool, so
+    /// neither theme can drift into the other without this failing. Before 2026-09-15 the wash was
+    /// a warmer shade of the same brown, and over a message of their own the two were one colour.
+    #[test]
+    fn the_selection_is_not_the_user_message_band() {
+        for (theme, palette) in palettes() {
+            let (Color::Rgb(ur, ug, ub), Color::Rgb(sr, sg, sb)) =
+                (palette.user_bg(), palette.selection_bg())
+            else {
+                panic!("{theme:?}: a band is not an rgb colour");
+            };
+            let distance = ((ur as f64 - sr as f64).powi(2)
+                + (ug as f64 - sg as f64).powi(2)
+                + (ub as f64 - sb as f64).powi(2))
+            .sqrt();
+            assert!(distance >= 50.0, "{theme:?}: the bands are {distance:.1} apart — one colour");
+            assert!(ur > ub, "{theme:?}: the person's band is the warm one");
+            assert!(sb > sr, "{theme:?}: the wash is the cool one");
         }
     }
 

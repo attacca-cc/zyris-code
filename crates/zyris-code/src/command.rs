@@ -495,8 +495,8 @@ pub fn keys(lang: crate::lang::Lang) -> Vec<(&'static str, &'static str)> {
             ("Ctrl+Y", "방금 지운 것 되붙이기"),
             ("Ctrl+A ∙ Ctrl+E", "줄 맨 앞∙맨 뒤로"),
             ("Alt+← Alt+→", "낱말 단위로 이동 (Alt+B ∙ Alt+F도 됩니다)"),
-            ("Esc", "도는 턴 멈추기"),
-            ("Ctrl+C", "멈추기 → 한 번 더 누르면 끝내기"),
+            ("Esc", "도는 턴 멈추기 ‒ 멈추는 키는 이것뿐"),
+            ("Ctrl+C", "한 번 더 누르면 끝내기 (턴은 멈추지 않습니다)"),
             ("드래그", "화면 아무 데나 ‒ 놓는 순간 고른 글이 클립보드로"),
         ],
         Lang::En => vec![
@@ -518,8 +518,8 @@ pub fn keys(lang: crate::lang::Lang) -> Vec<(&'static str, &'static str)> {
             ("Ctrl+Y", "Put back what you just cut"),
             ("Ctrl+A ∙ Ctrl+E", "Start and end of the line"),
             ("Ctrl+← Ctrl+→", "Move by word (Alt+B and Alt+F work too)"),
-            ("Esc", "Stop the running turn"),
-            ("Ctrl+C", "Stop, then press again to quit"),
+            ("Esc", "Stop the running turn ‒ the only key that stops it"),
+            ("Ctrl+C", "Press again to quit (it does not stop the turn)"),
             ("drag", "Drag anywhere ‒ the selected text goes to the clipboard when you let go"),
         ],
     }

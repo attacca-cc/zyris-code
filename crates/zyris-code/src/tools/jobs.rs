@@ -194,7 +194,7 @@ impl Jobs {
             .or_else(|| spec.argv.as_ref().map(|a| a.join(" ")))
             .unwrap_or_default();
 
-        let mut child = cmd.spawn().map_err(|e| format!("띄우지 못했습니다: {e}"))?;
+        let mut child = cmd.spawn().map_err(|e| format!("could not start it: {e}"))?;
         let pid = child.id();
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
@@ -382,17 +382,17 @@ pub(crate) fn shell_running(line: &str) -> tokio::process::Command {
 fn build(spec: &Spec, root: &Path) -> Result<tokio::process::Command, String> {
     let mut cmd = match (&spec.command, &spec.argv) {
         (Some(_), Some(_)) | (None, None) => {
-            return Err("command와 argv 중 정확히 하나를 주세요.".into())
+            return Err("give exactly one of `command` or `argv`".into())
         }
         (Some(line), None) => {
             if line.trim().is_empty() {
-                return Err("command가 비어 있습니다.".into());
+                return Err("`command` is empty".into());
             }
             shell_running(line)
         }
         (None, Some(argv)) => {
             let Some((program, rest)) = argv.split_first() else {
-                return Err("argv가 비어 있습니다.".into());
+                return Err("`argv` is empty".into());
             };
             let mut c = tokio::process::Command::new(program);
             c.args(rest);

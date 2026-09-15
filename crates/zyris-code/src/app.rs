@@ -331,6 +331,17 @@ pub enum Action {
     /// **Esc is `PanelClose`, which throws the draft away** — that is the whole reason the
     /// form edits a draft instead of the live settings.
     ConfigSave,
+    /// Move the manager's cursor (`/mcp`·`/plugin`). Positive is down.
+    ManagerMove(i32),
+    /// Switch what the manager's cursor is on (Enter/Space) — on or off, whichever it is not.
+    ManagerAct,
+    /// Take the row under the manager's cursor away. **Asks first**: the second press is the
+    /// answer.
+    ManagerRemove,
+    /// Fetch the newest version of the fetched plugin under the cursor.
+    ManagerUpdate,
+    /// Read the disk again — another window or another client may have changed it.
+    ManagerReload,
     CycleMode,
     /// From the start of the draft up to the cursor (`Ctrl+U`). With the cursor at the end —
     /// where it nearly always is — that is the whole draft, which is what this used to be.
@@ -399,10 +410,10 @@ pub struct State {
     pub update_wanted: bool,
     /// Have we already asked for this turn to stop?
     ///
-    /// **Without this there is no way to close the window when the server hangs.** Ctrl+C
-    /// goes to cancel while a turn runs, and if the cancel does not take so `running` stays
-    /// true, every press just sends the same request again. Once asked, the next Ctrl+C is
-    /// handed over to quitting.
+    /// **What says the turn is on its way out.** Esc asks for it (`Action::Cancel`), and until
+    /// the server answers, the activity line says so rather than looking frozen. **Ctrl+C never
+    /// sets this** — ending the window and ending the turn are two different things, and only one
+    /// of them can be taken back (2026-09-15).
     pub stopping: bool,
     /// Text selected in the transcript area. **It goes to the system clipboard on release.**
     pub selection: Option<String>,
@@ -451,6 +462,10 @@ pub struct State {
     /// `transcript::draw` fills it from the rows cache; `widgets::draw` wraps those cells
     /// in OSC 8 so the terminal makes them Ctrl+clickable.
     pub view_links: Vec<Vec<crate::markdown::Link>>,
+    /// **Where each drawn conversation line's own text starts**, parallel to the lines the
+    /// transcript last drew. `transcript::draw` fills it from the rows cache; the selection starts
+    /// where the text does, so a drag never picks the margin up (`rows::furniture_width`).
+    pub view_body: Vec<u16>,
     /// Links visible in the final composed frame, in absolute screen cells. Rebuilt every frame
     /// so an overlay can replace both the drawing and the hit target underneath it.
     pub screen_links: Vec<ScreenLink>,
@@ -495,6 +510,12 @@ pub struct State {
     /// moving must not count as a click. Overwritten by the next press, read when the button
     /// comes up (`Release`).
     pub press_cannot_click: bool,
+    /// When the last press landed and where — a second one on the same row within [`DOUBLE_CLICK`]
+    /// is a double click, and it takes that row.
+    pub last_press: Option<(Instant, u16, u16)>,
+    /// **The fold a single click just toggled**, if it toggled one, so the double click that may
+    /// follow can put it back. A double click asks for the line, not for a card to open.
+    pub click_flipped: Option<i64>,
     /// The visible text of the last drawn frame, one `String` per screen row. Mouse selection
     /// reads from this — a drag anywhere on the screen extracts what it covers.
     pub screen: Vec<String>,
@@ -556,6 +577,13 @@ pub struct State {
     /// Filled when the form takes Enter — (name, description). The I/O side does the
     /// creating.
     pub project_out: Option<(String, String)>,
+    /// What the `/mcp`·`/plugin` manager asked for.
+    ///
+    /// **`apply` is pure, so every act lands here** — switching a server on, taking an entry out
+    /// of a config file, deleting a fetched plugin — and the loop below carries it out, the same
+    /// way `command_out` and `project_out` are carried. The panel stays up across it: it is the
+    /// thing being used, and closing on every toggle would mean reopening it for the second one.
+    pub manager_out: Option<ManagerAsk>,
     /// Session usage — credits, context, tokens. Polled off the draw loop (`Frame::Poll`) and
     /// shown on the bottom bar's right edge.
     pub usage: crate::usage::Usage,
@@ -723,6 +751,7 @@ impl Default for State {
             view_cards: std::collections::HashMap::new(),
             view_open: std::collections::HashMap::new(),
             view_links: Vec::new(),
+            view_body: Vec::new(),
             screen_links: Vec::new(),
             drag: None,
             drag_top: 0,
@@ -732,6 +761,8 @@ impl Default for State {
             selection_stale: false,
             dragging: false,
             press_cannot_click: false,
+            last_press: None,
+            click_flipped: None,
             screen: Vec::new(),
             asking: None,
             plan: None,
@@ -750,6 +781,7 @@ impl Default for State {
             github_out: None,
             panel: None,
             project_out: None,
+            manager_out: None,
             usage: crate::usage::Usage::default(),
             title: "Zyris Code".into(),
             breath_origin: Instant::now(),
@@ -783,6 +815,9 @@ impl Default for State {
 /// After one Ctrl+C, pressing again within this window quits.
 pub const QUIT_WINDOW: Duration = Duration::from_millis(1500);
 
+/// Two presses on the same row within this window are a double click, and the row is selected.
+pub const DOUBLE_CLICK: Duration = Duration::from_millis(400);
+
 /// A fold on the move, on its way in.
 #[derive(Debug, Clone, Copy)]
 pub struct Fade {
@@ -808,6 +843,49 @@ const PAST_THE_RIGHT_EDGE: usize = u16::MAX as usize;
 /// The gap that marks a paste burst. Terminals without bracketed paste let a paste through
 /// as keys arriving a few ms apart — a speed no human can type at.
 const PASTE_BURST: Duration = Duration::from_millis(25);
+
+/// How many keys have to arrive at that speed, one after another, before an Enter among them is
+/// read as a paste's newline rather than as a person's Enter.
+///
+/// **One key is not a paste, and taking it for one cost every message.** The rule used to be "the
+/// key before this Enter was less than `PASTE_BURST` ago", which an input method satisfies on its
+/// own: fcitx commits the syllable still being composed **as Enter is pressed**, so the app is
+/// handed the committed character and the Enter in one read, microseconds apart — and the first
+/// Enter after any Korean word became a newline, with the message going out only on the second
+/// (reported 2026-09-15). A paste is not one key beside an Enter, it is a run of them: a word's
+/// end commits one or two characters, a pasted line is many.
+const PASTE_RUN: usize = 3;
+
+/// Keys arriving at paste speed, and how many of them have done so in a row.
+///
+/// **A press only.** Windows sends a press and a release for every key, and a release is not
+/// something anyone typed — counted, it would make a burst out of half as many presses.
+#[derive(Debug, Default)]
+struct PasteBurst {
+    last: Option<Instant>,
+    run: usize,
+}
+
+impl PasteBurst {
+    /// Records one key press and answers whether it landed inside a **sustained** run of
+    /// paste-speed keys — itself included.
+    fn press(&mut self, at: Instant) -> bool {
+        let rapid = self.last.is_some_and(|prev| at.duration_since(prev) < PASTE_BURST);
+        let before = self.run;
+        self.run = if rapid { before + 1 } else { 0 };
+        self.last = Some(at);
+        rapid && before >= PASTE_RUN
+    }
+
+    /// The same for a whole key event. A release is never part of a burst — and never breaks one
+    /// either, because it is not a key.
+    fn key(&mut self, key: &KeyEvent, at: Instant) -> bool {
+        if key.kind == KeyEventKind::Release {
+            return false;
+        }
+        self.press(at)
+    }
+}
 
 /// How long a notice stays on screen. Plenty to read one sentence.
 pub const STATUS_WINDOW: Duration = Duration::from_secs(6);
@@ -938,6 +1016,32 @@ impl State {
             let ((r0, _), (r1, _)) = drag.ordered();
             r0 >= top && r1 < top + self.view_height
         })
+    }
+
+    /// **What the highlight covers, as text.** One place, because the colour on the cells and the
+    /// words on the clipboard have to agree — reading the margins off the screen twice is how they
+    /// drift apart.
+    pub fn selected_text(&self, drag: &crate::selection::Drag) -> String {
+        crate::selection::extract(&self.screen, &self.screen_body(), drag)
+    }
+
+    /// **Where each row of the screen's own text starts**, one entry per drawn row.
+    ///
+    /// The conversation's rows are the layout's answer (`view_body`) — the layout is the only thing
+    /// that knows what it drew in a line's margin. Everything else (the bars, the input, an overlay,
+    /// a screen drawn before the first layout) has no such record, and there the text heuristic
+    /// stands in.
+    pub fn screen_body(&self) -> Vec<u16> {
+        (0..self.screen.len()).map(|row| self.body_of(row)).collect()
+    }
+
+    /// Where row `row` of the screen's own text starts — the conversation's record where it has one.
+    pub fn body_of(&self, row: usize) -> u16 {
+        let top = self.view_origin.1 as usize;
+        if row >= top && row - top < self.view_body.len() {
+            return self.view_body[row - top];
+        }
+        self.screen.get(row).map_or(0, |line| crate::selection::body_start(line) as u16)
     }
 
     /// Lets go of a highlight the conversation cannot carry. Called wherever it scrolls.
@@ -1265,6 +1369,21 @@ pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
                 _ => vec![],
             };
         }
+        // **A manager acts on the row under its cursor.** ↑↓ walk it, Enter/Space switches it,
+        // `d` takes it away (asking first), `u` fetches a fetched plugin's update, `r` reads the
+        // disk again. Nothing here scrolls: a list built to fit is not scrolled with ↓.
+        if state.panel.as_ref().is_some_and(|p| p.manager.is_some()) {
+            return match key.code {
+                KeyCode::Esc => vec![Action::PanelClose],
+                KeyCode::Up | KeyCode::Char('k') => vec![Action::ManagerMove(-1)],
+                KeyCode::Down | KeyCode::Char('j') => vec![Action::ManagerMove(1)],
+                KeyCode::Enter | KeyCode::Char(' ') => vec![Action::ManagerAct],
+                KeyCode::Char('d') | KeyCode::Delete => vec![Action::ManagerRemove],
+                KeyCode::Char('u') => vec![Action::ManagerUpdate],
+                KeyCode::Char('r') => vec![Action::ManagerReload],
+                _ => vec![],
+            };
+        }
         // **A panel that offers a choice takes the arrows.** `/mode` lists four modes with a
         // cursor beside one of them; scrolling a list that fits is not what ↓ means.
         if state.panel.as_ref().is_some_and(|p| p.mode_pick.is_some()) {
@@ -1368,16 +1487,16 @@ pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
     }
 
     match key.code {
-        // **Ctrl+C is the key that stops or quits.** Copy is not here — with three meanings
-        // overlapping there is no telling what happens when it matters. Selected text goes
-        // to the clipboard on release.
+        // **Ctrl+C quits and nothing else.** It used to stop the running turn first and quit on
+        // the second press, which made one key mean two things — and the one a person did not
+        // intend is the one that cannot be taken back. **Esc is the key that stops a turn, and it
+        // is the only one** (2026-09-15). Copy is not here either: the selected text goes to the
+        // clipboard the moment the mouse is released.
         KeyCode::Char('c') if ctrl => {
-            // **Once it cancels, after that it quits.** There is a case where the cancel
-            // does not take and `running` stays true — when the server hangs. The window
-            // must still be closable then.
-            if state.running && !state.stopping {
-                vec![Action::Cancel]
-            } else if state.quit_pending() {
+            // **Two presses, so one accident does not close the window.** A turn running, or a
+            // stop that never took because the server hung, no longer stands between the press
+            // and the quit — this is the way out whatever the session is doing.
+            if state.quit_pending() {
                 vec![Action::Quit]
             } else {
                 vec![Action::ArmQuit]
@@ -1429,10 +1548,9 @@ pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
         KeyCode::Char('b') if alt => vec![Action::WordLeft],
         KeyCode::Char('f') if alt => vec![Action::WordRight],
         KeyCode::Char('d') if alt => vec![Action::DeleteWordAfter],
-        // **`Ctrl+D` deletes forward and never quits.** In a shell it ends the session on an
-        // empty line; here `Ctrl+C` is the one key that stops or quits, and a second way out —
-        // reachable by one keystroke on an empty draft — is exactly the accident that rule
-        // exists to prevent.
+        // **Esc is the only key that stops a turn.** In a shell `Ctrl+D` ends the session on an
+        // empty line; here a second way out — reachable by one keystroke on an empty draft — is
+        // exactly the accident that rule exists to prevent.
         KeyCode::Char('d') if ctrl => vec![Action::Delete],
         // History, same rules as the arrows. In a shell these always reach for history, but
         // here that would throw away a draft in progress, so they follow `↑`/`↓` exactly rather
@@ -1448,6 +1566,8 @@ pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
         // With a selection up, Esc clears it. This comes before cancelling a running turn —
         // what is in front of you comes first.
         KeyCode::Esc if state.selection.is_some() => vec![Action::ClearSelection],
+        // **The one key that stops a turn.** Ctrl+C is the way out of the app (2026-09-15),
+        // so there is no second key here to be pressed by mistake.
         KeyCode::Esc if state.running => vec![Action::Cancel],
         // **Shift+Enter and Alt+Enter are newlines.** With the kitty keyboard protocol on
         // (`PushKeyboardEnhancementFlags` in `run()` below) Shift+Enter arrives separately as
@@ -1898,6 +2018,44 @@ pub fn apply(state: &mut State, action: &Action) {
                     return;
                 }
             }
+            // **A second press on the same row is a double click, and the row is taken.** Nothing
+            // moves the pointer between the two, so the row is the one under it. The first press
+            // went through `Release`, where a click folds whatever it landed on — and that has to
+            // be put back: the person asked for the line, not for a card to open.
+            let now = Instant::now();
+            let double = matches!(action, Action::Press(..))
+                && state.last_press.is_some_and(|(at, px, py)| {
+                    now.duration_since(at) < DOUBLE_CLICK && py == *y && px.abs_diff(*x) <= 1
+                });
+            // **Only a press that could become a click opens the sequence.** The press that
+            // brought the window its focus is not one (it never folds, never selects) — counting
+            // it would make the next ordinary click look like the second half of a double click.
+            if matches!(action, Action::Press(..)) {
+                state.last_press = Some((now, *x, *y));
+            }
+            if double {
+                if let Some(seq) = state.click_flipped.take() {
+                    state.flip_fold(seq);
+                }
+                // **The whole row, in screen columns.** Past the last character there is nothing
+                // to aim at, so an end off the right of the terminal is exactly "to the end of the
+                // line" — `extract` clamps it to the row.
+                let drag = crate::selection::Drag {
+                    from: (*y as usize, 0),
+                    to: (*y as usize, u16::MAX as usize),
+                };
+                state.drag = Some(drag);
+                state.drag_top = state.view_top;
+                state.drag_anchor = state.content_at(*x, *y).map(|(row, _)| row);
+                // **Not a drag.** The row itself is what was asked for, so a pointer moving
+                // afterwards does not stretch the selection over the lines below.
+                state.dragging = false;
+                state.press_cannot_click = true;
+                let text = state.selected_text(&drag);
+                state.selection = (!text.trim().is_empty()).then_some(text);
+                return;
+            }
+            state.click_flipped = None;
             // A new press discards the previous selection.
             state.selection = None;
             // **The whole screen is selectable — blank space included.** A drag that starts
@@ -1929,7 +2087,7 @@ pub fn apply(state: &mut State, action: &Action) {
                     // heavier in proportion to the screen — a drag runs at hand speed,
                     // so building it then is enough. The text comes from the last drawn
                     // frame, so any visible text — even the enrollment code — is copyable.
-                    let text = crate::selection::extract(&state.screen, &drag);
+                    let text = state.selected_text(&drag);
                     state.selection = (!text.trim().is_empty()).then_some(text);
                 }
             }
@@ -1958,6 +2116,10 @@ pub fn apply(state: &mut State, action: &Action) {
                 let content = state.content_at(drag.from.1 as u16, drag.from.0 as u16);
                 if let Some(&seq) = content.and_then(|(r, _)| state.view_cards.get(&r)) {
                     state.flip_fold(seq);
+                    // **Remembered for one double-click window.** The press that may arrive right
+                    // after is the second half of a double click, and it puts this back — taking a
+                    // line is not opening a card.
+                    state.click_flipped = Some(seq);
                 }
             }
         }
@@ -2061,6 +2223,99 @@ pub fn apply(state: &mut State, action: &Action) {
             }
         }
         Action::PanelClose => state.panel = None,
+        // **The cursor is the panel's own state**, so moving it is a rebuild of the one thing the
+        // widget draws — the same rule `ConfigMove` follows.
+        Action::ManagerMove(by) => {
+            if let Some(manager) = state.panel.as_mut().and_then(|p| p.manager.as_mut()) {
+                manager.move_cursor(*by);
+                manager.note = None;
+            }
+            refresh_the_manager_body(state);
+        }
+        // **The act is I/O and belongs to the loop below.** What happens here is only noting it
+        // down — or saying why this row will not take that key.
+        Action::ManagerAct => {
+            let lang = state.lang;
+            let ask = {
+                let Some(manager) = state.panel.as_mut().and_then(|p| p.manager.as_mut()) else {
+                    return;
+                };
+                let Some(row) = manager.row().cloned() else { return };
+                match ask_from(manager.kind, &row, Verb::Switch) {
+                    Some(ask) => {
+                        manager.note = None;
+                        Some(ask)
+                    }
+                    None => {
+                        manager.note = Some(lang.manager_cannot(&row.id));
+                        None
+                    }
+                }
+            };
+            if ask.is_some() {
+                state.manager_out = ask;
+            }
+            refresh_the_manager_body(state);
+        }
+        Action::ManagerRemove => {
+            let lang = state.lang;
+            let ask = {
+                let Some(manager) = state.panel.as_mut().and_then(|p| p.manager.as_mut()) else {
+                    return;
+                };
+                let Some(row) = manager.row().cloned() else { return };
+                match ask_from(manager.kind, &row, Verb::Remove) {
+                    None => {
+                        manager.note = Some(lang.manager_cannot(&row.id));
+                        None
+                    }
+                    Some(ask) => {
+                        // **Two presses, and the question names the row.** A deleted directory
+                        // cannot be put back, and `d` sits one key from the row above it.
+                        if manager.confirm.as_deref() == Some(row.id.as_str()) {
+                            manager.confirm = None;
+                            manager.note = None;
+                            Some(ask)
+                        } else {
+                            manager.confirm = Some(row.id.clone());
+                            manager.note = Some(lang.manager_confirm(&row.id));
+                            None
+                        }
+                    }
+                }
+            };
+            if ask.is_some() {
+                state.manager_out = ask;
+            }
+            refresh_the_manager_body(state);
+        }
+        Action::ManagerUpdate => {
+            let lang = state.lang;
+            let ask = {
+                let Some(manager) = state.panel.as_mut().and_then(|p| p.manager.as_mut()) else {
+                    return;
+                };
+                let Some(row) = manager.row().cloned() else { return };
+                match ask_from(manager.kind, &row, Verb::Update) {
+                    Some(ask) => Some(ask),
+                    None => {
+                        manager.note = Some(lang.manager_cannot(&row.id));
+                        None
+                    }
+                }
+            };
+            if ask.is_some() {
+                state.manager_out = ask;
+            }
+            refresh_the_manager_body(state);
+        }
+        Action::ManagerReload => {
+            if let Some(manager) = state.panel.as_mut().and_then(|p| p.manager.as_mut()) {
+                manager.note = None;
+                manager.confirm = None;
+            }
+            state.manager_out = Some(ManagerAsk::Reload);
+        }
         // **Rebuilt, not nudged.** The body is plain lines with no idea which one is the cursor,
         // so moving it is a rebuild with the new `pick` — which keeps the whole panel a pure
         // function of (current mode, cursor).
@@ -2333,8 +2588,8 @@ fn apply_frame(state: &mut State, frame: &Frame) {
                 state.flush_queue = true;
             }
             // The request to stop lasts only for that turn. **Release it only on a change** —
-            // the same state arrives many times while running, and releasing every time
-            // would make Ctrl+C repeat the cancel forever.
+            // the same state arrives many times while running, and releasing every time would
+            // make Esc repeat the cancel forever.
             if state.running != *running {
                 state.stopping = false;
             }
@@ -2986,6 +3241,31 @@ fn frame_interval() -> Duration {
 /// many notches can move state while producing one terminal frame; discrete input stays immediate.
 fn draws_immediately(actions: &[Action]) -> bool {
     actions.iter().any(|action| !matches!(action, Action::Wheel(_)))
+}
+
+/// Whether this tick owes a frame for the breath — the one thing a running turn puts on the
+/// screen by itself.
+///
+/// **A tempo, not a frame count.** The breath is a 1.6s fade, so every frame carries a slightly
+/// different colour and every frame is a different picture — which is why a running turn used to
+/// ask for one on every tick, sixty a second for as long as the turn lasted. A frame is not free,
+/// though: measured at 211×58 in a debug build it is 12-20ms against a tick of 16ms, so the loop
+/// was saturated for the whole of a turn, on a four-thread box that is also rendering the
+/// terminal. That is what "it flickers while I type with the agent working" was (2026-09-15). The
+/// frame is asked for when the breath steps instead — see `transcript::BREATH_STEPS`.
+fn tick_draws_for_the_breath(state: &State, last_step: u64) -> bool {
+    state.running && crate::widgets::transcript::breath_step(state.breath_ms()) != last_step
+}
+
+/// Whether the picker's dot has moved — the only animated thing left when no turn is running.
+///
+/// It is a tempo as well: it changes twice an 800ms (`activity::BLINK_HALF_MS`), so it is drawn
+/// then and not on the fifty-nine ticks in between.
+fn picker_dot_moved(state: &State, last_blink: bool) -> bool {
+    crate::widgets::activity::blink_on(state.blink_ms()) != last_blink
+        && state.picker.as_ref().is_some_and(|p| {
+            p.rows.iter().any(|r| r.status == Some(crate::picker::ThreadStatus::Running))
+        })
 }
 
 /// How often usage and title are asked for again. Asking every frame would hammer the server.
@@ -4031,9 +4311,9 @@ async fn run_inner(
     let mut poll = tokio::time::interval(POLL_INTERVAL);
     let mut git = tokio::time::interval(git_every.unwrap_or(Duration::from_secs(86400)));
     let mut pull = tokio::time::interval(pull_every.unwrap_or(Duration::from_secs(86400)));
-    // When the last key event happened — the basis for detecting a paste burst on a
-    // terminal without bracketed paste.
-    let mut last_key_at: Option<Instant> = None;
+    // Keys arriving at paste speed — the basis for detecting a paste burst on a terminal
+    // without bracketed paste (`PasteBurst`).
+    let mut burst = PasteBurst::default();
     // When focus last came back. The click that restored it must not act on the transcript.
     let mut focus_back_at: Option<Instant> = None;
     // When off, leave it as a timer that never fires. The point is not to add another
@@ -4052,6 +4332,11 @@ async fn run_inner(
     // draw once more.
     let mut last_quit_pending = false;
     let mut last_had_status = false;
+    // **The tempo of the two things that move on their own** — the breath's step and the dot's
+    // phase as the last frame drew them. Both are clocks, not frame counts: see
+    // `tick_draws_for_the_breath` and `picker_dot_moved`.
+    let mut last_breath_step = crate::widgets::transcript::breath_step(state.breath_ms());
+    let mut last_blink = crate::widgets::activity::blink_on(state.blink_ms());
     let mut shutdown = shutdown_signals();
     // **If the loop stalls, nobody finds out.** An await on a dead connection is released by
     // its deadline, but other blocking (a stuck terminal write, say) can remain. Then keys
@@ -4088,14 +4373,12 @@ async fn run_inner(
                         }
                         // **Rescue a paste burst as newlines.** A terminal without
                         // bracketed paste (mobile Termius and the like) lets a paste
-                        // through as keys arriving in rapid succession. When keys arrive
-                        // at an interval no human can type at (< PASTE_BURST), an Enter
-                        // among them is a newline, not a submit — otherwise the first line
-                        // of a multi-line prompt goes out on its own.
-                        let now = Instant::now();
-                        let in_burst = last_key_at
-                            .is_some_and(|t| now.duration_since(t) < PASTE_BURST);
-                        last_key_at = Some(now);
+                        // through as keys arriving in rapid succession. A *run* of them,
+                        // at an interval no human can type at, is what an Enter inside it
+                        // is read from — one key beside it is a person typing, or an input
+                        // method committing a syllable, and both of those send
+                        // (`PasteBurst`).
+                        let in_burst = burst.key(&k, Instant::now());
                         if enter_becomes_newline(&state, &k, in_burst) {
                             // An Enter that arrived mid-burst is a newline — and the
                             // decision is `enter_becomes_newline`'s, so an approval,
@@ -4243,8 +4526,9 @@ async fn run_inner(
                     apply(&mut state, &action);
 
                     // **Selected text goes to the clipboard the moment the mouse is
-                    // released.** There is no key to press — leaving Ctrl+C as the one stop
-                    // key is less confusing when it matters. `apply` sets the range, so
+                    // released.** There is no key to press — copy on a key would have to share it
+                    // with something else, and the something else is quitting. `apply` sets the
+                    // range, so
                     // this has to come after it. Exporting is I/O, hence here. A terminal
                     // that does not know OSC 52 ignores it quietly, at no cost — but one that
                     // was never going to read it is not asked at all (`caps.osc52`), because a
@@ -4289,6 +4573,17 @@ async fn run_inner(
                         // directory policy makes to the gate.
                         crate::theme::set(state.config.theme.resolve());
                         bridge.sync(state.mode, &state.config, state.plan_decided);
+                    }
+
+                    // **A manager key reaches the disk here.** `apply` only noted what was asked
+                    // for; this is where an entry leaves a config file, a server is switched, or a
+                    // fetched plugin is updated — and then the panel is rebuilt from what is now
+                    // on disk, so the row shows the truth rather than what was asked for.
+                    if let Some(ask) = state.manager_out.take() {
+                        if let Some(said) = carry_out_manager_ask(&mut state, ask).await {
+                            state.timeline.say(said);
+                        }
+                        refresh_the_manager(&mut state, &bridge);
                     }
 
                     // **The `@` list asked for a walk.** `apply` set the flag and put the
@@ -4540,9 +4835,15 @@ async fn run_inner(
                     dirty = true;
                     content = true;
                 }
-                // While working the dot has to blink, so keep redrawing. One frame is around
-                // 0.2ms, so it is no burden — before, this was not possible.
-                if state.running {
+                // **What moves on its own, and when it is drawn.** A running turn owes a frame
+                // when the breath steps; a list with a thread running in it owes one when its dot
+                // moves. Neither is a reason to draw on every tick — the measurements are on
+                // `tick_draws_for_the_breath`.
+                let breath_moved = tick_draws_for_the_breath(&state, last_breath_step);
+                last_breath_step = crate::widgets::transcript::breath_step(state.breath_ms());
+                let dot_moved = picker_dot_moved(&state, last_blink);
+                last_blink = crate::widgets::activity::blink_on(state.blink_ms());
+                if breath_moved || dot_moved {
                     dirty = true;
                 }
                 // Something is still fading in, so the next frame is a different picture even
@@ -4550,15 +4851,6 @@ async fn run_inner(
                 // few hundred milliseconds after a fold was opened, so an idle screen goes back to
                 // being drawn only when it changes.
                 if state.opening() {
-                    dirty = true;
-                }
-                // A running thread's status dot in the picker blinks too, so the list must be
-                // redrawn each frame while one is on screen.
-                if state
-                    .picker
-                    .as_ref()
-                    .is_some_and(|p| p.rows.iter().any(|r| r.status == Some(crate::picker::ThreadStatus::Running)))
-                {
                     dirty = true;
                 }
                 // With the enrollment code window up, the time left is ticking down, so keep
@@ -5129,15 +5421,7 @@ async fn finish_command(
         // since this window started, and a list that only knew about launch time would keep saying
         // it is not there.
         Command::Mcp(None) => {
-            let allowed = crate::mcp::discovery::Allowed::load();
-            let found: Vec<(String, String, bool)> = crate::mcp::discovery::found(&state.cwd)
-                .into_iter()
-                .map(|f| {
-                    let on = allowed.allows_found(&state.cwd, &f);
-                    (f.spec.slug.clone(), f.source, on)
-                })
-                .collect();
-            state.panel = Some(crate::panel::mcp(state.lang, &bridge.mcp_report(), &found));
+            open_mcp_panel(state, bridge);
         }
         Command::Mcp(Some(switch)) => {
             use crate::command::McpSwitch;
@@ -5198,15 +5482,7 @@ async fn finish_command(
             match what {
                 // The listing is a panel now — one row per plugin reads better than
                 // a paragraph of bullets.
-                P::List => {
-                    let allowed = crate::mcp::discovery::Allowed::load();
-                    state.panel = Some(crate::panel::plugins(
-                        state.lang,
-                        &state.cwd,
-                        &crate::plugin::discover(&state.cwd),
-                        &allowed,
-                    ));
-                }
+                P::List => open_plugin_panel(state),
                 other => {
                     let said = run_plugin(state, other).await;
                     // **An empty answer means the command opened something instead of finishing.**
@@ -5784,6 +6060,415 @@ async fn switch_agent(
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// The `/mcp` and `/plugin` managers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// What a manager key asked the I/O side for.
+///
+/// **`apply` is pure, so it cannot do any of it.** Each variant is one write to disk or one
+/// approval recorded, and the loop that owns the disk carries it out — the road `command_out` and
+/// `project_out` already take.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManagerAsk {
+    /// Switch a server: `/mcp on|off` under another name.
+    SetMcp {
+        slug: String,
+        on: bool,
+    },
+    /// Take a server out of the file it is written in.
+    RemoveMcp {
+        slug: String,
+    },
+    /// Forget that this machine said yes to a server another program set up.
+    ForgetMcp {
+        slug: String,
+    },
+    SetPlugin {
+        name: String,
+        on: bool,
+    },
+    RemovePlugin {
+        name: String,
+    },
+    UpdatePlugin {
+        name: String,
+    },
+    /// Read the disk again.
+    Reload,
+}
+
+/// Which act a key asked for, so one function turns a row into the right request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verb {
+    Switch,
+    Remove,
+    Update,
+}
+
+/// Turns the row under the cursor into what to ask for. `None` when the row will not take that key
+/// — which the caller says out loud rather than swallowing.
+fn ask_from(
+    kind: crate::panel::ManagerKind,
+    row: &crate::panel::ManagerRow,
+    verb: Verb,
+) -> Option<ManagerAsk> {
+    use crate::panel::{ManagerKind as K, Origin, Removal};
+    use ManagerAsk as A;
+    match (kind, verb) {
+        (K::Mcp, Verb::Switch) => row.toggle.map(|on| A::SetMcp { slug: row.id.clone(), on: !on }),
+        (K::Mcp, Verb::Remove) => match row.remove {
+            Some(Removal::FromFile) => Some(A::RemoveMcp { slug: row.id.clone() }),
+            Some(Removal::Approval) => Some(A::ForgetMcp { slug: row.id.clone() }),
+            _ => None,
+        },
+        (K::Plugins, Verb::Switch) => {
+            row.toggle.map(|on| A::SetPlugin { name: row.id.clone(), on: !on })
+        }
+        (K::Plugins, Verb::Remove) => match row.remove {
+            Some(Removal::Directory) => Some(A::RemovePlugin { name: row.id.clone() }),
+            _ => None,
+        },
+        // **Only something fetched can be pulled.** A plugin placed by hand has no remote, and one
+        // in a repository belongs to that repository's history — `git pull` here would fetch into
+        // somebody else's tree.
+        (K::Plugins, Verb::Update) => {
+            matches!(row.origin, Origin::Fetched).then(|| A::UpdatePlugin { name: row.id.clone() })
+        }
+        (K::Mcp, Verb::Update) => None,
+    }
+}
+
+/// Opens the `/mcp` manager.
+///
+/// **Read off disk at the moment it is asked for.** Another client may have added a server since
+/// this window started, and a list that only knew about launch time would keep saying it is not
+/// there.
+fn open_mcp_panel(state: &mut State, bridge: &crate::tools::bridge::Bridge) {
+    let lang = state.lang;
+    let allowed = crate::mcp::discovery::Allowed::load();
+    let found = crate::mcp::discovery::found(&state.cwd);
+    let plugins = crate::plugin::active(&state.cwd);
+    let rows = mcp_rows(lang, &state.cwd, &bridge.mcp_report(), &allowed, &found, &plugins);
+    state.panel = Some(crate::panel::mcp_manager(lang, rows));
+}
+
+/// Opens the `/plugin` manager.
+///
+/// **`discover`, not `active`.** A plugin switched off still gets a row, with its dot hollow —
+/// listing only what is on would make switching one back on impossible from here.
+fn open_plugin_panel(state: &mut State) {
+    let lang = state.lang;
+    let allowed = crate::mcp::discovery::Allowed::load();
+    let rows = plugin_rows(lang, &state.cwd, &crate::plugin::discover(&state.cwd), &allowed);
+    state.panel = Some(crate::panel::plugin_manager(lang, rows));
+}
+
+/// Rebuilds a manager's body from its own state. **Pure** — the cursor moved, nothing is read.
+fn refresh_the_manager_body(state: &mut State) {
+    if let Some(panel) = state.panel.as_mut() {
+        panel.refresh();
+    }
+}
+
+/// Reads the disk again and rebuilds whichever manager is up, **keeping the cursor on the same row
+/// where that row is still there**.
+///
+/// **After every act.** The panel would otherwise show what was asked for rather than what
+/// happened, and the failure case is exactly the one where believing the screen costs something.
+fn refresh_the_manager(state: &mut State, bridge: &crate::tools::bridge::Bridge) {
+    use crate::panel::ManagerKind;
+    let Some(kind) = state.panel.as_ref().and_then(|p| p.manager.as_ref()).map(|m| m.kind) else {
+        return;
+    };
+    let was = state
+        .panel
+        .as_ref()
+        .and_then(|p| p.manager.as_ref())
+        .and_then(|m| m.row())
+        .map(|row| row.id.clone());
+    let lang = state.lang;
+    let allowed = crate::mcp::discovery::Allowed::load();
+    let mut fresh = match kind {
+        ManagerKind::Mcp => {
+            let found = crate::mcp::discovery::found(&state.cwd);
+            let plugins = crate::plugin::active(&state.cwd);
+            let rows = mcp_rows(lang, &state.cwd, &bridge.mcp_report(), &allowed, &found, &plugins);
+            crate::panel::mcp_manager(lang, rows)
+        }
+        ManagerKind::Plugins => {
+            let rows =
+                plugin_rows(lang, &state.cwd, &crate::plugin::discover(&state.cwd), &allowed);
+            crate::panel::plugin_manager(lang, rows)
+        }
+    };
+    if let (Some(was), Some(manager)) = (was, fresh.manager.as_mut()) {
+        if let Some(at) = manager.rows.iter().position(|row| row.id == was) {
+            manager.cursor = at;
+        }
+    }
+    state.panel = Some(fresh);
+}
+
+/// Every MCP server this machine knows about, **one row each**.
+///
+/// Layered exactly the way they are started (`tools::start_mcp`): what the plugins contribute, then
+/// this app's own config, then the repository and the other clients' discoveries — a later
+/// definition replacing an earlier one of the same name, because the definition nearest this
+/// working directory is the specific one.
+///
+/// **One row per server, not one per place it is mentioned.** Two sections meant the same server
+/// could appear twice — once as something that failed to start and once as the candidate it came
+/// from — and the cursor could only ever act on one of them.
+fn mcp_rows(
+    lang: crate::lang::Lang,
+    cwd: &std::path::Path,
+    running: &[(String, Result<usize, String>)],
+    allowed: &crate::mcp::discovery::Allowed,
+    found: &[crate::mcp::discovery::Found],
+    plugins: &[crate::plugin::Plugin],
+) -> Vec<crate::panel::ManagerRow> {
+    use crate::panel::{ManagerRow as Row, Origin, Removal};
+
+    /// What is known about one server before the panel's own shape is put on it.
+    struct Draft {
+        spec: crate::mcp::bridge::ServerSpec,
+        origin: Origin,
+        subtitle: String,
+        toggle: Option<bool>,
+        remove: Option<Removal>,
+    }
+    fn put(drafts: &mut Vec<Draft>, draft: Draft) {
+        match drafts.iter_mut().find(|d| d.spec.slug == draft.spec.slug) {
+            Some(slot) => *slot = draft,
+            None => drafts.push(draft),
+        }
+    }
+
+    let mut drafts: Vec<Draft> = Vec::new();
+    for plugin in plugins {
+        for spec in &plugin.mcp {
+            put(
+                &mut drafts,
+                Draft {
+                    spec: spec.clone(),
+                    origin: Origin::Plugin(plugin.name.clone()),
+                    subtitle: lang.mcp_from_plugin(&plugin.name),
+                    // A plugin is switched off as a whole, one row over.
+                    toggle: None,
+                    remove: None,
+                },
+            );
+        }
+    }
+    for spec in crate::mcp::bridge::load_user_config() {
+        put(
+            &mut drafts,
+            Draft {
+                spec,
+                origin: Origin::User,
+                subtitle: lang.mcp_from_user().to_string(),
+                // **Written down here, so it starts itself.** There is nothing to switch; what
+                // this row offers is the way to take it out of the file.
+                toggle: None,
+                remove: Some(Removal::FromFile),
+            },
+        );
+    }
+    for one in found {
+        let on = allowed.allows_found(cwd, one);
+        let (origin, remove) = if one.project {
+            (Origin::Project, Removal::FromFile)
+        } else {
+            (Origin::Elsewhere, Removal::Approval)
+        };
+        put(
+            &mut drafts,
+            Draft {
+                spec: one.spec.clone(),
+                origin,
+                subtitle: lang.mcp_found_from(&one.source, on),
+                toggle: Some(on),
+                remove: Some(remove),
+            },
+        );
+    }
+
+    let mut rows: Vec<Row> = Vec::new();
+    for draft in drafts {
+        // **The name the bridge recorded is the sanitized capability name** (`mcp_<slug>`), not the
+        // slug itself — matching on the slug would find nothing and draw every server as stopped.
+        let wire = crate::mcp::client::sanitize(&format!("mcp_{}", draft.spec.slug));
+        let outcome = running.iter().find(|(name, _)| *name == wire).map(|(_, outcome)| outcome);
+        let (subtitle, state) = match outcome {
+            Some(Ok(n)) => (lang.mcp_row_running(*n), lang.mcp_row_running(*n)),
+            Some(Err(why)) => (lang.mcp_failed(why), lang.mcp_failed(why)),
+            None => (
+                draft.subtitle.clone(),
+                match draft.toggle {
+                    Some(on) => lang.on_off(on).to_string(),
+                    None => lang.mcp_row_always_on().to_string(),
+                },
+            ),
+        };
+        let mut detail = vec![
+            (lang.d_state().to_string(), state),
+            (lang.d_source().to_string(), draft.subtitle.clone()),
+            (lang.d_runs().to_string(), draft.spec.transport.detail()),
+        ];
+        let handed = draft.spec.transport.handed_names();
+        if !handed.is_empty() {
+            detail.push((lang.d_env().to_string(), handed.join(", ")));
+        }
+        detail.push((lang.d_agent().to_string(), wire));
+        if let Some(Ok(n)) = outcome {
+            detail.push((lang.d_tools().to_string(), lang.mcp_tools(*n)));
+        }
+        rows.push(Row {
+            id: draft.spec.slug.clone(),
+            title: draft.spec.slug,
+            subtitle,
+            detail,
+            origin: draft.origin,
+            toggle: draft.toggle,
+            remove: draft.remove,
+        });
+    }
+    rows.sort_by(|a, b| a.id.cmp(&b.id));
+    rows
+}
+
+/// Every plugin, whatever its tier, as one row each — with what its manifest says about itself and
+/// what it contributes.
+fn plugin_rows(
+    lang: crate::lang::Lang,
+    cwd: &std::path::Path,
+    plugins: &[crate::plugin::Plugin],
+    allowed: &crate::mcp::discovery::Allowed,
+) -> Vec<crate::panel::ManagerRow> {
+    use crate::panel::{ManagerRow as Row, Origin, Removal};
+    let install = crate::plugin::install_dir();
+    let project_dir = cwd.join(".zyris-code/plugins");
+    let mut rows: Vec<Row> = plugins
+        .iter()
+        .map(|p| {
+            let origin = if p.root.starts_with(&install) {
+                Origin::Fetched
+            } else if p.root.starts_with(&project_dir) {
+                Origin::InProject
+            } else {
+                Origin::HandPlaced
+            };
+            let on = !allowed.plugin_off(&p.name)
+                && (!matches!(origin, Origin::InProject) || allowed.allows_plugin(cwd, p));
+            let subtitle = match origin {
+                Origin::InProject => lang.plugin_row_project(on),
+                _ => lang.plugin_row_fetched().to_string(),
+            };
+            let mut detail: Vec<(String, String)> = Vec::new();
+            if !p.description.is_empty() {
+                detail.push((lang.d_about().to_string(), p.description.clone()));
+            }
+            let about = &p.about;
+            for (label, value) in [
+                (lang.d_version(), about.version.clone()),
+                (lang.d_author(), about.author.clone()),
+                (lang.d_home(), about.homepage.clone()),
+                (lang.d_repo(), about.repository.clone()),
+                (lang.d_license(), about.license.clone()),
+            ] {
+                if let Some(value) = value {
+                    detail.push((label.to_string(), value));
+                }
+            }
+            if !about.keywords.is_empty() {
+                detail.push((lang.d_keywords().to_string(), about.keywords.join(", ")));
+            }
+            detail.push((lang.d_path().to_string(), p.root.display().to_string()));
+            let skills = usize::from(p.skills.is_some()) + usize::from(p.agents.is_some());
+            detail.push((
+                lang.d_adds().to_string(),
+                lang.plugin_adds_line(p.commands.len(), skills, p.hooks.len(), p.mcp.len()),
+            ));
+            if !p.commands.is_empty() {
+                let names: Vec<String> =
+                    p.commands.iter().map(|c| format!("/{}", c.name)).collect();
+                detail.push((lang.d_agent().to_string(), names.join(" ")));
+            }
+            Row {
+                id: p.name.clone(),
+                title: p.name.clone(),
+                subtitle,
+                detail,
+                origin: origin.clone(),
+                toggle: Some(on),
+                // **Only what was fetched is deleted** — that flag is what tells the two apart, and
+                // it is also what makes the act safe: this app put the directory there.
+                remove: matches!(origin, Origin::Fetched).then_some(Removal::Directory),
+            }
+        })
+        .collect();
+    rows.sort_by(|a, b| a.id.cmp(&b.id));
+    rows
+}
+
+/// Carries out what a manager key asked for, and says what happened.
+///
+/// **The sentence goes to the conversation**, the way every other command's answer does; the panel
+/// is rebuilt from disk right after (`refresh_the_manager`), so the row itself shows the truth.
+async fn carry_out_manager_ask(state: &mut State, ask: ManagerAsk) -> Option<String> {
+    use ManagerAsk as A;
+    match ask {
+        A::SetMcp { slug, on } => {
+            let found =
+                crate::mcp::discovery::found(&state.cwd).into_iter().find(|f| f.spec.slug == slug);
+            let Some(found) = found else { return Some(state.lang.mcp_not_found(&slug)) };
+            let mut allowed = crate::mcp::discovery::Allowed::load();
+            Some(if allowed.set_found(&state.cwd, &found, on) {
+                allowed.save();
+                state.lang.mcp_switched(&slug, on)
+            } else {
+                state.lang.mcp_already(&slug, on)
+            })
+        }
+        A::RemoveMcp { slug } => {
+            // **Which file it is in decides which file is written.** A name in this app's own
+            // config is not necessarily in the repository's, and the two mean different things.
+            let in_user = crate::mcp::bridge::load_user_config().iter().any(|s| s.slug == slug);
+            let at = if in_user {
+                crate::conn::app_dir().map(|dir| dir.join("mcp.json"))
+            } else {
+                Some(state.cwd.join(".mcp.json"))
+            };
+            Some(match at {
+                Some(path) => match crate::mcp::bridge::remove_server(&path, &slug) {
+                    Ok(()) => state.lang.mcp_removed(&slug, &path.display().to_string()),
+                    Err(why) => why,
+                },
+                None => state.lang.mcp_not_found(&slug),
+            })
+        }
+        A::ForgetMcp { slug } => {
+            let mut allowed = crate::mcp::discovery::Allowed::load();
+            if allowed.set(&slug, false) {
+                allowed.save();
+            }
+            Some(state.lang.mcp_forgotten(&slug))
+        }
+        A::SetPlugin { name, on } => Some(switch_plugin(state, &name, on)),
+        A::RemovePlugin { name } => Some(match crate::plugin::remove(&name) {
+            Ok(()) => state.lang.plugin_removed(&name),
+            Err(why) => why,
+        }),
+        A::UpdatePlugin { name } => {
+            let done = crate::plugin::update(Some(&name)).await;
+            Some(state.lang.plugin_update_text(&done))
+        }
+        // Nothing said: re-reading the disk is not news, and the panel redrawing is the answer.
+        A::Reload => None,
+    }
+}
+
 /// `/plugin`. **Installing means putting someone else's code on this computer** — say so.
 async fn run_plugin(state: &mut State, what: crate::command::Plugin) -> String {
     use crate::command::Plugin as P;
@@ -5815,12 +6500,20 @@ async fn run_plugin(state: &mut State, what: crate::command::Plugin) -> String {
 }
 
 fn switch_plugin(state: &State, name: &str, on: bool) -> String {
-    let found = crate::plugin::discover(&state.cwd)
-        .into_iter()
-        .find(|p| p.name == name && p.root.starts_with(state.cwd.join(".zyris-code/plugins")));
+    // **The key does not know which tier it is acting on, and must not have to.** A plugin in the
+    // repository was never trusted, so switching it on is an approval bound to what its files
+    // contain (`Allowed::set_plugin` forgets that approval the moment they change); one fetched or
+    // placed by hand is already trusted, so switching it off is a plain no (`set_plugin_off`) and
+    // switching it on takes it back.
+    let found = crate::plugin::discover(&state.cwd).into_iter().find(|p| p.name == name);
     let Some(found) = found else { return state.lang.plugin_switch_not_found(name) };
     let mut allowed = crate::mcp::discovery::Allowed::load();
-    if allowed.set_plugin(&state.cwd, &found, on) {
+    let changed = if found.root.starts_with(state.cwd.join(".zyris-code/plugins")) {
+        allowed.set_plugin(&state.cwd, &found, on)
+    } else {
+        allowed.set_plugin_off(name, !on)
+    };
+    if changed {
         allowed.save();
         state.lang.plugin_switched(name, on)
     } else {
@@ -6126,6 +6819,30 @@ mod tests {
             on_key(&s, key(KeyCode::Enter, KeyModifiers::NONE)),
             vec![Action::Submit("a".into())]
         );
+    }
+
+    /// **A double click takes the row.** Nothing moves the pointer between the two presses, so the
+    /// second one names the row under it. The first press went through `Release`, which folds
+    /// whatever a click lands on — and that has to be put back: the person asked for the line, not
+    /// for a card to open (2026-09-15).
+    #[test]
+    fn a_double_click_selects_the_row_and_leaves_the_fold_alone() {
+        let mut s = state();
+        s.view_height = 24;
+        s.view_cards.insert(0, 7);
+        s.view_open.insert(0, false);
+        s.screen = vec!["  ◆ 지난 답".to_string()];
+
+        // One click: the card head on that row folds, which is what a click is for.
+        apply(&mut s, &Action::Press(4, 0));
+        apply(&mut s, &Action::Release);
+        assert_eq!(s.folds.get(&7).map(|f| f.open), Some(true), "the click did not fold it");
+
+        // The second press takes the row instead, and puts the fold back where it was.
+        apply(&mut s, &Action::Press(4, 0));
+        assert_eq!(s.folds.get(&7).map(|f| f.open), Some(false), "the fold was left flipped");
+        assert_eq!(s.selection.as_deref(), Some("지난 답"), "{:?}", s.selection);
+        assert!(s.drag.is_some_and(|d| !d.is_click()), "nothing was left selected");
     }
 
     /// **Every screen is draggable, overlays included.** The mapping lives in one function so the
@@ -8018,8 +8735,9 @@ mod tests {
         assert_eq!(s.scroll.top, 87);
     }
 
-    /// **Ctrl+C never copies, even with a selection.** It is the one key that stops or quits —
-    /// with meanings overlapping there is no telling what happens when it matters.
+    /// **Ctrl+C never copies, even with a selection.** It is the key that closes the window —
+    /// copy is not on a key at all, because the selection goes to the clipboard when the mouse is
+    /// released, and one key with several meanings is how the wrong thing happens.
     #[test]
     fn ctrl_c_never_copies_even_with_a_selection() {
         let mut s = state();
@@ -8027,42 +8745,47 @@ mod tests {
         s.running = true;
         assert_eq!(
             on_key(&s, key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
-            vec![Action::Cancel]
+            vec![Action::ArmQuit]
         );
     }
 
+    /// **Esc is the only key that stops a turn.** Ctrl+C used to stop it first and quit on the
+    /// second press, so one press could mean two things and the one a person did not intend is the
+    /// one that cannot be taken back (2026-09-15).
     #[test]
-    fn ctrl_c_cancels_the_turn_when_nothing_is_selected() {
+    fn ctrl_c_does_not_stop_the_running_turn() {
         let mut s = state();
         s.running = true;
-        assert_eq!(
-            on_key(&s, key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
-            vec![Action::Cancel]
-        );
+        let c = key(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(on_key(&s, c), vec![Action::ArmQuit], "Ctrl+C stopped the turn");
+        apply(&mut s, &Action::ArmQuit);
+        assert_eq!(on_key(&s, c), vec![Action::Quit], "the second press must still quit");
+
+        // The same turn, stopped the way it can be stopped.
+        let mut s = state();
+        s.running = true;
+        assert_eq!(on_key(&s, key(KeyCode::Esc, KeyModifiers::NONE)), vec![Action::Cancel]);
     }
 
-    /// **The window has to be closable even when the cancel does not take.**
+    /// **The window has to be closable even when the turn will not stop.**
     ///
-    /// When the server hangs, `running` stays true. If Ctrl+C only ever went to cancel then,
-    /// every press would just send the same request again and never reach quitting.
+    /// When the server hangs, `running` stays true and the turn never ends. Ctrl+C does not wait
+    /// on that: the first press arms the quit and the second closes the window, whatever the
+    /// session is doing.
     #[test]
-    fn ctrl_c_after_a_cancel_goes_to_quitting() {
+    fn ctrl_c_reaches_the_quit_while_a_turn_is_running() {
         let mut s = state();
         s.running = true;
         let k = key(KeyCode::Char('c'), KeyModifiers::CONTROL);
 
         let first = on_key(&s, k);
-        assert_eq!(first, vec![Action::Cancel], "the first should be a cancel");
+        assert_eq!(first, vec![Action::ArmQuit], "the first press arms the quit");
         apply(&mut s, &first[0]);
 
-        let second = on_key(&s, k);
-        assert_eq!(second, vec![Action::ArmQuit], "the second arms the quit even while running");
-        apply(&mut s, &second[0]);
-
-        assert_eq!(on_key(&s, k), vec![Action::Quit]);
+        assert_eq!(on_key(&s, k), vec![Action::Quit], "the second press quits the window");
     }
 
-    /// The request to stop lasts only for that turn. On the next turn Ctrl+C has to go back
+    /// The request to stop lasts only for that turn. On the next turn Esc has to go back
     /// to cancelling.
     #[test]
     fn asking_to_stop_lasts_only_for_that_turn() {
@@ -8704,6 +9427,95 @@ mod tests {
         assert_eq!(s.status(), None, "{:?}", s.status());
     }
 
+    /// One manager row, so these tests say what the keys do rather than repeating the shape.
+    fn manager_row(
+        id: &str,
+        origin: crate::panel::Origin,
+        toggle: Option<bool>,
+        remove: Option<crate::panel::Removal>,
+    ) -> crate::panel::ManagerRow {
+        crate::panel::ManagerRow {
+            id: id.into(),
+            title: id.into(),
+            subtitle: String::new(),
+            detail: Vec::new(),
+            origin,
+            toggle,
+            remove,
+        }
+    }
+
+    /// **The keys of `/mcp` become acts, and the acts become writes.** `apply` is pure, so what it
+    /// does is note the ask down; the loop below carries it out.
+    #[test]
+    fn the_mcp_keys_note_down_what_to_do_and_removal_asks_first() {
+        use crate::panel::{Origin, Removal};
+        let mut s = state();
+        s.panel = Some(crate::panel::mcp_manager(
+            s.lang,
+            vec![
+                manager_row("cursor-one", Origin::Elsewhere, Some(false), Some(Removal::Approval)),
+                manager_row("ours", Origin::User, None, Some(Removal::FromFile)),
+            ],
+        ));
+
+        // Enter switches the row under the cursor, whichever way it is not.
+        apply(&mut s, &Action::ManagerAct);
+        assert_eq!(s.manager_out, Some(ManagerAsk::SetMcp { slug: "cursor-one".into(), on: true }));
+
+        // **The first `d` asks and does nothing else.** A deleted thing cannot be put back.
+        s.manager_out = None;
+        apply(&mut s, &Action::ManagerRemove);
+        assert_eq!(s.manager_out, None, "the first press took something away");
+        let manager = s.panel.as_ref().and_then(|p| p.manager.as_ref()).expect("a manager");
+        assert_eq!(manager.confirm.as_deref(), Some("cursor-one"));
+        assert!(manager.note.is_some(), "nothing was asked");
+
+        // The second press answers it, and the act matches where the row came from.
+        apply(&mut s, &Action::ManagerRemove);
+        assert_eq!(s.manager_out, Some(ManagerAsk::ForgetMcp { slug: "cursor-one".into() }));
+
+        // A row with nothing to switch says so rather than doing nothing quietly.
+        s.manager_out = None;
+        apply(&mut s, &Action::ManagerMove(1));
+        apply(&mut s, &Action::ManagerAct);
+        assert_eq!(s.manager_out, None);
+        let manager = s.panel.as_ref().and_then(|p| p.manager.as_ref()).expect("a manager");
+        assert!(manager.note.is_some(), "a key that does nothing said nothing");
+    }
+
+    /// **A plugin's key knows which store to write to.** A repository plugin is an approval bound
+    /// to its contents; one fetched or placed by hand is a plain name on the off list.
+    #[test]
+    fn the_plugin_keys_take_the_tier_into_account() {
+        use crate::panel::{Origin, Removal};
+        let mut s = state();
+        s.panel = Some(crate::panel::plugin_manager(
+            s.lang,
+            vec![
+                manager_row("project-one", Origin::InProject, Some(false), None),
+                manager_row("fetched-one", Origin::Fetched, Some(true), Some(Removal::Directory)),
+            ],
+        ));
+
+        apply(&mut s, &Action::ManagerAct);
+        assert_eq!(
+            s.manager_out,
+            Some(ManagerAsk::SetPlugin { name: "project-one".into(), on: true })
+        );
+
+        s.manager_out = None;
+        apply(&mut s, &Action::ManagerMove(1));
+        apply(&mut s, &Action::ManagerUpdate);
+        assert_eq!(s.manager_out, Some(ManagerAsk::UpdatePlugin { name: "fetched-one".into() }));
+
+        // Removing is offered on a fetched plugin and nowhere else.
+        s.manager_out = None;
+        apply(&mut s, &Action::ManagerRemove);
+        apply(&mut s, &Action::ManagerRemove);
+        assert_eq!(s.manager_out, Some(ManagerAsk::RemovePlugin { name: "fetched-one".into() }));
+    }
+
     /// **A frame is not a key.** While an answer streams — or on an idle screen, where the usage
     /// poll still lands every few seconds — a selection used to die on the next frame, which is
     /// precisely when somebody drags over the output to copy it.
@@ -8998,6 +9810,140 @@ mod tests {
         let release =
             KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::NONE, KeyEventKind::Release);
         assert!(!enter_becomes_newline(&s, &release, true));
+    }
+
+    /// **The input method's commit is not a paste.** fcitx hands the app the syllable it was
+    /// composing and the Enter in the same read, microseconds apart — the case reported as "the
+    /// first Enter after a word goes to the next line": with one key counted as a burst, the
+    /// message only left on the second Enter.
+    #[test]
+    fn a_committed_syllable_does_not_turn_the_enter_into_a_newline() {
+        let mut s = state();
+        for c in "안녕".chars() {
+            apply(&mut s, &Action::Insert(c));
+        }
+        let mut burst = PasteBurst::default();
+        let now = Instant::now();
+        // The syllable still being composed, committed by the Enter, and then the Enter.
+        assert!(!burst.key(&key(KeyCode::Char('녕'), KeyModifiers::NONE), now));
+        let in_burst = burst.key(&key(KeyCode::Enter, KeyModifiers::NONE), now);
+        assert!(!in_burst, "one committed character is not a paste");
+        // Which is what decides it: not a burst, so this Enter sends.
+        assert!(!enter_becomes_newline(&s, &key(KeyCode::Enter, KeyModifiers::NONE), in_burst));
+    }
+
+    /// **A run is what a paste looks like.** Five keys in a row at paste speed, and the Enter
+    /// among them is a newline — the protection this rule was written for.
+    #[test]
+    fn a_run_of_keys_at_paste_speed_is_a_burst() {
+        let mut burst = PasteBurst::default();
+        let mut now = Instant::now();
+        for (i, c) in "hello".chars().enumerate() {
+            let in_run = burst.key(&key(KeyCode::Char(c), KeyModifiers::NONE), now);
+            // Three keys have to arrive at paste speed before the next one is inside a run: the
+            // first one can't be, and each of the other two has fewer than three behind it.
+            assert_eq!(in_run, i > PASTE_RUN, "key {i}");
+            now += Duration::from_millis(1);
+        }
+        assert!(
+            burst.key(&key(KeyCode::Enter, KeyModifiers::NONE), now),
+            "an Enter inside a paste is a newline"
+        );
+    }
+
+    /// Two keys a person typed, however close together, are not a paste either — and neither is
+    /// a key they held down until it repeated.
+    #[test]
+    fn keys_at_a_hand_s_speed_are_never_a_burst() {
+        let mut burst = PasteBurst::default();
+        let mut now = Instant::now();
+        for c in "안녕하세요".chars() {
+            now += Duration::from_millis(120);
+            assert!(!burst.key(&key(KeyCode::Char(c), KeyModifiers::NONE), now));
+        }
+        now += Duration::from_millis(120);
+        assert!(!burst.key(&key(KeyCode::Enter, KeyModifiers::NONE), now));
+    }
+
+    /// **A release is not a key.** Windows sends a press and a release for each one; counted as
+    /// keystrokes they would halve the interval a burst is measured over.
+    #[test]
+    fn a_key_release_neither_makes_nor_breaks_a_burst() {
+        let mut burst = PasteBurst::default();
+        let mut now = Instant::now();
+        for _ in 0..5 {
+            assert!(!burst.key(&key(KeyCode::Char('a'), KeyModifiers::NONE), now));
+            let release = KeyEvent::new_with_kind(
+                KeyCode::Char('a'),
+                KeyModifiers::NONE,
+                KeyEventKind::Release,
+            );
+            assert!(!burst.key(&release, now + Duration::from_millis(5)));
+            now += Duration::from_millis(40);
+        }
+        let release =
+            KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::NONE, KeyEventKind::Release);
+        assert!(!burst.key(&release, now));
+        assert!(
+            !burst.key(&key(KeyCode::Enter, KeyModifiers::NONE), now + Duration::from_millis(5)),
+            "five slow presses are not a paste, however many releases came with them"
+        );
+    }
+
+    /// **A running turn owes a frame when the breath steps, not on every tick.** Sixty frames a
+    /// second for the whole of a turn is what the loop used to spend, and a frame is 12-20ms at
+    /// this size in a debug build — the flicker reported while typing into a running turn.
+    #[test]
+    fn a_running_turn_owes_a_frame_when_the_breath_steps() {
+        let mut s = state();
+        s.running = true;
+        let step = crate::widgets::transcript::breath_step(s.breath_ms());
+        assert!(!tick_draws_for_the_breath(&s, step), "the breath had not stepped");
+        // Fifty ticks inside one step: not one of them is a reason to draw.
+        for _ in 0..50 {
+            assert!(!tick_draws_for_the_breath(&s, step));
+        }
+        assert!(
+            tick_draws_for_the_breath(&s, step + 1),
+            "the breath stepped and nothing asked for a frame"
+        );
+        // Nothing running: there is no breath on the screen to draw.
+        s.running = false;
+        assert!(!tick_draws_for_the_breath(&s, step + 1));
+    }
+
+    /// **A turn costs twenty frames over the breath's period, not one per tick.** This is the
+    /// whole of what the fix is worth: at 60fps a 1.6s period held ninety-six frames.
+    #[test]
+    fn the_breath_is_drawn_twenty_times_over_its_period() {
+        use crate::widgets::transcript::{breath_step, BREATH_PERIOD_MS};
+        let mut s = state();
+        s.running = true;
+        let mut asked = 0;
+        let mut last = breath_step(0);
+        for ms in (0..=BREATH_PERIOD_MS).step_by(16) {
+            // The loop reads its own clock; this is that clock walked a tick at a time.
+            s.breath_origin = std::time::Instant::now() - std::time::Duration::from_millis(ms);
+            if tick_draws_for_the_breath(&s, last) {
+                asked += 1;
+            }
+            last = breath_step(s.breath_ms());
+        }
+        assert_eq!(asked, 20, "a 1.6s period at 60fps asked for {asked} frames");
+    }
+
+    /// The picker's dot is a tempo too — the only animated thing left when no turn runs.
+    #[test]
+    fn the_pickers_dot_is_drawn_when_it_moves() {
+        let mut s = state();
+        let phase = crate::widgets::activity::blink_on(s.blink_ms());
+        // No list up: nothing to move, however the clock turns.
+        assert!(!picker_dot_moved(&s, phase));
+        assert!(!picker_dot_moved(&s, !phase));
+        // A list that is up, with nothing running in it, is not animated either —
+        // `loading_projects` has no rows yet.
+        s.picker = Some(crate::picker::Picker::loading_projects());
+        assert!(!picker_dot_moved(&s, !phase));
     }
 
     /// With the command picker open, Enter is a pick. A burst must not swallow it — the

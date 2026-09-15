@@ -41,7 +41,9 @@ pub mod status;
 /// Public because `lines` is the pure seam the todo list is read through — the same reason
 /// `activity` and `status` are.
 pub mod todos;
-mod transcript;
+/// Public because `breath_step` is the pure seam the frame loop reads the breath's tempo through
+/// — the same reason `activity`, `status` and `todos` are.
+pub mod transcript;
 
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::Frame;
@@ -251,7 +253,7 @@ pub fn draw(frame: &mut Frame, state: &mut State) {
     // reads was snapshotted a few lines up, so it is the one now under the highlight.
     if std::mem::take(&mut state.selection_stale) {
         if let Some(drag) = state.drag.filter(|d| !d.is_click()) {
-            let text = crate::selection::extract(&state.screen, &drag);
+            let text = state.selected_text(&drag);
             state.selection = (!text.trim().is_empty()).then_some(text);
         }
     }
@@ -281,10 +283,9 @@ pub fn draw(frame: &mut Frame, state: &mut State) {
             (0..area.height, 0)
         };
         // **Where each row's text starts, so the margin keeps its own colour.** `row_spans` is
-        // geometry and knows nothing about what is drawn; this is the one place that does, and it
-        // is the same answer `selection::extract` uses, so the colour and the clipboard agree.
-        let body: Vec<u16> =
-            state.screen.iter().map(|row| selection::body_start(row) as u16).collect();
+        // geometry and knows nothing about what is drawn; the layout's own record does, and it is
+        // the same answer `selection::extract` reads, so the colour and the clipboard agree.
+        let body: Vec<u16> = state.screen_body();
         let cells = frame.buffer_mut().content.as_mut_slice();
         for (y, from, to) in selection::row_spans(&drag, area.width, band, moved) {
             let from = from.max(body.get(y as usize).copied().unwrap_or(0));

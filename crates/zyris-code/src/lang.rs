@@ -8,8 +8,10 @@
 //!
 //! - `State.lang` — used by the drawing side. Since `apply` must stay pure, it has to be carried as
 //!   state, and screen tests being able to fix a language and look at it is thanks to this too.
-//! - `lang::current()` — used where there is no screen (the shell notice in `notice.rs`, errors the
-//!   tools return). Carrying it as an argument that far would string a `lang` through functions that aren't even pure.
+//! - `lang::current()` — used where there is no screen: the shell notice in `notice.rs`, which
+//!   goes to the terminal a person is looking at. **Not for anything a tool returns** — the agent
+//!   is what reads a tool's answer, and it does not read Korean (2026-09-14, user decision: the
+//!   tools answered in Korean on a Korean machine, which is the wrong reader).
 //!
 //! `/config lang` sets both together. If they diverged, the conversation window would be English while only the shell notice stayed Korean.
 //!
@@ -1901,6 +1903,209 @@ impl Lang {
         }
     }
 
+    // ── The managers (`/mcp` · `/plugin`)
+
+    /// The question asked before something is taken away. **It names the row** — the cursor can
+    /// move between the two presses, and "press again" with no name would be a question about
+    /// whatever happens to be under the cursor when it is answered.
+    pub fn manager_confirm(self, id: &str) -> String {
+        match self {
+            Lang::Ko => format!("`{id}`을 지우려면 한 번 더 누르세요."),
+            Lang::En => format!("Press again to remove `{id}`."),
+        }
+    }
+
+    /// A key that does nothing on this row, and why. **Said rather than swallowed** — a key that
+    /// quietly does nothing reads as the panel being broken.
+    ///
+    /// One sentence for all three keys (`Enter`, `d`, `u`), because what it says is the same
+    /// thing: this row does not take that act. **One sentence also keeps the box one size** —
+    /// it is measured against every question the panel can ask (`panel::room_for`).
+    pub fn manager_cannot(self, id: &str) -> String {
+        match self {
+            Lang::Ko => format!("`{id}`에는 이 키가 하는 일이 없습니다."),
+            Lang::En => format!("`{id}`: that key does nothing here."),
+        }
+    }
+
+    /// A server taken out of a config file.
+    pub fn mcp_removed(self, slug: &str, at: &str) -> String {
+        match self {
+            Lang::Ko => format!("`{slug}`을 `{at}`에서 지웠습니다."),
+            Lang::En => format!("Removed `{slug}` from `{at}`."),
+        }
+    }
+
+    /// An approval forgotten. **The entry in the other program's file is untouched** — that file
+    /// is not ours to write, and saying so is the difference between a person understanding this
+    /// and believing the server was deleted.
+    pub fn mcp_forgotten(self, slug: &str) -> String {
+        match self {
+            Lang::Ko => {
+                format!(
+                    "`{slug}`을 승인 목록에서 뺐습니다. 그 프로그램의 설정 파일은 그대로입니다."
+                )
+            }
+            Lang::En => format!(
+                "`{slug}` is off our list. The file that wrote it belongs to another program and \
+                 was left alone."
+            ),
+        }
+    }
+
+    /// The key hint along the bottom of a manager. **It is the whole discovery surface for the
+    /// keys** — nothing else says `d` removes and `u` updates.
+    pub fn manager_keys(self, kind: crate::panel::ManagerKind) -> String {
+        use crate::panel::ManagerKind;
+        match (self, kind) {
+            (Lang::Ko, ManagerKind::Mcp) => {
+                "↑↓ 고르기 ‒ Enter 켜기/끄기 ‒ d 지우기 ‒ r 다시 읽기 ‒ Esc 닫기".to_string()
+            }
+            (Lang::En, ManagerKind::Mcp) => {
+                "↑↓ pick ‒ Enter on/off ‒ d remove ‒ r re-read ‒ Esc close".to_string()
+            }
+            (Lang::Ko, ManagerKind::Plugins) => {
+                "↑↓ 고르기 ‒ Enter 켜기/끄기 ‒ u 갱신 ‒ d 지우기 ‒ r 다시 읽기 ‒ Esc 닫기"
+                    .to_string()
+            }
+            (Lang::En, ManagerKind::Plugins) => {
+                "↑↓ pick ‒ Enter on/off ‒ u update ‒ d remove ‒ r re-read ‒ Esc close".to_string()
+            }
+        }
+    }
+
+    /// The detail block's labels. **Short, because they are a column** — the value is the sentence.
+    pub fn d_state(self) -> &'static str {
+        self.pick("상태", "state")
+    }
+    pub fn d_source(self) -> &'static str {
+        self.pick("출처", "from")
+    }
+    pub fn d_runs(self) -> &'static str {
+        self.pick("실행", "runs")
+    }
+    pub fn d_env(self) -> &'static str {
+        self.pick("환경변수", "env")
+    }
+    pub fn d_tools(self) -> &'static str {
+        self.pick("도구", "tools")
+    }
+    pub fn d_agent(self) -> &'static str {
+        self.pick("에이전트가 부르는 이름", "called as")
+    }
+    pub fn d_path(self) -> &'static str {
+        self.pick("자리", "path")
+    }
+    pub fn d_adds(self) -> &'static str {
+        self.pick("주는 것", "adds")
+    }
+    pub fn d_about(self) -> &'static str {
+        self.pick("설명", "about")
+    }
+    pub fn d_version(self) -> &'static str {
+        self.pick("판", "version")
+    }
+    pub fn d_author(self) -> &'static str {
+        self.pick("만든이", "author")
+    }
+    pub fn d_home(self) -> &'static str {
+        self.pick("홈", "home")
+    }
+    pub fn d_repo(self) -> &'static str {
+        self.pick("저장소", "repo")
+    }
+    pub fn d_license(self) -> &'static str {
+        self.pick("라이선스", "license")
+    }
+    pub fn d_keywords(self) -> &'static str {
+        self.pick("낱말", "keywords")
+    }
+
+    pub fn on_off(self, on: bool) -> &'static str {
+        match (self, on) {
+            (Lang::Ko, true) => "켜짐",
+            (Lang::Ko, false) => "꺼짐",
+            (Lang::En, true) => "on",
+            (Lang::En, false) => "off",
+        }
+    }
+
+    /// Where a server written in one of our own files came from.
+    pub fn mcp_from_user(self) -> &'static str {
+        self.pick("이 앱의 설정", "this app's settings")
+    }
+    pub fn mcp_from_project(self) -> &'static str {
+        self.pick("이 저장소", "this repository")
+    }
+    pub fn mcp_from_plugin(self, name: &str) -> String {
+        match self {
+            Lang::Ko => format!("플러그인 `{name}`"),
+            Lang::En => format!("the plugin `{name}`"),
+        }
+    }
+    /// A server that is running, and what it brought.
+    pub fn mcp_row_running(self, n: usize) -> String {
+        match self {
+            Lang::Ko => format!("돌고 있습니다 ‒ 도구 {n}개"),
+            Lang::En => format!("running ‒ {n} tools"),
+        }
+    }
+    /// Nothing was switched off: it is written down here, so it starts itself.
+    pub fn mcp_row_always_on(self) -> &'static str {
+        self.pick("적혀 있어서 스스로 뜹니다", "written down, so it starts itself")
+    }
+
+    /// A plugin row's sentence about where it came from.
+    pub fn plugin_row_fetched(self) -> &'static str {
+        self.pick("받아 둔 것", "fetched")
+    }
+    pub fn plugin_row_project(self, on: bool) -> String {
+        match (self, on) {
+            (Lang::Ko, true) => "이 저장소 ‒ 켜짐".to_string(),
+            (Lang::Ko, false) => "이 저장소 ‒ 꺼짐 (승인 필요)".to_string(),
+            (Lang::En, true) => "this repository ‒ on".to_string(),
+            (Lang::En, false) => "this repository ‒ off (needs approval)".to_string(),
+        }
+    }
+    /// What a plugin contributes, as one line of counts.
+    pub fn plugin_adds_line(
+        self,
+        commands: usize,
+        skills: usize,
+        hooks: usize,
+        mcp: usize,
+    ) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if commands > 0 {
+            parts.push(match self {
+                Lang::Ko => format!("명령 {commands}개"),
+                Lang::En => format!("{commands} commands"),
+            });
+        }
+        if skills > 0 {
+            parts.push(match self {
+                Lang::Ko => format!("스킬 {skills}개"),
+                Lang::En => format!("{skills} skills"),
+            });
+        }
+        if mcp > 0 {
+            parts.push(match self {
+                Lang::Ko => format!("MCP {mcp}개"),
+                Lang::En => format!("{mcp} MCP servers"),
+            });
+        }
+        if hooks > 0 {
+            parts.push(match self {
+                Lang::Ko => format!("훅 {hooks}개"),
+                Lang::En => format!("{hooks} hooks"),
+            });
+        }
+        if parts.is_empty() {
+            return self.pick("얹는 것이 없습니다", "adds nothing").to_string();
+        }
+        parts.join(" ‒ ")
+    }
+
     // ── Skills panel
     pub fn skills_empty(self) -> &'static str {
         self.pick(
@@ -2328,80 +2533,6 @@ impl Lang {
     pub fn untitled(self) -> &'static str {
         self.pick("제목 없음", "untitled")
     }
-
-    // ── Edit tool errors (returned to the agent, shown in the timeline)
-    pub fn edit_mkdir_error(self, e: &str) -> String {
-        match self {
-            Lang::Ko => format!("상위 디렉터리를 만들지 못했습니다: {e}"),
-            Lang::En => format!("Couldn't create the parent directory: {e}"),
-        }
-    }
-    pub fn edit_changed_after_read(self, path: &str, base: &str, now: &str) -> String {
-        match self {
-            Lang::Ko => format!(
-                "'{path}'이(가) 읽은 뒤 바뀌었습니다 (base_version {base} != 지금 {now}). \
-                 file_io.read로 지금 내용을 다시 읽고, 새 버전 토큰을 base_version으로 다시 시도하세요."
-            ),
-            Lang::En => format!(
-                "'{path}' changed after it was read (base_version {base} != current {now}). \
-                 Re-read the current content with file_io.read and retry with the new version \
-                 token as base_version."
-            ),
-        }
-    }
-    pub fn edit_exists_no_base(self, path: &str) -> String {
-        match self {
-            Lang::Ko => format!(
-                "'{path}'은(는) 이미 있는 파일입니다 ‒ 덮어쓰려면 base_version을 주세요. \
-                 읽은 응답의 stat.modified_unix_ms:stat.size 또는 code_edit.version의 version을 \
-                 그대로 넘기세요."
-            ),
-            Lang::En => format!(
-                "'{path}' already exists ‒ pass base_version to overwrite it. Use the \
-                 stat.modified_unix_ms:stat.size of the read response or code_edit.version's \
-                 version as-is."
-            ),
-        }
-    }
-    pub fn edit_write_error(self, e: &str) -> String {
-        match self {
-            Lang::Ko => format!("쓰지 못했습니다: {e}"),
-            Lang::En => format!("Couldn't write: {e}"),
-        }
-    }
-    pub fn edit_not_found(self, needle: &str) -> String {
-        match self {
-            Lang::Ko => format!(
-                "'{needle}'을(를) 파일에서 찾지 못했습니다. file_io.read로 지금 내용을 다시 읽으세요."
-            ),
-            Lang::En => format!(
-                "'{needle}' wasn't found in the file. Read the current content with file_io.read."
-            ),
-        }
-    }
-    pub fn edit_ambiguous(self, n: usize) -> String {
-        match self {
-            Lang::Ko => format!(
-                "앞뒤를 더 붙여 한 곳만 가리키거나 replace_all을 켜세요. (파일에 {n}번 나옵니다)"
-            ),
-            Lang::En => format!(
-                "Add more context to point at one spot, or turn replace_all on. (It appears \
-                 {n} times in the file)"
-            ),
-        }
-    }
-    pub fn edit_read_error(self, path: &str, e: &str) -> String {
-        match self {
-            Lang::Ko => format!("'{path}'을(를) 읽지 못했습니다: {e}"),
-            Lang::En => format!("Couldn't read '{path}': {e}"),
-        }
-    }
-    pub fn edit_stat_error(self, path: &str, e: &str) -> String {
-        match self {
-            Lang::Ko => format!("'{path}'을(를) 확인하지 못했습니다: {e}"),
-            Lang::En => format!("Couldn't stat '{path}': {e}"),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -2672,12 +2803,6 @@ mod tests {
             en.project_list_error("x"),
             en.thread_list_error("x"),
             en.history_error("x"),
-            en.edit_mkdir_error("x"),
-            en.edit_write_error("x"),
-            en.edit_not_found("abc"),
-            en.edit_ambiguous(3),
-            en.edit_read_error("p", "x"),
-            en.edit_stat_error("p", "x"),
             en.plugin_removed("x"),
             en.plugin_unknown("x"),
             en.detail_exit_code(1),
@@ -2710,6 +2835,7 @@ mod tests {
                 agents: None,
                 commands: Vec::new(),
                 hooks: Vec::new(),
+                about: crate::plugin::About::default(),
                 root: "/tmp".into(),
             }),
             en.plugin_added(
@@ -2721,6 +2847,7 @@ mod tests {
                     agents: None,
                     commands: Vec::new(),
                     hooks: Vec::new(),
+                    about: crate::plugin::About::default(),
                     root: "/tmp".into(),
                 },
                 "contents",

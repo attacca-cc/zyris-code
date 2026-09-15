@@ -165,6 +165,10 @@ pub struct Turn {
 #[derive(Debug, Default)]
 pub struct Rendered {
     pub lines: Vec<Line<'static>>,
+    /// **Where each line's own text starts**, one entry per line of `lines`: the layout's margin
+    /// plus markdown's gutter, counted as each was drawn. A drag may not cover them — only the text
+    /// (`selection::extract`).
+    pub body: Vec<u16>,
     /// Row index → the seq of the card that clicking that row folds and unfolds.
     pub cards: HashMap<usize, i64>,
     /// The links on each line, in that line's display columns.
@@ -207,6 +211,7 @@ pub fn rows_with(
     let total = cache.total();
     Rendered {
         lines: cache.window(0, total),
+        body: cache.window_body(0, total),
         cards: cache.cards().clone(),
         links: cache.window_links(0, total),
         breathing: cache.breathing().to_vec(),
@@ -217,6 +222,10 @@ pub fn rows_with(
 #[derive(Debug, Clone)]
 struct Made {
     lines: Vec<Line<'static>>,
+    /// **Where each line's own text begins**, parallel to `lines` — see [`text_start`]. The
+    /// layout and the markdown renderer are the only things that know what they drew in a line's
+    /// margin, so the selection is told rather than left to read it back off the characters.
+    body: Vec<u16>,
     /// The links on each line, in that line's display columns. Parallel to `lines`.
     links: Vec<Vec<crate::markdown::Link>>,
     /// The lines that fold/unfold when clicked. (which line within this item, which seq).
@@ -535,6 +544,37 @@ impl Cache {
         out
     }
 
+    /// Where the text of each line `window` returns starts, in the same order.
+    ///
+    /// **Parallel to `window`**, and read by the selection: a highlight may not cover what the
+    /// screen drew in a line's margin. The blank separator between items has no text at all, so it
+    /// reports zero.
+    pub fn window_body(&self, from: usize, to: usize) -> Vec<u16> {
+        let to = to.min(self.total);
+        if from >= to {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(to - from);
+        for slot in &self.slots {
+            if slot.end() <= from {
+                continue;
+            }
+            if slot.begin >= to {
+                break;
+            }
+            let made = &self.made[&slot.seq].2;
+            for i in slot.begin.max(from)..slot.end().min(to) {
+                let inner = i - slot.begin;
+                out.push(match (slot.lead_blank, inner) {
+                    (true, 0) => 0,
+                    (true, n) => made.body[n - 1],
+                    (false, n) => made.body[n],
+                });
+            }
+        }
+        out
+    }
+
     /// Plain text of all lines. **Only called when copying a selection** — never per frame.
     pub fn plain(&self) -> Vec<String> {
         self.window(0, self.total)
@@ -542,6 +582,31 @@ impl Cache {
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect()
     }
+}
+
+/// The margin the layout drew plus what the renderer drew at the head of a line: **where the
+/// line's own text starts.** This is what a drag may not cover (`selection::extract`), and it is
+/// counted rather than guessed — `own` is the width of the spans this file pushed before handing
+/// the line to markdown, and `prefix` is markdown's own gutter (a code block's rule, the margin a
+/// wrapped line hangs under). Reading the margin back out of the drawn characters cannot tell a
+/// renderer's indent from text somebody indented by hand (2026-09-15 report).
+fn text_start(own: usize, prefix: &[u16], line: usize) -> u16 {
+    (own + prefix.get(line).copied().unwrap_or(0) as usize) as u16
+}
+
+/// The person's bar and the space after it, in columns.
+const USER_BAR_W: usize = 2;
+
+/// Splits a line into the whitespace in front of it and the rest.
+///
+/// **A person's indentation is theirs.** Markdown reads four leading spaces — or a tab — as an
+/// indented code block, so a line of code somebody typed into a message was drawn as
+/// `┌─`/`│ …`/`└─` with the indent itself swallowed, and a drag could not copy it back out
+/// (2026-09-15 report). The whitespace comes off before the line is parsed and goes back in front
+/// of the result, where it is text: it stays on screen and stays inside a selection.
+fn split_indent(line: &str) -> (&str, &str) {
+    let rest = line.trim_start_matches([' ', '\t']);
+    line.split_at(line.len() - rest.len())
 }
 
 fn blank() -> Line<'static> {
@@ -558,6 +623,8 @@ fn make(item: &Item, width: u16, folds: &Folds, turn: Turn, lang: crate::lang::L
     let Turn { running } = turn;
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut links: Vec<Vec<crate::markdown::Link>> = Vec::new();
+    // Where each line's own text starts, pushed in lockstep with `out` (see [`text_start`]).
+    let mut body: Vec<u16> = Vec::new();
     let mut heads: Vec<(usize, i64)> = Vec::new();
     let mut breathing: Vec<(usize, usize)> = Vec::new();
     match item {
@@ -566,14 +633,25 @@ fn make(item: &Item, width: u16, folds: &Folds, turn: Turn, lang: crate::lang::L
             // not reach here at all — the timeline lays it under the question that asked it
             // (`Item::Question::answer`), so what arrives as this item is something they typed.
             for raw in text.lines() {
-                let rendered = markdown::render_rich(raw, body_width(width));
+                // **Their indentation is theirs** — see [`split_indent`].
+                let (indent, rest) = split_indent(raw);
+                let rendered = markdown::render_rich(rest, body_width(width));
+                let md = rendered.prefix.clone();
                 for (li, line) in rendered.lines.into_iter().enumerate() {
                     // **The bar stands on every line.** Set only on the first line, the second line
                     // onward wouldn't be distinguishable from the message before it — the longer
                     // the message, the longer that stretch.
                     let bar = Span::styled("▌ ", Style::default().fg(theme::accent()));
-                    let prefix_w = markdown::display_width(&bar.content);
+                    let mut prefix_w = markdown::display_width(&bar.content);
                     let mut spans = vec![bar];
+                    // The indent the line was written with, in front of what markdown made of it.
+                    if li == 0 && !indent.is_empty() {
+                        spans.push(Span::styled(
+                            indent.to_string(),
+                            Style::default().fg(theme::text()),
+                        ));
+                        prefix_w += markdown::display_width(indent);
+                    }
                     spans.extend(line.spans);
                     // **The background rides on the line, not the spans.** Painted on a span it
                     // breaks at glyph widths into blotches, and padding with spaces to fill the
@@ -582,6 +660,22 @@ fn make(item: &Item, width: u16, folds: &Folds, turn: Turn, lang: crate::lang::L
                     // (`widgets::transcript::stretch`).
                     out.push(Line::from(spans).style(Style::default().bg(theme::user_bg())));
                     links.push(shift_links(&rendered.links[li], prefix_w));
+                    // **The bar's width, not the indent's.** The indent is the person's own text,
+                    // so it is inside what a drag may cover.
+                    body.push(text_start(USER_BAR_W, &md, li));
+                }
+                // A line that is nothing but whitespace has nothing for markdown to render, and
+                // dropping it would close the gap the person left in their own words.
+                if rest.trim().is_empty() && !indent.is_empty() {
+                    out.push(
+                        Line::from(vec![
+                            Span::styled("▌ ", Style::default().fg(theme::accent())),
+                            Span::styled(indent.to_string(), Style::default().fg(theme::text())),
+                        ])
+                        .style(Style::default().bg(theme::user_bg())),
+                    );
+                    links.push(Vec::new());
+                    body.push(USER_BAR_W as u16);
                 }
             }
         }
@@ -593,6 +687,7 @@ fn make(item: &Item, width: u16, folds: &Folds, turn: Turn, lang: crate::lang::L
             // the longest chunk in the conversation, that effect would cover the screen. With no marker at all,
             // only the answer lacks a sign — not "clean by default" but simply undifferentiated.
             let rendered = markdown::render_rich(text, body_width(width));
+            let md = rendered.prefix.clone();
             for (i, line) in rendered.lines.into_iter().enumerate() {
                 let mut spans = match i {
                     0 => vec![Span::styled("◆ ", Style::default().fg(theme::accent()))],
@@ -603,6 +698,7 @@ fn make(item: &Item, width: u16, folds: &Folds, turn: Turn, lang: crate::lang::L
                 spans.extend(line.spans);
                 out.push(Line::from(spans));
                 links.push(shift_links(&rendered.links[i], prefix_w));
+                body.push(text_start(prefix_w, &md, i));
             }
         }
         Item::Error { message, .. } => {
@@ -611,17 +707,21 @@ fn make(item: &Item, width: u16, folds: &Folds, turn: Turn, lang: crate::lang::L
                 Span::styled(message.clone(), Style::default().fg(theme::danger())),
             ]));
             links.push(Vec::new());
+            // The marker and the space after it, and nothing else on this line.
+            body.push(2);
         }
         // The question being answered doesn't come here — `layout` filters it out.
         Item::Question { steps, answered, answer, .. } => {
-            let rows = question_rows(steps, *answered, answer.as_deref(), width, lang);
+            let (rows, bodies) = question_rows(steps, *answered, answer.as_deref(), width, lang);
             let n = rows.len();
             out.extend(rows);
             links.extend(std::iter::repeat_with(Vec::new).take(n));
+            body.extend(bodies);
         }
         // What the app said. It's a third voice that is neither person nor agent, so it gets its own marker.
         Item::System { text, .. } => {
             let rendered = markdown::render_rich(text, body_width(width));
+            let md = rendered.prefix.clone();
             for (i, line) in rendered.lines.into_iter().enumerate() {
                 let mut spans = vec![Span::styled(
                     if i == 0 { "◈ " } else { "  " },
@@ -632,6 +732,7 @@ fn make(item: &Item, width: u16, folds: &Folds, turn: Turn, lang: crate::lang::L
                 spans.extend(line.spans);
                 out.push(Line::from(spans));
                 links.push(shift_links(&rendered.links[i], prefix_w));
+                body.push(text_start(prefix_w, &md, i));
             }
         }
         Item::Subagent { summary, .. } => {
@@ -640,6 +741,7 @@ fn make(item: &Item, width: u16, folds: &Folds, turn: Turn, lang: crate::lang::L
                 Span::styled(summary.clone(), Style::default().fg(theme::text_muted())),
             ]));
             links.push(Vec::new());
+            body.push(2);
         }
         // **What a run came to, in the agent's own words.** A row of the conversation — the same
         // head the card used to draw, without taking the input's spot and without a key to press.
@@ -654,7 +756,9 @@ fn make(item: &Item, width: u16, folds: &Folds, turn: Turn, lang: crate::lang::L
                 ),
             ]));
             links.push(Vec::new());
+            body.push(2);
             let rendered = markdown::render_rich(summary, body_width(width).saturating_sub(2));
+            let md = rendered.prefix.clone();
             for (li, line) in rendered.lines.into_iter().enumerate() {
                 let mut spans = vec![pad(), pad()];
                 let prefix_w =
@@ -662,6 +766,7 @@ fn make(item: &Item, width: u16, folds: &Folds, turn: Turn, lang: crate::lang::L
                 spans.extend(line.spans);
                 out.push(Line::from(spans));
                 links.push(shift_links(&rendered.links[li], prefix_w));
+                body.push(text_start(prefix_w, &md, li));
             }
         }
         Item::Work { seq, title, parts } => {
@@ -727,8 +832,9 @@ fn make(item: &Item, width: u16, folds: &Folds, turn: Turn, lang: crate::lang::L
             heads.push((out.len(), *seq));
             out.push(Line::from(card));
             links.push(Vec::new());
+            body.push(2);
             if !card_open {
-                return Made { lines: out, links, heads, breathing };
+                return Made { lines: out, links, body, heads, breathing };
             }
 
             // ── Children, in arrival order ───────────────────────────────────────────────────
@@ -743,28 +849,36 @@ fn make(item: &Item, width: u16, folds: &Folds, turn: Turn, lang: crate::lang::L
                         // and what they changed, but the tool rows are right there below it
                         // saying the same thing — and the card head already totals the run
                         // (decided with the user, 2026-08-11).
-                        let spans = vec![
+                        let mut spans = vec![
                             pad(),
                             Span::styled(
                                 if open { "▾ " } else { "▸ " },
                                 Style::default().fg(theme::topic()),
                             ),
-                            // Not bold: the card head is the heading, and a chip is one step down.
-                            Span::styled(title.clone(), Style::default().fg(theme::topic())),
                         ];
+                        // The chip's own margin is the padding and the fold marker.
+                        let own = spans
+                            .iter()
+                            .map(|s| markdown::display_width(&s.content))
+                            .sum::<usize>();
+                        // Not bold: the card head is the heading, and a chip is one step down.
+                        spans
+                            .push(Span::styled(title.clone(), Style::default().fg(theme::topic())));
                         heads.push((out.len(), t.seq));
                         out.push(Line::from(spans));
                         links.push(Vec::new());
+                        body.push(own as u16);
                         // **The body is only drawn when it says more than the title.** With no
                         // server title, one short sentence of reasoning becomes both, and the
                         // chip printed the same line twice.
-                        let body = t.text.trim();
-                        if !open || body.is_empty() || body == title {
+                        let body_text = t.text.trim();
+                        if !open || body_text.is_empty() || body_text == title {
                             continue;
                         }
                         // The reasoning body, dim so the answer beside it keeps the eye.
                         let rendered =
                             markdown::render_rich(&t.text, body_width(width).saturating_sub(2));
+                        let md = rendered.prefix.clone();
                         for (li, line) in rendered.lines.into_iter().enumerate() {
                             let mut spans = vec![
                                 pad(),
@@ -780,6 +894,7 @@ fn make(item: &Item, width: u16, folds: &Folds, turn: Turn, lang: crate::lang::L
                             }));
                             out.push(Line::from(spans));
                             links.push(shift_links(&rendered.links[li], prefix_w));
+                            body.push(text_start(prefix_w, &md, li));
                         }
                     }
                     Part::Said(t) => {
@@ -795,6 +910,7 @@ fn make(item: &Item, width: u16, folds: &Folds, turn: Turn, lang: crate::lang::L
                         // it (2026-09-13 user report).
                         let rendered =
                             markdown::render_rich(&t.text, body_width(width).saturating_sub(2));
+                        let md = rendered.prefix.clone();
                         for (li, line) in rendered.lines.into_iter().enumerate() {
                             let mut spans = vec![
                                 pad(),
@@ -810,11 +926,12 @@ fn make(item: &Item, width: u16, folds: &Folds, turn: Turn, lang: crate::lang::L
                             spans.extend(line.spans);
                             out.push(Line::from(spans));
                             links.push(shift_links(&rendered.links[li], prefix_w));
+                            body.push(text_start(prefix_w, &md, li));
                         }
                     }
                     Part::Step(step) => {
                         let open = effective_open(NodeKind::Tool, &fold_of(folds, step.seq), false);
-                        let (rows, clickable, waiting) = tool_row(step, open, width, lang);
+                        let (rows, bodies, clickable, waiting) = tool_row(step, open, width, lang);
                         // The dot sits on the row's first line, right after the indent.
                         if waiting {
                             breathing.push((out.len(), DOT_SPAN));
@@ -823,27 +940,29 @@ fn make(item: &Item, width: u16, folds: &Folds, turn: Turn, lang: crate::lang::L
                             heads.push((out.len(), step.seq));
                         }
                         links.extend(std::iter::repeat_with(Vec::new).take(rows.len()));
+                        body.extend(bodies);
                         out.extend(rows);
                     }
                 }
             }
         }
     }
-    Made { lines: out, links, heads, breathing }
+    Made { lines: out, links, body, heads, breathing }
 }
 
 /// One tool row: the status dot, the short name, what it was run against, how much it changed,
 /// and — when the person opened it — its detail.
-/// Returns the row's lines, and whether the row is a fold target — a tool with nothing to expand
-/// does nothing when pressed, so it must not look pressable.
+/// Returns the row's lines and where their text starts, and whether the row is a fold target — a
+/// tool with nothing to expand does nothing when pressed, so it must not look pressable.
 fn tool_row(
     step: &Step,
     open: bool,
     width: u16,
     lang: crate::lang::Lang,
-) -> (Vec<Line<'static>>, bool, bool) {
+) -> (Vec<Line<'static>>, Vec<u16>, bool, bool) {
     use crate::tool_view::{Detail, ToolState};
     let mut out: Vec<Line<'static>> = Vec::new();
+    let mut body: Vec<u16> = Vec::new();
     let can_open = !matches!(step.detail, Detail::None);
     // **The dot reads the call, not the turn.** Waiting is yellow and breathes, a failure is red, a
     // return is green. Painting "the last tool of a running turn" yellow instead would call every
@@ -855,14 +974,13 @@ fn tool_row(
         ToolState::Pending => Span::styled("● ", Style::default().fg(theme::warning())),
     };
     let waiting = matches!(step.state, ToolState::Pending);
-    let mut head = vec![
-        pad(),
-        dot,
-        Span::styled(
-            step.name.clone(),
-            Style::default().fg(theme::tool()).add_modifier(Modifier::BOLD),
-        ),
-    ];
+    // **The row's own margin is the padding and the dot**, and it is the same on every tool row.
+    let mut head = vec![pad(), dot];
+    let own = head.iter().map(|s| markdown::display_width(&s.content)).sum::<usize>();
+    head.push(Span::styled(
+        step.name.clone(),
+        Style::default().fg(theme::tool()).add_modifier(Modifier::BOLD),
+    ));
     if !step.action.is_empty() {
         head.push(Span::styled(
             format!("  {}", step.action),
@@ -882,10 +1000,13 @@ fn tool_row(
         Style::default().fg(theme::border_light()),
     ));
     out.push(Line::from(head));
+    body.push(own as u16);
     if open {
-        out.extend(detail_lines(&step.detail, width, step.state, lang));
+        let (lines, bodies) = detail_lines(&step.detail, width, step.state, lang);
+        out.extend(lines);
+        body.extend(bodies);
     }
-    (out, can_open, waiting)
+    (out, body, can_open, waiting)
 }
 
 /// The indent a tool's detail sits at. Deep enough to read as belonging to the row above,
@@ -894,20 +1015,28 @@ const DETAIL_PAD: &str = "    ";
 
 /// Draws an opened tool row's detail. **Per shape, not one flat dump** — a shell log, a diff and a
 /// match list are read three different ways, and a JSON dump of any of them is read none.
+///
+/// Returns the lines and, per line, where its own text starts: the indent and the mark, never the
+/// text — a JSON line's own indentation is text and stays (`detail_lines` pushes it into `body` as
+/// each line is built, so the two cannot drift).
 fn detail_lines(
     detail: &crate::tool_view::Detail,
     width: u16,
     state: crate::tool_view::ToolState,
     lang: crate::lang::Lang,
-) -> Vec<Line<'static>> {
+) -> (Vec<Line<'static>>, Vec<u16>) {
     use crate::tool_view::{Detail, ToolState};
     let failed = state == ToolState::Failed;
     let inner = body_width(width).saturating_sub(DETAIL_PAD.len() as u16).max(8);
     let mut out: Vec<Line<'static>> = Vec::new();
+    let mut body: Vec<u16> = Vec::new();
     // The gutter that ties the detail to its row. Red when the call failed, so a failure is
     // visible without reading a word of it.
     let rail = if failed { theme::danger() } else { theme::border_light() };
-    let row = |mark: &str, spans: Vec<Span<'static>>| {
+    let mut row = |mark: &str, spans: Vec<Span<'static>>| {
+        // **Every detail line wears the same margin**: the indent and the mark that ties it to the
+        // row above. Where the text starts is that width, whatever the text turns out to be.
+        body.push((DETAIL_PAD.len() + markdown::display_width(mark)) as u16);
         let mut line = vec![
             Span::styled(DETAIL_PAD, Style::default()),
             Span::styled(mark.to_string(), Style::default().fg(rail)),
@@ -929,6 +1058,8 @@ fn detail_lines(
         Detail::Diff(d) => {
             for line in &d.lines {
                 out.push(diff_line(line, inner as usize, lang));
+                // A diff line carries its own sign in column zero; nothing was drawn in front.
+                body.push(0);
             }
         }
         Detail::Exec { exit, timed_out, out: stdout, err } => {
@@ -1070,7 +1201,7 @@ fn detail_lines(
             }
         }
     }
-    out
+    (out, body)
 }
 
 /// Shifts link columns by the marker prefix width so they land in the output line's columns.
@@ -1172,16 +1303,20 @@ fn json_line(raw: &str, base: ratatui::style::Color) -> Vec<Span<'static>> {
 const ANSWER_MARK: &str = "  → ";
 
 /// Question card. While awaiting an answer it can be chosen; after the answer it's read-only.
+///
+/// Returns the card's lines and, per line, where its text starts: the mark the card wears (`? ` or
+/// `✓ `, and the answer's `→ `), never the question itself.
 fn question_rows(
     steps: &[crate::question::Step],
     answered: bool,
     answer: Option<&str>,
     width: u16,
     lang: crate::lang::Lang,
-) -> Vec<Line<'static>> {
+) -> (Vec<Line<'static>>, Vec<u16>) {
     let mut out = Vec::new();
+    let mut body: Vec<u16> = Vec::new();
     let Some(step) = steps.first() else {
-        return out;
+        return (out, body);
     };
 
     let mark = if answered { "✓" } else { "?" };
@@ -1203,7 +1338,10 @@ fn question_rows(
     // **The question wraps.** It is the whole reason this row is up, and a long one used to be cut
     // at the right edge in silence — `ratatui` drops whatever runs past it. The wrapped part hangs
     // under the marker, where the arrow of the answer below it also lines up.
-    out.extend(crate::wrap::line(Line::from(head), width as usize));
+    let head_lines = crate::wrap::line(Line::from(head), width as usize);
+    // Every line the question wrapped to wears the mark and its space.
+    body.extend(std::iter::repeat_n(2u16, head_lines.len()));
+    out.extend(head_lines);
 
     // **What was answered, in one line, under the question.** One row picked off a list is not a
     // paragraph the person typed, so it does not wear their bar; the question is not repeated,
@@ -1219,9 +1357,10 @@ fn question_rows(
             Span::styled(ANSWER_MARK.to_string(), Style::default().fg(theme::text_muted())),
             Span::styled(markdown::truncate_to(&shown, room), Style::default().fg(theme::text())),
         ]));
+        body.push(markdown::display_width(ANSWER_MARK) as u16);
     }
 
-    out
+    (out, body)
 }
 
 #[cfg(test)]
@@ -1363,6 +1502,132 @@ mod tests {
     /// about, since a finished stretch folds itself away.
     fn live(items: &[Item], width: u16, folds: &Folds, lang: crate::lang::Lang) -> Rendered {
         rows_with(items, width, folds, None, lang, Turn { running: true })
+    }
+
+    /// **The margin is recorded, not guessed.** A card's head is drawn one margin in, a tool row
+    /// two (its dot stands in a margin of its own), and an opened detail two more plus its `⎿` —
+    /// characters a reader takes for layout and which are indistinguishable from text somebody
+    /// indented by hand. `body` says where each line's own text starts, so a drag over any of them
+    /// starts at the text (2026-09-15 user report).
+    #[test]
+    fn each_line_records_where_its_own_text_starts() {
+        let item = work();
+        let Item::Work { seq, parts, .. } = &item else {
+            panic!("not a work item");
+        };
+        // The card, every tool in it — a detail is only drawn when its row is open.
+        let mut folds = Folds::new();
+        folds.insert(*seq, Fold { open: true, user_touched: true });
+        for part in parts {
+            if let Part::Step(s) = part {
+                folds.insert(s.seq, Fold { open: true, user_touched: true });
+            }
+        }
+        let r = live(&[item], 60, &folds, crate::lang::Lang::Ko);
+        let rows = r.plain();
+        let at = |needle: &str| {
+            rows.iter()
+                .position(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("no {needle} in {rows:?}"))
+        };
+
+        // The card's head: the marker and the space after it.
+        assert_eq!(r.body[0], 2, "{:?}", rows[0]);
+        // A tool row: the padding and the dot that stands in the second margin.
+        let tool = at("grep");
+        assert_eq!(r.body[tool], 4, "{:?}", rows[tool]);
+        // Its opened detail: the four-column indent and the `⎿ ` after it.
+        let detail = at("⎿");
+        assert_eq!(r.body[detail], 6, "{:?}", rows[detail]);
+        assert_eq!(r.body.len(), rows.len(), "one body per line");
+    }
+
+    /// **What a tool printed keeps its own indentation.** A JSON block and a file's tab-indented
+    /// code are indented *by their author*, and reading the margin back out of the drawn
+    /// characters ate those spaces because they were drawn as a span of their own — so what came
+    /// back could not be pasted anywhere that cares (2026-09-15 report). Only the renderer's own
+    /// margin is counted now, so what is left is the text.
+    #[test]
+    fn a_details_own_indentation_is_kept_in_the_copy() {
+        use crate::tool_view::{Detail, ToolState};
+        let step = |seq, name: &str, detail| Step {
+            seq,
+            name: name.into(),
+            action: String::new(),
+            state: ToolState::Ok,
+            detail,
+        };
+        let draggable = |rows: &[String], body: &[u16]| {
+            let last = rows.len() - 1;
+            crate::selection::extract(
+                rows,
+                body,
+                &crate::selection::Drag { from: (0, 0), to: (last, 0) },
+            )
+        };
+
+        let json = Item::Work {
+            seq: 1,
+            title: "working".into(),
+            parts: vec![Part::Step(step(
+                7,
+                "code_edit",
+                Detail::Json {
+                    args: "{\n  \"path\": \"src/app.rs\"\n}".into(),
+                    result: String::new(),
+                },
+            ))],
+        };
+        let mut folds = Folds::new();
+        folds.insert(1, Fold { open: true, user_touched: true });
+        folds.insert(7, Fold { open: true, user_touched: true });
+        let r = live(&[json], 60, &folds, crate::lang::Lang::En);
+        let rows = r.plain();
+        let out = draggable(&rows, &r.body);
+        assert!(out.contains("\n  \"path\": \"src/app.rs\""), "the JSON indent went: {out:?}");
+        assert!(!out.contains('⎿'), "the detail's mark came along: {out:?}");
+
+        let body = Item::Work {
+            seq: 2,
+            title: "working".into(),
+            parts: vec![Part::Step(step(
+                8,
+                "read",
+                Detail::Body {
+                    label: "src/app.rs".into(),
+                    text: "fn main() {\n\tif x {\n\t\tgo();\n\t}\n}".into(),
+                },
+            ))],
+        };
+        let mut folds = Folds::new();
+        folds.insert(2, Fold { open: true, user_touched: true });
+        folds.insert(8, Fold { open: true, user_touched: true });
+        let r = live(&[body], 60, &folds, crate::lang::Lang::En);
+        let rows = r.plain();
+        let out = draggable(&rows, &r.body);
+        assert!(out.contains("\n\tif x {\n\t\tgo();"), "the tabs went: {out:?}");
+    }
+
+    /// **A person's own indentation survives**, on screen and in a copy. Markdown reads four
+    /// leading spaces, or a tab, as an indented code block — so a line of code typed into a message
+    /// was drawn as `┌─`/`│ …`/`└─` with its indent swallowed, and dragging it back out could not
+    /// put the indent anywhere (2026-09-15 report).
+    #[test]
+    fn a_persons_indentation_is_their_own() {
+        let items = [Item::User { seq: 1, text: "look:\n\tif x {\n\t\tgo();\n\t}".into() }];
+        let r = live(&items, 60, &Folds::new(), crate::lang::Lang::En);
+        let rows = r.plain();
+        assert!(!rows.iter().any(|l| l.contains('┌')), "their line became a code block: {rows:?}");
+        assert!(rows.iter().any(|l| l.contains("\tif x {")), "the tab is gone: {rows:?}");
+        assert_eq!(r.body[1], 2, "the bar is what a drag may not cover: {rows:?}");
+
+        let last = rows.len() - 1;
+        let out = crate::selection::extract(
+            &rows,
+            &r.body,
+            &crate::selection::Drag { from: (0, 0), to: (last, 200) },
+        );
+        assert_eq!(out, "look:\n\tif x {\n\t\tgo();\n\t}", "{rows:?}");
     }
 
     /// The first chip's fold key, so a test can open a single chip.
@@ -2029,7 +2294,7 @@ mod tests {
             out: "Up to date".into(),
             err: String::new(),
         };
-        let out = detail_lines(&d, 60, ToolState::Ok, crate::lang::Lang::Ko);
+        let (out, _) = detail_lines(&d, 60, ToolState::Ok, crate::lang::Lang::Ko);
         let plain: Vec<String> =
             out.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect()).collect();
         assert!(plain[0].contains("완료"), "no headline saying it finished: {plain:?}");
@@ -2047,7 +2312,7 @@ mod tests {
             out: String::new(),
             err: "error[E0308]".into(),
         };
-        let out = detail_lines(&d, 60, ToolState::Failed, crate::lang::Lang::Ko);
+        let (out, _) = detail_lines(&d, 60, ToolState::Failed, crate::lang::Lang::Ko);
         let plain: Vec<String> =
             out.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect()).collect();
         assert!(plain.iter().any(|l| l.contains("종료 코드 3")), "{plain:?}");
@@ -2068,7 +2333,7 @@ mod tests {
             out: String::new(),
             err: String::new(),
         };
-        let out = detail_lines(&d, 60, ToolState::Ok, crate::lang::Lang::Ko);
+        let (out, _) = detail_lines(&d, 60, ToolState::Ok, crate::lang::Lang::Ko);
         let plain: Vec<String> =
             out.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect()).collect();
         assert!(plain.iter().any(|l| l.contains("출력 없음")), "{plain:?}");
@@ -2087,7 +2352,7 @@ mod tests {
             }],
             truncated: false,
         };
-        let out = detail_lines(&d, 60, ToolState::Ok, crate::lang::Lang::Ko);
+        let (out, _) = detail_lines(&d, 60, ToolState::Ok, crate::lang::Lang::Ko);
         let plain: Vec<String> =
             out.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect()).collect();
         assert!(plain[0].contains("42"), "no scanned count: {plain:?}");
@@ -2103,7 +2368,7 @@ mod tests {
     fn a_cut_short_result_says_so() {
         use crate::tool_view::{Detail, ToolState};
         let d = Detail::Paths { paths: vec!["a.rs".into()], truncated: true };
-        let out = detail_lines(&d, 60, ToolState::Ok, crate::lang::Lang::Ko);
+        let (out, _) = detail_lines(&d, 60, ToolState::Ok, crate::lang::Lang::Ko);
         let plain: Vec<String> =
             out.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect()).collect();
         assert!(plain.iter().any(|l| l.contains("여기까지만")), "{plain:?}");
@@ -2118,7 +2383,7 @@ mod tests {
             args: "{\n  \"command\": \"git push\"\n}".into(),
             result: String::new(),
         };
-        let out = detail_lines(&d, 60, ToolState::Ok, crate::lang::Lang::Ko);
+        let (out, _) = detail_lines(&d, 60, ToolState::Ok, crate::lang::Lang::Ko);
         let plain: Vec<String> =
             out.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect()).collect();
         assert!(
@@ -2135,7 +2400,7 @@ mod tests {
             args: "{\n  \"cmd\": \"git push\"\n}".into(),
             result: "{\n  \"ok\": true\n}".into(),
         };
-        let out = detail_lines(&d, 60, ToolState::Ok, crate::lang::Lang::Ko);
+        let (out, _) = detail_lines(&d, 60, ToolState::Ok, crate::lang::Lang::Ko);
         let plain: Vec<String> =
             out.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect()).collect();
         assert!(plain.iter().any(|l| l.contains("⎿ 인자")), "no arguments heading: {plain:?}");
