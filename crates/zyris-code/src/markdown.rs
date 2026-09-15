@@ -29,11 +29,19 @@ pub struct Link {
     pub url: String,
 }
 
-/// What `render_rich` produced: the lines plus, per line, the links on it.
+/// What `render_rich` produced: the lines plus, per line, the links on it and **how much of the
+/// line's front the renderer drew**.
+///
+/// `prefix` is the gutter this module adds — the rule down a code block's left (`│ `), the margin a
+/// wrapped line hangs under — and nothing else. It exists because the caller prints its own margin
+/// in front (`rows::PAD`, a marker) and the selection has to know where the author's text starts:
+/// counting it as each is drawn beats reading the drawn characters back, which cannot tell a
+/// renderer's indent from text somebody indented by hand (2026-09-15 report).
 #[derive(Debug, Default)]
 pub struct Rendered {
     pub lines: Vec<Line<'static>>,
     pub links: Vec<Vec<Link>>,
+    pub prefix: Vec<u16>,
 }
 
 pub fn render(src: &str, width: u16) -> Vec<Line<'static>> {
@@ -59,6 +67,8 @@ pub fn render_rich(src: &str, width: u16) -> Rendered {
     let width = width.max(8) as usize;
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut out_links: Vec<Vec<Link>> = Vec::new();
+    // Where each line's own text starts, parallel to `out` (see [`Rendered::prefix`]).
+    let mut out_prefix: Vec<u16> = Vec::new();
     let mut buf: Vec<Piece> = Vec::new();
     let mut style = Style::default().fg(theme::text());
     let mut in_code = false;
@@ -83,7 +93,7 @@ pub fn render_rich(src: &str, width: u16) -> Rendered {
                 style = Style::default().fg(theme::text_heading()).add_modifier(Modifier::BOLD);
             }
             Event::End(TagEnd::Heading(_)) => {
-                flush(&mut out, &mut out_links, &mut buf, width, "", false);
+                flush(&mut out, &mut out_links, &mut out_prefix, &mut buf, width, "", false);
                 style = Style::default().fg(theme::text());
             }
             Event::Start(Tag::Emphasis) => style = style.add_modifier(Modifier::ITALIC),
@@ -94,7 +104,7 @@ pub fn render_rich(src: &str, width: u16) -> Rendered {
             Event::End(TagEnd::Strong) => style = Style::default().fg(theme::text()),
             Event::Start(Tag::BlockQuote(_)) => style = Style::default().fg(theme::text_muted()),
             Event::End(TagEnd::BlockQuote(_)) => {
-                flush(&mut out, &mut out_links, &mut buf, width, "│ ", false);
+                flush(&mut out, &mut out_links, &mut out_prefix, &mut buf, width, "│ ", false);
                 style = Style::default().fg(theme::text());
             }
             Event::Start(Tag::List(_)) => {
@@ -102,7 +112,15 @@ pub fn render_rich(src: &str, width: u16) -> Rendered {
                 // the line, so without this the inner bullet is glued onto the end of the outer
                 // item's sentence: `∙ 바깥  ∙ 안쪽`. The flush carries the outer item's margin,
                 // which is what the line it closes belongs to.
-                flush(&mut out, &mut out_links, &mut buf, width, &item_indent, false);
+                flush(
+                    &mut out,
+                    &mut out_links,
+                    &mut out_prefix,
+                    &mut buf,
+                    width,
+                    &item_indent,
+                    false,
+                );
                 list_depth += 1;
             }
             Event::End(TagEnd::List(_)) => list_depth = list_depth.saturating_sub(1),
@@ -123,14 +141,22 @@ pub fn render_rich(src: &str, width: u16) -> Rendered {
                 // **A tight list item ends here and nowhere else.** With no paragraph of its own
                 // (that is what "tight" means) the item's text is still in the buffer, and this is
                 // the only flush it gets — so this is where its margin has to be passed.
-                flush(&mut out, &mut out_links, &mut buf, width, &item_indent, false);
+                flush(
+                    &mut out,
+                    &mut out_links,
+                    &mut out_prefix,
+                    &mut buf,
+                    width,
+                    &item_indent,
+                    false,
+                );
                 // **Back out one level, not to nothing.** An item inside an item leaves the outer
                 // item's margin behind it, which is where its own remaining text belongs.
                 item_indent = "  ".repeat(list_depth.saturating_sub(1));
                 item_first_para = false;
             }
             Event::Start(Tag::CodeBlock(kind)) => {
-                flush(&mut out, &mut out_links, &mut buf, width, "", false);
+                flush(&mut out, &mut out_links, &mut out_prefix, &mut buf, width, "", false);
                 let lang = match &kind {
                     CodeBlockKind::Fenced(l) if !l.is_empty() => l.to_string(),
                     _ => String::new(),
@@ -140,6 +166,8 @@ pub fn render_rich(src: &str, width: u16) -> Rendered {
                     Style::default().fg(theme::border_light()),
                 )));
                 out_links.push(Vec::new());
+                // The frame is dropped from a selection whole (`selection::is_code_fence`).
+                out_prefix.push(0);
                 in_code = true;
             }
             Event::End(TagEnd::CodeBlock) => {
@@ -148,6 +176,7 @@ pub fn render_rich(src: &str, width: u16) -> Rendered {
                     Style::default().fg(theme::border_light()),
                 )));
                 out_links.push(Vec::new());
+                out_prefix.push(0);
                 in_code = false;
             }
             Event::Code(t) => {
@@ -168,6 +197,8 @@ pub fn render_rich(src: &str, width: u16) -> Rendered {
                         Span::styled(raw.to_string(), Style::default().fg(theme::text())),
                     ]));
                     out_links.push(Vec::new());
+                    // The rule and the space after it; the code's own indent follows in `raw`.
+                    out_prefix.push(display_width("│ ") as u16);
                 }
             }
             // A link. Its text renders styled (underlined) and **its URL rides along** so the
@@ -185,7 +216,7 @@ pub fn render_rich(src: &str, width: u16) -> Rendered {
             // Cell text is collected, then drawn once with widths aligned when the table ends. Column
             // widths need every row, so they can't be drawn midway.
             Event::Start(Tag::Table(_)) => {
-                flush(&mut out, &mut out_links, &mut buf, width, "", false);
+                flush(&mut out, &mut out_links, &mut out_prefix, &mut buf, width, "", false);
                 table = Some(Table::default());
             }
             Event::End(TagEnd::Table) => {
@@ -193,6 +224,8 @@ pub fn render_rich(src: &str, width: u16) -> Rendered {
                     for line in t.render(width) {
                         out.push(line);
                         out_links.push(Vec::new());
+                        // A table's border is part of it and stays selectable.
+                        out_prefix.push(0);
                     }
                 }
             }
@@ -233,7 +266,15 @@ pub fn render_rich(src: &str, width: u16) -> Rendered {
                 // second paragraph of the same item is indented from its own first line, because
                 // the bullet is not in front of it — the item's first paragraph is the one line the
                 // bullet stands on.
-                flush(&mut out, &mut out_links, &mut buf, width, &item_indent, !item_first_para);
+                flush(
+                    &mut out,
+                    &mut out_links,
+                    &mut out_prefix,
+                    &mut buf,
+                    width,
+                    &item_indent,
+                    !item_first_para,
+                );
                 item_first_para = false;
             }
             Event::Rule => {
@@ -242,12 +283,13 @@ pub fn render_rich(src: &str, width: u16) -> Rendered {
                     Style::default().fg(theme::border()),
                 )));
                 out_links.push(Vec::new());
+                out_prefix.push(0);
             }
             _ => {}
         }
     }
-    flush(&mut out, &mut out_links, &mut buf, width, "", false);
-    Rendered { lines: out, links: out_links }
+    flush(&mut out, &mut out_links, &mut out_prefix, &mut buf, width, "", false);
+    Rendered { lines: out, links: out_links, prefix: out_prefix }
 }
 
 /// **Pre-draws as a table** one whose delimiter row hasn't arrived yet during streaming.
@@ -494,6 +536,7 @@ pub fn truncate_to(s: &str, limit: usize) -> String {
 fn flush(
     out: &mut Vec<Line<'static>>,
     out_links: &mut Vec<Vec<Link>>,
+    out_prefix: &mut Vec<u16>,
     buf: &mut Vec<Piece>,
     width: usize,
     indent: &str,
@@ -510,6 +553,9 @@ fn flush(
     let mut line: Vec<Span<'static>> = Vec::new();
     let mut links: Vec<Link> = Vec::new();
     let mut used = 0usize;
+    // **How much of this line's front is the margin**, which is what the caller records the line's
+    // own text starting after (see [`Rendered::prefix`]). Zero when no margin was drawn.
+    let mut margin_w = 0usize;
     // **Words, not columns.** A line holding only the margin is not a line: a break must not be
     // decided on one, or the first word of every item would be pushed a line down on its own.
     let mut words = 0usize;
@@ -519,6 +565,7 @@ fn flush(
     if indent_first && indent_w > 0 {
         line.push(margin());
         used = indent_w;
+        margin_w = indent_w;
     }
 
     for piece in buf.drain(..) {
@@ -532,6 +579,7 @@ fn flush(
                 }
                 out.push(Line::from(std::mem::take(&mut line)));
                 out_links.push(std::mem::take(&mut links));
+                out_prefix.push(margin_w as u16);
                 used = 0;
                 words = 0;
                 // Leading spaces carried onto a new line are dropped — they'd look like indentation.
@@ -540,9 +588,11 @@ fn flush(
                 }
                 // **The margin opens the next line.** Dropped with the spaces above, the wrapped
                 // part would sit against the left edge it was told to stay away from.
+                margin_w = 0;
                 if indent_w > 0 {
                     line.push(margin());
                     used = indent_w;
+                    margin_w = indent_w;
                 }
             }
             match (&open, &piece.url) {
@@ -577,6 +627,7 @@ fn flush(
     if !line.is_empty() {
         out.push(Line::from(line));
         out_links.push(links);
+        out_prefix.push(margin_w as u16);
     }
 }
 

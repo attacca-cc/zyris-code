@@ -167,19 +167,15 @@ pub fn row_spans(
     out
 }
 
-/// The glyphs the screen draws in a row's left margin, which are furniture rather than text.
+/// The glyphs a row's left margin can hold: `▌` marks what a person said, `✻` a stretch of
+/// working, `▸`/`▾` a fold, `●` a tool row and `◆` an answer; `│` runs down the left of a code
+/// block and `┊` down an opened reasoning body.
 ///
-/// `▌` marks what a person said, `✻` a stretch of working, `▸`/`▾` a fold, `●` a tool row and `◆`
-/// an answer; `│` runs down the left of a code block and `┊` down an opened reasoning body.
+/// **This is what a row with no record is read with** (`body_start`) — the bars, the input, an
+/// overlay, a screen drawn before the first layout. Everything the conversation's layout drew is
+/// counted as it is drawn (`rows::text_start`), which cannot be fooled by a line of text that
+/// merely looks like a margin (2026-09-15 report).
 const MARGIN_GLYPHS: [char; 8] = ['▌', '✻', '▸', '▾', '●', '◆', '│', '┊'];
-
-/// Everything the screen draws in a row's margin, as opposed to what a row says.
-///
-/// This is the set [`start_of`]'s record is built from (`rows::furniture_width`): a run of these at
-/// the head of a line is decoration and no part of the text. It is wider than [`MARGIN_GLYPHS`]
-/// because the margin is not always one glyph deep — a tool's detail carries its indent and its
-/// `⎿`, a report's body two margins of its own — and because a row of blank space is furniture too.
-pub const FURNITURE: [char; 12] = [' ', '▌', '✻', '▸', '▾', '●', '◆', '◈', '└', '┊', '│', '⎿'];
 
 /// The column a row's own text starts at, past whatever the screen drew in its margin.
 ///
