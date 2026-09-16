@@ -17,9 +17,10 @@
 //! `zyris::Account::register_node` would mint a `znt_` that never expires and let `Link` take this
 //! job over, and `nodes:write` is already in `conn::REQUIRED_SCOPES`. Deliberately not taken: it
 //! changes the node-identity story that was tried and reverted on 2026-08-12 — one credential is
-//! one node, and the newest connection wins — and nothing about compiling against the library-only
-//! zyris needs it.
+//! one node, and the window that starts later holds the slot while the one it displaced stands by
+//! (`Runner::slot`) — and nothing about compiling against the library-only zyris needs it.
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -27,6 +28,7 @@ use std::time::{Duration, Instant};
 use futures_util::future::BoxFuture;
 use zyris::{Capabilities, ConnectError, Connection, Node, NodeKind};
 
+use crate::conn;
 use crate::runtime::credentials::{token_prefix, Credentials, CredentialsError};
 
 /// A connection that stayed up this long counts as healthy, so its eventual drop restarts the
@@ -38,6 +40,9 @@ const DEFAULT_BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// Long enough for a closing frame to reach the server, so it retires the node promptly instead of
 /// waiting for the heartbeat to lapse.
 const CLOSE_GRACE: Duration = Duration::from_millis(200);
+/// How often a window that is standing by looks at the slot again. **This is the only thing that notices the
+/// other window ending**, so it is short; two file reads and two `kill(pid, 0)` a second cost nothing.
+const STAND_BY_POLL: Duration = Duration::from_secs(2);
 
 /// Everything a node needs to know before it dials.
 #[derive(Debug, Clone)]
@@ -241,6 +246,11 @@ pub struct Runner {
     node: Node,
     credentials: Arc<dyn Credentials>,
     on_connect: Option<ConnectHook>,
+    /// This window's slot file, when there is one (`conn::claim_window`). **`None` leaves the loop exactly as
+    /// it was before this existed** — one window on the machine, or no credential directory to write into.
+    slot: Option<PathBuf>,
+    /// Run once each time the loop gives the node up to another window.
+    on_stand_by: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl Runner {
@@ -259,7 +269,7 @@ impl Runner {
     /// attempt would hand every reconnect a freshly initialised capability that had forgotten
     /// whatever the last one knew.
     pub fn new(config: RunConfig, node: Node, credentials: Arc<dyn Credentials>) -> Runner {
-        Runner { config, node, credentials, on_connect: None }
+        Runner { config, node, credentials, on_connect: None, slot: None, on_stand_by: None }
     }
 
     pub fn config(&self) -> &RunConfig {
@@ -286,6 +296,30 @@ impl Runner {
         Fut: std::future::Future<Output = ()> + Send + 'static,
     {
         self.on_connect = Some(Arc::new(move |conn| Box::pin(hook(conn))));
+        self
+    }
+
+    /// **Where this window's slot file is.** With it, the loop will not dial while another *living* window
+    /// holds the node — see `conn::claim_instance_lock` for why that is what stops two windows taking the
+    /// node from each other every half minute.
+    ///
+    /// `None` (no credential directory was found) leaves the loop as it was before this existed.
+    pub fn slot(mut self, slot: Option<PathBuf>) -> Self {
+        self.slot = slot;
+        self
+    }
+
+    /// Run once when the loop stands by because another window holds the node. **Not again until it has
+    /// dialed in between** — the state is entered once per hand-over, and repeating it every poll would be
+    /// noise in the log and on the activity line.
+    ///
+    /// It exists because a window that stands by otherwise looks stuck: it is not reconnecting, so nothing on
+    /// screen says what it is waiting for.
+    pub fn on_stand_by<F>(mut self, hook: F) -> Self
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        self.on_stand_by = Some(Arc::new(hook));
         self
     }
 
@@ -326,8 +360,29 @@ impl Runner {
         // Tracks whether a refusal has already been answered with a forced rotation, so a genuinely
         // dead credential still terminates instead of refreshing forever.
         let mut rotated_after_refusal = false;
+        // Whether the previous pass was spent standing by, so the hand-over is logged and shown once rather
+        // than once per poll.
+        let mut stood_by = false;
 
         loop {
+            // **Somebody else is holding this credential's node.** Dialing would take it from that window,
+            // which would then dial back and take it in turn — the ~31s trade described in `conn.rs`'s
+            // window-lock header, which ran for hours on this machine and showed up as "the node keeps
+            // disconnecting". So this loop waits, and looks again: the slot names a pid, and the window that
+            // holds it ending is the signal to take the node back.
+            if self.another_window_has_the_node() {
+                if !stood_by {
+                    stood_by = true;
+                    tracing::warn!("standing by: another zyris-code window holds this node");
+                    if let Some(hook) = &self.on_stand_by {
+                        hook();
+                    }
+                }
+                tokio::time::sleep(STAND_BY_POLL).await;
+                continue;
+            }
+            stood_by = false;
+
             // Freshness is decided immediately before each dial rather than by a timer task: a
             // token that is valid now is valid for the handshake, and a connection that outlives
             // its token is handled server-side by the heartbeat.
@@ -403,6 +458,13 @@ impl Runner {
 
             backoff = self.wait_then_widen(backoff).await;
         }
+    }
+
+    /// **Is the node another window's right now?** Read from the slot file every time rather than remembered,
+    /// because that is the whole mechanism: a later window takes the slot by writing its pid over ours, and
+    /// this reading is how a window finds out it has been displaced.
+    fn another_window_has_the_node(&self) -> bool {
+        self.slot.as_deref().is_some_and(conn::held_by_another_live_window)
     }
 
     /// Hold a live connection until it drops or the operator interrupts. `true` means shut down.

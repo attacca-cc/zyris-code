@@ -462,49 +462,82 @@ pub fn node_preamble(cwd: &std::path::Path) -> String {
 
 // ── Window lock ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 //
-// **With two windows using the same credentials, the server registry is overwritten by the later connection.** So it
-// doesn't quietly tangle: if an earlier window is already up, we say so on screen. We don't block —
-// in the same directory, whichever window receives it, the files changed are the same (CLAUDE.md "Multiple windows").
+// **One credential is one node, and that is what makes two windows fight.** The server keeps a single
+// connection per node (`insert(node_id, connection)`), so the window that dials second takes the node from
+// the one that dialed first — and since each redials about a second after being closed, each takes it back in
+// turn. Measured on this machine, 2026-09-15/16: two live windows alternating at a fixed ~31s for as long as
+// both were up, a disconnect on screen every round and any call in flight dead server-side. Neither window
+// was doing anything wrong; the loop was.
+//
+// **So the lock file is the slot, and holding it is the right to dial.** The window that starts later takes the
+// slot; a window whose pid is no longer in the file has lost the node and stands by rather than dialing back
+// (the runner asks this file before every attempt). Standing by is not forever — the file names a pid, and a
+// pid that is gone is a free slot, so the window that stayed quiet takes the node up again on its own a couple
+// of seconds after the other one ends. `/reconnect` is the deliberate way to take it back sooner.
 
 /// Lock file name. Branched by profile, so different profiles (different nodes) don't interfere with each other.
 fn instance_lock_path(config_dir: &std::path::Path, profile: &str) -> std::path::PathBuf {
     config_dir.join(format!(".instance-{}.lock", slugify_profile(profile)))
 }
 
-/// A handle that removes the lock file while alive. **However the window ends, it gets removed.**
-pub struct InstanceLock(std::path::PathBuf);
+/// A handle on this window's slot. **It removes the file on the way out — but only while the file is still
+/// ours.**
+pub struct InstanceLock {
+    path: std::path::PathBuf,
+    /// Our own pid, as written. Compared on drop: another window may have taken the slot since.
+    pid: String,
+}
+
+impl InstanceLock {
+    /// Where the slot is written. The runner asks this path before every dial, and `/reconnect` takes the
+    /// slot back through it.
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
 
 impl Drop for InstanceLock {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        // **Deleting a slot another window has taken is worse than leaving it.** The next window to start
+        // would find no file, claim a node that is very much in use, and be displaced again — the one thing
+        // this file exists to stop.
+        if slot_pid(&self.path).as_deref() == Some(self.pid.as_str()) {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
-/// Is there **already a living** other window for this profile? True if the PID in the lock file is alive —
-/// a dead window's trace is not a living window.
-pub fn another_instance_alive(config_dir: &std::path::Path, profile: &str) -> bool {
-    let Ok(pid) = std::fs::read_to_string(instance_lock_path(config_dir, profile)) else {
-        return false;
-    };
-    process_alive(pid.trim())
+/// **The pid written in the slot file**, or `None` when there is no file, or it holds nothing at all.
+fn slot_pid(path: &std::path::Path) -> Option<String> {
+    let pid = std::fs::read_to_string(path).ok()?;
+    let pid = pid.trim().to_string();
+    (!pid.is_empty()).then_some(pid)
 }
 
-/// Claims the lock. If a living window already exists, `None` — then we only show a notice and carry on.
+/// **Is the slot another living window's right now?** Read fresh at every use, because the answer changes
+/// while this process runs — that is the whole mechanism.
 ///
-/// **Clears a dead window's trace and claims again.** Since only one PID is stored, if two windows claim
-/// at once the later one wins — this lock asks "is there another living window", not "who is the owner",
-/// so the losing side of a race will see the other one at the next check.
+/// **Our own pid in the file reads as `false`.** The question is whether dialing would displace a *living*
+/// window, and we are not one; a window that read its own slot as taken would refuse to start at all.
+///
+/// A dead window's pid is not a window either: a file left behind by a killed process must not keep the next
+/// one standing by forever.
+pub fn held_by_another_live_window(path: &std::path::Path) -> bool {
+    slot_pid(path)
+        .is_some_and(|pid| pid != std::process::id().to_string() && process_alive(&pid))
+}
+
+/// **Claims the slot, and takes it even when a living window is already there.** The window that starts
+/// later is the one that gets the node — what else could opening it mean — and the window it displaced finds
+/// out by reading this file, not by being refused here. Refusing here was the old behaviour, and it is what
+/// left the two windows trading the node for hours: the newcomer took the node anyway by dialing.
+///
+/// `None` only when the file cannot be written at all. The window runs either way; it just cannot tell
+/// whether another one is up.
 pub fn claim_instance_lock(config_dir: &std::path::Path, profile: &str) -> Option<InstanceLock> {
     let path = instance_lock_path(config_dir, profile);
-    if another_instance_alive(config_dir, profile) {
-        return None;
-    }
-    let _ = std::fs::remove_file(&path);
-    if std::fs::write(&path, std::process::id().to_string()).is_ok() {
-        Some(InstanceLock(path))
-    } else {
-        None
-    }
+    let pid = std::process::id().to_string();
+    std::fs::write(&path, &pid).ok().map(|()| InstanceLock { path, pid })
 }
 
 /// Which window this process is.
@@ -515,22 +548,45 @@ pub fn claim_instance_lock(config_dir: &std::path::Path, profile: &str) -> Optio
 /// server is what makes two windows awkward, and moving the awkwardness onto the credential only
 /// moved it somewhere worse.
 ///
-/// The lock is still claimed, because knowing whether another window is up is worth knowing —
-/// see `claim_instance_lock`.
+/// The slot is what decides **which window dials**, which is now a decision rather than an observation —
+/// see `claim_instance_lock`. The rest of the file's job is unchanged: knowing whether another window is up.
 pub struct Window {
     /// The profile its credentials are filed under (`wss-<server>-<profile>.json`).
     pub profile: String,
-    /// `None` when another window already holds it. That window is the one the server routes to.
+    /// `None` when the slot file could not be written at all (an unwritable credential directory).
     pub lock: Option<InstanceLock>,
+    /// **A living window held this slot until now.** It has just been displaced and stands by as soon as it
+    /// notices, which is worth saying on screen — the enrollment-code window may be in that one.
+    pub took_over: bool,
 }
 
-/// Claims this window's place, if it is free.
-///
-/// **Failing to claim is not a failure to start.** With two windows on one credential the server
-/// keeps the connection that arrived last (`insert(node_id, connection)`), and there is nothing a
-/// node can do about that — so the second window runs, and says so.
+/// Claims this window's place. **Never refuses** — see `claim_instance_lock` for why taking the slot from a
+/// living window is the point and not the accident.
 pub fn claim_window(config_dir: &std::path::Path, base: &str) -> Window {
-    Window { profile: base.to_string(), lock: claim_instance_lock(config_dir, base) }
+    let took_over = held_by_another_live_window(&instance_lock_path(config_dir, base));
+    Window { profile: base.to_string(), lock: claim_instance_lock(config_dir, base), took_over }
+}
+
+/// Where this window's slot file is, for the one place that needs it without the handle: `/reconnect`, which
+/// runs in the screen and knows only that the node is not attached (`app.rs`). Set once, at startup.
+static SLOT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// Remember this window's slot file. The first call wins — a slot never moves.
+pub fn remember_slot(path: &std::path::Path) {
+    let _ = SLOT.set(path.to_path_buf());
+}
+
+/// **Take the node back from another window** — what `/reconnect` means to a window that has been standing by.
+/// Writing our pid is the whole of it: the other window's runner checks this file before every dial and stands
+/// by when the slot is not its own.
+///
+/// `false` means there is no slot to take (the credential directory was never found), not that the write was
+/// refused on its merits.
+pub fn take_the_slot_back() -> bool {
+    let Some(path) = SLOT.get() else {
+        return false;
+    };
+    std::fs::write(path, std::process::id().to_string()).is_ok()
 }
 
 #[cfg(unix)]
@@ -1370,42 +1426,71 @@ mod tests {
         assert_eq!(compose_name("arch", None), "arch zyris-code");
     }
 
-    /// A dead window's trace is not a living window. PID 0 must be treated as dead, since kill(0, 0)
-    /// always succeeds.
+    /// A dead window's trace is not a living window — and PID 0 must be treated as dead, since kill(0, 0)
+    /// always succeeds. A slot read as taken would leave the next window standing by for a node nobody holds.
     #[test]
-    fn a_stale_instance_lock_is_not_a_living_window() {
+    fn a_stale_slot_is_not_a_living_window() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(instance_lock_path(dir.path(), "test"), "0").unwrap();
-        assert!(!another_instance_alive(dir.path(), "test"));
+        let path = instance_lock_path(dir.path(), "test");
+        std::fs::write(&path, "0").unwrap();
+        assert!(!held_by_another_live_window(&path));
+        std::fs::write(&path, "4000000000").unwrap();
+        assert!(!held_by_another_live_window(&path));
     }
 
-    /// Claiming the lock makes "another window" for that profile visible, and dropping the handle releases it.
-    /// A second window can't claim the lock again — that's where the notice goes.
+    /// **Our own slot is not another window's.** A window that read its own pid as a take-over would refuse
+    /// to dial the node it holds, which is a node nobody serves.
     #[test]
-    fn claiming_the_lock_marks_another_window_and_releasing_clears_it() {
+    fn our_own_slot_is_not_another_window() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(!another_instance_alive(dir.path(), "test"));
-        let lock = claim_instance_lock(dir.path(), "test").expect("the first window is the owner");
-        assert!(another_instance_alive(dir.path(), "test"));
-        assert!(
-            claim_instance_lock(dir.path(), "test").is_none(),
-            "the second window cannot become the owner"
-        );
-        drop(lock);
-        assert!(!another_instance_alive(dir.path(), "test"), "released, yet it is still there");
+        let window = claim_window(dir.path(), "test");
+        let lock = window.lock.as_ref().expect("the credential directory is writable");
+        assert_eq!(slot_pid(lock.path()).as_deref(), Some(std::process::id().to_string().as_str()));
+        assert!(!held_by_another_live_window(lock.path()));
+        assert!(!window.took_over, "nobody was here first");
     }
 
-    /// A lock holding a dead PID is cleared and claimed again — if a dead window makes the second window
-    /// get a false notice, that's noise too.
+    /// Releasing the slot clears it, so the next window to start finds it free.
     #[test]
-    fn a_dead_pid_lock_is_reclaimed() {
+    fn releasing_the_slot_clears_it() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(instance_lock_path(dir.path(), "test"), "4000000000").unwrap();
-        assert!(!another_instance_alive(dir.path(), "test"));
-        assert!(
-            claim_instance_lock(dir.path(), "test").is_some(),
-            "a dead window's lock must be cleared away"
-        );
+        let path = instance_lock_path(dir.path(), "test");
+        drop(claim_window(dir.path(), "test"));
+        assert!(!path.exists(), "released, yet it is still there");
+    }
+
+    /// **A later window takes the slot from a living one** — that is what opening it means — and the window it
+    /// displaced reads its own pid gone from the file, which is how it knows to stand by instead of dialing
+    /// back and starting the trade of CLAUDE.md "창 여럿".
+    #[cfg(unix)]
+    #[test]
+    fn a_later_window_takes_the_slot_from_a_living_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = instance_lock_path(dir.path(), "test");
+        let mut first = std::process::Command::new("sleep").arg("60").spawn().unwrap();
+        std::fs::write(&path, first.id().to_string()).unwrap();
+        assert!(held_by_another_live_window(&path));
+
+        let second = claim_window(dir.path(), "test");
+        assert!(second.took_over, "it took the node from a living window");
+        assert!(!held_by_another_live_window(&path), "the slot is the newcomer's now");
+
+        // Any way the other window ends — cleanly or killed — the slot is free, never somebody else's forever.
+        first.kill().ok();
+        first.wait().ok();
+        assert!(!held_by_another_live_window(&path), "a dead pid is a free slot");
+    }
+
+    /// **The window that lost the slot does not delete the winner's file on its way out.** Doing so would
+    /// leave the winner looking absent, and the next window to start would take a node that is in use.
+    #[test]
+    fn handing_the_slot_over_leaves_the_new_owners_file_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = instance_lock_path(dir.path(), "test");
+        let loser = claim_window(dir.path(), "test");
+        std::fs::write(&path, "1").unwrap();
+        drop(loser);
+        assert_eq!(slot_pid(&path).as_deref(), Some("1"));
     }
 
     /// Changing the agent **opens a new session at the next message.** A session's agent is fixed at

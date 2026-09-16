@@ -659,13 +659,23 @@ impl Lang {
             Lang::En => format!("Couldn't reach the server ({secs}s in): {why}"),
         }
     }
-    /// Another window already holding this credential. **The enrollment-code window may be
-    /// in that window** — saying only "connected elsewhere" would send the person looking
-    /// for the code in the wrong place.
+    /// **This window has just taken the node from another one** (`conn::claim_instance_lock`). Said
+    /// because the other window is about to go quiet, and because the enrollment-code window may be
+    /// over there — "connected elsewhere" would send the person looking in the wrong place.
     pub fn another_window_notice(self) -> &'static str {
         self.pick(
-            "다른 zyris-code 창이 이미 같은 자격으로 붙어 있습니다. 등록 코드 창이 그 창에 떠 있을 수 있습니다.",
-            "Another zyris-code window is already using the same credential. The enrollment-code window may be there.",
+            "다른 zyris-code 창이 같은 자격으로 붙어 있었습니다. 이 창이 노드를 넘겨받았고, 그 창은 잠시 뒤 물러납니다. 등록 코드 창이 그쪽에 떠 있을 수 있습니다.",
+            "Another zyris-code window was attached with the same credential. This window has taken the node over, and that one stands by shortly. The enrollment-code window may be there.",
+        )
+    }
+    /// **This window has just given the node up to a later one**, so it is not reconnecting — it is
+    /// waiting for that window to end. Said once per hand-over, with the one thing the person might
+    /// want instead: taking the node back now (`/reconnect` writes this window's pid into the slot,
+    /// and the other window stands by in turn).
+    pub fn stood_by_notice(self) -> &'static str {
+        self.pick(
+            "다른 창이 이 노드를 가져갔습니다. 그 창이 끝나면 자동으로 다시 붙습니다 ∙ /reconnect 로 지금 가져올 수 있습니다.",
+            "Another window has taken this node. This one reattaches by itself once that window ends ∙ /reconnect takes it back now.",
         )
     }
     /// A window that took a slot of its own. **Said because the first launch of a slot asks for
@@ -2942,6 +2952,7 @@ mod tests {
             (ko.connection_lost(), en.connection_lost()),
             (ko.waiting_for_approval(), en.waiting_for_approval()),
             (ko.another_window_notice(), en.another_window_notice()),
+            (ko.stood_by_notice(), en.stood_by_notice()),
             (ko.free_mark(), en.free_mark()),
         ];
         for (k, e) in pairs {
@@ -2987,6 +2998,7 @@ mod tests {
             en.connection_lost(),
             en.waiting_for_approval(),
             en.another_window_notice(),
+            en.stood_by_notice(),
             en.clear_done(),
             en.agent_cannot_send(),
             en.undo_log_not_ready(),

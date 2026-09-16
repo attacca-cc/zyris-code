@@ -92,14 +92,20 @@ same machine — and windows in different directories are distinguishable in
 Attacca at a glance. Override with `ZYRIS_NODE_NAME`; `/cwd` shows what this
 window registered as.
 
-**Open as many windows as you like.** Nothing stops a second one, in the same
-directory or another. What you should know is that this deployment gives one
-credential exactly one node: connecting twice returns the same `node_id`, and
-the server routes tool calls to whichever connection arrived last. The earlier
-window keeps drawing, keeps its history, and receives no tool calls. A window
-that starts while another is already using the same credential says so on the
-activity line (an instance lock with a PID liveness check), so the takeover is
-not silent.
+**Open as many windows as you like, but one of them holds the node.** This
+deployment gives one credential exactly one node: connecting twice returns the
+same `node_id`, and the server routes tool calls to whichever connection arrived
+last. So the window that starts later takes the node, and the window it was taken
+from **stands by** — it keeps drawing and keeps its history, says once on the
+activity line that the node is elsewhere, and reattaches by itself once the other
+window ends. `/reconnect` takes it back sooner.
+
+Standing by is what keeps two windows from spending all their time taking the node
+from each other. The slot is a file in the credential directory holding a PID,
+checked for liveness (and for being someone other than us) before every dial.
+Without that check each window redialed about a second after being closed, and the
+two traded the node at a fixed ~31s for as long as both were up: a disconnect on
+screen every round, and any call in flight dead server-side.
 
 In the same directory that changes nothing worth guarding against — whichever
 window the agent reaches, the files it edits are the same. Across different

@@ -309,36 +309,38 @@ async fn main() -> ExitCode {
     // another window can touch this computer too. The only thing blocking is `tools::guard::Gate`.
     let cwd = zyris_code::tools::working_dir();
 
-    // **Every window is its own node** (`conn::claim_window`, taken at the top of `main`).
+    // **One credential is one node, so one window holds it at a time** (`conn::claim_window`, taken
+    // at the top of `main`). Per-window identities were tried (2026-08-12) and taken out again: a
+    // window's identity then depended on what else happened to be running when it started.
     //
-    // It used to be one node for all of them, because identity is the credential and they shared
-    // one. The server registry is keyed by node id (`insert(node_id, connection)`), so the second
-    // window replaced the first's connection and the first was handed no tool calls at all while
-    // its socket stayed up. This app could only say so and carry on. Now each window takes a slot,
-    // files its credentials under a profile of its own, and registers under a name of its own —
-    // so a tool call lands in the window whose session made it.
-    //
-    // **The judgment still belongs to the window that received the call** (plan mode, `/config`
-    // dir access). That is now the same window that asked, which is what it always should have been.
+    // **What the slot decides is who dials.** The server registry is keyed by node id
+    // (`insert(node_id, connection)`), so the second window to connect takes the node from the
+    // first — and with each of them redialing a second after being closed, they take it in turn for
+    // as long as both are up. Measured on this machine: a fixed ~31s alternation, every round a
+    // disconnect on screen and any call in flight dead server-side. So this window writes its pid
+    // into the slot, the runner refuses to dial while another *living* window holds it, and the
+    // window that was displaced stands by until this one ends — see `### 창 여럿` in CLAUDE.md.
     //
     // **The handle has to live as long as the window does.** Bound inside a block it was dropped at
     // the closing brace, and `Drop` deletes the very file it had just written — so no window ever
-    // left a lock behind and no later window ever found one.
+    // left a slot behind and no later window ever found one.
     //
-    // Here is where the screen exists to say what the slot means. **A window past the first enrols
-    // once** — an approval window with no explanation reads as the app having logged itself out.
-    // **The second window is told, and told once.** With one credential the server keeps the
-    // connection that arrived last, so this window has just taken the tool calls from the other
-    // one — see `### 창 여럿` in CLAUDE.md.
-    if window.as_ref().is_some_and(|w| w.lock.is_none()) {
-        tracing::warn!(
-            "another zyris-code window is attached with the same credentials. tool calls go to \
-             whichever window the server picked."
-        );
+    // Here is where the screen exists to say what the take-over means. **A window past the first
+    // enrols once** — an approval window with no explanation reads as the app having logged itself
+    // out. **The window it displaced is told, and told once.**
+    if window.as_ref().is_some_and(|w| w.took_over) {
+        tracing::warn!("another zyris-code window held this node; this one takes it over");
         bridge.frame(zyris_code::app::Frame::Notice(
             zyris_code::lang::current().another_window_notice().to_string(),
         ));
     }
+    // **Where the slot is, for the two callers that need it without this handle**: the runner, which
+    // asks before every dial, and `/reconnect` in the screen, which is how a window that stood by
+    // takes the node back.
+    let slot = window.as_ref().and_then(|w| w.lock.as_ref()).map(|lock| {
+        zyris_code::conn::remember_slot(lock.path());
+        lock.path().to_path_buf()
+    });
     let _instance_lock = window;
 
     // **`notify` says it here, through the same door as every other notice.** The check happened
@@ -422,10 +424,23 @@ async fn main() -> ExitCode {
     // `Link` take this job over, and `nodes:write` is already in `conn::REQUIRED_SCOPES` — not
     // taken, because it changes the one-credential-one-node story that was tried and reverted on
     // 2026-08-12.
-    let runner = zyris_code::runtime::Runner::new(config, node, creds).on_connect({
-        let bridge = bridge.clone();
-        let notice = notice.clone();
-        move |conn| {
+    let runner = zyris_code::runtime::Runner::new(config, node, creds)
+        // **Standing by is said on screen.** A window that gave the node up is not reconnecting — it
+        // is waiting for the window that holds it to end — so nothing else would tell the person
+        // why this one is quiet.
+        .on_stand_by({
+            let bridge = bridge.clone();
+            move || {
+                bridge.frame(zyris_code::app::Frame::Notice(
+                    zyris_code::lang::current().stood_by_notice().to_string(),
+                ));
+            }
+        })
+        .slot(slot)
+        .on_connect({
+            let bridge = bridge.clone();
+            let notice = notice.clone();
+            move |conn| {
             let api_tx = Arc::clone(&api_tx);
             // `on_connect` is called again on every reconnect. The bridge and notice are handles, so
             // clones are passed — moving them outright would leave nothing to move on the second connect.
