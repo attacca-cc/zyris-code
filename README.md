@@ -184,9 +184,12 @@ what you open here is what you look up there.
 |---|---|
 | `search` | `glob`, `grep` — respects `.gitignore`, skips binaries |
 | `file_io` | `stat`, `list`, `read`, `read_stream` — **read only** |
-| `code_edit` | `edit`, `write` |
+| `code_edit` | `edit`, `write`, `version` |
 | `terminal` | `exec`, plus a full PTY: `open`, `read`, `write`, `screen`, `resize`, `close` |
 | `skill` | `list`, `load` |
+| `rules` | `load` — the current `CLAUDE.md`·`AGENTS.md`, read now rather than as the session was created |
+| `wait` | `start`, `until`, `logs`, `list`, `stop` — background commands, and waiting on a local build, a remote build or a work |
+| `git` | `status`, `log`, `diff`, `branches`, `switch`, `commit`, `push`, plus GitHub: `issues`, `pulls`, `comment`, `create_issue`, `create_pull`, `review`, `request_review` |
 | `work` | `start`, `status`, `list`, `say`, `stop`, `resume` — hands a goal to attacca |
 | `mcp_*` | whatever your MCP servers expose |
 

@@ -11,6 +11,7 @@ use std::path::PathBuf;
 
 use async_trait::async_trait;
 // The `serve` module itself is private. Its items are re-exported at the crate root, so use those.
+use serde_json::Value;
 use zyris::{CapabilityDescriptor, IncomingCall, Outgoing, Result, ServeCapability};
 use zyris_caps::FileIoServer;
 use zyris_fs::LocalFileIo;
@@ -54,8 +55,42 @@ impl ServeCapability for ReadOnlyFileIo {
         if !READ_ONLY.contains(&call.tool.as_str()) {
             return Err(zyris::unknown_tool("file_io", &call.tool));
         }
-        self.0.dispatch(call).await
+        let out = self.0.dispatch(call).await?;
+        Ok(note_how_to_read_on(out))
     }
+}
+
+/// Adds the two things a caller would otherwise put together by hand to a `read` answer: the
+/// file's **version token** and, when the file was cut short, the **offset that reads on**.
+///
+/// **The token is spelled out here because spelling it wrong looks like something else.**
+/// `code_edit` wants `"mtime_ms:size"`, and upstream hands those out as two separate numbers under
+/// `stat` — joining them with a colon is exactly the step that goes wrong in a way that reads as a
+/// stale file, costing a re-read and a retry. `offset + len` is the same kind of arithmetic, and it
+/// was written down in a description that trimming then cut shorter than the sentence carrying it
+/// (`tools/trim.rs`).
+///
+/// Only `read` is touched: it is the one answer with bytes in it. `read_stream`'s head is a stat and
+/// its bytes are a stream, and `stat`·`list` have nothing to add.
+fn note_how_to_read_on(out: Outgoing) -> Outgoing {
+    let Outgoing::Response(payload) = out else { return out };
+    let Ok(mut body) = payload.to_json() else { return Outgoing::Response(payload) };
+    let Some(map) = body.as_object_mut() else { return Outgoing::Response(payload) };
+    if map.get("content").is_none() {
+        return Outgoing::Response(payload);
+    }
+    let stat = map.get("stat");
+    let ms = stat.and_then(|s| s.get("modified_unix_ms")).and_then(Value::as_u64);
+    let size = stat.and_then(|s| s.get("size")).and_then(Value::as_u64);
+    if let (Some(ms), Some(size)) = (ms, size) {
+        map.insert("version".into(), Value::from(format!("{ms}:{size}")));
+    }
+    if map.get("truncated").and_then(Value::as_bool) == Some(true) {
+        let offset = map.get("offset").and_then(Value::as_u64).unwrap_or(0);
+        let len = map.get("len").and_then(Value::as_u64).unwrap_or(0);
+        map.insert("next_offset".into(), Value::from(offset + len));
+    }
+    Outgoing::Response(zyris::Payload::from_json(body))
 }
 
 #[cfg(test)]
@@ -139,5 +174,49 @@ mod tests {
             meta: zyris::Payload::default(),
         };
         assert!(cap.dispatch(call).await.is_err(), "a filtered tool must not be callable");
+    }
+
+    /// **The version token and the way on are in the answer**, rather than assembled by the caller:
+    /// `code_edit` wants `mtime_ms:size`, and `offset + len` is what reads on.
+    #[tokio::test]
+    async fn a_read_answer_carries_the_version_token_and_the_next_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "hello\n").unwrap();
+        let cap = ReadOnlyFileIo::new(dir.path().to_path_buf());
+        let call = IncomingCall {
+            tool: "read".into(),
+            params: zyris::Payload::from_json(serde_json::json!({ "path": "a.txt", "len": 2 })),
+            serialization: zyris::Serialization::Json,
+            meta: zyris::Payload::default(),
+        };
+        let out = cap.dispatch(call).await.unwrap();
+        let Outgoing::Response(payload) = &out else { panic!("a read answers in one response") };
+        let body = payload.to_json().unwrap();
+        let md = std::fs::metadata(dir.path().join("a.txt")).unwrap();
+        let ms = md.modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+        assert_eq!(body["content"], serde_json::json!("he"));
+        assert_eq!(body["truncated"], serde_json::json!(true));
+        assert_eq!(body["version"], serde_json::json!(format!("{ms}:6")));
+        assert_eq!(body["next_offset"], serde_json::json!(2));
+    }
+
+    /// A whole file is not cut short: there is no offset to read on to, and saying nothing beats
+    /// pointing past the end of the file.
+    #[tokio::test]
+    async fn a_whole_read_has_no_next_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "hello\n").unwrap();
+        let cap = ReadOnlyFileIo::new(dir.path().to_path_buf());
+        let call = IncomingCall {
+            tool: "read".into(),
+            params: zyris::Payload::from_json(serde_json::json!({ "path": "a.txt" })),
+            serialization: zyris::Serialization::Json,
+            meta: zyris::Payload::default(),
+        };
+        let out = cap.dispatch(call).await.unwrap();
+        let Outgoing::Response(payload) = &out else { panic!("a read answers in one response") };
+        let body = payload.to_json().unwrap();
+        assert!(body.get("next_offset").is_none(), "{body}");
+        assert!(body.get("version").is_some(), "{body}");
     }
 }

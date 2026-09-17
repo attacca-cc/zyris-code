@@ -443,6 +443,9 @@ mod tests {
             removed: d.removed,
             diff: d.to_unified(),
             version: "0:0".into(),
+            // **Empty, so the shape this test pins does not change**: `relaxed` is skipped when
+            // there is nothing to say, which is the usual answer.
+            relaxed: Vec::new(),
         })
         .unwrap();
         let e = ev(
