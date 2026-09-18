@@ -252,6 +252,24 @@ impl Lang {
             },
         }
     }
+    /// The head of a subagent's row. **It says what the row is**, so the sentence under it is not
+    /// read as the agent speaking, and a finished subagent is not a grey line nobody notices
+    /// (issue #32, 2026-09-18).
+    pub fn subagent_head(self) -> &'static str {
+        self.pick("하위 에이전트", "Subagent")
+    }
+    /// Which of the three a subagent's row is in. **Said in words as well as in colour** — colour
+    /// alone is not a message, and "still running" is the one of them that must not be missed
+    /// (issue #32, 2026-09-18).
+    pub fn subagent_running(self) -> &'static str {
+        self.pick("실행 중", "running")
+    }
+    pub fn subagent_done(self) -> &'static str {
+        self.pick("완료", "done")
+    }
+    pub fn subagent_failed(self) -> &'static str {
+        self.pick("실패", "failed")
+    }
     /// The head of a report row. **A failure says so in words as well as in colour** — colour
     /// alone is not a message.
     pub fn report_head(self, ok: bool) -> &'static str {

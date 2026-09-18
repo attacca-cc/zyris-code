@@ -8,6 +8,31 @@
 use serde_json::Value;
 use zyris_attacca::ZSessionEvent;
 
+/// How a subagent is getting on, as the wire says it.
+///
+/// The three names are attacca's (`DelegationStatus` in `attacca-domain`'s
+/// `subagent_delegation.rs`), and this is a transcription of them rather than a new vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubagentStatus {
+    Running,
+    Completed,
+    Failed,
+}
+
+impl SubagentStatus {
+    /// **Anything unknown counts as running.** A status this build has never heard of is not a
+    /// finished subagent, and saying "done" over work that is still going is the one mistake this
+    /// value exists to prevent. A payload that says nothing about status — an older attacca — lands
+    /// the same way, for the same reason.
+    fn from_wire(status: Option<&str>) -> SubagentStatus {
+        match status {
+            Some("completed") => SubagentStatus::Completed,
+            Some("failed") => SubagentStatus::Failed,
+            _ => SubagentStatus::Running,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
     pub seq: i64,
@@ -55,7 +80,14 @@ pub enum EntryKind {
         steps: Vec<crate::question::Step>,
         answered: bool,
     },
-    Subagent(String),
+    /// A subagent the agent handed work to. **`status` is the point of it**: attacca writes this
+    /// event when the delegation starts and updates it in place when it ends, so a row that ignores
+    /// the status reads the same while the subagent is still working as it does once it is done —
+    /// and the person cannot tell whether anything is happening (issue #32, 2026-09-18).
+    Subagent {
+        status: SubagentStatus,
+        summary: String,
+    },
     Error(String),
 }
 
@@ -107,7 +139,10 @@ pub fn entry_from(event: &ZSessionEvent) -> Option<Entry> {
         // is nothing to put on screen but a bare status word. Dropped until the server sends the
         // todo's own words (2026-08-10).
         "todo_change" => return None,
-        "subagent_update" => EntryKind::Subagent(text(p, "summary")),
+        "subagent_update" => EntryKind::Subagent {
+            status: SubagentStatus::from_wire(p.get("status").and_then(Value::as_str)),
+            summary: text(p, "summary"),
+        },
         "tool_call" => {
             let name = text(p, "name");
             let failed = p.get("error").is_some_and(|e| !e.is_null());
@@ -280,6 +315,36 @@ mod tests {
             ev(3, "chat_system", json!({"kind": "chat_system", "content": "하위 에이전트 완료"}));
         assert_eq!(entry_from(&recall), None);
         assert_eq!(entry_from(&system), None);
+    }
+
+    /// **A subagent's status is read off the wire, and anything unknown counts as running.**
+    ///
+    /// The same event arrives when a delegation starts and again, updated in place, when it ends —
+    /// the status is the only thing on it that tells the two apart, and reading it wrong leaves a
+    /// subagent that is still working looking exactly like one that has finished (issue #32,
+    /// 2026-09-18).
+    #[test]
+    fn a_subagent_update_carries_how_it_is_getting_on() {
+        fn status_of(e: &ZSessionEvent) -> SubagentStatus {
+            match entry_from(e).expect("a subagent update is rendered").kind {
+                EntryKind::Subagent { status, .. } => status,
+                other => panic!("not a subagent row: {other:?}"),
+            }
+        }
+
+        let running = ev(6, "subagent_update", json!({"status": "running", "summary": "읽는 중"}));
+        let done = ev(7, "subagent_update", json!({"status": "completed", "summary": "다 했다"}));
+        let failed = ev(8, "subagent_update", json!({"status": "failed", "summary": "못 했다"}));
+        // A state this build has never heard of, and a payload that says nothing about status at
+        // all — an older attacca. **Neither is a finished subagent.**
+        let unknown = ev(9, "subagent_update", json!({"status": "queued", "summary": ""}));
+        let silent = ev(10, "subagent_update", json!({"summary": ""}));
+
+        assert_eq!(status_of(&running), SubagentStatus::Running);
+        assert_eq!(status_of(&done), SubagentStatus::Completed);
+        assert_eq!(status_of(&failed), SubagentStatus::Failed);
+        assert_eq!(status_of(&unknown), SubagentStatus::Running);
+        assert_eq!(status_of(&silent), SubagentStatus::Running);
     }
 
     /// A failed tool must stand out — it must not quietly look like a success.

@@ -132,6 +132,9 @@ pub enum Item {
     },
     Subagent {
         seq: i64,
+        /// How the subagent is getting on. **A row without it cannot say whether the subagent is
+        /// still working** — the event arrives again, updated in place, when it ends.
+        status: crate::event::SubagentStatus,
         summary: String,
     },
     /// What the agent asked. It stands **outside**, not inside the work card — it's something to answer.
@@ -457,8 +460,8 @@ impl Timeline {
                     open_work = None;
                     out.push(Item::Error { seq, message: message.clone() });
                 }
-                EntryKind::Subagent(summary) => {
-                    out.push(Item::Subagent { seq, summary: summary.clone() });
+                EntryKind::Subagent { status, summary } => {
+                    out.push(Item::Subagent { seq, status: *status, summary: summary.clone() });
                 }
                 EntryKind::Question { steps, answered } => {
                     // A question must not be buried in a card. Close the run and stand it outside.

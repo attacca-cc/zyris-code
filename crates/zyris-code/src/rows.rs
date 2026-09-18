@@ -735,13 +735,45 @@ fn make(item: &Item, width: u16, folds: &Folds, turn: Turn, lang: crate::lang::L
                 body.push(text_start(prefix_w, &md, i));
             }
         }
-        Item::Subagent { summary, .. } => {
+        // **A subagent's answer is a report, not a footnote.**
+        //
+        // The whole row used to be one grey line — marker, words and sentence all in
+        // `text_muted` — and neither what had come back nor whether the thing was still going
+        // could be read off it (2026-09-18, issue #32). It wears a head of its own now, in the
+        // accent colour, and the sentence under it is ordinary text: the one thing on this row
+        // worth reading.
+        Item::Subagent { status, summary, .. } => {
+            // **The head says which of the three it is**, because the same event arrives when the
+            // subagent starts and again, updated in place, when it ends: without the status the row
+            // read the same while the subagent was still working as it did once it was done
+            // (issue #32, 2026-09-18).
+            let (colour, word) = match status {
+                crate::event::SubagentStatus::Running => (theme::accent(), lang.subagent_running()),
+                crate::event::SubagentStatus::Completed => (theme::success(), lang.subagent_done()),
+                crate::event::SubagentStatus::Failed => (theme::danger(), lang.subagent_failed()),
+            };
             out.push(Line::from(vec![
-                Span::styled("└ ", Style::default().fg(theme::text_muted())),
-                Span::styled(summary.clone(), Style::default().fg(theme::text_muted())),
+                Span::styled("└ ", Style::default().fg(colour)),
+                Span::styled(
+                    format!("{}  ∙  {word}", lang.subagent_head()),
+                    Style::default().fg(colour).add_modifier(Modifier::BOLD),
+                ),
             ]));
             links.push(Vec::new());
             body.push(2);
+            // The sentence is markdown like every other sentence the agent writes: a subagent
+            // that hands back a list or a code span must not show the raw `**` for it.
+            let rendered = markdown::render_rich(summary, body_width(width).saturating_sub(2));
+            let md = rendered.prefix.clone();
+            for (li, line) in rendered.lines.into_iter().enumerate() {
+                let mut spans = vec![pad(), pad()];
+                let prefix_w =
+                    spans.iter().map(|s| markdown::display_width(&s.content)).sum::<usize>();
+                spans.extend(line.spans);
+                out.push(Line::from(spans));
+                links.push(shift_links(&rendered.links[li], prefix_w));
+                body.push(text_start(prefix_w, &md, li));
+            }
         }
         // **What a run came to, in the agent's own words.** A row of the conversation — the same
         // head the card used to draw, without taking the input's spot and without a key to press.
@@ -2053,8 +2085,50 @@ mod tests {
                 text: "| 경로 | 크기 |\n|---|---|\n| a | 1 |\n| b | 2 |\n\n끝입니다.".into(),
             },
             Item::Error { seq: 4, message: "크레딧이 부족합니다".into() },
-            Item::Subagent { seq: 5, summary: "하위 에이전트가 끝났다".into() },
+            Item::Subagent {
+                seq: 5,
+                status: crate::event::SubagentStatus::Completed,
+                summary: "하위 에이전트가 끝났다".into(),
+            },
         ]
+    }
+
+    /// **A subagent's answer says what it is and how it is getting on** (issue #32, 2026-09-18).
+    ///
+    /// It was one muted line, so a subagent looked like a footnote to the work card and its
+    /// sentence was the same colour as the furniture. Worse, the same event arrives when the
+    /// subagent starts and when it ends: with nothing read off `status`, a subagent that was still
+    /// working wore the same row as one that had finished, and the person had no way to tell.
+    #[test]
+    fn a_subagent_row_says_what_it_is_and_how_it_is_doing() {
+        use crate::event::SubagentStatus;
+        let row = |status| {
+            let items =
+                [Item::Subagent {
+                    seq: 1, status, summary: "**세 파일**을 고쳤습니다.".into()
+                }];
+            rows(&items, 60, &Folds::new(), crate::lang::Lang::Ko)
+        };
+
+        // Running, done and failed do not look alike, in word or in colour.
+        let running = row(SubagentStatus::Running);
+        assert!(running.plain()[0].contains("실행 중"), "{:?}", running.plain());
+        assert_eq!(running.lines[0].spans[1].style.fg, Some(crate::theme::accent()));
+
+        let done = row(SubagentStatus::Completed);
+        assert!(done.plain()[0].contains("완료"), "{:?}", done.plain());
+        assert_eq!(done.lines[0].spans[1].style.fg, Some(crate::theme::success()));
+
+        let failed = row(SubagentStatus::Failed);
+        assert!(failed.plain()[0].contains("실패"), "{:?}", failed.plain());
+        assert_eq!(failed.lines[0].spans[1].style.fg, Some(crate::theme::danger()));
+
+        // The sentence is a body of its own, and its markdown is drawn rather than shown raw.
+        let out = done.plain();
+        assert!(out[0].starts_with("└ 하위 에이전트"), "{out:?}");
+        let line = out.iter().find(|l| l.contains("세 파일")).expect("the sentence is missing");
+        assert!(!line.contains("**"), "markdown was not rendered: {line:?}");
+        assert!(line.contains("을 고쳤습니다"), "{line:?}");
     }
 
     /// **The cache must draw exactly like the plain path.** Faster but different is useless.
