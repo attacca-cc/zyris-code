@@ -909,9 +909,6 @@ impl Lang {
             Lang::En => format!("Couldn't send: {e}"),
         }
     }
-    pub fn stopping_turn(self) -> &'static str {
-        self.pick("진행 중인 턴을 멈추는 중입니다…", "Stopping the running turn…")
-    }
     pub fn undo_log_not_ready(self) -> &'static str {
         self.pick("되돌림 기록을 아직 열지 못했습니다.", "Undo history isn't ready yet.")
     }

@@ -32,7 +32,8 @@ pub enum Command {
     /// **There are no logs here** — those are what the agent reads with `wait.logs`, and covering
     /// the transcript hides the conversation itself.
     Jobs(Option<String>),
-    /// Quits. **If a turn is running, it stops on the server too** (`turn_to_stop` in `app.rs`).
+    /// Quits. **It does not stop the turn** — leaving is not stopping, and `Esc` is the only key
+    /// that stops a turn (issue #35, 2026-09-18).
     Quit,
     /// Shows who this node is attached as (`/account`), or logs out (`/account logout`).
     Account(Option<AccountAction>),

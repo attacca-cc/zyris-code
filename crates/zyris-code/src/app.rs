@@ -921,11 +921,6 @@ impl PasteBurst {
 /// How long a notice stays on screen. Plenty to read one sentence.
 pub const STATUS_WINDOW: Duration = Duration::from_secs(6);
 
-/// How long we wait, while quitting, for an answer to "stop the turn".
-///
-/// One round trip is all it takes, so keep it short. **The window closes even past it** —
-/// holding on to someone who wants out is worse than one leftover turn.
-pub const STOP_WAIT: Duration = Duration::from_secs(3);
 /// If the app has not ended this long after a shutdown signal, restore the screen and force
 /// the exit. A safety net for the case where the loop is stuck and never sees the signal.
 ///
@@ -5240,43 +5235,17 @@ async fn run_inner(
     // false alarm 60 seconds later, so cut it here.
     watchdog.abort();
 
-    // **Closing the window stops it on the server too.**
+    // **Leaving is not stopping** (user decision, 2026-09-18, issue #35).
     //
-    // Turns run on the server — even once this side is gone, that side keeps thinking and
-    // fails looking for a node that is not there on every tool call. Credits keep going out
-    // meanwhile. Someone closing means "stop", not "keep it working while I stop watching".
-    if let Some(id) = turn_to_stop(&state, &session) {
-        // One last frame. If the network is sluggish this looks like a brief freeze, and
-        // with nothing said it reads as refusing to quit. The screen is still ours — `run`
-        // is what restores it.
-        //
-        // Disarm the quit first. The activity line puts that above everything
-        // (`activity.rs`), so leaving it armed lets the notice from the Ctrl+C just pressed
-        // cover this last line.
-        state.quit_armed_at = None;
-        state.set_status(state.lang.stopping_turn());
-        let _ = draw_frame(terminal, &mut state);
-        // **The window closes even if it cannot be stopped.** Waiting here indefinitely for
-        // a server that does not answer leaves someone who wanted out in front of a screen
-        // they cannot close.
-        match tokio::time::timeout(STOP_WAIT, api.cancel_turn(id)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => tracing::warn!(error = %e, "could not stop the turn while quitting"),
-            Err(_) => tracing::warn!("asked to stop the turn while quitting, but got no answer"),
-        }
-    }
+    // Quitting used to cancel the turn on the server as well, so closing the window stopped the
+    // work wherever the person happened to be in it — and `Ctrl+C`, the key a hand reaches for to
+    // get out of a terminal, is not a key that should stop anything. It does not any more:
+    // **`Esc` is the only thing that stops a turn.**
+    //
+    // A stop sent on the way out is a stop nobody asked for: the turn is cut and the window is
+    // gone, so there is nothing left to watch it end on. What the turn then does without a node
+    // is the server's business, and it says so in the thread.
     Ok(())
-}
-
-/// The session to ask to stop when quitting. `None` if no turn is running.
-///
-/// Split out pure — with the decision mixed into the I/O place, tests would have to stand up
-/// a server.
-fn turn_to_stop(state: &State, session: &Session) -> Option<String> {
-    if !state.running {
-        return None;
-    }
-    session.id().map(str::to_string)
 }
 
 /// Gathers the shutdown signals sent from outside into one channel.
@@ -10303,29 +10272,30 @@ mod tests {
         assert_eq!(on_key(&s, key(KeyCode::Esc, KeyModifiers::NONE)), vec![Action::Cancel]);
     }
 
-    /// **Closing the window stops it on the server too.** Otherwise the far side keeps thinking
-    /// after this side is gone, failing to find the missing node on every tool call, burning credit.
+    /// **Leaving is not stopping** (user decision, 2026-09-18, issue #35).
+    ///
+    /// Quitting used to cancel the turn on the server as well, so closing the window stopped the
+    /// work wherever the person happened to be in it — and the key a hand reaches for to get out
+    /// of a terminal is not a key that is supposed to stop anything. It does not any more:
+    /// **`Esc` is the only thing that stops a turn.** What the turn does once the node is gone is
+    /// the server's business, and it says so in the thread.
+    ///
+    /// A stop sent on the way out is a stop nobody asked for: with the turn cut and the window
+    /// gone, there is nothing left to watch it end on.
     #[test]
-    fn quitting_mid_turn_stops_the_turn_on_the_server() {
+    fn quitting_while_a_turn_runs_asks_the_server_for_nothing() {
         let mut s = state();
         let mut session = Session::new(None);
         session.switch_to("세션-1".into(), None);
-
         apply(&mut s, &Action::Frame(Frame::Status { running: true }));
-        assert_eq!(turn_to_stop(&s, &session), Some("세션-1".into()));
-    }
 
-    /// With nothing running we do not ask it to stop — no pointless round trip on the way out.
-    #[test]
-    fn quitting_while_idle_says_nothing_to_the_server() {
-        let mut s = state();
-        let mut session = Session::new(None);
-        session.switch_to("세션-1".into(), None);
-        assert_eq!(turn_to_stop(&s, &session), None);
-
-        // A session that never sent a first message does not exist on the server. There is nothing to stop.
-        apply(&mut s, &Action::Frame(Frame::Status { running: true }));
-        assert_eq!(turn_to_stop(&s, &Session::new(None)), None);
+        // **Nothing is derived to send.** `turn_to_stop` is gone from the exit path, and this is
+        // what stood there: a session with a turn running, which used to come back as that
+        // session's id. There is no such helper to call any more, so what is locked here is the
+        // state it read — a running turn, in a session that exists — and that nothing about it is
+        // sent on the way out.
+        assert!(s.running, "a turn is not running, so this test says nothing");
+        assert!(session.id().is_some(), "a session with no id has nothing to cancel anyway");
     }
 
     /// **Leaving a session clears the previous one's turn state.** Without that the status line
