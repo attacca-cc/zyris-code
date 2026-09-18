@@ -2028,15 +2028,16 @@ fn an_expanded_edit_shows_the_diff_instead_of_the_raw_json() {
     let screen = dump(&mut s, 80, 24);
     assert!(!screen.contains("인자"), "the raw JSON came out alongside the diff:\n{screen}");
 }
-/// While a command runs, **what is running** must be shown. Since `exec` only reports once at completion,
-/// without this the person waits up to 55 seconds in the dark.
+/// While a command runs, **that something is running** must be shown. Since `exec` only reports
+/// once at completion, without this the person waits up to a minute in the dark.
 ///
-/// **The tool, never the command.** A command is as long as the agent wrote it — one heredoc or one
-/// `sed`-and-`awk` pipeline filled this line end to end and took the `Esc 정지` hint off it. What the
-/// line names is the tool, and the run's own subtitle carries the "what for" (2026-09-15).
+/// **Not by name any more.** The tool used to be named here and the command never was; the name has
+/// gone with the rest of the narration (issue #34, 2026-09-18) — a tool call is `working`, and what
+/// says more than that is the title of the reasoning being written.
 #[test]
-fn a_running_command_is_named_by_its_tool_and_not_by_its_command() {
+fn a_running_command_shows_on_screen_as_work() {
     let mut s = State::new();
+    s.lang = zyris_code::lang::Lang::Ko;
     s.connected = true;
     s.running = true;
     apply(
@@ -2044,11 +2045,7 @@ fn a_running_command_is_named_by_its_tool_and_not_by_its_command() {
         &Action::Frame(AppFrame::ExecStart { id: 1, tool: "exec".into(), session: None }),
     );
     let screen = dump(&mut s, 80, 12);
-    assert!(screen.contains("exec"), "what is running is not visible:\n{screen}");
-    assert!(
-        !screen.contains("작업 중…"),
-        "it generalised even though a specific reason was known:\n{screen}"
-    );
+    assert!(screen.contains("작업 중…"), "what is happening is not visible:\n{screen}");
 }
 
 /// It disappears when done. If it lingered, it would overlap the next one.
@@ -2083,28 +2080,29 @@ fn finishing_another_command_does_not_clear_the_running_one() {
     );
     apply(&mut s, &Action::Frame(AppFrame::ExecDone { id: 1 }));
     // **Judged on the state, because the two calls can no longer be told apart by their words** —
-    // both tool names are `exec`. Which one is left is exactly what this test is about.
+    // the line does not name the tool at all any more (issue #34). Which one is left is exactly
+    // what this test is about.
     assert_eq!(s.running_tool.as_ref().map(|(id, _, _)| *id), Some(2), "the wrong id was cleared");
-    let screen = dump(&mut s, 80, 12);
-    assert!(screen.contains("exec"), "the running call left the line:\n{screen}");
+    let (_, label, _) = zyris_code::widgets::activity_parts_at(&s, std::time::Instant::now());
+    assert_eq!(label, s.lang.working().to_string(), "the running call left the line");
 }
 
-/// The elapsed time must show so you know it's still running. The test controls the clock.
+/// **A tool call is work, and work is one word** (user decision, 2026-09-18, issue #34).
+///
+/// The line used to name the running tool and count its seconds. Both are gone: what says the
+/// turn is still alive is the blinking dot, the word, and the `Esc` hint.
 #[test]
-fn the_activity_line_counts_the_seconds() {
-    use std::time::{Duration, Instant};
+fn a_running_tool_takes_the_activity_line_as_work() {
     let mut s = State::new();
-    s.lang = zyris_code::lang::Lang::Ko;
     s.connected = true;
     s.running = true;
     apply(
         &mut s,
         &Action::Frame(AppFrame::ExecStart { id: 1, tool: "exec".into(), session: None }),
     );
-    let start = s.running_tool.as_ref().unwrap().2;
-    let (_, label, _) = zyris_code::widgets::activity_parts_at(&s, start + Duration::from_secs(12));
-    assert!(label.contains("12초"), "{label}");
-    let _ = Instant::now();
+    let (_, label, hint) = zyris_code::widgets::activity_parts_at(&s, std::time::Instant::now());
+    assert_eq!(label, s.lang.working().to_string(), "the line named the tool at all");
+    assert_eq!(hint, s.lang.esc_stops(), "the way out of the turn is not offered");
 }
 
 /// **It must be visible that Ctrl+C landed.** Until the server replies, the status stays "working",

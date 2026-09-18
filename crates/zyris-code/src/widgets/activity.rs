@@ -91,35 +91,35 @@ pub fn parts_at(
     // **`Esc 정지` stops this session's turn and nothing else.** Beside work that belongs to
     // another conversation it is a lie, and pressing it would look broken.
     let stop = if ours { lang.esc_stops() } else { "" };
-    // **What is running, never the command it was given.** The command is as long as the agent
-    // wrote it — one heredoc filled this line edge to edge and took the `Esc 정지` hint off the
-    // end — while the tool's name and the run's own subtitle say what is happening in the space
-    // the line has (user decision, 2026-09-15).
-    if let Some((_, tool, since)) = &state.running_tool {
-        let secs = now.saturating_duration_since(*since).as_secs();
-        return (colour, lang.running_tool(tool, &state.work_summary, secs) + &plan, stop);
-    }
-    // **What runs in the background is more specific than "working…".** It is shown even while a
-    // turn is running — that turn is usually waiting on this job, and what a person wants to know
-    // is what has been running and for how long. Unseen, they quit the app and kill the build.
+    // **Two states and no narration** (user decision, 2026-09-18, issue #34).
+    //
+    // This line used to tell everything at once: the running tool by name, with the run's
+    // subtitle and a second counter beside it, and then the background jobs by id and label. On a
+    // busy turn that was a wall of words, and the question the line exists to answer is narrower —
+    // which thought is the agent on, or is it working. So a tool call and a background job are
+    // **work**, and work is one word; while nothing is running but the turn is, what is up is the
+    // title of the thought being written.
+    //
     // **Other conversations' jobs are not this line's news.** A job outlives the thread that
     // started it, and this window runs commands for every session on the account — so a row from a
-    // conversation nobody is looking at used to sit here, describing work this conversation never
-    // asked for. Naming it as somebody else's (which this did next) is still this conversation
-    // being told about work that is not happening here: the line's one job is to say what is going
-    // on *now*, and a build that belongs to another thread is not an answer to that. It is not
-    // hidden — `/jobs` lists it, marked, and quitting the app still kills it with the rest.
-    let ours: Vec<_> = state
+    // conversation nobody is looking at would describe work this conversation never asked for.
+    // It is not hidden: `/jobs` lists it, marked, and quitting the app still kills it with the
+    // rest.
+    let jobs: Vec<_> = state
         .jobs
         .iter()
         .filter(|j| j.session.as_deref().is_none_or(|s| Some(s) == state.session_id.as_deref()))
         .collect();
-    if let Some(job) = ours.first() {
-        let secs = now.saturating_duration_since(job.since).as_secs();
-        let text = lang.background_job(ours.len(), &job.id, &job.label, secs);
-        return (colour, text + &plan, stop);
+    if state.running_tool.is_some() || !jobs.is_empty() {
+        return (colour, lang.working().to_string() + &plan, stop);
     }
     if state.running {
+        // The thought's own title, the very words the chip under the work card wears. **Empty is
+        // ordinary at the start of a turn** — the server writes the title a moment after the block
+        // opens, and the side model may be off — so the word is the fallback and not the rule.
+        if let Some(title) = state.reasoning_title.as_deref().filter(|t| !t.trim().is_empty()) {
+            return (colour, lang.reasoning(title) + &plan, stop);
+        }
         return (theme::accent(), lang.working().to_string() + &plan, lang.esc_stops());
     }
     if state.asking.is_some() {

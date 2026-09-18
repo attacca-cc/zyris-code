@@ -58,7 +58,6 @@ const KEPT: &[(char, &str)] = &[
     // exactly the places that ran out of room to begin with.
     ('…', "the truncation mark, where a column is what there was not enough of"),
     ('•', "a bullet, in text the terminal is not laying out"),
-    ('×', "in prose, not in a laid-out row"),
 ];
 
 /// Every character the app can draw, taken from the string and char literals of the code that

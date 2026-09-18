@@ -661,17 +661,21 @@ pub struct State {
     /// Closing with Esc puts it back to `None` — enrollment itself keeps running in the
     /// background, and `EnrollDone` closes it once approved.
     pub enroll: Option<EnrollView>,
-    /// The tool call running right now — (id, the tool's name, when it started). The activity
-    /// line shows this, beside the run's subtitle and how long it has been going.
-    pub running_tool: Option<(u64, String, Instant)>,
-    /// **The newest `work_summary` of the run on screen** — the server's own one-line answer to
-    /// "what is being done", and the very words the work card's head is wearing.
+    /// The tool call running right now — (id, the tool's name, when it started).
     ///
-    /// The activity line wears it while a command runs, in place of the command's text. It is
-    /// kept **off the entry stream** rather than read out of the timeline: `Timeline::items`
-    /// needs `&mut` and rebuilds lazily, while the activity line is drawn from `&State`
-    /// (`widgets::activity::parts`). Empty until a run writes one.
-    pub work_summary: String,
+    /// The activity line reads **one** fact off this: a call is running, which is what `working`
+    /// means on that line (issue #34, 2026-09-18). The name and the start time are kept because a
+    /// later `ExecDone` has to clear the right one when calls overlap.
+    pub running_tool: Option<(u64, String, Instant)>,
+    /// **The newest reasoning title of the run on screen** — the very words the reasoning chip
+    /// under the work card is wearing.
+    ///
+    /// The activity line wears it while the agent is thinking and nothing is running (user
+    /// decision, 2026-09-18, issue #34). Kept off the entry stream rather than read out of the
+    /// timeline: `Timeline::items` needs `&mut` and rebuilds lazily, while the activity line is
+    /// drawn from `&State` (`widgets::activity::parts`). `None` until the server titles a block —
+    /// the side model may be off, and the title lands a moment after the block opens.
+    pub reasoning_title: Option<String>,
     /// Set by the self-healing tick. The next draw **forces every cell out again** —
     /// the `AlwaysUpdate` flag bypasses the diff and overwrites. It does not clear, so it
     /// does not flicker.
@@ -824,7 +828,7 @@ impl Default for State {
             command_out: None,
             enroll: None,
             running_tool: None,
-            work_summary: String::new(),
+            reasoning_title: None,
             force_update: false,
             force_update_blank: false,
             prev_wide: Vec::new(),
@@ -2774,14 +2778,21 @@ fn apply_frame(state: &mut State, frame: &Frame) {
                 }
             }
             let Some(entry) = entry else { return };
-            if let EntryKind::WorkStart(title) = &entry.kind {
+            if let EntryKind::WorkStart(_) = &entry.kind {
                 state.folds.entry(entry.seq).or_default();
-                // The run's subtitle, for the activity line to wear while a command runs.
-                // **An empty title is skipped**: the server opens the event at run start and
-                // fills the title in place afterwards, so writing down what arrives empty would
-                // blank the words that did land.
+                // **A new subject takes the last title off the activity line.** What the previous
+                // stretch was about is not what this one is thinking about. The run's own summary
+                // is the timeline's business: it is the work card's head, and it is read from
+                // there (`Item::Work`), so it is not kept in `State` as well.
+                state.reasoning_title = None;
+            }
+            // **The thought being written rides the activity line** (issue #34, 2026-09-18).
+            //
+            // Only the server's title. The fallback a chip uses is the first *sentence of the
+            // body*, which is a whole sentence and does not belong on a one-line status.
+            if let EntryKind::Thinking { title: Some(title), .. } = &entry.kind {
                 if !title.trim().is_empty() {
-                    state.work_summary = title.clone();
+                    state.reasoning_title = Some(title.clone());
                 }
             }
             // A question awaiting an answer puts us straight into answering mode. The turn
@@ -2841,7 +2852,8 @@ fn apply_frame(state: &mut State, frame: &Frame) {
             // the words of the run before would then sit beside it describing work nobody is
             // doing.
             if !*running {
-                state.work_summary.clear();
+                // The line belongs to the run that just ended; the next turn writes its own.
+                state.reasoning_title = None;
             }
             state.running = *running;
         }
@@ -5651,8 +5663,9 @@ fn clear_conversation(state: &mut State) {
     state.timeline = Timeline::new();
     state.todos = crate::todos::Todos::new();
     state.folds = Folds::new();
-    // The words belonged to the run that was on screen; the conversation arriving has its own.
-    state.work_summary.clear();
+    // What the run that was on screen was thinking belongs to it; the conversation arriving has
+    // its own.
+    state.reasoning_title = None;
     state.asking = None;
     state.last_cursor = None;
     state.scroll = Scroll::new(); // Start from the bottom.
@@ -9627,10 +9640,12 @@ mod tests {
         assert!(s.status().is_some_and(|t| t.contains("b1")), "{:?}", s.status());
     }
 
-    /// The activity line **picks something more specific than "working…".** It does so even while
-    /// a turn is running — that turn is usually waiting on this job.
+    /// **A background job is work, not a row on the activity line** (issue #34, 2026-09-18).
+    ///
+    /// It used to be listed there by id and label. The line says what is happening *now*, and a
+    /// job is a thing that is happening — `/jobs` is where the list itself lives.
     #[test]
-    fn the_activity_line_prefers_the_background_job_over_working() {
+    fn a_background_job_shows_on_the_activity_line_as_work() {
         let mut s = state();
         s.connected = true;
         s.running = true;
@@ -9643,54 +9658,60 @@ mod tests {
             }),
         );
         let (_, text, _) = crate::widgets::activity_parts_at(&s, std::time::Instant::now());
-        assert!(text.contains("b1") && text.contains("cargo build"), "{text}");
+        assert_eq!(text, s.lang.working().to_string(), "the line listed the job: {text}");
     }
 
-    /// **The line names the tool and the run's own words — never the command.**
+    /// **While the agent thinks, the line wears the thought's own title** (issue #34,
+    /// 2026-09-18).
     ///
-    /// A command is as long as the agent wrote it: one heredoc filled this line end to end and
-    /// took the `Esc 정지` hint off the end of it. The subtitle is the newest `work_summary` —
-    /// the very words the work card's head is wearing — and it is the only thing on this line
-    /// that says what the work is *for* (user decision, 2026-09-15).
+    /// The tool's name is not on this line any more and neither is the run's subtitle: a tool call
+    /// and a background job are both `working`, and what is left to say something more is the
+    /// title of the reasoning being written — the very words the chip under the card is wearing.
     #[test]
-    fn the_activity_line_names_the_tool_and_the_runs_own_words() {
+    fn the_activity_line_wears_the_reasoning_title_while_the_agent_thinks() {
         let mut s = state();
         s.connected = true;
         apply(&mut s, &Action::Frame(Frame::Status { running: true }));
-        apply(
-            &mut s,
-            &Action::Frame(Frame::ExecStart { id: 1, tool: "exec".into(), session: None }),
-        );
 
-        // Before the run has said anything about itself: the tool alone — no dangling separator.
+        // Before any title has landed there is nothing better than the word.
         let (_, text, hint) = crate::widgets::activity_parts_at(&s, std::time::Instant::now());
-        assert!(text.contains("exec"), "{text}");
+        assert_eq!(text, s.lang.working().to_string(), "{text}");
         assert_eq!(hint, s.lang.esc_stops());
 
-        // The run's first `work_summary` lands, and rides the line.
+        // The server titles the block and it rides the line.
         apply(
             &mut s,
             &Action::Frame(Frame::Event {
                 cursor: 1,
                 entry: Some(Entry {
                     seq: 1,
-                    kind: EntryKind::WorkStart("위젯 picker 테스트를 배경에서 실행".into()),
+                    kind: EntryKind::Thinking {
+                        title: Some("위젯 picker를 고치는 중".into()),
+                        text: "본문".into(),
+                    },
                 }),
                 todo: None,
                 plan: None,
             }),
         );
         let (_, text, _) = crate::widgets::activity_parts_at(&s, std::time::Instant::now());
-        assert!(text.contains("exec"), "{text}");
-        assert!(text.contains("위젯 picker 테스트를"), "{text}");
+        assert!(text.contains("위젯 picker를 고치는 중"), "{text}");
 
-        // **The end of the run takes its words with it.** The next turn's first command can beat
-        // its own summary, and the finished run's words beside it would describe work nobody is
-        // doing.
+        // **A tool call takes it back to the word.** Something is running now, and what is running
+        // is not the thought.
+        apply(
+            &mut s,
+            &Action::Frame(Frame::ExecStart { id: 1, tool: "exec".into(), session: None }),
+        );
+        let (_, text, _) = crate::widgets::activity_parts_at(&s, std::time::Instant::now());
+        assert_eq!(text, s.lang.working().to_string(), "{text}");
+
+        // **The end of the run takes the title with it.** The next turn writes its own.
+        apply(&mut s, &Action::Frame(Frame::ExecDone { id: 1 }));
         apply(&mut s, &Action::Frame(Frame::Status { running: false }));
         apply(&mut s, &Action::Frame(Frame::Status { running: true }));
         let (_, text, _) = crate::widgets::activity_parts_at(&s, std::time::Instant::now());
-        assert!(!text.contains("위젯"), "a finished run's words were still up: {text}");
+        assert!(!text.contains("위젯"), "a finished run's title was still up: {text}");
     }
 
     /// **`Esc 정지` stops this session's turn and nothing else.** A tool call reaches this node
@@ -9715,7 +9736,9 @@ mod tests {
 
         s.running = false;
         let (theirs, text, hint) = crate::widgets::activity_parts_at(&s, std::time::Instant::now());
-        assert!(text.contains("cargo build"), "the machine being busy is still said: {text}");
+        // **Said, but as work and not as this conversation's.** The word is the muted one and no
+        // hint comes with it, because Esc would not stop somebody else's job (issue #34).
+        assert_eq!(text, s.lang.working().to_string(), "the machine being busy: {text}");
         assert_eq!(hint, "", "nothing here for Esc to stop");
         assert_ne!(theirs, mine, "and it must not be painted as this conversation's");
     }
@@ -9742,14 +9765,15 @@ mod tests {
         assert!(!text.contains("exec"), "somebody else's command was named: {text}");
         assert_eq!(hint, "", "this session has no turn to stop");
 
-        // Ours, though, is exactly what this line is for.
+        // Ours, though, is exactly what this line is for: it says the machine is busy **and** the
+        // hint that stops it comes back.
         apply(&mut s, &Action::Frame(Frame::Status { running: true }));
         apply(
             &mut s,
             &Action::Frame(Frame::ExecStart { id: 2, tool: "exec".into(), session: None }),
         );
         let (_, text, hint) = crate::widgets::activity_parts_at(&s, std::time::Instant::now());
-        assert!(text.contains("exec"), "{text}");
+        assert_eq!(text, s.lang.working().to_string(), "{text}");
         assert_eq!(hint, s.lang.esc_stops());
     }
 
@@ -9777,7 +9801,9 @@ mod tests {
         assert!(frame_is_current(&mine.session().map(Origin::asked), on_screen, 0));
         apply(&mut s, &Action::Frame(mine));
         let (_, text, _) = crate::widgets::activity_parts_at(&s, std::time::Instant::now());
-        assert!(text.contains("exec"), "our own command was withheld: {text}");
+        // **Shown as work.** The tool's name is not on this line any more (issue #34), so what
+        // says the call was not withheld is that the line left `idle` for `working`.
+        assert_eq!(text, s.lang.working().to_string(), "our own command was withheld: {text}");
 
         // Another conversation's, while our turn is running: the guess would have shown it.
         apply(&mut s, &Action::Frame(Frame::Status { running: true }));
@@ -10161,7 +10187,7 @@ mod tests {
         let listed = jobs_text(&s.jobs, s.lang, s.session_id.as_deref());
         assert!(listed.contains(&marker), "{listed}");
 
-        // **This conversation's own job does take the line**, and is not marked.
+        // **This conversation's own job does take the line** — as work, not by name.
         let mut mine = state();
         mine.connected = true;
         mine.session_id = Some("s-here".into());
@@ -10174,7 +10200,7 @@ mod tests {
             }),
         );
         let (_, activity, _) = crate::widgets::activity_parts_at(&mine, std::time::Instant::now());
-        assert_eq!(activity, mine.lang.background_job(1, "b2", "cargo build", 0));
+        assert_eq!(activity, mine.lang.working().to_string());
         let listed = jobs_text(&mine.jobs, mine.lang, mine.session_id.as_deref());
         assert!(!listed.contains(&marker), "this conversation's own job {listed}");
     }

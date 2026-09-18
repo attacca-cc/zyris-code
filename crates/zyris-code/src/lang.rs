@@ -280,22 +280,16 @@ impl Lang {
             (Lang::En, false) => "Job result ∙ failed",
         }
     }
-    /// What to show in the activity line while a command runs: **the tool that is running, and
-    /// the run's own subtitle — never the command.**
+    /// What the activity line wears while the agent is **thinking and nothing is running**: the
+    /// newest reasoning title — the same words the chip under the work card is wearing.
     ///
-    /// The command is as long as the agent wrote it. One `python3 -c`, one heredoc or one
-    /// `sed -n '1,200p' …` fills the line right to its edge, pushes the `Esc 정지` hint off the
-    /// end of it, and still does not say what the work is for. `tool` (`exec`) is what is
-    /// running; `what` is the newest `work_summary` of the run — the very words the work card's
-    /// head is wearing, and the server's own one-line answer to "what is being done". Both are
-    /// short by construction (user decision, 2026-09-15).
-    pub fn running_tool(self, tool: &str, what: &str, secs: u64) -> String {
-        let took = self.duration(secs);
-        let what = clip_columns(what.trim(), ACTIVITY_WIDTH);
-        match what.is_empty() {
-            true => format!("▶ {tool}  ∙  {took}"),
-            false => format!("▶ {tool}  ∙  {what}  ∙  {took}"),
-        }
+    /// **This is what replaced the running tool's name** (user decision, 2026-09-18, issue #34).
+    /// The line had grown into a narration — the tool, the run's subtitle and a counter, then the
+    /// background jobs — and the question it exists to answer is narrower: which thought is the
+    /// agent on, or is it working. A tool call and a background job both answer that with the same
+    /// word (`working`); while nothing is running, this is the title of the thought being written.
+    pub fn reasoning(self, title: &str) -> String {
+        clip_columns(title.trim(), ACTIVITY_WIDTH)
     }
     /// Says once, on the status line, that a background job finished. **It says so on success
     /// too** — not knowing it is done leaves a person waiting.
@@ -308,21 +302,10 @@ impl Lang {
             (Lang::En, false) => format!("background {id} done ∙ failed ∙ {took}"),
         }
     }
-    /// Background jobs on the activity line. With several, only the count and the oldest one —
-    /// they don't all fit on a single line.
-    pub fn background_job(self, count: usize, id: &str, label: &str, secs: u64) -> String {
-        let head = match (self, count) {
-            (Lang::Ko, 1) => "배경".to_string(),
-            (Lang::Ko, n) => format!("배경 {n}개"),
-            (Lang::En, 1) => "background".to_string(),
-            (Lang::En, n) => format!("background ×{n}"),
-        };
-        // **Clipped for the same reason a command is not shown at all.** The label defaults to
-        // the job's own command (`jobs.rs`), so a backgrounded build would otherwise sprawl
-        // across this line exactly the way a running one used to.
-        let label = clip_columns(label.trim(), ACTIVITY_WIDTH);
-        format!("{head}  {id} {label}  ∙  {}", self.duration(secs))
-    }
+    // **A background job no longer takes the activity line** (user decision, 2026-09-18, issue
+    // #34): a job outlives the thread that started it, and a line that has to say what is
+    // happening *now* was listing work by id and label. `/jobs` is where that list lives, and
+    // `job_ended` below still says once, on the status line, when one finishes.
     /// One row of `/jobs`, when that job belongs to a conversation other than the one on screen.
     ///
     /// `∙` rather than `·`: the middle dot is ambiguous width, so a terminal set up for CJK draws
@@ -2784,28 +2767,22 @@ fn clip_columns(text: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
 
-    /// **The run's own words are cut to fit, by columns and not by characters.** A Hangul syllable
-    /// is one `char` and two columns, so a character count would hand back twice the line — and this
-    /// is the line whose whole reason for changing was that it got too long.
+    /// **The thought's own title is cut to fit, by columns and not by characters.** A Hangul
+    /// syllable is one `char` and two columns, so a character count would hand back twice the line
+    /// — and this is the line the title has to fit on.
     #[test]
-    fn the_activity_line_clips_the_runs_words_by_columns() {
+    fn the_activity_line_clips_the_thoughts_title_by_columns() {
         let long = "가".repeat(80);
-        let text = Lang::Ko.running_tool("exec", &long, 0);
-        let label = text.trim_start_matches("▶ exec  ∙  ").trim_end_matches("  ∙  0초");
-        assert_ne!(label, long, "the words were not clipped: {text}");
-        assert_eq!(label.chars().last(), Some('…'), "{text}");
+        let label = Lang::Ko.reasoning(&long);
+        assert_ne!(label, long, "the title was not clipped: {label}");
+        assert_eq!(label.chars().last(), Some('…'), "{label}");
         assert!(
-            crate::markdown::display_width(label) <= ACTIVITY_WIDTH,
+            crate::markdown::display_width(&label) <= ACTIVITY_WIDTH,
             "{} columns: {label}",
-            crate::markdown::display_width(label)
+            crate::markdown::display_width(&label)
         );
-        // Nothing to clip is left exactly as it was, ellipsis and all.
-        assert_eq!(
-            Lang::En.running_tool("exec", "running the tests", 0),
-            "▶ exec  ∙  running the tests  ∙  0s"
-        );
-        // And no words at all is the tool alone, not a dangling separator.
-        assert_eq!(Lang::Ko.running_tool("exec", "", 12), "▶ exec  ∙  12초");
+        // Nothing to clip, and the surrounding spaces of a title go.
+        assert_eq!(Lang::En.reasoning("  running the tests\n"), "running the tests");
     }
 
     /// Found against a real session: a card that used one tool said "1 tools".
@@ -2851,12 +2828,8 @@ mod tests {
     /// kind of drift a shared helper prevents.
     #[test]
     fn every_span_shown_uses_the_same_units() {
-        assert!(Lang::Ko.running_tool("exec", "", 110).contains("1분 50초"));
-        assert!(Lang::En.running_tool("exec", "", 110).contains("1m 50s"));
         assert!(Lang::Ko.job_ended("b1", true, 3600).contains("1시간 0분"));
         assert!(Lang::En.job_ended("b1", true, 3600).contains("1h 0m"));
-        assert!(Lang::Ko.background_job(1, "b1", "build", 110).contains("1분 50초"));
-        assert!(Lang::En.background_job(1, "b1", "build", 110).contains("1m 50s"));
         assert!(Lang::Ko.jobs_row("b1", "build", 3660).contains("1시간 1분"));
         assert!(Lang::En.jobs_row("b1", "build", 3660).contains("1h 1m"));
     }
@@ -3141,10 +3114,9 @@ mod tests {
             assert!(!text.chars().any(|c| ('가'..='힣').contains(&c)), "Hangul in {text:?}");
         }
         for text in [
-            en.running_tool("exec", "", 110),
+            en.reasoning("thinking about it"),
             en.job_ended("b1", true, 110),
             en.job_ended("b1", false, 3660),
-            en.background_job(2, "b1", "build", 110),
             en.jobs_row("b1", "build", 7325),
             en.report_head(true).to_string(),
             en.report_head(false).to_string(),
