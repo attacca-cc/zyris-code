@@ -4161,12 +4161,19 @@ fn api_of(rx: &ApiRx) -> Option<Arc<AttaccaApiClient>> {
 fn draw_frame(terminal: &mut ratatui::DefaultTerminal, state: &mut State) -> std::io::Result<()> {
     use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
 
-    // **The cursor is hidden while the frame is written.** A diff lays cells out across the whole
-    // screen, and the terminal's cursor rides those writes — visible, darting from row to row,
-    // which is exactly what "the cursor is jumping around" looks like while tool calls fill the
-    // transcript. Hidden here it is placed once, at the end, by whichever surface knows where the
-    // typing is (`widgets::draw`), and ratatui shows it again as part of that.
-    execute!(io::stdout(), BeginSynchronizedUpdate, crossterm::cursor::Hide)?;
+    // **The frame is written between a begin and an end, and the cursor is not hidden for it.**
+    //
+    // Hiding it here kept the terminal's cursor from riding the diff's writes as they spread over
+    // the screen. What it also did was turn that cursor off and on **once per frame** — and while a
+    // turn streams that is up to sixty times a second. The input method draws the box a Korean
+    // syllable is being assembled in *at that cursor*, so it blinked with every frame (reported
+    // 2026-09-18, issue #36). A terminal that understands the synchronized update (mode 2026)
+    // already draws the whole frame at once, so there is nothing for the hide to hide; one that
+    // does not may let the cursor ride the writes for that frame, which is the lesser of the two.
+    //
+    // The position is still placed once, at the end, by whichever surface knows where the typing
+    // is (`widgets::draw`), and that placement is also what shows the cursor again.
+    execute!(io::stdout(), BeginSynchronizedUpdate)?;
     let drawn = terminal.draw(|f| crate::widgets::draw(f, state));
     let ended = execute!(io::stdout(), EndSynchronizedUpdate);
     match drawn {
