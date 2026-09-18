@@ -210,7 +210,7 @@ impl LocalEdit {
         // arrives here with nothing read at all.
         if tool == Tool::Edit && new == old {
             return Err(WireError::invalid_params(format!(
-                "'{}' changed nothing, so it was not written — the file already reads that way. \
+                "'{}' changed nothing, so it was not written: the file already reads that way. \
                  Check the lines you quoted: they may already say what you meant, and the edit that \
                  matters is somewhere else.",
                 clip(path)
@@ -238,7 +238,7 @@ impl LocalEdit {
         })?;
         if on_disk != new.as_bytes() {
             return Err(WireError::internal(format!(
-                "'{}' was written but does not hold what this call wrote — something else is \
+                "'{}' was written but does not hold what this call wrote: something else is \
                  changing the file. What was there before this call is in the undo history \
                  (`/undo`).",
                 clip(path)
@@ -312,7 +312,7 @@ async fn atomic_write(full: &Path, content: &[u8]) -> std::io::Result<()> {
 fn substitute(body: &str, spec: &EditSpec) -> Result<(String, Option<Found>), WireError> {
     if spec.old_string.is_empty() {
         return Err(WireError::invalid_params(
-            "`old_string` is empty — there is nothing to look for. Use `write` to create a file, or \
+            "`old_string` is empty: there is nothing to look for. Use `write` to create a file, or \
              quote the text you mean to replace.",
         ));
     }
