@@ -126,6 +126,12 @@ pub trait Wait {
     /// it exits 0, or until its output matches `matches`), or `work` (an attacca work id).
     /// `every_ms` is the gap between re-runs of `command`, at least 2000. `timeout_ms` caps
     /// this one call; it is trimmed to the deadline, never past it.
+    ///
+    /// **Call it again as a call of its own, one at a time.** When the answer is `done: false`
+    /// the wait is simply not over yet; the way to keep waiting is the same call again. Do **not**
+    /// put several `until` calls into one `sequential_tool_calls` batch to hold a longer wait —
+    /// that is the same wait bought several times over, and every call in the batch is another
+    /// round of tokens spent saying nothing (issue #33, 2026-09-18).
     async fn until(
         &self,
         job: Option<String>,
@@ -367,7 +373,10 @@ impl Waits {
                 snap.label,
                 snap.elapsed_ms / 1000
             ),
-            next: format!("Call `wait.until` again with the same arguments ‒ `job: \"{id}\"`."),
+            next: format!(
+                "Call `wait.until` again with the same arguments ‒ `job: \"{id}\"`. One call, \
+                 not a batch."
+            ),
             elapsed_ms: at.elapsed().as_millis() as u64,
             tail: self.jobs.tail(id, TAIL_BYTES),
             exit_code: None,
@@ -428,7 +437,7 @@ impl Waits {
         Ok(Outcome {
             done: false,
             why: format!("checked {rounds} times and the condition is still not true."),
-            next: "Call `wait.until` again with the same arguments.".into(),
+            next: "Call `wait.until` again with the same arguments. One call, not a batch.".into(),
             elapsed_ms: at.elapsed().as_millis() as u64,
             tail: tail_of(&last),
             exit_code: None,
@@ -475,7 +484,8 @@ impl Waits {
             done: false,
             why: format!("work `{work_id}` is still `{name}`."),
             next: format!(
-                "Call `wait.until` again with the same arguments ‒ `work: \"{work_id}\"`."
+                "Call `wait.until` again with the same arguments ‒ `work: \"{work_id}\"`. One \
+                 call, not a batch."
             ),
             elapsed_ms: at.elapsed().as_millis() as u64,
             tail: String::new(),
@@ -694,6 +704,9 @@ mod tests {
         assert_eq!(out.exit_code, None);
         // It has to say to call again. Otherwise the agent reads it as "stuck" and gives up.
         assert!(out.next.contains("wait.until"), "{}", out.next);
+        // **One call at a time** — the batch that bought the same wait several times over is
+        // what this line exists to stop (issue #33, 2026-09-18).
+        assert!(out.next.contains("One call, not a batch"), "{}", out.next);
         assert!(out.why.contains(&id), "{}", out.why);
         w.stop(id).await.unwrap();
     }
@@ -823,6 +836,7 @@ mod tests {
         let out = w.until_probe("false", None, probe_gap(None), ms(1500), at).await.unwrap();
         assert!(!out.done);
         assert!(out.next.contains("wait.until"), "{}", out.next);
+        assert!(out.next.contains("One call, not a batch"), "{}", out.next);
         assert!(at.elapsed() < std::time::Duration::from_secs(4), "{:?}", at.elapsed());
     }
 
