@@ -14,15 +14,15 @@
 //! valuable part of what moved. Where the shape had to change, the comment says why.
 //!
 //! What did **not** move is anything the library still does: the handshake, the reconnect
-//! primitives, the device-grant flow, and the account layer that rotates a refresh token. `Node`,
-//! `Account` and `zyris::enroll` are still upstream's, and this layer is only the loop around them.
+//! primitives and the device-grant flow. `Node` and `zyris::enroll` are still upstream's, and this
+//! layer is only the loop around them.
 
 pub mod credentials;
 mod runner;
 pub mod store;
 
 pub use credentials::{
-    token_prefix, Credentials, CredentialsError, StaticToken, TokenFile, NODE_TOKEN_PREFIX,
+    token_prefix, Credentials, CredentialsError, StaticToken, TokenFile, CREDENTIAL_PREFIX,
 };
 pub use runner::{RunConfig, RunError, Runner};
 pub use store::{

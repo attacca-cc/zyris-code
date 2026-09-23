@@ -171,24 +171,6 @@ async fn main() -> ExitCode {
         std::env::set_var("ZYRIS_PROFILE", zyris_code::conn::APP);
     }
 
-    // What's left in the old place is **moved over** (not copied). If two live refresh tokens
-    // sit on disk, both will be presented eventually, and attacca reads that reuse as a leaked
-    // chain and revokes the whole node — both die.
-    //
-    // **Only this window's own profile is moved.** A later window's profile never existed back
-    // then, so there is nothing of its to find, and reaching for another profile's file would log
-    // that program out.
-    if let (Some(dir), Some(legacy)) =
-        (zyris_code::conn::credential_dir(), zyris_code::conn::legacy_credential_dir())
-    {
-        let profile =
-            std::env::var("ZYRIS_PROFILE").unwrap_or_else(|_| zyris_code::conn::APP.to_string());
-        let moved = zyris_code::conn::migrate_credentials(&legacy, &dir, &profile);
-        if moved > 0 {
-            tracing::info!(moved, "moved credentials from the old credential directory");
-        }
-    }
-
     // **The scopes to request must be decided before credentials are made.** The device grant
     // copies `config.scopes` when it is built, and it is built by `enroll::source` from the
     // `RunConfig::from_env()` read further down — so anything set after that would not ride on the
@@ -304,11 +286,8 @@ async fn main() -> ExitCode {
     }
 
     // **The enrollment code goes to the screen because `enroll.rs` runs the loop that produces it**
-    // (`AccountGrant` → `ScreenEnroll`). It used to arrive through an upstream `EnrollmentUi` hook
-    // (`Enroller::with_ui`, upstream PR #6); the library keeps no opinion about screens any more, so
-    // the polling loop — and with it the "expired, here is a new code" branch — is this app's.
-    // Only when there's no screen (the extreme where the app couldn't start) does it fall to a stdout box. The old
-    // "leaking into the terminal behind the screen" problem is structurally gone either way.
+    // (`DeviceGrant` → `ScreenEnroll`). Only when there's no screen (the extreme where the app
+    // couldn't start) does it fall to a stdout box.
     let config = zyris_code::runtime::RunConfig::from_env();
     let creds: Arc<dyn zyris_code::runtime::Credentials> =
         match zyris_code::enroll::source(&config, &bridge) {
@@ -366,17 +345,10 @@ async fn main() -> ExitCode {
     // so MCP servers that come up seconds later announce through it (`start_mcp`, below).
     let capabilities = node.capabilities();
 
-    // **Splitting windows is the server's job.** The node has nothing to offer — neither `.instance(…)`
-    // nor registering siblings via `register_node` exists on the real server (measured 2026-08-03). So
-    // here it just attaches, and the day the server starts splitting nodes, it happens by itself.
-    //
-    // **`Node::connect` is not used, deliberately.** It takes one fixed token and redials with it
-    // for ever, which is right for a `znt_` that never expires and wrong for what this app holds:
-    // an account access token good for about an hour. `runtime::Runner` asks for a bearer
-    // immediately before every dial instead. `Account::register_node` would mint a `znt_` and let
-    // `Link` take this job over, and `nodes:write` is already in `conn::REQUIRED_SCOPES` — not
-    // taken, because it changes the one-credential-one-node story that was tried and reverted on
-    // 2026-08-12.
+    // **Each window is a node of its own**, and the server names a second one in the same
+    // directory `…-2`. `Node::connect` is not used: `runtime::Runner` asks for the bearer before
+    // every dial, which is what lets a refused credential be forgotten and a fresh enrollment code
+    // drawn (`enroll::DeviceGrant::forget_refused`).
     let runner = zyris_code::runtime::Runner::new(config, node, creds).on_connect({
         let bridge = bridge.clone();
         let notice = notice.clone();

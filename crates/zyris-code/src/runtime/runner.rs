@@ -1,24 +1,17 @@
 //! The dial/reconnect loop this node runs, so nothing above it has to write one.
 //!
 //! Nothing here is clever, and that is the point: backoff with jitter, a healthy connection resets
-//! it, one forced credential rotation on a refusal — which a credential source may answer by
-//! discarding itself and enrolling again — graceful shutdown on `Ctrl-C`, and exit codes a
-//! supervisor can act on. Each of those is a small decision that is easy to get subtly wrong once
-//! and then carry forever — a node pinned at the backoff ceiling after a nightly server restart, a
-//! restart loop printing enrollment codes into a log nobody reads.
+//! it, one re-enrollment when Attacca refuses the credential, graceful shutdown on `Ctrl-C`, and
+//! exit codes a supervisor can act on. Each of those is a small decision that is easy to get subtly
+//! wrong once and then carry forever — a node pinned at the backoff ceiling after a nightly server
+//! restart, a restart loop printing enrollment codes into a log nobody reads.
 //!
-//! **Why this loop exists at all when the library has `Node::connect`.** `connect` takes one fixed
-//! token string and redials with it forever behind a `Link`. That is exactly right for a `znt_`
-//! node token, which never expires, and exactly wrong for what this app holds: an account access
-//! token good for about an hour. A `Link` built on one would redial with a spent token from the
-//! second hour on. So the loop stays ours and asks [`Credentials::bearer`] immediately before
-//! *every* dial, which is what makes expiry a non-event rather than a reconnect storm.
-//!
-//! `zyris::Account::register_node` would mint a `znt_` that never expires and let `Link` take this
-//! job over, and `nodes:write` is already in `conn::REQUIRED_SCOPES`. Deliberately not taken: it
-//! changes the node-identity story that was tried and reverted on 2026-08-12 — one credential is
-//! one node, and the window that starts later holds the slot while the one it displaced stands by
-//! (`Runner::slot`) — and nothing about compiling against the library-only zyris needs it.
+//! **Why this loop exists when the library has `Node::connect`.** `connect` redials with one fixed
+//! credential behind a `Link` and ends on a 401. A `zc_` never expires, so the fixed credential is
+//! fine; the 401 is not. Attacca answers a revoked credential — and every `zna_`/`znt_` an earlier
+//! build stored — with exactly that, and this app's answer is to forget the credential and draw a
+//! fresh enrollment code, which only a loop that asks [`Credentials::bearer`] before every dial can
+//! do.
 
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -210,8 +203,8 @@ impl RunError {
 /// the folding that turns a revocation into a node reconnecting forever and never coming back.
 /// Upstream keeps the same habit in its own `Ending::of`, and for the same reason.
 enum Refusal {
-    /// Worth one forced credential rotation before giving up.
-    Rotate,
+    /// Attacca will not take this credential. Worth forgetting it and enrolling once more.
+    Reenroll,
     /// Retrying gets the same answer. A different build or a different person fixes it.
     Fatal,
     /// The network or the server, briefly. Back off and dial again.
@@ -221,10 +214,11 @@ enum Refusal {
 impl Refusal {
     fn of(error: &ConnectError) -> Refusal {
         match error {
-            // A 401 can be a slept laptop or a clock that drifted, and `Revoked` is recoverable
-            // too for the source this app uses: `AccountGrant::refresh` throws the dead credential
-            // away, so the next `bearer` enrolls and the following dial is a fresh identity.
-            ConnectError::Unauthorized | ConnectError::Revoked => Refusal::Rotate,
+            // A revoked credential, one typed wrong, and one from before credentials existed
+            // (`zna_`/`znt_`) all arrive as 401, or as `Revoked` when the revocation closes a live
+            // connection. The device-grant source answers by forgetting the credential, so the next
+            // `bearer` enrolls and the following dial presents a fresh one.
+            ConnectError::Unauthorized | ConnectError::Revoked => Refusal::Reenroll,
             // A build speaking the wrong major will speak it just as wrong in a second; a build
             // with no TLS provider compiled in cannot grow one at runtime.
             ConnectError::VersionMismatch { .. } | ConnectError::NoTlsProvider => Refusal::Fatal,
@@ -323,9 +317,9 @@ impl Runner {
         );
 
         let mut backoff = self.config.backoff_min;
-        // Tracks whether a refusal has already been answered with a forced rotation, so a genuinely
-        // dead credential still terminates instead of refreshing forever.
-        let mut rotated_after_refusal = false;
+        // Whether a refusal has already been answered with a re-enrollment, so a server that refuses
+        // even a credential just approved still ends the process.
+        let mut reenrolled_after_refusal = false;
 
         loop {
             // Freshness is decided immediately before each dial rather than by a timer task: a
@@ -347,10 +341,10 @@ impl Runner {
 
             tracing::info!(token = %token_prefix(&bearer), "connecting");
             // `dial`, not `connect`: one attempt, and the loop around it is ours. See the module
-            // comment for why a `Link` cannot hold an account access token.
+            // comment for why.
             let error = match self.node.dial(&self.config.url, &bearer).await {
                 Ok(conn) => {
-                    rotated_after_refusal = false;
+                    reenrolled_after_refusal = false;
                     let up = Instant::now();
                     tracing::info!(
                         node_id = %conn.info().node_id,
@@ -375,27 +369,25 @@ impl Runner {
             };
 
             match Refusal::of(&error) {
-                Refusal::Rotate if !rotated_after_refusal => {
-                    tracing::warn!(%error, "credential refused; rotating once before giving up");
-                    rotated_after_refusal = true;
-                    match credentials.refresh().await {
-                        // A different credential is ready right now, so no backoff: this is the
-                        // one path in the loop that dials again immediately.
+                Refusal::Reenroll if !reenrolled_after_refusal => {
+                    tracing::warn!(%error, "credential refused; forgetting it and enrolling once more");
+                    reenrolled_after_refusal = true;
+                    match credentials.forget_refused().await {
+                        // The next `bearer` enrolls, or adopts a credential another window has just
+                        // written, so dial again at once.
                         Ok(true) => continue,
                         Ok(false) => return Err(RunError::Refused(error.to_string())),
-                        // The rotation endpoint could not be reached, so no rotation actually
-                        // happened. Charging it against the one attempt would mean a server that
-                        // blipped during a deploy kills every node that dialled through it.
-                        Err(refresh_error @ CredentialsError::Unavailable(_)) => {
-                            tracing::warn!(error = %refresh_error, "could not rotate the credential");
-                            rotated_after_refusal = false;
+                        // Nothing was forgotten, so the one attempt is not spent.
+                        Err(forget_error @ CredentialsError::Unavailable(_)) => {
+                            tracing::warn!(error = %forget_error, "could not forget the credential");
+                            reenrolled_after_refusal = false;
                         }
-                        Err(refresh_error) => return Err(refresh_error.into()),
+                        Err(forget_error) => return Err(forget_error.into()),
                     }
                 }
-                // The one rotation is spent, so this credential really is dead. Saying so is what
+                // The one re-enrollment is spent, so this really is the end. Saying so is what
                 // stops a supervisor restart-looping on it.
-                Refusal::Rotate | Refusal::Fatal => {
+                Refusal::Reenroll | Refusal::Fatal => {
                     return Err(RunError::Refused(error.to_string()))
                 }
                 Refusal::Backoff => tracing::warn!(%error, "connect failed"),
@@ -517,9 +509,9 @@ mod tests {
     /// never comes back. This is the table that keeps them apart.
     #[test]
     fn a_refusal_is_classified_by_what_another_dial_could_possibly_change() {
-        let rotate = [ConnectError::Unauthorized, ConnectError::Revoked];
-        for error in rotate {
-            assert!(matches!(Refusal::of(&error), Refusal::Rotate), "{error}");
+        let reenroll = [ConnectError::Unauthorized, ConnectError::Revoked];
+        for error in reenroll {
+            assert!(matches!(Refusal::of(&error), Refusal::Reenroll), "{error}");
         }
 
         let mismatch =

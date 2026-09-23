@@ -8,16 +8,17 @@
 //! is why [`CredentialStore`] is the seam and [`FileCredentialStore`] is merely the default behind
 //! it.
 //!
-//! What gets stored is [`zyris::AccountCredential`], and **it is field-for-field the old
-//! `StoredCredential` with the same `version = 1`**. That is the load-bearing fact of the whole
-//! move: a `wss-<server>-<profile>.json` written by any earlier release of this app deserializes
-//! into the new type unchanged, so **nobody is logged out by the migration**. Do not change the
-//! JSON, and do not change the file name — see [`FileCredentialStore::for_server`].
+//! What gets stored is [`zyris::Credential`] with `version = 2`, exactly as the device grant
+//! returned it. **A file an earlier release wrote holds an account credential instead** (`version
+//! = 1`, `access_token`/`refresh_token`): it does not parse as a credential, reads as
+//! [`CredentialStoreError::Unusable`], and is cleared so the window enrolls again — Attacca would
+//! answer its tokens with 401 anyway. The file name is unchanged (see
+//! [`FileCredentialStore::for_server`]), which is what lets that happen in place.
 //!
 //! Be honest about the threat model of the file backend: a file on disk cannot be protected from
 //! anyone who can `sudo -u` the account that owns it. For a shared service account the right answer
-//! is a static `znt_` out of a secret manager, which is exactly why
-//! [`StaticToken`](crate::runtime::credentials::StaticToken) stays supported. What this backend
+//! is a `zc_` issued in Attacca and handed over through `ZYRIS_CREDENTIAL_FILE`, which is exactly
+//! why [`TokenFile`](crate::runtime::credentials::TokenFile) is tried first. What this backend
 //! *can* do is stop a credential from leaking through a permissive umask or a restored tarball,
 //! and it does.
 
@@ -28,17 +29,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use zyris::AccountCredential;
+use zyris::Credential;
 
 /// Bumped only on an incompatible change. A file from the future is refused rather than guessed
 /// at, because guessing wrong here means a node that authenticates as something unintended.
 ///
-/// **This must stay equal to the version `zyris::AccountCredential::new` stamps.** Upstream keeps
-/// its own copy of the number private, so there is nothing to import; the two agree at 1 today and
-/// that agreement is the only reason existing credential files still load. If upstream ever bumps
-/// its version, this has to move with it — otherwise every enrolled user is silently told to
-/// enroll again.
-const CREDENTIAL_VERSION: u32 = 1;
+/// **This is the `version` Attacca's device grant stamps on a `zyris::Credential` (2).** An
+/// account credential from an earlier release never reaches this check — it lacks `secret` and
+/// fails to parse — but both roads end at `Unusable` and a fresh enrollment.
+const CREDENTIAL_VERSION: u32 = 2;
 const LOCK_WAIT: Duration = Duration::from_secs(10);
 const LOCK_POLL: Duration = Duration::from_millis(25);
 static TEMP_ID: AtomicU64 = AtomicU64::new(0);
@@ -109,10 +108,10 @@ pub trait CredentialStore: Send + Sync + 'static {
         Ok(CredentialLock { file: None })
     }
     /// The stored credential, or `None` when this node has never enrolled.
-    async fn load(&self) -> Result<Option<AccountCredential>, CredentialStoreError>;
+    async fn load(&self) -> Result<Option<Credential>, CredentialStoreError>;
     /// Write, replacing whatever was there. Callers persist *before* using a credential, so a
     /// backend that can be atomic should be.
-    async fn save(&self, credential: &AccountCredential) -> Result<(), CredentialStoreError>;
+    async fn save(&self, credential: &Credential) -> Result<(), CredentialStoreError>;
     /// Forget a credential the server will never honour again, so the next start enrolls cleanly
     /// instead of looping on it. Clearing nothing is success, not an error.
     async fn clear(&self) -> Result<(), CredentialStoreError>;
@@ -137,12 +136,12 @@ impl Drop for CredentialLock {
 /// Keeps a credential for exactly as long as the process lives.
 ///
 /// It exists so the enrollment flow can be exercised end to end without touching a filesystem —
-/// `enroll.rs`'s tests build every `AccountGrant` and `Reauth` on top of this. A node using it in
+/// `enroll.rs`'s tests build every `DeviceGrant` and `Reauth` on top of this. A node using it in
 /// earnest re-enrolls on every restart, which is a real choice for a short-lived worker and a
 /// mistake for anything else.
 #[derive(Debug, Default)]
 pub struct MemoryCredentialStore {
-    held: std::sync::Mutex<Option<AccountCredential>>,
+    held: std::sync::Mutex<Option<Credential>>,
 }
 
 impl MemoryCredentialStore {
@@ -153,11 +152,11 @@ impl MemoryCredentialStore {
 
 #[async_trait]
 impl CredentialStore for MemoryCredentialStore {
-    async fn load(&self) -> Result<Option<AccountCredential>, CredentialStoreError> {
+    async fn load(&self) -> Result<Option<Credential>, CredentialStoreError> {
         Ok(self.held.lock().expect("credential mutex poisoned").clone())
     }
 
-    async fn save(&self, credential: &AccountCredential) -> Result<(), CredentialStoreError> {
+    async fn save(&self, credential: &Credential) -> Result<(), CredentialStoreError> {
         *self.held.lock().expect("credential mutex poisoned") = Some(credential.clone());
         Ok(())
     }
@@ -256,9 +255,8 @@ impl FileCredentialStore {
     /// servers cannot clobber each other, and no locking is needed to make that true.
     ///
     /// **The name is not ours to change.** Every release of this app so far wrote
-    /// `<server>-<profile>.json` by this exact rule, and `conn::migrate_credentials` recognises the
-    /// files to move by the same suffix. Change it and a person with a perfectly good credential
-    /// gets the enrollment screen.
+    /// `<server>-<profile>.json` by this exact rule. Change it and a person with a perfectly good
+    /// credential gets the enrollment screen.
     pub fn for_server(server_url: &str, profile: &str) -> Result<FileCredentialStore, StoreError> {
         Ok(FileCredentialStore { path: config_dir()?.join(file_name(server_url, profile)) })
     }
@@ -322,11 +320,11 @@ impl CredentialStore for FileCredentialStore {
         }
     }
 
-    async fn load(&self) -> Result<Option<AccountCredential>, CredentialStoreError> {
+    async fn load(&self) -> Result<Option<Credential>, CredentialStoreError> {
         Ok(load(&self.path)?)
     }
 
-    async fn save(&self, credential: &AccountCredential) -> Result<(), CredentialStoreError> {
+    async fn save(&self, credential: &Credential) -> Result<(), CredentialStoreError> {
         Ok(save(&self.path, credential)?)
     }
 
@@ -351,9 +349,9 @@ fn file_name(server_url: &str, profile: &str) -> String {
 ///
 /// **In this app the variable is always set**: `main.rs` fills it with `conn::credential_dir()`,
 /// which is the one place that decides where this app's credentials live. The fallback branches
-/// below still join `"zyris"` rather than `"zyris-code"` — that is the *old* shared location, the
-/// one `conn::migrate_credentials` moves files out of, and inventing a new answer here would only
-/// give this app a second opinion about a question `conn` already settles.
+/// below still join `"zyris"` rather than `"zyris-code"` — that is the *old* shared location, and
+/// inventing a new answer here would only give this app a second opinion about a question `conn`
+/// already settles.
 ///
 /// Under `systemd` with `ProtectHome=yes` there is no usable `$HOME`. That case fails loudly and
 /// names the variable to set, rather than silently writing a credential into the working directory
@@ -382,7 +380,7 @@ pub fn config_dir() -> Result<PathBuf, StoreError> {
 /// private key. This is the cheapest possible mitigation for a credential restored from a tarball
 /// or created under a permissive umask, and refusing is safer than silently repairing: the
 /// operator should know it was exposed.
-fn load(path: &Path) -> Result<Option<AccountCredential>, StoreError> {
+fn load(path: &Path) -> Result<Option<Credential>, StoreError> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -398,8 +396,7 @@ fn load(path: &Path) -> Result<Option<AccountCredential>, StoreError> {
         }
     }
 
-    let credential: AccountCredential =
-        serde_json::from_slice(&bytes).map_err(StoreError::Corrupt)?;
+    let credential: Credential = serde_json::from_slice(&bytes).map_err(StoreError::Corrupt)?;
     if credential.version != CREDENTIAL_VERSION {
         return Err(StoreError::UnknownVersion { found: credential.version });
     }
@@ -409,7 +406,7 @@ fn load(path: &Path) -> Result<Option<AccountCredential>, StoreError> {
 /// Write atomically: temp file, `sync_all`, rename. A node killed mid-write must not come back to
 /// a half-written credential, because that is indistinguishable from a corrupt one and would
 /// force a re-enrollment that needed a human.
-fn save(path: &Path, credential: &AccountCredential) -> Result<(), StoreError> {
+fn save(path: &Path, credential: &Credential) -> Result<(), StoreError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
         #[cfg(unix)]
@@ -457,11 +454,6 @@ fn clear(path: &Path) -> Result<(), StoreError> {
 }
 
 /// Reduce a URL or profile name to something safe as a filename component.
-///
-/// **`conn::slugify_profile` is a verbatim copy of this.** It has to be: `conn` recognises the
-/// files to migrate out of the old shared directory by the suffix this produces, so if the two
-/// rules ever diverge it walks past a file it should have moved and the person sees an enrollment
-/// screen with no explanation. Change one, change both.
 fn slugify(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut prev_dash = false;
@@ -489,15 +481,27 @@ fn slugify(input: &str) -> String {
 mod tests {
     use super::*;
 
-    fn credential() -> AccountCredential {
-        AccountCredential::new(
-            "zna_access".into(),
-            "znr_refresh".into(),
-            "node-id".into(),
-            "hello node".into(),
-            "allen@example.com".into(),
-            1_000_000,
-        )
+    fn credential() -> Credential {
+        Credential {
+            version: CREDENTIAL_VERSION,
+            secret: "zc_secret".into(),
+            system: zyris::Named { id: "s".into(), name: "arch".into(), slug: "arch".into() },
+            program: zyris::Named {
+                id: "c".into(),
+                name: "zyris-code".into(),
+                slug: "zyris-code".into(),
+            },
+            scopes: vec!["agents:read".into()],
+            owner_email: "allen@example.com".into(),
+        }
+    }
+
+    fn private(path: &Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
     }
 
     #[tokio::test]
@@ -523,33 +527,32 @@ mod tests {
         );
     }
 
-    /// `bearer` immediately before each dial is the whole mid-connection-expiry story, so the
-    /// skew boundary is the thing worth pinning. The method is upstream's now — this stays as a
-    /// characterization test, because our dial loop is built on the answer it gives.
+    /// The JSON the device grant turns into, spelled out as bytes so a change to
+    /// `zyris::Credential`'s shape has to fail here before it strands an enrolled window.
     #[test]
-    fn bearer_expires_early_by_the_skew_allowance() {
-        let credential = credential();
-        assert_eq!(credential.bearer(0, 30), Some("zna_access"));
-        assert_eq!(credential.bearer(999_969, 30), Some("zna_access"));
-        // 30 seconds out with a 30-second allowance: refuse, rather than race the handshake.
-        assert_eq!(credential.bearer(999_970, 30), None);
-        assert_eq!(credential.bearer(2_000_000, 30), None);
-    }
-
-    #[test]
-    fn refresh_fires_at_eighty_percent_of_the_lifetime() {
-        let credential = credential();
-        // A one-hour token expiring at 1_000_000 was issued at 996_400; 80% of the way is 999_280.
-        assert!(!credential.should_refresh(999_279, 3600));
-        assert!(credential.should_refresh(999_280, 3600));
-    }
-
-    /// The credential written by every release before this migration must still load, which is
-    /// only true while the JSON and the version number stay exactly as they were.
-    #[test]
-    fn a_credential_file_written_by_an_older_release_still_loads() {
+    fn a_credential_file_in_the_stored_format_loads() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("wss-attacca-cc-zyris-v1-ws-zyris-code.json");
+        let path = dir.path().join("wss-attacca-cc-api-zyris-v1-ws-zyris-code.json");
+        fs::write(
+            &path,
+            br#"{"version":2,"secret":"zc_secret",
+                "system":{"id":"s","name":"arch","slug":"arch"},
+                "program":{"id":"c","name":"zyris-code","slug":"zyris-code"},
+                "scopes":["agents:read"],"owner_email":"allen@example.com"}"#,
+        )
+        .unwrap();
+        private(&path);
+        assert_eq!(load(&path).unwrap().unwrap(), credential());
+    }
+
+    /// **An account credential an earlier release wrote is thrown away, not refused.** Attacca
+    /// answers its tokens with 401 now, so the only way forward is a fresh enrollment — and
+    /// `Unusable` is the shade that clears the file and shows the code, where `Refused` would stop
+    /// the app and send the person to delete a file by hand.
+    #[test]
+    fn an_account_credential_from_an_earlier_release_is_discardable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wss-attacca-cc-api-zyris-v1-ws-zyris-code.json");
         fs::write(
             &path,
             br#"{"version":1,"access_token":"zna_access","refresh_token":"znr_refresh",
@@ -557,12 +560,9 @@ mod tests {
                 "access_expires_at":1000000}"#,
         )
         .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-        }
-        assert_eq!(load(&path).unwrap().unwrap(), credential());
+        private(&path);
+        let error = CredentialStoreError::from(load(&path).unwrap_err());
+        assert!(error.is_discardable(), "{error}");
     }
 
     #[tokio::test]
@@ -579,29 +579,31 @@ mod tests {
         store.clear().await.unwrap();
     }
 
+    /// The lock is what makes read-then-write one step across windows: of two windows that both
+    /// find the same credential and replace it, exactly one does the replacing.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn concurrent_refresh_rotates_once() {
+    async fn the_lock_lets_one_window_replace_the_credential() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("creds.json");
         let store = FileCredentialStore::at(&path);
         store.save(&credential()).await.unwrap();
 
-        let rotate = |path: PathBuf| async move {
+        let replace = |path: PathBuf| async move {
             let store = FileCredentialStore::at(path);
             let _transaction = store.lock().await.unwrap();
             let mut current = store.load().await.unwrap().unwrap();
-            if current.refresh_token != "znr_refresh" {
+            if current.secret != "zc_secret" {
                 return false;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-            current.refresh_token = "znr_rotated".into();
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            current.secret = "zc_replaced".into();
             store.save(&current).await.unwrap();
             true
         };
-        let (first, second) = tokio::join!(rotate(path.clone()), rotate(path.clone()));
+        let (first, second) = tokio::join!(replace(path.clone()), replace(path.clone()));
 
         assert_eq!(u8::from(first) + u8::from(second), 1);
-        assert_eq!(store.load().await.unwrap().unwrap().refresh_token, "znr_rotated");
+        assert_eq!(store.load().await.unwrap().unwrap().secret, "zc_replaced");
     }
 
     #[cfg(unix)]

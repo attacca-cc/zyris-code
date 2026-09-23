@@ -139,7 +139,7 @@ fn print_mode_never_updates() {
         &[
             ("ZYRIS_CODE_UPDATE_TAG", "v99.0.0".into()),
             ("ZYRIS_CODE_UPDATE_SCRIPT", script.display().to_string()),
-            ("ZYRIS_NODE_TOKEN", "znt_update_test_not_a_real_token".into()),
+            ("ZYRIS_CREDENTIAL", "zc_update_test_not_a_real_token".into()),
             ("ZYRIS_SERVER_URL", "ws://127.0.0.1:1".into()),
             ("ZYRIS_CONFIG_DIR", dir.display().to_string()),
         ],

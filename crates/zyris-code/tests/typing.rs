@@ -25,7 +25,7 @@ impl Session {
             .openpty(PtySize { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 })
             .expect("pty");
         let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_zyris-code"));
-        cmd.env("ZYRIS_NODE_TOKEN", "znt_typing_probe_not_a_real_token");
+        cmd.env("ZYRIS_CREDENTIAL", "zc_typing_probe_not_a_real_token");
         cmd.env("ZYRIS_SERVER_URL", "ws://127.0.0.1:1");
         let dir = std::env::temp_dir().join(format!("zyris-typing-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);

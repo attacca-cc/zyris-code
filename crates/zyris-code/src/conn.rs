@@ -83,7 +83,7 @@ pub const DEFAULT_AGENT: &str = "Main Agent";
 /// POST /api/zyris/v1/device/authorize {"scopes":[…,"nodes:write"], …}
 ///   → 422 … unknown variant `nodes:write`, expected one of `agents:read`, … `events:read`
 /// ```
-pub const REQUIRED_SCOPES: [&str; 11] = [
+pub const REQUIRED_SCOPES: [&str; 10] = [
     "agents:read",
     "projects:read",
     // Used by the project form. Re-added after checking the deployed build on 2026-08-03 — it was 200.
@@ -103,24 +103,12 @@ pub const REQUIRED_SCOPES: [&str; 11] = [
     // POST /api/zyris/v1/device/authorize {"scopes":[…,"jobs:read","jobs:write"], …}
     //   → 200 {"device_code":"zdc_…","user_code":"…"}
     // ```
-    // Registering a node of this window's own (`register_node`). **Answered 422 on 2026-08-03 and
-    // was taken back out**; re-measured 2026-08-12 and the whole list authorizes (200), with
-    // `register_node` and `list_nodes` answering `ForbiddenScope` rather than `MethodNotFound` —
-    // the methods are there, only the grant was missing.
-    //
-    // This is the way out of two windows fighting over one node: the server keys its registry by
-    // node id, so a second window on the same credential takes every tool call from the first, and
-    // nothing on this side can change that. A node of its own can.
-    "nodes:write",
     "jobs:read",
     "jobs:write",
 ];
 
 /// This program's name. The credential directory branches on it.
 pub const APP: &str = "zyris-code";
-
-/// The old location all zyris programs shared. Credentials left here are migrated on first run.
-pub const LEGACY_APP: &str = "zyris";
 
 /// The directory where credentials live. `/cwd` shows it.
 ///
@@ -173,16 +161,6 @@ pub fn credential_dir() -> Option<std::path::PathBuf> {
     app_dir()
 }
 
-/// The old location. Credentials found here are migrated on first run.
-pub fn legacy_credential_dir() -> Option<std::path::PathBuf> {
-    // When the person has set `$ZYRIS_CONFIG_DIR`, there is no old location to migrate — they have
-    // already decided where things go, and we have no reason to search other directories.
-    if given_config_dir().is_some() {
-        return None;
-    }
-    config_home_for(LEGACY_APP)
-}
-
 /// The location the person chose. **An empty value counts as not given** — handing an empty path
 /// to someone who tried to clear it with `ZYRIS_CONFIG_DIR=` would drop credentials into the working directory.
 fn given_config_dir() -> Option<std::ffi::OsString> {
@@ -222,95 +200,6 @@ fn platform_config_base() -> Option<std::path::PathBuf> {
         .filter(|v| !v.is_empty())
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
-}
-
-/// **Migrates** this profile's credentials left in the old location. Returns the number moved.
-///
-/// **It's a move, not a copy.** If a live refresh token exists twice on disk, both eventually get
-/// presented, and attacca treats a reuse beyond the 30-second grace as a leaked chain and **revokes
-/// the whole node** (`RefreshAttempt::Reused` in `zyris_enrollment_service.rs`). Both die.
-///
-/// **Never overwrites what is already here.** Credentials this app already registered are newer than the old file,
-/// and overwriting would lose the identity currently attached. In that case the old file isn't deleted either —
-/// deleting a credential we don't hold is throwing away someone else's.
-pub fn migrate_credentials(from: &std::path::Path, into: &std::path::Path, profile: &str) -> usize {
-    let suffix = format!("-{}.json", slugify_profile(profile));
-    let Ok(entries) = std::fs::read_dir(from) else {
-        return 0;
-    };
-    let mut moved = 0;
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name_str) = name.to_str() else { continue };
-        if !name_str.ends_with(&suffix) || !entry.path().is_file() {
-            continue;
-        }
-        let target = into.join(&name);
-        if target.exists() {
-            continue;
-        }
-        if std::fs::create_dir_all(into).is_err() {
-            continue;
-        }
-        // On the same filesystem it's a single rename. If the home directory spans several mounts, that
-        // fails with EXDEV, so we copy first and **delete afterwards** — if the delete fails, two copies remain,
-        // and we count that as not moved.
-        let done = match std::fs::rename(entry.path(), &target) {
-            Ok(()) => true,
-            Err(_) => match std::fs::copy(entry.path(), &target) {
-                Ok(_) => match std::fs::remove_file(entry.path()) {
-                    Ok(()) => true,
-                    Err(_) => {
-                        let _ = std::fs::remove_file(&target);
-                        false
-                    }
-                },
-                Err(_) => false,
-            },
-        };
-        if done {
-            // It's a credential. If the move loosens permissions, upstream refuses to read it next run.
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600));
-            }
-            moved += 1;
-        }
-    }
-    moved
-}
-
-/// The profile fragment that goes into credential file names.
-///
-/// **The same rule as `runtime::store::slugify`, which is what names the files.** This one only
-/// recognizes them — for the migration out of the old shared directory, and for the window lock —
-/// so if the two diverge we fail to recognize the files to move and quietly pass them by, and the
-/// person sees a "please re-enroll" screen with their credential still sitting on disk.
-///
-/// It used to be a copy of *upstream's* rule, back when upstream named the files. Both copies are
-/// in this repo now, which makes them easier to keep in step and no less necessary to.
-fn slugify_profile(profile: &str) -> String {
-    let mut out = String::with_capacity(profile.len());
-    let mut prev_dash = false;
-    for ch in profile.chars() {
-        if ch.is_ascii_alphanumeric() {
-            out.extend(ch.to_lowercase());
-            prev_dash = false;
-        } else if !prev_dash && !out.is_empty() {
-            out.push('-');
-            prev_dash = true;
-        }
-        if out.len() >= 48 {
-            break;
-        }
-    }
-    let trimmed = out.trim_matches('-').to_string();
-    if trimmed.is_empty() {
-        "default".to_string()
-    } else {
-        trimmed
-    }
 }
 
 /// What's **missing** from the granted permissions. The requested list and the verified list are always the single `REQUIRED_SCOPES`.
@@ -1078,24 +967,16 @@ mod tests {
 
     /// **Credentials go to this app's own directory.** `~/.config/zyris/` was shared by every zyris
     /// program, so two unprofiled ones registered on top of each other's identity.
-    ///
-    /// Jiggling environment variables would trample other tests running in parallel, so here we only look at the
-    /// branching rule — the old and new locations must differ **only in the last segment** and be the same above it.
     #[test]
     fn credentials_live_under_this_apps_own_name() {
         if given_config_dir().is_some() {
-            // When a location is given, it's used verbatim rather than the branching rule —
-            // that rule is covered by a_given_config_dir_wins_and_is_taken_literally.
+            // When a location is given, it's used verbatim — see the next test.
             return;
         }
-        let (Some(ours), Some(legacy)) = (config_home_for(APP), config_home_for(LEGACY_APP)) else {
-            // In an environment without a home (systemd `ProtectHome=yes`), both being absent is correct.
-            assert!(config_home_for(APP).is_none() && config_home_for(LEGACY_APP).is_none());
-            return;
-        };
-        assert_eq!(ours.file_name().unwrap(), "zyris-code");
-        assert_eq!(legacy.file_name().unwrap(), "zyris");
-        assert_eq!(ours.parent(), legacy.parent(), "both places must sit under the same parent");
+        // In an environment without a home (systemd `ProtectHome=yes`), absent is correct.
+        if let Some(ours) = config_home_for(APP) {
+            assert_eq!(ours.file_name().unwrap(), "zyris-code");
+        }
     }
 
     /// **The location the person gave wins.** And no app name is appended to it — that
@@ -1110,42 +991,6 @@ mod tests {
         // An empty value counts as not given — using the empty path as-is would drop credentials into the working directory.
         let empty: Option<std::ffi::OsString> = Some(std::ffi::OsString::new());
         assert!(empty.filter(|v| !v.is_empty()).is_none());
-    }
-
-    /// **Old credentials move over and the old spot is left empty.** Copying would leave a live refresh token
-    /// twice on disk, and attacca, seeing the reuse, revokes the whole node.
-    #[test]
-    fn a_legacy_credential_moves_and_leaves_nothing_behind() {
-        let old = tempfile::tempdir().unwrap();
-        let new = tempfile::tempdir().unwrap();
-        let name = "wss-attacca-cc-zyris-v1-ws-zyris-code.json";
-        std::fs::write(old.path().join(name), "{\"refresh_token\":\"r\"}").unwrap();
-        // Another profile's file belongs to someone else. Touching it logs that program out.
-        std::fs::write(old.path().join("wss-attacca-cc-default.json"), "{}").unwrap();
-
-        assert_eq!(migrate_credentials(old.path(), new.path(), "zyris-code"), 1);
-        assert!(new.path().join(name).exists(), "must be at the new place");
-        assert!(!old.path().join(name).exists(), "the old place must be empty");
-        assert!(
-            old.path().join("wss-attacca-cc-default.json").exists(),
-            "someone else's file is left alone"
-        );
-    }
-
-    /// **If something is already here, don't overwrite it.** Overwriting the identity currently attached
-    /// with the old file loses that credential. And the old file isn't deleted either — that would be
-    /// throwing away a credential we don't hold.
-    #[test]
-    fn migration_never_overwrites_what_is_already_here() {
-        let old = tempfile::tempdir().unwrap();
-        let new = tempfile::tempdir().unwrap();
-        let name = "wss-attacca-cc-zyris-v1-ws-zyris-code.json";
-        std::fs::write(old.path().join(name), "옛것").unwrap();
-        std::fs::write(new.path().join(name), "지금것").unwrap();
-
-        assert_eq!(migrate_credentials(old.path(), new.path(), "zyris-code"), 0);
-        assert_eq!(std::fs::read_to_string(new.path().join(name)).unwrap(), "지금것");
-        assert!(old.path().join(name).exists(), "what wasn't taken isn't deleted either");
     }
 
     /// **When short, we ask once more.** Permissions fixed at approval time don't widen on refresh,
@@ -1179,16 +1024,6 @@ mod tests {
         assert!(missing.contains(&"events:read"), "{missing:?}");
         assert!(!missing.contains(&"agents:read"), "{missing:?}");
         assert!(missing_scopes_message(&missing).contains("events:read"));
-    }
-
-    /// The one naming files is upstream. **If the rules diverge, we fail to recognize the files to migrate.**
-    #[test]
-    fn the_profile_slug_matches_what_zyris_writes() {
-        // Values copied verbatim from zyris `enroll/file_store.rs`'s tests.
-        assert_eq!(slugify_profile("zyris-code"), "zyris-code");
-        assert_eq!(slugify_profile("///"), "default");
-        assert_eq!(slugify_profile(""), "default");
-        assert_eq!(slugify_profile("Two  Words"), "two-words");
     }
 
     /// **The slug rule must match attacca.** If this diverges, the judgment about whether the name gets
