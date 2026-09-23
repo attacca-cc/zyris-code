@@ -599,21 +599,21 @@ mod tests {
         assert_eq!(d.tools[0].request_schema["properties"]["title"]["type"], json!("string"));
     }
 
-    /// **The wire name must split into exactly four.** That is the real test.
+    /// **The wire name must split into exactly three.** That is the real test.
     ///
     /// Sanitizing only the slug isn't enough. A name with no alphanumerics collapses entirely to
     /// `mcp_`, and the joining `__` then makes `mcp___echo` — that actually went out on the wire,
     /// and that tool was never called. **A place we got wrong twice.**
     #[tokio::test]
-    async fn the_wire_name_still_splits_into_four() {
+    async fn the_wire_name_still_splits_into_three() {
         if echo_server().is_none() {
             return;
         }
         for slug in ["my__server", "연습", "--", "깃 허브", "github"] {
             let cap = cap_of(slug, vec![tool("create-issue")]).await;
             let d = cap.descriptor();
-            let wire = format!("zyris__arch__{}__{}", d.name, d.tools[0].name);
-            assert_eq!(wire.split("__").count(), 4, "{slug} → {wire}");
+            let wire = format!("zyris__{}_v{}__{}", d.name, d.version, d.tools[0].name);
+            assert_eq!(wire.split("__").count(), 3, "{slug} → {wire}");
         }
     }
 
@@ -623,7 +623,7 @@ mod tests {
         let out = unique_names(vec!["mcp_".into(), "mcp_".into(), "mcp_".into()]);
         assert_eq!(out, vec!["mcp", "mcp_2", "mcp_3"]);
         for n in &out {
-            assert_eq!(format!("zyris__arch__{n}__x").split("__").count(), 4, "{n}");
+            assert_eq!(format!("zyris__{n}_v1__x").split("__").count(), 3, "{n}");
         }
     }
 

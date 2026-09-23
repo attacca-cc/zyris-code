@@ -70,18 +70,26 @@ const ROW_LIMIT: usize = 60;
 /// How wide the words beside a tool name may get.
 const ACTION_LIMIT: usize = 72;
 
-/// The tool's own name, without attacca's `zyris__{node}__{capability}__` prefix.
+/// The tool's own name, without attacca's `zyris__{capability}_v{version}__` prefix.
 fn tail(name: &str) -> &str {
     name.rsplit("__").next().unwrap_or(name)
 }
 
 /// The capability segment, when the wire name carries one — `terminal` in
-/// `zyris__arch__terminal__read`. Two capabilities share the tool name `read`, and they mean
-/// entirely different things.
+/// `zyris__terminal_v1__read`. Two capabilities share the tool name `read`, and they mean
+/// entirely different things. The version rides on the segment and is dropped here.
 fn cap(name: &str) -> &str {
     let mut parts = name.rsplit("__");
     parts.next();
-    parts.next().unwrap_or("")
+    let segment = parts.next().unwrap_or("");
+    match segment.rsplit_once("_v") {
+        Some((capability, version))
+            if !version.is_empty() && version.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            capability
+        }
+        _ => segment,
+    }
 }
 
 /// The words shown beside the tool name: **what it was run against.**
@@ -358,8 +366,18 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// How attacca names a node tool since the credential/node redesign: one tool per
+    /// capability version, with the node chosen by the `node_path` argument.
     fn wire(capability: &str, tool: &str) -> String {
-        format!("zyris__arch-zyris-code__{capability}__{tool}")
+        format!("zyris__{capability}_v1__{tool}")
+    }
+
+    #[test]
+    fn the_version_is_not_part_of_the_capability() {
+        assert_eq!(cap("zyris__file_io_v1__read"), "file_io");
+        assert_eq!(cap("zyris__mcp_desk-notes_v12__list"), "mcp_desk-notes");
+        // A server built-in has no prefix at all.
+        assert_eq!(cap("todo_add"), "");
     }
 
     #[test]

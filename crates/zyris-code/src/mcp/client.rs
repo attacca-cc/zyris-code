@@ -366,8 +366,8 @@ mod tests {
             assert!(!name.ends_with('_'), "{raw} → {name}");
             assert!(!name.is_empty(), "{raw} → an empty name cannot be called");
             // Actually join them and split again. This is the real test.
-            let wire = format!("zyris__arch__cap__{name}");
-            assert_eq!(wire.split("__").count(), 4, "{raw} → {wire}");
+            let wire = format!("zyris__cap_v1__{name}");
+            assert_eq!(wire.split("__").count(), 3, "{raw} → {wire}");
         }
     }
 

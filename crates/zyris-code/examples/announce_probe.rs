@@ -26,7 +26,7 @@ use zyris_code::runtime::{RunConfig, Runner};
 const CONSUME_WAIT: Duration = Duration::from_secs(5);
 /// **Actually makes it happen.** Asking the model to list tools in prose is something it's bad at,
 /// so a "there is none" answer can't be trusted — only whether the file actually changed is evidence.
-/// **Tell it the tool's real name.** The wire name is `zyris__{node}__{capability}__{tool}`, so
+/// **Tell it the tool's real name.** The wire name is `zyris__{capability}_v{version}__{tool}`, so
 /// calling it `file_io.read` makes the model fail to find it and give up with "no such tool". This
 /// actually happened once.
 /// What to ask. Override with `$ZYRIS_CODE_PROBE_ASK` — no reason to edit the example to test something else.
@@ -35,8 +35,8 @@ fn ask() -> String {
 }
 
 const ASK: &str = "Do two things. \
-                   (1) Call the tool whose name ends in '__code_probe__ping' with say='PROBE-OK'. \
-                   (2) Call the tool whose name ends in '__code_edit__edit' with \
+                   (1) Call the tool whose name ends in '__code_probe_v1__ping' with say='PROBE-OK'. \
+                   (2) Call the tool whose name ends in '__code_edit_v2__edit' with \
                    path='note.txt', old_string='BEFORE', new_string='AFTER'. \
                    For each one, say in a single line whether the tool was in your list or not.";
 

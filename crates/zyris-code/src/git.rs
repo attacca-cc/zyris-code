@@ -843,21 +843,21 @@ mod what_is_announced {
         assert_eq!(got, want);
     }
 
-    /// **The wire name has to split into exactly four.** attacca builds
-    /// `zyris__{node}__{capability}__{tool}` and reads it back by splitting on `__`, so a name
+    /// **The wire name has to split into exactly three.** attacca builds
+    /// `zyris__{capability}_v{version}__{tool}` and reads it back by splitting on `__`, so a name
     /// carrying `__` inside it, or ending in `_`, breaks apart somewhere else. This repository has
     /// shipped that mistake twice, both times green locally and only visible live — and a new
     /// capability name is exactly when it happens again.
     #[test]
-    fn every_wire_name_splits_into_four() {
+    fn every_wire_name_splits_into_three() {
         let server = GitCapServer(Git::new(std::path::PathBuf::from("/")));
         let descriptor = zyris::ServeCapability::descriptor(&server);
         assert_eq!(descriptor.name, "git");
         for tool in &descriptor.tools {
-            let wire = format!("zyris__arch-zyris-code__{}__{}", descriptor.name, tool.name);
+            let wire = format!("zyris__{}_v{}__{}", descriptor.name, descriptor.version, tool.name);
             let parts: Vec<&str> = wire.split("__").collect();
-            assert_eq!(parts.len(), 4, "`{wire}` split into {parts:?}");
-            assert_eq!(parts[3], tool.name);
+            assert_eq!(parts.len(), 3, "`{wire}` split into {parts:?}");
+            assert_eq!(parts[2], tool.name);
         }
     }
 }

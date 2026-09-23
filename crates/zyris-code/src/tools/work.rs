@@ -287,17 +287,18 @@ mod tests {
         assert!(!next_step(ZWorkState::Executing).contains("person"));
     }
 
-    /// **The wire name must split into exactly four.** attacca re-reads
-    /// `zyris__{node}__{capability}__{tool}` by splitting on `__`, so a `__` inside the name or a
-    /// trailing `_` misaligns it right there. The test is always **join it back together and split it.**
+    /// **The wire name must split into exactly three.** attacca re-reads
+    /// `zyris__{capability}_v{version}__{tool}` by splitting on `__`, so a `__` inside the name or
+    /// a trailing `_` misaligns it right there. The test is always **join it back together and
+    /// split it.**
     #[test]
-    fn the_wire_name_splits_into_exactly_four() {
+    fn the_wire_name_splits_into_exactly_three() {
         for tool in ["start", "status", "list", "say", "stop", "resume"] {
-            let wire = format!("zyris__arch-zyris-code__work__{tool}");
+            let wire = format!("zyris__work_v1__{tool}");
             let parts: Vec<&str> = wire.split("__").collect();
-            assert_eq!(parts.len(), 4, "{wire}");
-            assert_eq!(parts[2], "work");
-            assert_eq!(parts[3], tool);
+            assert_eq!(parts.len(), 3, "{wire}");
+            assert_eq!(parts[1], "work_v1");
+            assert_eq!(parts[2], tool);
         }
     }
 
