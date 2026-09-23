@@ -75,60 +75,34 @@ zyris          # or, from a checkout: cargo run -p zyris-code
 ```
 
 On first launch an 8-digit enrollment code is shown in a panel with the URL to
-open. Enter it on any device with a browser to pair this node with your Attacca
-account; it continues on its own once you approve. Credentials are stored in
-`~/.config/zyris-code/wss-<server>-<profile>.json` — this client's own
-directory, not one shared with every other zyris program on the machine. A
-credential left behind by an older build is moved across on first run.
+open. Enter it on any device with a browser, pick (or create) the system this
+machine is in Attacca, and approve. That issues one credential for the program
+`zyris-code` on that system; zyris-code keeps it in
+`~/.config/zyris-code/wss-<server>-<profile>.json` and does not need a browser
+again unless it is revoked. A credential file left by a build from before
+credentials existed is discarded, and the enrollment panel appears once.
 
-Approve **every** scope on that screen. Scopes are fixed at approval time and
-refreshing never widens them, so a grant missing `agents:read` or
-`projects:read` shows an empty agent or project list rather than an error.
-zyris-code names what is missing and asks once for a fresh code.
+Approve **every** scope on that screen. Scopes are fixed at approval time, so a
+grant missing `agents:read` or `projects:read` shows an empty agent or project
+list rather than an error. zyris-code names what is missing and asks once for a
+fresh code.
 
-The first enrolment registers as `<hostname> zyris-code · <directory>` rather
-than the bare hostname, so it stays distinct from any other zyris node on the
-same machine — and windows in different directories are distinguishable in
-Attacca at a glance. Override with `ZYRIS_NODE_NAME`; `/cwd` shows what this
-window registered as.
-
-**Open as many windows as you like, but one of them holds the node.** This
-deployment gives one credential exactly one node: connecting twice returns the
-same `node_id`, and the server routes tool calls to whichever connection arrived
-last. So the window that starts later takes the node, and the window it was taken
-from **stands by** — it keeps drawing and keeps its history, says once on the
-activity line that the node is elsewhere, and reattaches by itself once the other
-window ends. `/reconnect` takes it back sooner.
-
-Standing by is what keeps two windows from spending all their time taking the node
-from each other. The slot is a file in the credential directory holding a PID,
-checked for liveness (and for being someone other than us) before every dial.
-Without that check each window redialed about a second after being closed, and the
-two traded the node at a fixed ~31s for as long as both were up: a disconnect on
-screen every round, and any call in flight dead server-side.
-
-In the same directory that changes nothing worth guarding against — whichever
-window the agent reaches, the files it edits are the same. Across different
-directories it matters, and so does this: **the directory-access policy and the
+**Each window is a node of its own**, named after the directory it was started
+in. Attacca shows it as `<system>/zyris-code/<directory>` — for example
+`laptop/zyris-code/myrepo` — and a second window in the same directory becomes
+`myrepo-2` for as long as both are open. Override the last part with
+`ZYRIS_NODE_NAME`; `/cwd` shows the path this window was given. The agent sees
+every node's tools under one name and picks the computer with each tool's
+`node_path` argument; the session preamble and the `rules` tool tell it which
+path is the one you are sitting at. **The directory-access policy and the
 plan/edit mode that judge a call belong to the window that received it.**
 
-An earlier design had each window register a sibling node of its own
-(`register_node`), which would have split the routing per window. The server does
-not implement it — `attacca_api.register_node` answers `MethodNotFound`, and the
-`nodes:write` scope it needs is rejected at enrolment — so that code is gone.
-`cargo run -p zyris-code --example nodes_probe` re-measures both in a few seconds
-if you want to know whether that has changed.
-
-Machines that share a hostname (`arch`, `nixos`) each enrol separately, so they
-are distinct nodes on the server and the slug is disambiguated automatically.
-Only the display name collides — name them with `ZYRIS_NODE_NAME`.
-
-If the credential is ever revoked mid-session — the node is deleted in Attacca,
-or its grant chain breaks — zyris-code notices and **draws the enrollment code in
-the UI itself**: a panel over the conversation with the URL, the code and a
-countdown. The panel is dismissed only with `Esc`; approving in the browser
-closes it on its own, and a fresh code re-opens it if the old one lapses. The
-same panel is what you see on a first launch, since the UI starts before the
+If the credential is ever revoked — in Attacca's settings, directly or by
+deleting the system — zyris-code notices at the next connection and **draws the
+enrollment code in the UI itself**: a panel over the conversation with the URL,
+the code and a countdown. The panel is dismissed only with `Esc`; approving in the
+browser closes it on its own, and a fresh code re-opens it if the old one lapses.
+The same panel is what you see on a first launch, since the UI starts before the
 connection is even established.
 
 Run it **from the directory you want to work in** — that directory defines the
@@ -376,11 +350,11 @@ Messages typed while a turn is running are queued and sent in order when it ends
 | Variable | Default | Does |
 |---|---|---|
 | `ZYRIS_CODE_AGENT` | `Main Agent` | Agent to connect to at startup |
-| `ZYRIS_NODE_NAME` | `<hostname> zyris-code` | The name this node registers under |
+| `ZYRIS_NODE_NAME` | the working directory's name | The node name this window asks for; Attacca adds `-2` while another window of this credential holds it |
 | `ZYRIS_PROFILE` | `zyris-code` | Credential file within that directory, so one machine can hold several identities |
 | `ZYRIS_CONFIG_DIR` | `<config>/zyris-code` | Directory the credential lives in. Set it and it wins outright |
 | `ZYRIS_CODE_BG` | — | Paint a page background (`zyris`, or `#rrggbb`). Off by default so the terminal's own background shows; turn it on if wide characters leave smears over SSH |
-| `ZYRIS_NODE_TOKEN` | — | Dial with a fixed node token instead of enrolling |
+| `ZYRIS_CREDENTIAL` / `ZYRIS_CREDENTIAL_FILE` | — | Dial with a `zc_` credential issued in Attacca (or a file holding one) instead of enrolling |
 | `ZYRIS_CODE_LOG` | `/tmp/zyris-code.log` | Log file. Logs never go to the terminal — they would land in the middle of the UI |
 | `ZYRIS_CODE_EXEC_MAX_SECS` | `1800` | Longest a `terminal.exec` command may run before this node kills it — and, because the two must agree, the wait it asks callers for. `0` lifts the ceiling, and then only the agent's own `timeout_ms` bounds a command |
 | `ZYRIS_CODE_WIRE_DEADLINE_SECS` | `55` | Answer the wire before the server gives up on a call, for the tools that declare no limit of their own (`wait.until`); `0` disables it |
