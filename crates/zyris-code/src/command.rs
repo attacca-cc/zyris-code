@@ -45,12 +45,9 @@ pub enum Command {
     Config(Option<ConfigAction>),
     /// Drops the connection so the runner redials.
     ///
-    /// **The way back from a connection the server no longer routes to.** attacca's registry is
-    /// `insert(node_id, connection)`, so a second window with the same credentials displaces the
-    /// first — and if that window then closes, the registry points at a dead connection and every
-    /// tool call sits pending forever. Nothing detects it: zyris discards the heartbeat the server
-    /// advertises, has no ping/pong, and `conn.closed()` never fires for a merely unrouted socket.
-    /// Redialling re-announces, which puts this connection back in the registry.
+    /// **The way back from a connection that stopped carrying calls without closing.** Nothing
+    /// detects that state: `conn.closed()` never fires for a socket that is merely unrouted.
+    /// Redialling announces this node from scratch.
     Reconnect,
     /// Install the newest release and come back on it. What `update: notify` leaves to be asked
     /// for, and what `auto` does on its own.

@@ -60,13 +60,9 @@ struct Inner {
     undo: Mutex<Option<crate::undo::Undo>>,
     /// The live connection, so `/reconnect` can drop it and make the runner redial.
     ///
-    /// **This is the only way back from a connection the server no longer routes to.** attacca's
-    /// registry is `insert(node_id, connection)`, so a second window with the same credentials
-    /// displaces the first — and if that second window then closes, the registry points at a dead
-    /// connection and every tool call sits pending forever. Nothing notices: zyris discards the
-    /// heartbeat the server advertises in `HelloAck`, has no ping/pong, and `conn.closed()` never
-    /// fires for a socket that is merely unrouted. Redialling re-announces, which puts *this*
-    /// connection back in the registry.
+    /// **The way back from a connection that stopped carrying calls without closing.** Nothing
+    /// notices that state: `conn.closed()` never fires for a socket that is merely unrouted.
+    /// Redialling announces this node from scratch.
     connection: Mutex<Option<zyris::Connection>>,
     /// A handle for dropping credentials and getting re-approved.
     ///
