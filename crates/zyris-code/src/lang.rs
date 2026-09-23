@@ -668,19 +668,19 @@ impl Lang {
             "Screen cleared. The thread's history is untouched.",
         )
     }
-    pub fn cwd_text(self, cwd: &Path, node: &str, slug: &str, cred: &str) -> String {
+    pub fn cwd_text(self, cwd: &Path, node: &str, cred: &str) -> String {
         match self {
             Lang::Ko => format!(
                 "도구는 `{}`에서 돕니다.\n\n\
-                 이 노드는 **{node}**로 등록돼 있습니다 ‒ 도구 이름은 `zyris__{slug}__…`입니다. \
-                 `ZYRIS_NODE_NAME`으로 바꿉니다.\n\n\
+                 이 노드의 주소는 **{node}**입니다 ‒ 에이전트는 도구를 부를 때 이 값을 \
+                 `node_path`로 넘깁니다. 마지막 이름은 `ZYRIS_NODE_NAME`으로 바꿉니다.\n\n\
                  자격은 `{cred}`에 있습니다.",
                 cwd.display(),
             ),
             Lang::En => format!(
                 "Tools run in `{}`.\n\n\
-                 This node is registered as **{node}** ‒ tool names are `zyris__{slug}__…`. \
-                 Change it with `ZYRIS_NODE_NAME`.\n\n\
+                 This node is **{node}** ‒ the agent passes that as `node_path` when it calls a \
+                 tool. Change the last part with `ZYRIS_NODE_NAME`.\n\n\
                  Credentials live in `{cred}`.",
                 cwd.display(),
             ),
@@ -2994,7 +2994,7 @@ mod tests {
             en.screen_failed("x"),
             en.log_location("/tmp/zyris-code.log"),
             en.server_unreachable(5, "x"),
-            en.cwd_text(std::path::Path::new("/home/ruma"), "node", "slug", "cred"),
+            en.cwd_text(std::path::Path::new("/home/ruma"), "laptop/zyris-code/ruma", "cred"),
             en.agent_staged("Main Agent"),
             en.reverted("src/x.rs"),
             en.undo_failed("x"),

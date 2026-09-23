@@ -33,7 +33,7 @@ impl Rules {
     /// work has no preamble at all — `ZNewJob` and `ZNewWork` have no such field — so for those
     /// this tool is the only way the agent can find out whose machine it is holding.
     pub fn whole(&self) -> String {
-        let here = crate::conn::node_preamble(&self.cwd);
+        let here = crate::conn::node_preamble(&self.cwd, crate::conn::address().as_ref());
         match self.load() {
             Some(rules) => format!("{here}\n\n{rules}"),
             None => {
@@ -97,7 +97,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let r = Rules::new(d.path().to_path_buf());
         let out = RulesCap::load(&r).await.unwrap();
-        assert!(out.contains(&crate::conn::node_name()), "the node is not named: {out}");
+        assert!(out.contains("node_path"), "the node is not named: {out}");
         assert!(out.contains(&d.path().display().to_string()), "the directory is missing: {out}");
         assert!(out.contains(std::env::consts::OS), "the platform is missing: {out}");
     }

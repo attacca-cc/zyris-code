@@ -240,26 +240,9 @@ pub fn agent_name() -> String {
     std::env::var("ZYRIS_CODE_AGENT").unwrap_or_else(|_| DEFAULT_AGENT.to_string())
 }
 
-/// The node name to register with the server.
-///
-/// **Using only the hostname gives the same identity as the machine's other nodes.** If `zyris-daemon`
-/// runs on the same computer, both register as `arch`, and attacca separates them by appending
-/// `-2` to one with `slug_with_suffix` — **which one keeps `arch` depends on the order
-/// they attached**, so the tool names (`zyris__arch__…`) can change between runs.
-///
-/// That's why this app registers carrying its own name: `arch zyris-code`.
-///
-/// **Length is a constraint.** attacca's `slugify_node_name` keeps only alphanumerics, folds the rest into hyphens,
-/// then **truncates at 16 characters** (`ZYRIS_NODE_SLUG_MAX_LEN`). `arch zyris-code` fits exactly as
-/// `arch-zyris-code` (15 chars), but with a long hostname the trailing `zyris-code` gets cut
-/// away and only the hostname remains. In that case **the distinguishing part goes first.**
-/// The name **actually announced**, which is whatever `$ZYRIS_NODE_NAME` holds — `main` fills it
-/// in at startup and a value the person gave wins. Read this to *report* the name (`/cwd`); use
-/// `default_node_name` to decide what to put there.
-///
-/// Before, this recomputed the default instead, so `/cwd` named a node that was not the one on the
-/// server whenever the name had been set by hand — and, once windows split, for every window but
-/// the first.
+/// The name this window's node asks for: `$ZYRIS_NODE_NAME`, which `main` fills from
+/// [`default_node_name`] unless a person set it. The server appends `-2` while another window in
+/// the same directory holds the name; [`address`] is what it actually assigned.
 pub fn node_name() -> String {
     match std::env::var("ZYRIS_NODE_NAME") {
         Ok(name) if !name.trim().is_empty() => name,
@@ -267,114 +250,60 @@ pub fn node_name() -> String {
     }
 }
 
-/// What this window registers as when nobody said otherwise.
+/// The working directory's name. Windows in different directories are told apart by this, and two
+/// windows in one directory by the server (`myrepo`, `myrepo-2`).
 pub fn default_node_name() -> String {
-    let host = zyris::machine_name().unwrap_or_else(|| "node".to_string());
-    let dir = std::env::current_dir()
-        .ok()
-        .and_then(|d| d.file_name().map(|n| n.to_string_lossy().into_owned()));
-    compose_name(&host, dir.as_deref())
+    dir_name(&std::env::current_dir().unwrap_or_default())
 }
 
-/// The pure decision that builds the name. `dir` is the last fragment of the working directory.
+/// The last component of `dir`, or this app's name for `/` and anything else without one.
+fn dir_name(dir: &std::path::Path) -> String {
+    dir.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| APP.to_string())
+}
+
+/// The address Attacca assigned this window's node on its latest connection (`HelloAck.node`).
+/// `runtime::Runner` writes it on every connection — one that did not resume can come back under a
+/// different name — and it is `None` until the first.
+static ADDRESS: std::sync::Mutex<Option<zyris::NodeAddress>> = std::sync::Mutex::new(None);
+
+pub fn set_address(address: Option<zyris::NodeAddress>) {
+    *ADDRESS.lock().unwrap_or_else(|e| e.into_inner()) = address;
+}
+
+pub fn address() -> Option<zyris::NodeAddress> {
+    ADDRESS.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Who the agent is talking to, for the session preamble and the `rules` tool.
 ///
-/// **The working directory goes into the name.** Windows opened in different directories of the same machine
-/// must be distinguishable in attacca's node list — like `arch zyris-code · zyris-daemon`.
-/// Since the slug truncates at 16 characters, the directory only survives in the display name (the slug is always
-/// of the form `arch-zyris-code`). When the directory equals the app name (running in this repo), it's not
-/// appended — no reason to say the same thing twice.
-fn compose_name(host: &str, dir: Option<&str>) -> String {
-    let suffix = dir.filter(|d| !d.is_empty() && *d != SUFFIX);
-    let natural = match suffix {
-        Some(dir) => format!("{host} {SUFFIX} ∙ {dir}"),
-        None => format!("{host} {SUFFIX}"),
+/// **The agent sees every node of the account through the same tools.** Each tool takes a
+/// `node_path` naming the computer it runs on, so the one thing this block has to say is which path
+/// is the computer the person is sitting at. `address` is passed rather than read so a test does
+/// not depend on a connection.
+///
+/// **English, like everything else a tool returns** (user decision, 2026-09-14): the agent is the
+/// reader, and the person reads it too, through `/rules`.
+pub fn node_preamble(cwd: &std::path::Path, address: Option<&zyris::NodeAddress>) -> String {
+    let path = match address {
+        Some(address) => address.path(),
+        None => format!("not assigned yet ‒ this window asks to be called `{}`", node_name()),
     };
-    if slug_of(&natural).contains(SUFFIX) {
-        natural
-    } else {
-        // Truncated away the app name. Reversing the order at least keeps what it is.
-        format!("{SUFFIX} {host}")
-    }
-}
-
-/// The slug attacca gives this node. It's the middle fragment of tool names.
-///
-/// **If it collides, the server appends `-2`** (`slug_with_suffix`). So the value here isn't always the actual
-/// one — with two nodes of the same name, which keeps the bare name is the attach order.
-pub fn node_slug() -> String {
-    slug_of(&std::env::var("ZYRIS_NODE_NAME").unwrap_or_else(|_| node_name()))
-}
-
-/// This app's display appended to the name. For the distinction to work, this must survive in the slug.
-const SUFFIX: &str = "zyris-code";
-
-/// Who the agent is talking to, for the session preamble.
-///
-/// **The agent has the tools of every node on the account and no way to tell which one is here.**
-/// attacca puts `[slug · platform · "name"]` at the front of each tool's description, which says
-/// what a tool belongs to but not which of them is the machine the person is sitting at — so a
-/// question about "this repo" was answered by whichever node the model happened to pick, and a
-/// second machine on the same account is enough for that to be the wrong one.
-///
-/// **The name is the thing to match on, not the slug.** The slug is what shows up inside a tool
-/// name, but attacca appends `-2` to it when two nodes collide (`slug_with_suffix`), and this side
-/// cannot know whether that happened. The display name goes over the wire unchanged.
-///
-/// `cwd` is passed rather than read so a test does not have to move the process.
-///
-/// The preamble that tells an agent which computer it is holding.
-///
-/// **English, like everything else a tool returns.** The agent is the reader, and the machine this
-/// node is on happens to be Korean — a preamble in Korean is a preamble half the models in the
-/// world read as noise (user decision, 2026-09-14).
-///
-/// The person at the keyboard reads this too, through `/rules`, so it is written to be read by
-/// either.
-pub fn node_preamble(cwd: &std::path::Path) -> String {
     format!(
         "This conversation is coming from the node below. The person talking to you is at \
          that computer right now.\n\n\
-         - name: {name}\n\
+         - node_path: {path}\n\
          - working directory: {cwd}\n\
          - platform: {platform}\n\n\
-         The bracketed word at the front of a tool's description says which node the tool \
-         belongs to. The node named above is this computer ‒ its tools are usually named \
-         `zyris__{slug}__…` ‒ and reading and editing files, running a shell and everything \
-         else here happens there. Another node's tools touch a different computer: do not use \
-         them unless that computer is what the conversation is about.",
-        name = node_name(),
+         Every zyris tool takes a `node_path` argument that says which computer it runs on. \
+         Pass the node_path above to read and edit files, run a shell and do everything else \
+         here. Another node_path touches a different computer: do not use it unless that \
+         computer is what the conversation is about.",
         cwd = cwd.display(),
         platform = std::env::consts::OS,
-        slug = node_slug(),
     )
-}
-
-/// **The same rule** as attacca's `slugify_node_name` (`attacca-domain/src/zyris_node.rs`).
-///
-/// We must know here in advance what the server will produce to judge whether the name gets truncated. If the rules
-/// diverge, this judgment is wrong, so when it changes this must change too.
-fn slug_of(name: &str) -> String {
-    const MAX: usize = 16;
-    let mut slug = String::new();
-    let mut prev_dash = false;
-    for ch in name.chars() {
-        if ch.is_ascii_alphanumeric() {
-            slug.extend(ch.to_lowercase());
-            prev_dash = false;
-        } else if !prev_dash && !slug.is_empty() {
-            slug.push('-');
-            prev_dash = true;
-        }
-        if slug.len() >= MAX {
-            break;
-        }
-    }
-    let trimmed = slug.trim_matches('-').to_string();
-    if trimmed.is_empty() {
-        "node".to_string()
-    } else {
-        trimmed
-    }
 }
 
 #[derive(Debug, Default)]
@@ -902,24 +831,34 @@ pub async fn session_title(api: &AttaccaApiClient, session_id: &str) -> Option<S
 
 #[cfg(test)]
 mod tests {
-    /// **The block has to name the node the way the tool descriptions do.** attacca writes
-    /// `[slug · platform · "name"]` in front of every tool it relays, and matching on the name is
-    /// how the agent picks this machine's tools out of the account's. Naming it any other way —
-    /// "this node", "the local one" — leaves nothing to match against.
-    ///
-    /// **Under the host lock.** `node_name()` reads `$HOSTNAME`, and `a_long_hostname_does_not_…`
-    /// sets that to a fake long one — process-globally. Without the lock this test can read the
-    /// real name for its first assertion and the fake one for its second, and the failure is then
-    /// about the suite's order rather than about the block. That is exactly how it failed on a CI
-    /// runner whose hostname was long (2026-09-13) while passing here.
+    /// **The block names the path every tool is called with.** The agent sees every node's tools
+    /// under one name and picks a computer with `node_path`; naming this one any other way —
+    /// "this node", a display name — leaves it nothing to pass.
     #[test]
-    fn the_node_block_names_what_the_tool_descriptions_name() {
-        let _g = HOST.lock().unwrap_or_else(|e| e.into_inner());
-        let out = node_preamble(std::path::Path::new("/home/ruma/zyris-code"));
-        assert!(out.contains(&node_name()), "the display name is what joins the two: {out}");
-        assert!(out.contains(&node_slug()), "the slug is how a tool name reads: {out}");
-        assert!(out.contains("/home/ruma/zyris-code"), "where it is standing: {out}");
+    fn the_node_block_names_the_path_every_tool_is_called_with() {
+        let address = zyris::NodeAddress {
+            system: "laptop".into(),
+            program: "zyris-code".into(),
+            name: "myrepo-2".into(),
+        };
+        let out = node_preamble(std::path::Path::new("/home/ruma/myrepo"), Some(&address));
+        assert!(out.contains("node_path: laptop/zyris-code/myrepo-2"), "{out}");
+        assert!(out.contains("/home/ruma/myrepo"), "where it is standing: {out}");
         assert!(out.contains(std::env::consts::OS), "what it is running on: {out}");
+    }
+
+    /// Before the first connection there is no path, and the block must not invent one.
+    #[test]
+    fn before_the_first_connection_the_block_says_the_path_is_not_known() {
+        let out = node_preamble(std::path::Path::new("/home/ruma/myrepo"), None);
+        assert!(out.contains("not assigned yet"), "{out}");
+    }
+
+    /// **The node is named after its directory**, and a directory with no name gets this app's.
+    #[test]
+    fn a_node_is_named_after_its_directory() {
+        assert_eq!(dir_name(std::path::Path::new("/home/ruma/myrepo")), "myrepo");
+        assert_eq!(dir_name(std::path::Path::new("/")), "zyris-code");
     }
 
     use super::*;
@@ -1024,67 +963,6 @@ mod tests {
         assert!(missing.contains(&"events:read"), "{missing:?}");
         assert!(!missing.contains(&"agents:read"), "{missing:?}");
         assert!(missing_scopes_message(&missing).contains("events:read"));
-    }
-
-    /// **The slug rule must match attacca.** If this diverges, the judgment about whether the name gets
-    /// truncated is wrong, and the app registers without its name.
-    #[test]
-    fn the_slug_rule_matches_what_attacca_does() {
-        // Values copied verbatim from `attacca-domain/src/zyris_node.rs`'s tests.
-        assert_eq!(slug_of("Allen's Desktop!!"), "allen-s-desktop");
-        assert_eq!(slug_of("   "), "node");
-        assert_eq!(slug_of("a-very-long-machine-name-here"), "a-very-long-mach");
-    }
-
-    /// `HOSTNAME` is process-global, so these two run in one thread.
-    static HOST: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// **Registering with only the hostname makes the same identity as the machine's other nodes.**
-    #[test]
-    fn the_node_name_carries_this_app() {
-        let _g = HOST.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var("ZYRIS_NODE_NAME");
-        // The machine name comes from upstream (`zyris::machine_name`) and can be short
-        // (`arch`) or long (`DESKTOP-33GBATB`), so the exact string is platform-dependent.
-        // What must always hold is that the app name rides along in the node name.
-        let name = node_name();
-        assert!(name.contains("zyris-code"), "{name}");
-        // And it is never empty or a bare hostname — a window registers under its own name.
-        assert!(name.len() >= "zyris-code".len(), "{name}");
-    }
-
-    /// **A long hostname cuts off the tail.** Left as is, only the hostname remains and the
-    /// distinction disappears — then the distinguishing part goes first.
-    #[test]
-    fn a_long_hostname_does_not_swallow_the_app_name() {
-        let _g = HOST.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("HOSTNAME", "a-very-long-machine-name-here");
-        let name = node_name();
-        let slug = slug_of(&name);
-        assert!(slug.contains("zyris-code"), "the app name got truncated away: {name} → {slug}");
-        assert!(slug.len() <= 16, "{slug}");
-    }
-
-    /// Two windows on one credential are one node to the server, and the registry keeps the
-    /// connection that arrived last — so the earlier window's socket lives on while every tool
-    /// call goes to the other one. Splitting the credential is what makes them separate nodes;
-    /// this is the name half of it.
-    ///
-    /// The distinguishing part goes **first**, because the slug is cut at 16 characters: putting
-    /// the number on the end (`arch zyris-code 2`) is trimmed straight back to `arch-zyris-code`
-    /// Taking simply the lowest free slot made identity depend on what else happened to be running:
-    /// open a second window, close the first, start a third, and it lands on a profile with no
-    /// credential — an approval screen, for doing nothing unusual. That is what "it asks me to
-    /// **The working directory goes into the name.** Different directories on the same machine must be distinguishable.
-    /// The slug truncates at 16 characters, so it only survives in the display name.
-    #[test]
-    fn the_node_name_carries_the_working_directory() {
-        assert_eq!(compose_name("arch", Some("zyris-daemon")), "arch zyris-code ∙ zyris-daemon");
-        assert_eq!(slug_of("arch zyris-code ∙ zyris-daemon"), "arch-zyris-code");
-        // A directory equal to the app name isn't appended — it's a duplicate.
-        assert_eq!(compose_name("arch", Some("zyris-code")), "arch zyris-code");
-        // Without a directory (e.g. root) it's the usual name.
-        assert_eq!(compose_name("arch", None), "arch zyris-code");
     }
 
     /// Changing the agent **opens a new session at the next message.** A session's agent is fixed at

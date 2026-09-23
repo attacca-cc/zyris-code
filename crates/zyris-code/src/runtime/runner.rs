@@ -346,9 +346,19 @@ impl Runner {
                 Ok(conn) => {
                     reenrolled_after_refusal = false;
                     let up = Instant::now();
+                    // What the server named this node, for the session preamble, `/cwd` and the
+                    // `rules` tool. Written on every connection: one that did not resume can come
+                    // back as `myrepo-2`.
+                    crate::conn::set_address(conn.info().node.clone());
                     tracing::info!(
                         node_id = %conn.info().node_id,
                         conn_id = %conn.info().conn_id,
+                        address = %conn
+                            .info()
+                            .node
+                            .as_ref()
+                            .map(zyris::NodeAddress::path)
+                            .unwrap_or_default(),
                         "connected"
                     );
                     if let Some(hook) = &self.on_connect {

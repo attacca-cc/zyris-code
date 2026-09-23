@@ -42,11 +42,12 @@ struct Inner {
     /// A signal that wakes when the screen attaches. Used when `main` waits for the screen to attach
     /// before the first enrollment so the enrollment code can reach the screen.
     screen_ready: tokio::sync::Notify,
-    /// The skill list to load when creating a session. `tools::announce` decides it and the screen picks it up.
+    /// The working directory, and what the session preamble says besides which node this is —
+    /// `tools::announce` decides it and the screen picks it up.
     ///
-    /// **Fixed for the session's lifetime** — attacca's `preamble` is set once when the session is created
-    /// and can't be changed later. So MCP tools that attach later aren't loaded here.
-    preamble: Mutex<Option<String>>,
+    /// **Fixed for the session's lifetime** — attacca's `preamble` is set once when the session is
+    /// created and can't be changed later. So MCP tools that attach later aren't loaded here.
+    preamble: Mutex<Option<(std::path::PathBuf, Option<String>)>>,
     /// MCP servers that connected or failed to. `/mcp` reads it.
     ///
     /// **Failures are kept too.** Right now a `Frame::Notice` shows for 6 seconds and disappears, so there's no way to ask later
@@ -181,12 +182,19 @@ impl Bridge {
         self.0.mcp.lock().unwrap().clone()
     }
 
-    pub fn set_preamble(&self, preamble: Option<String>) {
-        *self.0.preamble.lock().unwrap() = preamble;
+    pub fn set_preamble(&self, cwd: std::path::PathBuf, rest: Option<String>) {
+        *self.0.preamble.lock().unwrap() = Some((cwd, rest));
     }
 
+    /// The session preamble, with which node this is written in front **now**. A session is made
+    /// after the connection is up, and only then does the server's path for this window exist.
     pub fn preamble(&self) -> Option<String> {
-        self.0.preamble.lock().unwrap().clone()
+        let (cwd, rest) = self.0.preamble.lock().unwrap().clone()?;
+        let here = crate::conn::node_preamble(&cwd, crate::conn::address().as_ref());
+        Some(match rest {
+            Some(rest) => format!("{here}\n\n{rest}"),
+            None => here,
+        })
     }
 
     /// Also tells the screen side about the undo log the edit tool uses.
@@ -249,6 +257,21 @@ mod tests {
 
     fn edit_call() -> Call {
         Call::new("code_edit", "edit", "/tmp/a".into())
+    }
+
+    /// **Which node this is is written when a session is made, not when the tools are.** The tools
+    /// are announced before there is a connection, and only a connection has a path.
+    #[test]
+    fn the_preamble_names_the_node_in_front_of_the_rest() {
+        let b = Bridge::new();
+        assert_eq!(b.preamble(), None, "nothing announced yet");
+
+        b.set_preamble(std::path::PathBuf::from("/home/ruma/myrepo"), Some("RULES".into()));
+
+        let preamble = b.preamble().unwrap();
+        assert!(preamble.starts_with("This conversation is coming from"), "{preamble}");
+        assert!(preamble.contains("node_path"), "{preamble}");
+        assert!(preamble.ends_with("RULES"), "{preamble}");
     }
 
     /// The screen decides the mode and the gate sees it. **If it isn't carried over, the screen is in plan mode

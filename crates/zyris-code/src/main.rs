@@ -204,10 +204,9 @@ async fn main() -> ExitCode {
         std::env::set_var("ZYRIS_SCOPES", zyris_code::conn::REQUIRED_SCOPES.join(","));
     }
 
-    // Same for the node name. **Registering with just the hostname makes you the same identity as the
-    // machine's other nodes** — if `zyris-daemon` runs alongside, both attach as `arch`, and attacca
-    // separates them by appending `-2` to one, but which one keeps `arch` depends on attach order.
-    // Then the tool names the agent reads (`zyris__arch__…`) change from run to run.
+    // Same for the node name: the working directory's name unless the person set one. The machine
+    // and the program are already in the node's path (`laptop/zyris-code/…`), so the directory is
+    // the part that tells windows apart; two in one directory get `-2` from the server.
     if std::env::var_os("ZYRIS_NODE_NAME").is_none() {
         std::env::set_var("ZYRIS_NODE_NAME", zyris_code::conn::default_node_name());
     }
@@ -312,8 +311,8 @@ async fn main() -> ExitCode {
     // on it, and `Runner::new` receives the finished `Node`.
     //
     // **The name has to be said here now.** The runner used to take it out of `RunConfig`; a
-    // builder that is never told falls back to this machine's hostname, which is precisely the
-    // collision `$ZYRIS_NODE_NAME` was set above to avoid.
+    // builder that is never told falls back to this machine's hostname rather than the directory
+    // `$ZYRIS_NODE_NAME` was set from above.
     let node = match zyris_code::tools::announce(
         zyris::Node::builder(),
         cwd.clone(),

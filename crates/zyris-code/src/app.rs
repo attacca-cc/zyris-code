@@ -3288,15 +3288,17 @@ pub fn run_command(state: &mut State, text: &str) -> Option<crate::command::Comm
             state.timeline.say(said);
         }
         Command::Cwd => {
-            // **Say the node name too.** With two machines sharing a hostname (`arch` is
-            // common) this is the only way to tell them apart in the server's node list.
+            // **Say where this node is.** Its path is what the agent passes as `node_path`, and
+            // with two machines sharing a hostname it is the only way to tell them apart.
             // **No leading spaces on a line.** Markdown reads a four-space-indented line as
             // a code block — folding the string for readability turns it into a box on
             // screen.
+            let node = crate::conn::address()
+                .map(|address| address.path())
+                .unwrap_or_else(|| format!("…/{}", crate::conn::node_name()));
             state.timeline.say(state.lang.cwd_text(
                 &state.cwd,
-                &crate::conn::node_name(),
-                &crate::conn::node_slug(),
+                &node,
                 &crate::conn::credential_home(),
             ));
         }
