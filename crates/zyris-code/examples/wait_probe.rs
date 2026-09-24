@@ -41,9 +41,9 @@ fn ask(marker: &std::path::Path) -> String {
     std::env::var("ZYRIS_CODE_PROBE_ASK").unwrap_or_else(|_| {
         format!(
             "Run one long-running job. \
-             (1) Call the tool whose name ends in '__wait__start' with \
+             (1) Call the tool whose name ends in '__wait_v1__start' with \
              command='sleep {SLEEP_SECS}; date > {}'. \
-             (2) Then call the tool whose name ends in '__wait__until' with that job id. \
+             (2) Then call the tool whose name ends in '__wait_v1__until' with that job id. \
              If done comes back false that is **not a failure, it just has not finished**, so \
              call it again with the same arguments. Repeat until done is true. \
              (3) When it finishes, report the exit code in one line.",

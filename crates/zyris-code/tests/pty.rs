@@ -11,7 +11,7 @@
 //! here and a ConPTY (`CreatePseudoConsole`, Windows 10 1809 and later) there, behind one API, so
 //! `cargo test` covers both.
 //!
-//! **Nothing here touches the network.** A node token from the environment skips enrolment
+//! **Nothing here touches the network.** A credential from the environment skips enrolment
 //! outright (`StaticToken::from_env` wins over everything), and the server address points at a
 //! port that refuses at once — so the screen comes up, draws, and takes keys with no account, no
 //! credential on disk, and nothing to wait for.
@@ -84,7 +84,7 @@ impl Session {
             cmd.env(name, value);
         }
         // A credential given outright: no enrolment window, nothing written to disk, no browser.
-        cmd.env("ZYRIS_NODE_TOKEN", "znt_pty_test_not_a_real_token");
+        cmd.env("ZYRIS_CREDENTIAL", "zc_pty_test_not_a_real_token");
         // Refused at once rather than left hanging, so the screen settles quickly.
         cmd.env("ZYRIS_SERVER_URL", "ws://127.0.0.1:1");
         // Somewhere empty, so a real credential on this machine is never read or written.

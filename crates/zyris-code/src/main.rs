@@ -165,41 +165,10 @@ async fn main() -> ExitCode {
         }
     }
 
-    // **One credential, one node.** Splitting it per window was tried (2026-08-12) and taken out:
-    // it made a window's identity depend on what else happened to be running when it started, so
-    // ordinary use produced an approval screen again and again. What remains is the lock, which
-    // says whether another window is already up.
-    //
-    // **The handle lives as long as `main`** — dropping it removes the lock file, and a window
-    // that let go early would look absent to the next one to start.
-    let window = zyris_code::conn::credential_dir().map(|dir| {
-        let base =
-            std::env::var("ZYRIS_PROFILE").unwrap_or_else(|_| zyris_code::conn::APP.to_string());
-        zyris_code::conn::claim_window(&dir, &base)
-    });
-
     // The profile splits again inside that directory. Unset just leaves it `default`, and now
     // that `default` is ours.
     if std::env::var_os("ZYRIS_PROFILE").is_none() {
         std::env::set_var("ZYRIS_PROFILE", zyris_code::conn::APP);
-    }
-
-    // What's left in the old place is **moved over** (not copied). If two live refresh tokens
-    // sit on disk, both will be presented eventually, and attacca reads that reuse as a leaked
-    // chain and revokes the whole node — both die.
-    //
-    // **Only this window's own profile is moved.** A later window's profile never existed back
-    // then, so there is nothing of its to find, and reaching for another profile's file would log
-    // that program out.
-    if let (Some(dir), Some(legacy)) =
-        (zyris_code::conn::credential_dir(), zyris_code::conn::legacy_credential_dir())
-    {
-        let profile =
-            std::env::var("ZYRIS_PROFILE").unwrap_or_else(|_| zyris_code::conn::APP.to_string());
-        let moved = zyris_code::conn::migrate_credentials(&legacy, &dir, &profile);
-        if moved > 0 {
-            tracing::info!(moved, "moved credentials from the old credential directory");
-        }
     }
 
     // **The scopes to request must be decided before credentials are made.** The device grant
@@ -235,10 +204,9 @@ async fn main() -> ExitCode {
         std::env::set_var("ZYRIS_SCOPES", zyris_code::conn::REQUIRED_SCOPES.join(","));
     }
 
-    // Same for the node name. **Registering with just the hostname makes you the same identity as the
-    // machine's other nodes** — if `zyris-daemon` runs alongside, both attach as `arch`, and attacca
-    // separates them by appending `-2` to one, but which one keeps `arch` depends on attach order.
-    // Then the tool names the agent reads (`zyris__arch__…`) change from run to run.
+    // Same for the node name: the working directory's name unless the person set one. The machine
+    // and the program are already in the node's path (`laptop/zyris-code/…`), so the directory is
+    // the part that tells windows apart; two in one directory get `-2` from the server.
     if std::env::var_os("ZYRIS_NODE_NAME").is_none() {
         std::env::set_var("ZYRIS_NODE_NAME", zyris_code::conn::default_node_name());
     }
@@ -309,40 +277,6 @@ async fn main() -> ExitCode {
     // another window can touch this computer too. The only thing blocking is `tools::guard::Gate`.
     let cwd = zyris_code::tools::working_dir();
 
-    // **One credential is one node, so one window holds it at a time** (`conn::claim_window`, taken
-    // at the top of `main`). Per-window identities were tried (2026-08-12) and taken out again: a
-    // window's identity then depended on what else happened to be running when it started.
-    //
-    // **What the slot decides is who dials.** The server registry is keyed by node id
-    // (`insert(node_id, connection)`), so the second window to connect takes the node from the
-    // first — and with each of them redialing a second after being closed, they take it in turn for
-    // as long as both are up. Measured on this machine: a fixed ~31s alternation, every round a
-    // disconnect on screen and any call in flight dead server-side. So this window writes its pid
-    // into the slot, the runner refuses to dial while another *living* window holds it, and the
-    // window that was displaced stands by until this one ends — see `### 창 여럿` in CLAUDE.md.
-    //
-    // **The handle has to live as long as the window does.** Bound inside a block it was dropped at
-    // the closing brace, and `Drop` deletes the very file it had just written — so no window ever
-    // left a slot behind and no later window ever found one.
-    //
-    // Here is where the screen exists to say what the take-over means. **A window past the first
-    // enrols once** — an approval window with no explanation reads as the app having logged itself
-    // out. **The window it displaced is told, and told once.**
-    if window.as_ref().is_some_and(|w| w.took_over) {
-        tracing::warn!("another zyris-code window held this node; this one takes it over");
-        bridge.frame(zyris_code::app::Frame::Notice(
-            zyris_code::lang::current().another_window_notice().to_string(),
-        ));
-    }
-    // **Where the slot is, for the two callers that need it without this handle**: the runner, which
-    // asks before every dial, and `/reconnect` in the screen, which is how a window that stood by
-    // takes the node back.
-    let slot = window.as_ref().and_then(|w| w.lock.as_ref()).map(|lock| {
-        zyris_code::conn::remember_slot(lock.path());
-        lock.path().to_path_buf()
-    });
-    let _instance_lock = window;
-
     // **`notify` says it here, through the same door as every other notice.** The check happened
     // before the screen existed, so this is the one way the tag reaches it — and the bridge holds
     // frames until the screen attaches, so saying it early loses nothing.
@@ -351,11 +285,8 @@ async fn main() -> ExitCode {
     }
 
     // **The enrollment code goes to the screen because `enroll.rs` runs the loop that produces it**
-    // (`AccountGrant` → `ScreenEnroll`). It used to arrive through an upstream `EnrollmentUi` hook
-    // (`Enroller::with_ui`, upstream PR #6); the library keeps no opinion about screens any more, so
-    // the polling loop — and with it the "expired, here is a new code" branch — is this app's.
-    // Only when there's no screen (the extreme where the app couldn't start) does it fall to a stdout box. The old
-    // "leaking into the terminal behind the screen" problem is structurally gone either way.
+    // (`DeviceGrant` → `ScreenEnroll`). Only when there's no screen (the extreme where the app
+    // couldn't start) does it fall to a stdout box.
     let config = zyris_code::runtime::RunConfig::from_env();
     let creds: Arc<dyn zyris_code::runtime::Credentials> =
         match zyris_code::enroll::source(&config, &bridge) {
@@ -380,8 +311,8 @@ async fn main() -> ExitCode {
     // on it, and `Runner::new` receives the finished `Node`.
     //
     // **The name has to be said here now.** The runner used to take it out of `RunConfig`; a
-    // builder that is never told falls back to this machine's hostname, which is precisely the
-    // collision `$ZYRIS_NODE_NAME` was set above to avoid.
+    // builder that is never told falls back to this machine's hostname rather than the directory
+    // `$ZYRIS_NODE_NAME` was set from above.
     let node = match zyris_code::tools::announce(
         zyris::Node::builder(),
         cwd.clone(),
@@ -413,34 +344,14 @@ async fn main() -> ExitCode {
     // so MCP servers that come up seconds later announce through it (`start_mcp`, below).
     let capabilities = node.capabilities();
 
-    // **Splitting windows is the server's job.** The node has nothing to offer — neither `.instance(…)`
-    // nor registering siblings via `register_node` exists on the real server (measured 2026-08-03). So
-    // here it just attaches, and the day the server starts splitting nodes, it happens by itself.
-    //
-    // **`Node::connect` is not used, deliberately.** It takes one fixed token and redials with it
-    // for ever, which is right for a `znt_` that never expires and wrong for what this app holds:
-    // an account access token good for about an hour. `runtime::Runner` asks for a bearer
-    // immediately before every dial instead. `Account::register_node` would mint a `znt_` and let
-    // `Link` take this job over, and `nodes:write` is already in `conn::REQUIRED_SCOPES` — not
-    // taken, because it changes the one-credential-one-node story that was tried and reverted on
-    // 2026-08-12.
-    let runner = zyris_code::runtime::Runner::new(config, node, creds)
-        // **Standing by is said on screen.** A window that gave the node up is not reconnecting — it
-        // is waiting for the window that holds it to end — so nothing else would tell the person
-        // why this one is quiet.
-        .on_stand_by({
-            let bridge = bridge.clone();
-            move || {
-                bridge.frame(zyris_code::app::Frame::Notice(
-                    zyris_code::lang::current().stood_by_notice().to_string(),
-                ));
-            }
-        })
-        .slot(slot)
-        .on_connect({
-            let bridge = bridge.clone();
-            let notice = notice.clone();
-            move |conn| {
+    // **Each window is a node of its own**, and the server names a second one in the same
+    // directory `…-2`. `Node::connect` is not used: `runtime::Runner` asks for the bearer before
+    // every dial, which is what lets a refused credential be forgotten and a fresh enrollment code
+    // drawn (`enroll::DeviceGrant::forget_refused`).
+    let runner = zyris_code::runtime::Runner::new(config, node, creds).on_connect({
+        let bridge = bridge.clone();
+        let notice = notice.clone();
+        move |conn| {
             let api_tx = Arc::clone(&api_tx);
             // `on_connect` is called again on every reconnect. The bridge and notice are handles, so
             // clones are passed — moving them outright would leave nothing to move on the second connect.

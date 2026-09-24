@@ -850,17 +850,17 @@ mod tests {
             .is_err());
     }
 
-    /// **A wire name has to split into exactly four.** This repo got it wrong twice, and both
+    /// **A wire name has to split into exactly three.** This repo got it wrong twice, and both
     /// times the local tests stayed green and it surfaced live.
     #[test]
-    fn the_wire_name_splits_into_exactly_four() {
+    fn the_wire_name_splits_into_exactly_three() {
         use zyris::ServeCapability;
         let d = WaitServer(waits()).descriptor();
         assert!(!d.name.contains("__") && !d.name.ends_with('_'), "{}", d.name);
         for tool in ["start", "until", "list", "logs", "stop"] {
             assert!(d.tools.iter().any(|t| t.name == tool), "{tool} is missing");
-            let wire = format!("zyris__arch__{}__{tool}", d.name);
-            assert_eq!(wire.split("__").count(), 4, "{wire}");
+            let wire = format!("zyris__{}_v{}__{tool}", d.name, d.version);
+            assert_eq!(wire.split("__").count(), 3, "{wire}");
         }
     }
 

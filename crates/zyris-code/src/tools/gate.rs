@@ -920,7 +920,8 @@ mod tests {
     fn an_absolute_path_inside_a_shell_command_is_caught() {
         let args = json!({"command": "cat /home/ruma/attacca/.env"});
         let got = escaping_path(root(), "terminal", "exec", &args);
-        assert_eq!(got, Some(PathBuf::from("/home/ruma/attacca/.env")));
+        // Compared as the policy sees it: on Windows that is the drive-qualified, canonical form.
+        assert_eq!(got, Some(policy_path(Path::new("/home/ruma/attacca/.env"))));
     }
 
     /// Climbing out with `..` is caught too.

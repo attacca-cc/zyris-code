@@ -366,8 +366,8 @@ mod tests {
             assert!(!name.ends_with('_'), "{raw} → {name}");
             assert!(!name.is_empty(), "{raw} → an empty name cannot be called");
             // Actually join them and split again. This is the real test.
-            let wire = format!("zyris__arch__cap__{name}");
-            assert_eq!(wire.split("__").count(), 4, "{raw} → {wire}");
+            let wire = format!("zyris__cap_v1__{name}");
+            assert_eq!(wire.split("__").count(), 3, "{raw} → {wire}");
         }
     }
 
@@ -446,14 +446,11 @@ mod tests {
             return;
         }
         let (_dir, script) = fake_server();
-        let mut c = McpClient::spawn_with_timeout(
-            "python3",
-            &[script],
-            &HashMap::new(),
-            std::time::Duration::from_millis(100),
-        )
-        .await
-        .unwrap();
+        // The handshake runs with the ordinary timeout: starting Python alone can take longer than
+        // 100ms on a Windows runner. Only the call under test gets the short one.
+        let mut c = McpClient::spawn("python3", &[script], &HashMap::new()).await.unwrap();
+        let McpClient::Stdio(stdio) = &mut c else { unreachable!("spawn is stdio") };
+        stdio.request_timeout = std::time::Duration::from_millis(100);
         let error = c.call("hang", json!({})).await.unwrap_err();
         assert!(error.to_string().contains("timed out"), "{error}");
         c.shutdown().await;

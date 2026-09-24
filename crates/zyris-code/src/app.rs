@@ -3288,15 +3288,17 @@ pub fn run_command(state: &mut State, text: &str) -> Option<crate::command::Comm
             state.timeline.say(said);
         }
         Command::Cwd => {
-            // **Say the node name too.** With two machines sharing a hostname (`arch` is
-            // common) this is the only way to tell them apart in the server's node list.
+            // **Say where this node is.** Its path is what the agent passes as `node_path`, and
+            // with two machines sharing a hostname it is the only way to tell them apart.
             // **No leading spaces on a line.** Markdown reads a four-space-indented line as
             // a code block — folding the string for readability turns it into a box on
             // screen.
+            let node = crate::conn::address()
+                .map(|address| address.path())
+                .unwrap_or_else(|| format!("…/{}", crate::conn::node_name()));
             state.timeline.say(state.lang.cwd_text(
                 &state.cwd,
-                &crate::conn::node_name(),
-                &crate::conn::node_slug(),
+                &node,
                 &crate::conn::credential_home(),
             ));
         }
@@ -5784,28 +5786,17 @@ async fn finish_command(
         // **A setting change reaches the disk and the gate.** `run_command` only touched
         // the state; `save` writes the file and `bridge.sync` carries the new policy to the
         // tools (same lesson as `/mode` forgetting `bridge.sync`).
-        // **Drop the socket and let the runner redial.** That redial re-announces, which is the
-        // only way to get back into attacca's registry once another window displaced us —
-        // nothing else here can even detect that state, let alone leave it.
-        //
-        // **Taking the slot is what makes that redial happen at all.** A window that lost the node
-        // stands by instead of dialing back — that is what stops two windows taking it from each
-        // other every half minute — so asking to reconnect has to say "mine again" first. Writing
-        // this window's pid into the slot is that, and the other window stands by in turn.
-        Command::Reconnect => {
-            let took_the_slot = crate::conn::take_the_slot_back();
-            match bridge.connection() {
-                Some(conn) => {
-                    state.reconnecting = true;
-                    state.set_status(state.lang.reconnecting());
-                    conn.close("reconnect requested from /reconnect");
-                }
-                // No socket to drop: this window has been standing by, and writing the slot was the
-                // whole of it. The loop dials again within a couple of seconds.
-                None if took_the_slot => state.set_status(state.lang.reconnecting()),
-                None => state.set_error(state.lang.reconnect_not_attached()),
+        // **Drop the socket and let the runner redial.** The way back from a connection that has
+        // stopped carrying calls without closing: nothing here can detect that state, and a redial
+        // announces this node from scratch.
+        Command::Reconnect => match bridge.connection() {
+            Some(conn) => {
+                state.reconnecting = true;
+                state.set_status(state.lang.reconnecting());
+                conn.close("reconnect requested from /reconnect");
             }
-        }
+            None => state.set_error(state.lang.reconnect_not_attached()),
+        },
         Command::Config(Some(action)) => {
             state.config.save();
             // The palette applies to the very next frame — the same promise the directory

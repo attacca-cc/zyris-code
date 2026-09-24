@@ -83,7 +83,7 @@ pub const DEFAULT_AGENT: &str = "Main Agent";
 /// POST /api/zyris/v1/device/authorize {"scopes":[…,"nodes:write"], …}
 ///   → 422 … unknown variant `nodes:write`, expected one of `agents:read`, … `events:read`
 /// ```
-pub const REQUIRED_SCOPES: [&str; 11] = [
+pub const REQUIRED_SCOPES: [&str; 10] = [
     "agents:read",
     "projects:read",
     // Used by the project form. Re-added after checking the deployed build on 2026-08-03 — it was 200.
@@ -103,24 +103,12 @@ pub const REQUIRED_SCOPES: [&str; 11] = [
     // POST /api/zyris/v1/device/authorize {"scopes":[…,"jobs:read","jobs:write"], …}
     //   → 200 {"device_code":"zdc_…","user_code":"…"}
     // ```
-    // Registering a node of this window's own (`register_node`). **Answered 422 on 2026-08-03 and
-    // was taken back out**; re-measured 2026-08-12 and the whole list authorizes (200), with
-    // `register_node` and `list_nodes` answering `ForbiddenScope` rather than `MethodNotFound` —
-    // the methods are there, only the grant was missing.
-    //
-    // This is the way out of two windows fighting over one node: the server keys its registry by
-    // node id, so a second window on the same credential takes every tool call from the first, and
-    // nothing on this side can change that. A node of its own can.
-    "nodes:write",
     "jobs:read",
     "jobs:write",
 ];
 
 /// This program's name. The credential directory branches on it.
 pub const APP: &str = "zyris-code";
-
-/// The old location all zyris programs shared. Credentials left here are migrated on first run.
-pub const LEGACY_APP: &str = "zyris";
 
 /// The directory where credentials live. `/cwd` shows it.
 ///
@@ -173,16 +161,6 @@ pub fn credential_dir() -> Option<std::path::PathBuf> {
     app_dir()
 }
 
-/// The old location. Credentials found here are migrated on first run.
-pub fn legacy_credential_dir() -> Option<std::path::PathBuf> {
-    // When the person has set `$ZYRIS_CONFIG_DIR`, there is no old location to migrate — they have
-    // already decided where things go, and we have no reason to search other directories.
-    if given_config_dir().is_some() {
-        return None;
-    }
-    config_home_for(LEGACY_APP)
-}
-
 /// The location the person chose. **An empty value counts as not given** — handing an empty path
 /// to someone who tried to clear it with `ZYRIS_CONFIG_DIR=` would drop credentials into the working directory.
 fn given_config_dir() -> Option<std::ffi::OsString> {
@@ -224,95 +202,6 @@ fn platform_config_base() -> Option<std::path::PathBuf> {
         .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
 }
 
-/// **Migrates** this profile's credentials left in the old location. Returns the number moved.
-///
-/// **It's a move, not a copy.** If a live refresh token exists twice on disk, both eventually get
-/// presented, and attacca treats a reuse beyond the 30-second grace as a leaked chain and **revokes
-/// the whole node** (`RefreshAttempt::Reused` in `zyris_enrollment_service.rs`). Both die.
-///
-/// **Never overwrites what is already here.** Credentials this app already registered are newer than the old file,
-/// and overwriting would lose the identity currently attached. In that case the old file isn't deleted either —
-/// deleting a credential we don't hold is throwing away someone else's.
-pub fn migrate_credentials(from: &std::path::Path, into: &std::path::Path, profile: &str) -> usize {
-    let suffix = format!("-{}.json", slugify_profile(profile));
-    let Ok(entries) = std::fs::read_dir(from) else {
-        return 0;
-    };
-    let mut moved = 0;
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name_str) = name.to_str() else { continue };
-        if !name_str.ends_with(&suffix) || !entry.path().is_file() {
-            continue;
-        }
-        let target = into.join(&name);
-        if target.exists() {
-            continue;
-        }
-        if std::fs::create_dir_all(into).is_err() {
-            continue;
-        }
-        // On the same filesystem it's a single rename. If the home directory spans several mounts, that
-        // fails with EXDEV, so we copy first and **delete afterwards** — if the delete fails, two copies remain,
-        // and we count that as not moved.
-        let done = match std::fs::rename(entry.path(), &target) {
-            Ok(()) => true,
-            Err(_) => match std::fs::copy(entry.path(), &target) {
-                Ok(_) => match std::fs::remove_file(entry.path()) {
-                    Ok(()) => true,
-                    Err(_) => {
-                        let _ = std::fs::remove_file(&target);
-                        false
-                    }
-                },
-                Err(_) => false,
-            },
-        };
-        if done {
-            // It's a credential. If the move loosens permissions, upstream refuses to read it next run.
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600));
-            }
-            moved += 1;
-        }
-    }
-    moved
-}
-
-/// The profile fragment that goes into credential file names.
-///
-/// **The same rule as `runtime::store::slugify`, which is what names the files.** This one only
-/// recognizes them — for the migration out of the old shared directory, and for the window lock —
-/// so if the two diverge we fail to recognize the files to move and quietly pass them by, and the
-/// person sees a "please re-enroll" screen with their credential still sitting on disk.
-///
-/// It used to be a copy of *upstream's* rule, back when upstream named the files. Both copies are
-/// in this repo now, which makes them easier to keep in step and no less necessary to.
-fn slugify_profile(profile: &str) -> String {
-    let mut out = String::with_capacity(profile.len());
-    let mut prev_dash = false;
-    for ch in profile.chars() {
-        if ch.is_ascii_alphanumeric() {
-            out.extend(ch.to_lowercase());
-            prev_dash = false;
-        } else if !prev_dash && !out.is_empty() {
-            out.push('-');
-            prev_dash = true;
-        }
-        if out.len() >= 48 {
-            break;
-        }
-    }
-    let trimmed = out.trim_matches('-').to_string();
-    if trimmed.is_empty() {
-        "default".to_string()
-    } else {
-        trimmed
-    }
-}
-
 /// What's **missing** from the granted permissions. The requested list and the verified list are always the single `REQUIRED_SCOPES`.
 pub fn missing_scopes(granted: &[String]) -> Vec<&'static str> {
     REQUIRED_SCOPES.iter().copied().filter(|s| !granted.iter().any(|g| g == s)).collect()
@@ -351,26 +240,9 @@ pub fn agent_name() -> String {
     std::env::var("ZYRIS_CODE_AGENT").unwrap_or_else(|_| DEFAULT_AGENT.to_string())
 }
 
-/// The node name to register with the server.
-///
-/// **Using only the hostname gives the same identity as the machine's other nodes.** If `zyris-daemon`
-/// runs on the same computer, both register as `arch`, and attacca separates them by appending
-/// `-2` to one with `slug_with_suffix` — **which one keeps `arch` depends on the order
-/// they attached**, so the tool names (`zyris__arch__…`) can change between runs.
-///
-/// That's why this app registers carrying its own name: `arch zyris-code`.
-///
-/// **Length is a constraint.** attacca's `slugify_node_name` keeps only alphanumerics, folds the rest into hyphens,
-/// then **truncates at 16 characters** (`ZYRIS_NODE_SLUG_MAX_LEN`). `arch zyris-code` fits exactly as
-/// `arch-zyris-code` (15 chars), but with a long hostname the trailing `zyris-code` gets cut
-/// away and only the hostname remains. In that case **the distinguishing part goes first.**
-/// The name **actually announced**, which is whatever `$ZYRIS_NODE_NAME` holds — `main` fills it
-/// in at startup and a value the person gave wins. Read this to *report* the name (`/cwd`); use
-/// `default_node_name` to decide what to put there.
-///
-/// Before, this recomputed the default instead, so `/cwd` named a node that was not the one on the
-/// server whenever the name had been set by hand — and, once windows split, for every window but
-/// the first.
+/// The name this window's node asks for: `$ZYRIS_NODE_NAME`, which `main` fills from
+/// [`default_node_name`] unless a person set it. The server appends `-2` while another window in
+/// the same directory holds the name; [`address`] is what it actually assigned.
 pub fn node_name() -> String {
     match std::env::var("ZYRIS_NODE_NAME") {
         Ok(name) if !name.trim().is_empty() => name,
@@ -378,288 +250,60 @@ pub fn node_name() -> String {
     }
 }
 
-/// What this window registers as when nobody said otherwise.
+/// The working directory's name. Windows in different directories are told apart by this, and two
+/// windows in one directory by the server (`myrepo`, `myrepo-2`).
 pub fn default_node_name() -> String {
-    let host = zyris::machine_name().unwrap_or_else(|| "node".to_string());
-    let dir = std::env::current_dir()
-        .ok()
-        .and_then(|d| d.file_name().map(|n| n.to_string_lossy().into_owned()));
-    compose_name(&host, dir.as_deref())
+    dir_name(&std::env::current_dir().unwrap_or_default())
 }
 
-/// The pure decision that builds the name. `dir` is the last fragment of the working directory.
+/// The last component of `dir`, or this app's name for `/` and anything else without one.
+fn dir_name(dir: &std::path::Path) -> String {
+    dir.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| APP.to_string())
+}
+
+/// The address Attacca assigned this window's node on its latest connection (`HelloAck.node`).
+/// `runtime::Runner` writes it on every connection — one that did not resume can come back under a
+/// different name — and it is `None` until the first.
+static ADDRESS: std::sync::Mutex<Option<zyris::NodeAddress>> = std::sync::Mutex::new(None);
+
+pub fn set_address(address: Option<zyris::NodeAddress>) {
+    *ADDRESS.lock().unwrap_or_else(|e| e.into_inner()) = address;
+}
+
+pub fn address() -> Option<zyris::NodeAddress> {
+    ADDRESS.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Who the agent is talking to, for the session preamble and the `rules` tool.
 ///
-/// **The working directory goes into the name.** Windows opened in different directories of the same machine
-/// must be distinguishable in attacca's node list — like `arch zyris-code · zyris-daemon`.
-/// Since the slug truncates at 16 characters, the directory only survives in the display name (the slug is always
-/// of the form `arch-zyris-code`). When the directory equals the app name (running in this repo), it's not
-/// appended — no reason to say the same thing twice.
-fn compose_name(host: &str, dir: Option<&str>) -> String {
-    let suffix = dir.filter(|d| !d.is_empty() && *d != SUFFIX);
-    let natural = match suffix {
-        Some(dir) => format!("{host} {SUFFIX} ∙ {dir}"),
-        None => format!("{host} {SUFFIX}"),
+/// **The agent sees every node of the account through the same tools.** Each tool takes a
+/// `node_path` naming the computer it runs on, so the one thing this block has to say is which path
+/// is the computer the person is sitting at. `address` is passed rather than read so a test does
+/// not depend on a connection.
+///
+/// **English, like everything else a tool returns** (user decision, 2026-09-14): the agent is the
+/// reader, and the person reads it too, through `/rules`.
+pub fn node_preamble(cwd: &std::path::Path, address: Option<&zyris::NodeAddress>) -> String {
+    let path = match address {
+        Some(address) => address.path(),
+        None => format!("not assigned yet ‒ this window asks to be called `{}`", node_name()),
     };
-    if slug_of(&natural).contains(SUFFIX) {
-        natural
-    } else {
-        // Truncated away the app name. Reversing the order at least keeps what it is.
-        format!("{SUFFIX} {host}")
-    }
-}
-
-/// The slug attacca gives this node. It's the middle fragment of tool names.
-///
-/// **If it collides, the server appends `-2`** (`slug_with_suffix`). So the value here isn't always the actual
-/// one — with two nodes of the same name, which keeps the bare name is the attach order.
-pub fn node_slug() -> String {
-    slug_of(&std::env::var("ZYRIS_NODE_NAME").unwrap_or_else(|_| node_name()))
-}
-
-/// This app's display appended to the name. For the distinction to work, this must survive in the slug.
-const SUFFIX: &str = "zyris-code";
-
-/// Who the agent is talking to, for the session preamble.
-///
-/// **The agent has the tools of every node on the account and no way to tell which one is here.**
-/// attacca puts `[slug · platform · "name"]` at the front of each tool's description, which says
-/// what a tool belongs to but not which of them is the machine the person is sitting at — so a
-/// question about "this repo" was answered by whichever node the model happened to pick, and a
-/// second machine on the same account is enough for that to be the wrong one.
-///
-/// **The name is the thing to match on, not the slug.** The slug is what shows up inside a tool
-/// name, but attacca appends `-2` to it when two nodes collide (`slug_with_suffix`), and this side
-/// cannot know whether that happened. The display name goes over the wire unchanged.
-///
-/// `cwd` is passed rather than read so a test does not have to move the process.
-///
-/// The preamble that tells an agent which computer it is holding.
-///
-/// **English, like everything else a tool returns.** The agent is the reader, and the machine this
-/// node is on happens to be Korean — a preamble in Korean is a preamble half the models in the
-/// world read as noise (user decision, 2026-09-14).
-///
-/// The person at the keyboard reads this too, through `/rules`, so it is written to be read by
-/// either.
-pub fn node_preamble(cwd: &std::path::Path) -> String {
     format!(
         "This conversation is coming from the node below. The person talking to you is at \
          that computer right now.\n\n\
-         - name: {name}\n\
+         - node_path: {path}\n\
          - working directory: {cwd}\n\
          - platform: {platform}\n\n\
-         The bracketed word at the front of a tool's description says which node the tool \
-         belongs to. The node named above is this computer ‒ its tools are usually named \
-         `zyris__{slug}__…` ‒ and reading and editing files, running a shell and everything \
-         else here happens there. Another node's tools touch a different computer: do not use \
-         them unless that computer is what the conversation is about.",
-        name = node_name(),
+         Every zyris tool takes a `node_path` argument that says which computer it runs on. \
+         Pass the node_path above to read and edit files, run a shell and do everything else \
+         here. Another node_path touches a different computer: do not use it unless that \
+         computer is what the conversation is about.",
         cwd = cwd.display(),
         platform = std::env::consts::OS,
-        slug = node_slug(),
     )
-}
-
-// ── Window lock ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-//
-// **One credential is one node, and that is what makes two windows fight.** The server keeps a single
-// connection per node (`insert(node_id, connection)`), so the window that dials second takes the node from
-// the one that dialed first — and since each redials about a second after being closed, each takes it back in
-// turn. Measured on this machine, 2026-09-15/16: two live windows alternating at a fixed ~31s for as long as
-// both were up, a disconnect on screen every round and any call in flight dead server-side. Neither window
-// was doing anything wrong; the loop was.
-//
-// **So the lock file is the slot, and holding it is the right to dial.** The window that starts later takes the
-// slot; a window whose pid is no longer in the file has lost the node and stands by rather than dialing back
-// (the runner asks this file before every attempt). Standing by is not forever — the file names a pid, and a
-// pid that is gone is a free slot, so the window that stayed quiet takes the node up again on its own a couple
-// of seconds after the other one ends. `/reconnect` is the deliberate way to take it back sooner.
-
-/// Lock file name. Branched by profile, so different profiles (different nodes) don't interfere with each other.
-fn instance_lock_path(config_dir: &std::path::Path, profile: &str) -> std::path::PathBuf {
-    config_dir.join(format!(".instance-{}.lock", slugify_profile(profile)))
-}
-
-/// A handle on this window's slot. **It removes the file on the way out — but only while the file is still
-/// ours.**
-pub struct InstanceLock {
-    path: std::path::PathBuf,
-    /// Our own pid, as written. Compared on drop: another window may have taken the slot since.
-    pid: String,
-}
-
-impl InstanceLock {
-    /// Where the slot is written. The runner asks this path before every dial, and `/reconnect` takes the
-    /// slot back through it.
-    pub fn path(&self) -> &std::path::Path {
-        &self.path
-    }
-}
-
-impl Drop for InstanceLock {
-    fn drop(&mut self) {
-        // **Deleting a slot another window has taken is worse than leaving it.** The next window to start
-        // would find no file, claim a node that is very much in use, and be displaced again — the one thing
-        // this file exists to stop.
-        if slot_pid(&self.path).as_deref() == Some(self.pid.as_str()) {
-            let _ = std::fs::remove_file(&self.path);
-        }
-    }
-}
-
-/// **The pid written in the slot file**, or `None` when there is no file, or it holds nothing at all.
-fn slot_pid(path: &std::path::Path) -> Option<String> {
-    let pid = std::fs::read_to_string(path).ok()?;
-    let pid = pid.trim().to_string();
-    (!pid.is_empty()).then_some(pid)
-}
-
-/// **Is the slot another living window's right now?** Read fresh at every use, because the answer changes
-/// while this process runs — that is the whole mechanism.
-///
-/// **Our own pid in the file reads as `false`.** The question is whether dialing would displace a *living*
-/// window, and we are not one; a window that read its own slot as taken would refuse to start at all.
-///
-/// A dead window's pid is not a window either: a file left behind by a killed process must not keep the next
-/// one standing by forever.
-pub fn held_by_another_live_window(path: &std::path::Path) -> bool {
-    slot_pid(path)
-        .is_some_and(|pid| pid != std::process::id().to_string() && process_alive(&pid))
-}
-
-/// **Claims the slot, and takes it even when a living window is already there.** The window that starts
-/// later is the one that gets the node — what else could opening it mean — and the window it displaced finds
-/// out by reading this file, not by being refused here. Refusing here was the old behaviour, and it is what
-/// left the two windows trading the node for hours: the newcomer took the node anyway by dialing.
-///
-/// `None` only when the file cannot be written at all. The window runs either way; it just cannot tell
-/// whether another one is up.
-pub fn claim_instance_lock(config_dir: &std::path::Path, profile: &str) -> Option<InstanceLock> {
-    let path = instance_lock_path(config_dir, profile);
-    let pid = std::process::id().to_string();
-    std::fs::write(&path, &pid).ok().map(|()| InstanceLock { path, pid })
-}
-
-/// Which window this process is.
-///
-/// **One credential, one node — as it always was.** Splitting the credential per window was tried
-/// (2026-08-12) and taken out again: it made a window's identity depend on what else happened to
-/// be running when it started, so ordinary use produced an approval screen again and again. The
-/// server is what makes two windows awkward, and moving the awkwardness onto the credential only
-/// moved it somewhere worse.
-///
-/// The slot is what decides **which window dials**, which is now a decision rather than an observation —
-/// see `claim_instance_lock`. The rest of the file's job is unchanged: knowing whether another window is up.
-pub struct Window {
-    /// The profile its credentials are filed under (`wss-<server>-<profile>.json`).
-    pub profile: String,
-    /// `None` when the slot file could not be written at all (an unwritable credential directory).
-    pub lock: Option<InstanceLock>,
-    /// **A living window held this slot until now.** It has just been displaced and stands by as soon as it
-    /// notices, which is worth saying on screen — the enrollment-code window may be in that one.
-    pub took_over: bool,
-}
-
-/// Claims this window's place. **Never refuses** — see `claim_instance_lock` for why taking the slot from a
-/// living window is the point and not the accident.
-pub fn claim_window(config_dir: &std::path::Path, base: &str) -> Window {
-    let took_over = held_by_another_live_window(&instance_lock_path(config_dir, base));
-    Window { profile: base.to_string(), lock: claim_instance_lock(config_dir, base), took_over }
-}
-
-/// Where this window's slot file is, for the one place that needs it without the handle: `/reconnect`, which
-/// runs in the screen and knows only that the node is not attached (`app.rs`). Set once, at startup.
-static SLOT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
-
-/// Remember this window's slot file. The first call wins — a slot never moves.
-pub fn remember_slot(path: &std::path::Path) {
-    let _ = SLOT.set(path.to_path_buf());
-}
-
-/// **Take the node back from another window** — what `/reconnect` means to a window that has been standing by.
-/// Writing our pid is the whole of it: the other window's runner checks this file before every dial and stands
-/// by when the slot is not its own.
-///
-/// `false` means there is no slot to take (the credential directory was never found), not that the write was
-/// refused on its merits.
-pub fn take_the_slot_back() -> bool {
-    let Some(path) = SLOT.get() else {
-        return false;
-    };
-    std::fs::write(path, std::process::id().to_string()).is_ok()
-}
-
-#[cfg(unix)]
-fn process_alive(pid: &str) -> bool {
-    let Ok(pid) = pid.trim().parse::<u32>() else {
-        return false;
-    };
-    // PID 0 means "my process group", so kill(0, 0) always succeeds — treat it as an impossible value.
-    if pid == 0 {
-        return false;
-    }
-    // kill(pid, 0): sends no signal, only asks whether that PID exists.
-    unsafe { libc::kill(pid as i32, 0) == 0 }
-}
-
-/// Windows has no `kill(pid, 0)`, so it asks the task list.
-///
-/// **Answering `false` unconditionally, as this used to, disabled the warning entirely on
-/// Windows** — every window claimed the lock, no window ever saw another, and the one message
-/// that explains "my tool calls just sit there" (the server routes to whichever window connected
-/// last) could never appear on the platform where it is hardest to diagnose.
-///
-/// `tasklist` ships with every Windows install. It runs once at startup, and any failure — the
-/// binary missing, output we cannot read — answers `false`, which is exactly the old behaviour.
-/// A recycled PID can say "alive" wrongly, the same risk `kill(pid, 0)` carries on Unix.
-#[cfg(not(unix))]
-fn process_alive(pid: &str) -> bool {
-    let Ok(pid) = pid.trim().parse::<u32>() else {
-        return false;
-    };
-    // **PID 0 is the System Idle Process on Windows**, and `tasklist` happily reports it
-    // alive. A stale lock is written by a dead window, never by PID 0, so treat 0 as an
-    // impossible value the same way the Unix branch does.
-    if pid == 0 {
-        return false;
-    }
-    let out = std::process::Command::new("tasklist")
-        .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
-        .output();
-    let Ok(out) = out else { return false };
-    // With no match it prints an INFO line instead of a row, so look for the PID as its own
-    // quoted CSV field — the memory column carries digits too (`"1,234 K"`).
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .any(|line| line.split(',').any(|field| field.trim().trim_matches('"') == pid.to_string()))
-}
-
-/// **The same rule** as attacca's `slugify_node_name` (`attacca-domain/src/zyris_node.rs`).
-///
-/// We must know here in advance what the server will produce to judge whether the name gets truncated. If the rules
-/// diverge, this judgment is wrong, so when it changes this must change too.
-fn slug_of(name: &str) -> String {
-    const MAX: usize = 16;
-    let mut slug = String::new();
-    let mut prev_dash = false;
-    for ch in name.chars() {
-        if ch.is_ascii_alphanumeric() {
-            slug.extend(ch.to_lowercase());
-            prev_dash = false;
-        } else if !prev_dash && !slug.is_empty() {
-            slug.push('-');
-            prev_dash = true;
-        }
-        if slug.len() >= MAX {
-            break;
-        }
-    }
-    let trimmed = slug.trim_matches('-').to_string();
-    if trimmed.is_empty() {
-        "node".to_string()
-    } else {
-        trimmed
-    }
 }
 
 #[derive(Debug, Default)]
@@ -1187,24 +831,34 @@ pub async fn session_title(api: &AttaccaApiClient, session_id: &str) -> Option<S
 
 #[cfg(test)]
 mod tests {
-    /// **The block has to name the node the way the tool descriptions do.** attacca writes
-    /// `[slug · platform · "name"]` in front of every tool it relays, and matching on the name is
-    /// how the agent picks this machine's tools out of the account's. Naming it any other way —
-    /// "this node", "the local one" — leaves nothing to match against.
-    ///
-    /// **Under the host lock.** `node_name()` reads `$HOSTNAME`, and `a_long_hostname_does_not_…`
-    /// sets that to a fake long one — process-globally. Without the lock this test can read the
-    /// real name for its first assertion and the fake one for its second, and the failure is then
-    /// about the suite's order rather than about the block. That is exactly how it failed on a CI
-    /// runner whose hostname was long (2026-09-13) while passing here.
+    /// **The block names the path every tool is called with.** The agent sees every node's tools
+    /// under one name and picks a computer with `node_path`; naming this one any other way —
+    /// "this node", a display name — leaves it nothing to pass.
     #[test]
-    fn the_node_block_names_what_the_tool_descriptions_name() {
-        let _g = HOST.lock().unwrap_or_else(|e| e.into_inner());
-        let out = node_preamble(std::path::Path::new("/home/ruma/zyris-code"));
-        assert!(out.contains(&node_name()), "the display name is what joins the two: {out}");
-        assert!(out.contains(&node_slug()), "the slug is how a tool name reads: {out}");
-        assert!(out.contains("/home/ruma/zyris-code"), "where it is standing: {out}");
+    fn the_node_block_names_the_path_every_tool_is_called_with() {
+        let address = zyris::NodeAddress {
+            system: "laptop".into(),
+            program: "zyris-code".into(),
+            name: "myrepo-2".into(),
+        };
+        let out = node_preamble(std::path::Path::new("/home/ruma/myrepo"), Some(&address));
+        assert!(out.contains("node_path: laptop/zyris-code/myrepo-2"), "{out}");
+        assert!(out.contains("/home/ruma/myrepo"), "where it is standing: {out}");
         assert!(out.contains(std::env::consts::OS), "what it is running on: {out}");
+    }
+
+    /// Before the first connection there is no path, and the block must not invent one.
+    #[test]
+    fn before_the_first_connection_the_block_says_the_path_is_not_known() {
+        let out = node_preamble(std::path::Path::new("/home/ruma/myrepo"), None);
+        assert!(out.contains("not assigned yet"), "{out}");
+    }
+
+    /// **The node is named after its directory**, and a directory with no name gets this app's.
+    #[test]
+    fn a_node_is_named_after_its_directory() {
+        assert_eq!(dir_name(std::path::Path::new("/home/ruma/myrepo")), "myrepo");
+        assert_eq!(dir_name(std::path::Path::new("/")), "zyris-code");
     }
 
     use super::*;
@@ -1252,24 +906,16 @@ mod tests {
 
     /// **Credentials go to this app's own directory.** `~/.config/zyris/` was shared by every zyris
     /// program, so two unprofiled ones registered on top of each other's identity.
-    ///
-    /// Jiggling environment variables would trample other tests running in parallel, so here we only look at the
-    /// branching rule — the old and new locations must differ **only in the last segment** and be the same above it.
     #[test]
     fn credentials_live_under_this_apps_own_name() {
         if given_config_dir().is_some() {
-            // When a location is given, it's used verbatim rather than the branching rule —
-            // that rule is covered by a_given_config_dir_wins_and_is_taken_literally.
+            // When a location is given, it's used verbatim — see the next test.
             return;
         }
-        let (Some(ours), Some(legacy)) = (config_home_for(APP), config_home_for(LEGACY_APP)) else {
-            // In an environment without a home (systemd `ProtectHome=yes`), both being absent is correct.
-            assert!(config_home_for(APP).is_none() && config_home_for(LEGACY_APP).is_none());
-            return;
-        };
-        assert_eq!(ours.file_name().unwrap(), "zyris-code");
-        assert_eq!(legacy.file_name().unwrap(), "zyris");
-        assert_eq!(ours.parent(), legacy.parent(), "both places must sit under the same parent");
+        // In an environment without a home (systemd `ProtectHome=yes`), absent is correct.
+        if let Some(ours) = config_home_for(APP) {
+            assert_eq!(ours.file_name().unwrap(), "zyris-code");
+        }
     }
 
     /// **The location the person gave wins.** And no app name is appended to it — that
@@ -1284,42 +930,6 @@ mod tests {
         // An empty value counts as not given — using the empty path as-is would drop credentials into the working directory.
         let empty: Option<std::ffi::OsString> = Some(std::ffi::OsString::new());
         assert!(empty.filter(|v| !v.is_empty()).is_none());
-    }
-
-    /// **Old credentials move over and the old spot is left empty.** Copying would leave a live refresh token
-    /// twice on disk, and attacca, seeing the reuse, revokes the whole node.
-    #[test]
-    fn a_legacy_credential_moves_and_leaves_nothing_behind() {
-        let old = tempfile::tempdir().unwrap();
-        let new = tempfile::tempdir().unwrap();
-        let name = "wss-attacca-cc-zyris-v1-ws-zyris-code.json";
-        std::fs::write(old.path().join(name), "{\"refresh_token\":\"r\"}").unwrap();
-        // Another profile's file belongs to someone else. Touching it logs that program out.
-        std::fs::write(old.path().join("wss-attacca-cc-default.json"), "{}").unwrap();
-
-        assert_eq!(migrate_credentials(old.path(), new.path(), "zyris-code"), 1);
-        assert!(new.path().join(name).exists(), "must be at the new place");
-        assert!(!old.path().join(name).exists(), "the old place must be empty");
-        assert!(
-            old.path().join("wss-attacca-cc-default.json").exists(),
-            "someone else's file is left alone"
-        );
-    }
-
-    /// **If something is already here, don't overwrite it.** Overwriting the identity currently attached
-    /// with the old file loses that credential. And the old file isn't deleted either — that would be
-    /// throwing away a credential we don't hold.
-    #[test]
-    fn migration_never_overwrites_what_is_already_here() {
-        let old = tempfile::tempdir().unwrap();
-        let new = tempfile::tempdir().unwrap();
-        let name = "wss-attacca-cc-zyris-v1-ws-zyris-code.json";
-        std::fs::write(old.path().join(name), "옛것").unwrap();
-        std::fs::write(new.path().join(name), "지금것").unwrap();
-
-        assert_eq!(migrate_credentials(old.path(), new.path(), "zyris-code"), 0);
-        assert_eq!(std::fs::read_to_string(new.path().join(name)).unwrap(), "지금것");
-        assert!(old.path().join(name).exists(), "what wasn't taken isn't deleted either");
     }
 
     /// **When short, we ask once more.** Permissions fixed at approval time don't widen on refresh,
@@ -1353,144 +963,6 @@ mod tests {
         assert!(missing.contains(&"events:read"), "{missing:?}");
         assert!(!missing.contains(&"agents:read"), "{missing:?}");
         assert!(missing_scopes_message(&missing).contains("events:read"));
-    }
-
-    /// The one naming files is upstream. **If the rules diverge, we fail to recognize the files to migrate.**
-    #[test]
-    fn the_profile_slug_matches_what_zyris_writes() {
-        // Values copied verbatim from zyris `enroll/file_store.rs`'s tests.
-        assert_eq!(slugify_profile("zyris-code"), "zyris-code");
-        assert_eq!(slugify_profile("///"), "default");
-        assert_eq!(slugify_profile(""), "default");
-        assert_eq!(slugify_profile("Two  Words"), "two-words");
-    }
-
-    /// **The slug rule must match attacca.** If this diverges, the judgment about whether the name gets
-    /// truncated is wrong, and the app registers without its name.
-    #[test]
-    fn the_slug_rule_matches_what_attacca_does() {
-        // Values copied verbatim from `attacca-domain/src/zyris_node.rs`'s tests.
-        assert_eq!(slug_of("Allen's Desktop!!"), "allen-s-desktop");
-        assert_eq!(slug_of("   "), "node");
-        assert_eq!(slug_of("a-very-long-machine-name-here"), "a-very-long-mach");
-    }
-
-    /// `HOSTNAME` is process-global, so these two run in one thread.
-    static HOST: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// **Registering with only the hostname makes the same identity as the machine's other nodes.**
-    #[test]
-    fn the_node_name_carries_this_app() {
-        let _g = HOST.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var("ZYRIS_NODE_NAME");
-        // The machine name comes from upstream (`zyris::machine_name`) and can be short
-        // (`arch`) or long (`DESKTOP-33GBATB`), so the exact string is platform-dependent.
-        // What must always hold is that the app name rides along in the node name.
-        let name = node_name();
-        assert!(name.contains("zyris-code"), "{name}");
-        // And it is never empty or a bare hostname — a window registers under its own name.
-        assert!(name.len() >= "zyris-code".len(), "{name}");
-    }
-
-    /// **A long hostname cuts off the tail.** Left as is, only the hostname remains and the
-    /// distinction disappears — then the distinguishing part goes first.
-    #[test]
-    fn a_long_hostname_does_not_swallow_the_app_name() {
-        let _g = HOST.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("HOSTNAME", "a-very-long-machine-name-here");
-        let name = node_name();
-        let slug = slug_of(&name);
-        assert!(slug.contains("zyris-code"), "the app name got truncated away: {name} → {slug}");
-        assert!(slug.len() <= 16, "{slug}");
-    }
-
-    /// Two windows on one credential are one node to the server, and the registry keeps the
-    /// connection that arrived last — so the earlier window's socket lives on while every tool
-    /// call goes to the other one. Splitting the credential is what makes them separate nodes;
-    /// this is the name half of it.
-    ///
-    /// The distinguishing part goes **first**, because the slug is cut at 16 characters: putting
-    /// the number on the end (`arch zyris-code 2`) is trimmed straight back to `arch-zyris-code`
-    /// Taking simply the lowest free slot made identity depend on what else happened to be running:
-    /// open a second window, close the first, start a third, and it lands on a profile with no
-    /// credential — an approval screen, for doing nothing unusual. That is what "it asks me to
-    /// **The working directory goes into the name.** Different directories on the same machine must be distinguishable.
-    /// The slug truncates at 16 characters, so it only survives in the display name.
-    #[test]
-    fn the_node_name_carries_the_working_directory() {
-        assert_eq!(compose_name("arch", Some("zyris-daemon")), "arch zyris-code ∙ zyris-daemon");
-        assert_eq!(slug_of("arch zyris-code ∙ zyris-daemon"), "arch-zyris-code");
-        // A directory equal to the app name isn't appended — it's a duplicate.
-        assert_eq!(compose_name("arch", Some("zyris-code")), "arch zyris-code");
-        // Without a directory (e.g. root) it's the usual name.
-        assert_eq!(compose_name("arch", None), "arch zyris-code");
-    }
-
-    /// A dead window's trace is not a living window — and PID 0 must be treated as dead, since kill(0, 0)
-    /// always succeeds. A slot read as taken would leave the next window standing by for a node nobody holds.
-    #[test]
-    fn a_stale_slot_is_not_a_living_window() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = instance_lock_path(dir.path(), "test");
-        std::fs::write(&path, "0").unwrap();
-        assert!(!held_by_another_live_window(&path));
-        std::fs::write(&path, "4000000000").unwrap();
-        assert!(!held_by_another_live_window(&path));
-    }
-
-    /// **Our own slot is not another window's.** A window that read its own pid as a take-over would refuse
-    /// to dial the node it holds, which is a node nobody serves.
-    #[test]
-    fn our_own_slot_is_not_another_window() {
-        let dir = tempfile::tempdir().unwrap();
-        let window = claim_window(dir.path(), "test");
-        let lock = window.lock.as_ref().expect("the credential directory is writable");
-        assert_eq!(slot_pid(lock.path()).as_deref(), Some(std::process::id().to_string().as_str()));
-        assert!(!held_by_another_live_window(lock.path()));
-        assert!(!window.took_over, "nobody was here first");
-    }
-
-    /// Releasing the slot clears it, so the next window to start finds it free.
-    #[test]
-    fn releasing_the_slot_clears_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = instance_lock_path(dir.path(), "test");
-        drop(claim_window(dir.path(), "test"));
-        assert!(!path.exists(), "released, yet it is still there");
-    }
-
-    /// **A later window takes the slot from a living one** — that is what opening it means — and the window it
-    /// displaced reads its own pid gone from the file, which is how it knows to stand by instead of dialing
-    /// back and starting the trade of CLAUDE.md "창 여럿".
-    #[cfg(unix)]
-    #[test]
-    fn a_later_window_takes_the_slot_from_a_living_one() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = instance_lock_path(dir.path(), "test");
-        let mut first = std::process::Command::new("sleep").arg("60").spawn().unwrap();
-        std::fs::write(&path, first.id().to_string()).unwrap();
-        assert!(held_by_another_live_window(&path));
-
-        let second = claim_window(dir.path(), "test");
-        assert!(second.took_over, "it took the node from a living window");
-        assert!(!held_by_another_live_window(&path), "the slot is the newcomer's now");
-
-        // Any way the other window ends — cleanly or killed — the slot is free, never somebody else's forever.
-        first.kill().ok();
-        first.wait().ok();
-        assert!(!held_by_another_live_window(&path), "a dead pid is a free slot");
-    }
-
-    /// **The window that lost the slot does not delete the winner's file on its way out.** Doing so would
-    /// leave the winner looking absent, and the next window to start would take a node that is in use.
-    #[test]
-    fn handing_the_slot_over_leaves_the_new_owners_file_alone() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = instance_lock_path(dir.path(), "test");
-        let loser = claim_window(dir.path(), "test");
-        std::fs::write(&path, "1").unwrap();
-        drop(loser);
-        assert_eq!(slot_pid(&path).as_deref(), Some("1"));
     }
 
     /// Changing the agent **opens a new session at the next message.** A session's agent is fixed at

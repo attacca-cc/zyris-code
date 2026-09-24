@@ -90,18 +90,13 @@ pub fn announce(
     // capability separately, so a list held per wrapper would drift the moment one was rebuilt.
     bridge.set_hooks(crate::plugin::hooks(&crate::plugin::active(&cwd)));
 
-    // Three things to put in the session: **which node this is**, **this repo's conventions**
-    // (`CLAUDE.md`·`AGENTS.md`) and the skill list. Where the person is sitting comes first — it
-    // is the frame the other two are read in, and without it the agent cannot tell which of the
-    // account's nodes owns the files the conventions are about. Conventions then come before
-    // skills: they must be followed no matter what, while skills are only used when relevant.
-    let parts = [
-        Some(crate::conn::node_preamble(&cwd)),
-        crate::instructions::preamble(&cwd),
-        skill::preamble(&skills),
-    ];
+    // What goes in the session besides **which node this is**: this repo's conventions
+    // (`CLAUDE.md`·`AGENTS.md`), then the skill list. Conventions come first: they must be
+    // followed no matter what, while skills are only used when relevant. The node block is put in
+    // front by `Bridge::preamble` when a session is made, because only a connection has a path.
+    let parts = [crate::instructions::preamble(&cwd), skill::preamble(&skills)];
     let joined: Vec<String> = parts.into_iter().flatten().collect();
-    bridge.set_preamble((!joined.is_empty()).then(|| joined.join("\n\n")));
+    bridge.set_preamble(cwd.clone(), (!joined.is_empty()).then(|| joined.join("\n\n")));
 
     node.capability(Gate::new(skill::SkillServer(skills), bridge.clone()))
         .capability(Gate::new(rules::RulesCapServer(Rules::new(cwd.clone())), bridge.clone()))

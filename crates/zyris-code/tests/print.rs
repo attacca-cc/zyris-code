@@ -27,7 +27,7 @@ fn print_mode_gives_up_instead_of_waiting_for_ever() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_zyris-code"))
         .args(["-p", "say hello"])
         // A credential given outright: no enrolment, no browser, nothing written to a real config.
-        .env("ZYRIS_NODE_TOKEN", "znt_print_test_not_a_real_token")
+        .env("ZYRIS_CREDENTIAL", "zc_print_test_not_a_real_token")
         .env("ZYRIS_SERVER_URL", "ws://127.0.0.1:1")
         .env("ZYRIS_CONFIG_DIR", &dir)
         .env("ZYRIS_CODE_CONNECT_WAIT_SECS", "3")
