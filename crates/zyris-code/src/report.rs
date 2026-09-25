@@ -67,6 +67,7 @@ mod tests {
 
     fn ev(seq: i64, payload: Value) -> zyris_attacca::ZSessionEvent {
         zyris_attacca::ZSessionEvent {
+            id: None,
             seq,
             cursor: seq,
             kind: "tool_call".into(),

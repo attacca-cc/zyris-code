@@ -162,7 +162,14 @@ mod tests {
     use serde_json::json;
 
     fn ev(seq: i64, payload: Value) -> ZSessionEvent {
-        ZSessionEvent { seq, cursor: seq, kind: "tool_call".into(), payload, created_at: None }
+        ZSessionEvent {
+            id: None,
+            seq,
+            cursor: seq,
+            kind: "tool_call".into(),
+            payload,
+            created_at: None,
+        }
     }
 
     fn item(id: &str, content: &str, status: &str) -> Value {
@@ -298,6 +305,7 @@ mod tests {
             ev(1, json!({"name": "zyris__arch__terminal__exec", "arguments": {"command": "ls"}}));
         assert_eq!(change_from(&tool), None);
         let thinking = ZSessionEvent {
+            id: None,
             seq: 2,
             cursor: 2,
             kind: "thinking".into(),

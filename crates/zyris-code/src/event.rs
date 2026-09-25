@@ -35,6 +35,16 @@ impl SubagentStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
+    /// The event's id off the wire, when the server sends one. **Identity across a move.** The
+    /// server re-sequences a message sent mid-turn to where the turn took it — same id, new
+    /// `seq` — and this is what lets `Timeline::upsert` recognise that as a move rather than a
+    /// second message.
+    ///
+    /// **`Box<str>` rather than `String`.** `Entry` rides inside `Frame`, which rides inside
+    /// `Action` — every key press pays for the widest variant, and `String`'s spare capacity is
+    /// three words nothing here ever grows into. The saved word is what keeps `Action` clear of
+    /// clippy's `large_enum_variant`.
+    pub id: Option<Box<str>>,
     pub seq: i64,
     pub kind: EntryKind,
 }
@@ -152,6 +162,7 @@ pub fn entry_from(event: &ZSessionEvent) -> Option<Entry> {
                     let answered =
                         question_answered(p.get("result").filter(|v| !v.is_null()), failed);
                     return Some(Entry {
+                        id: event.id.as_deref().map(Into::into),
                         seq: event.seq,
                         kind: EntryKind::Question { steps, answered },
                     });
@@ -161,6 +172,7 @@ pub fn entry_from(event: &ZSessionEvent) -> Option<Entry> {
             // the run was for, and the timeline draws it as a row of its own.
             if let Some(report) = crate::report::of(event) {
                 return Some(Entry {
+                    id: event.id.as_deref().map(Into::into),
                     seq: event.seq,
                     kind: EntryKind::Report { ok: report.ok, summary: report.summary },
                 });
@@ -185,7 +197,7 @@ pub fn entry_from(event: &ZSessionEvent) -> Option<Entry> {
         // Things v1 doesn't handle, and future kinds that don't exist yet. Ignore without dying.
         _ => return None,
     };
-    Some(Entry { seq: event.seq, kind })
+    Some(Entry { id: event.id.as_deref().map(Into::into), seq: event.seq, kind })
 }
 
 fn text(payload: &Value, field: &str) -> String {
@@ -198,7 +210,7 @@ mod tests {
     use serde_json::json;
 
     fn ev(seq: i64, kind: &str, payload: serde_json::Value) -> ZSessionEvent {
-        ZSessionEvent { seq, cursor: seq, kind: kind.into(), payload, created_at: None }
+        ZSessionEvent { id: None, seq, cursor: seq, kind: kind.into(), payload, created_at: None }
     }
 
     /// The wire name is `zyris__{node}__{capability}__{tool}`.

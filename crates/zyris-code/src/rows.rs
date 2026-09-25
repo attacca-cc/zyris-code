@@ -2707,7 +2707,7 @@ mod tests {
     #[test]
     fn a_turn_that_changed_its_subject_three_times_is_still_one_card() {
         let mut t = crate::timeline::Timeline::new();
-        let at = |seq, kind| crate::event::Entry { seq, kind };
+        let at = |seq, kind| crate::event::Entry { id: None, seq, kind };
         t.upsert(at(1, crate::event::EntryKind::WorkStart("노드 재시도".into())));
         t.upsert(at(2, crate::event::EntryKind::WorkStart("보고서 작성 중".into())));
         t.upsert(at(3, crate::event::EntryKind::WorkStart("결과를 보고 중".into())));

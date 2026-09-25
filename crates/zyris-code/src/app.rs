@@ -41,6 +41,10 @@ pub enum Frame {
     Status {
         running: bool,
     },
+    /// The turn was cancelled at a delivery point — another client asked it to stop. It ends the
+    /// turn exactly as `Frame::Status { running: false }` marks the card, but nothing in that
+    /// frame says which of the two happened, so this is said instead.
+    Cancelled,
     /// A newer release was found. Carried as a frame rather than acted on where it was found,
     /// because the check runs off the loop and `apply` is the one place that changes state.
     UpdateFound(String),
@@ -2852,6 +2856,9 @@ fn apply_frame(state: &mut State, frame: &Frame) {
             }
             state.running = *running;
         }
+        // Another client asked the turn to stop. Marks the card the same way `Esc` would,
+        // rather than leaving it reading as a turn that finished on its own.
+        Frame::Cancelled => state.timeline.mark_stopped(),
         Frame::ShellOpened { id, name } => {
             // The same PTY arriving twice would put two copies in the list.
             if !state.shells.iter().any(|s| s.id == *id) {
@@ -4805,8 +4812,9 @@ async fn run_inner(
                         }
                         Action::Cancel => {
                             if let Some(id) = session.id() {
-                                let _ = crate::conn::within(&api, api.cancel_turn(id.to_string()))
-                                    .await;
+                                let _ =
+                                    crate::conn::within(&api, api.cancel_turn(id.to_string(), None))
+                                        .await;
                             }
                         }
                         // Only clears the screen. It is redrawn just below.
@@ -8353,7 +8361,7 @@ mod tests {
     fn work_start(seq: i64) -> Action {
         Action::Frame(Frame::Event {
             cursor: seq,
-            entry: Some(Entry { seq, kind: EntryKind::WorkStart(String::new()) }),
+            entry: Some(Entry { id: None, seq, kind: EntryKind::WorkStart(String::new()) }),
             todo: None,
             plan: None,
         })
@@ -8505,6 +8513,7 @@ mod tests {
             &Action::Frame(Frame::Event {
                 cursor: 2,
                 entry: Some(Entry {
+                    id: None,
                     seq: 2,
                     kind: EntryKind::Tool {
                         name: "read".into(),
@@ -8806,6 +8815,7 @@ mod tests {
             "result": {"id": id, "content": content, "status": "pending"},
         });
         let event = zyris_attacca::ZSessionEvent {
+            id: None,
             seq,
             cursor: seq,
             kind: "tool_call".into(),
@@ -9227,7 +9237,9 @@ mod tests {
         let work = |seq: i64| {
             Action::Frame(Frame::Event {
                 cursor: seq,
-                entry: Some(Entry { seq, kind: EntryKind::WorkStart("빌드 중".into()) }),
+                entry: Some(Entry {
+                    id: None, seq, kind: EntryKind::WorkStart("빌드 중".into())
+                }),
                 todo: None,
                 plan: None,
             })
@@ -9572,7 +9584,11 @@ mod tests {
             &mut s,
             &Action::Frame(Frame::Event {
                 cursor: 2,
-                entry: Some(Entry { seq: 2, kind: EntryKind::Agent("먼저 볼게요".into()) }),
+                entry: Some(Entry {
+                    id: None,
+                    seq: 2,
+                    kind: EntryKind::Agent("먼저 볼게요".into()),
+                }),
                 todo: None,
                 plan: None,
             }),
@@ -9651,6 +9667,7 @@ mod tests {
             &Action::Frame(Frame::Event {
                 cursor: 1,
                 entry: Some(Entry {
+                    id: None,
                     seq: 1,
                     kind: EntryKind::Thinking {
                         title: Some("위젯 picker를 고치는 중".into()),
@@ -9793,6 +9810,7 @@ mod tests {
             Action::Frame(Frame::Event {
                 cursor: seq,
                 entry: Some(crate::event::Entry {
+                    id: None,
                     seq,
                     kind: EntryKind::Question {
                         steps: vec![crate::question::Step {
@@ -9829,6 +9847,7 @@ mod tests {
             Action::Frame(Frame::Event {
                 cursor: seq,
                 entry: Some(crate::event::Entry {
+                    id: None,
                     seq,
                     kind: EntryKind::Question {
                         steps: vec![crate::question::Step {
@@ -9864,6 +9883,7 @@ mod tests {
 
     fn event(seq: i64, kind: &str, payload: serde_json::Value) -> zyris_attacca::ZSessionEvent {
         zyris_attacca::ZSessionEvent {
+            id: None,
             seq,
             cursor: seq,
             kind: kind.into(),

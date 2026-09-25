@@ -338,6 +338,11 @@ impl Timeline {
         if let EntryKind::User(text) = &entry.kind {
             self.retire_echo(text);
         }
+        // **A moved event drops its old place.** The server re-sequences a message sent mid-turn to
+        // where the turn took it; the same id under another seq is that move, not a second message.
+        if let Some(id) = &entry.id {
+            self.entries.retain(|seq, held| *seq == entry.seq || held.id.as_ref() != Some(id));
+        }
         self.entries.insert(entry.seq, entry);
         self.dirty = true;
     }
@@ -832,7 +837,11 @@ mod tests {
     use crate::event::{Entry, EntryKind};
 
     fn e(seq: i64, kind: EntryKind) -> Entry {
-        Entry { seq, kind }
+        Entry { id: None, seq, kind }
+    }
+
+    fn e_id(seq: i64, id: &str, kind: EntryKind) -> Entry {
+        Entry { id: Some(id.into()), ..e(seq, kind) }
     }
 
     fn texts(t: &mut Timeline) -> Vec<String> {
@@ -844,6 +853,18 @@ mod tests {
                 other => format!("{other:?}"),
             })
             .collect()
+    }
+
+    /// **A message moved to where the turn took it leaves its old place.** The server re-sequences a
+    /// message sent mid-turn; the same id under a new seq is the same message, not a second one.
+    #[test]
+    fn a_moved_message_stands_once_at_its_new_place() {
+        let mut t = Timeline::new();
+        t.upsert(e_id(1, "u0", EntryKind::User("시작".into())));
+        t.upsert(e_id(2, "u1", EntryKind::User("방향 바꿔".into())));
+        t.upsert(e_id(3, "a1", EntryKind::Agent("첫 라운드".into())));
+        t.upsert(e_id(4, "u1", EntryKind::User("방향 바꿔".into())));
+        assert_eq!(texts(&mut t), vec!["시작", "첫 라운드", "방향 바꿔"]);
     }
 
     /// **What the app says stands where it was said.** Pushed to the very top or bottom,

@@ -73,7 +73,9 @@ fn full_screen() -> State {
             &Action::Frame(AppFrame::Event {
                 cursor: seq,
                 entry: Some(Entry {
-                    seq, kind: EntryKind::User(format!("{i}번째 질문입니다"))
+                    id: None,
+                    seq,
+                    kind: EntryKind::User(format!("{i}번째 질문입니다")),
                 }),
                 todo: None,
                 plan: None,
@@ -85,6 +87,7 @@ fn full_screen() -> State {
             &Action::Frame(AppFrame::Event {
                 cursor: seq,
                 entry: Some(Entry {
+                    id: None,
                     seq,
                     kind: EntryKind::Agent("그라데이션 부분은 이렇게 바꾸면 됩니다. ".repeat(30)),
                 }),
