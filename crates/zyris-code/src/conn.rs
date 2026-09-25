@@ -665,6 +665,7 @@ pub fn frame_from(f: ZTurnFrame) -> Frame {
         },
         ZTurnFrame::Delta { kind, text } => Frame::Delta { kind, text },
         ZTurnFrame::Status { running } => Frame::Status { running },
+        ZTurnFrame::Cancelled => Frame::Cancelled,
     }
 }
 
@@ -867,6 +868,7 @@ mod tests {
 
     fn event(seq: i64, kind: &str, message: &str) -> ZSessionEvent {
         ZSessionEvent {
+            id: None,
             seq,
             cursor: seq,
             kind: kind.into(),
@@ -1120,6 +1122,7 @@ mod tests {
         let f = ZTurnFrame::Event {
             cursor: 99,
             event: ZSessionEvent {
+                id: None,
                 seq: 5,
                 cursor: 99,
                 kind: "recall".into(),

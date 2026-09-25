@@ -125,7 +125,7 @@ fn a_user_message_appears_above_the_input() {
         &mut s,
         &Action::Frame(AppFrame::Event {
             cursor: 1,
-            entry: Some(Entry { seq: 1, kind: EntryKind::User("안녕하세요".into()) }),
+            entry: Some(Entry { id: None, seq: 1, kind: EntryKind::User("안녕하세요".into()) }),
             todo: None,
             plan: None,
         }),
@@ -160,7 +160,7 @@ fn the_servers_copy_of_a_submitted_message_does_not_double_it() {
         &mut s,
         &Action::Frame(AppFrame::Event {
             cursor: 1,
-            entry: Some(Entry { seq: 1, kind: EntryKind::User("안녕하세요".into()) }),
+            entry: Some(Entry { id: None, seq: 1, kind: EntryKind::User("안녕하세요".into()) }),
             todo: None,
             plan: None,
         }),
@@ -198,7 +198,7 @@ fn cell_bg(state: &mut State, w: u16, h: u16, x: u16, y: u16) -> Option<ratatui:
 }
 
 fn said(state: &mut State, seq: i64, kind: EntryKind) {
-    let entry = Some(Entry { seq, kind });
+    let entry = Some(Entry { id: None, seq, kind });
     apply(state, &Action::Frame(AppFrame::Event { cursor: seq, entry, todo: None, plan: None }));
 }
 
@@ -496,7 +496,7 @@ fn there_is_no_header_taking_up_the_top_line() {
         &mut s,
         &Action::Frame(AppFrame::Event {
             cursor: 1,
-            entry: Some(Entry { seq: 1, kind: EntryKind::User("첫 줄".into()) }),
+            entry: Some(Entry { id: None, seq: 1, kind: EntryKind::User("첫 줄".into()) }),
             todo: None,
             plan: None,
         }),
@@ -516,6 +516,7 @@ fn drawing_at_a_very_narrow_width_does_not_panic() {
         &Action::Frame(AppFrame::Event {
             cursor: 1,
             entry: Some(Entry {
+                id: None,
                 seq: 1, kind: EntryKind::Agent("한글 **강조** `코드`".into())
             }),
             todo: None,
@@ -579,6 +580,7 @@ fn what_is_happening_now_sits_between_the_chat_and_the_input_box() {
 /// Puts one task on the session's plan, the way the server does: a `todo_add` tool call.
 fn planned(state: &mut State, seq: i64, content: &str, status: &str) {
     let event = zyris_attacca::ZSessionEvent {
+        id: None,
         seq,
         cursor: seq,
         kind: "tool_call".into(),
@@ -790,7 +792,7 @@ fn a_form_being_open_does_not_swallow_what_the_server_says() {
             &mut s,
             &Action::Frame(AppFrame::Event {
                 cursor: 42,
-                entry: Some(Entry { seq: 42, kind: EntryKind::Agent("들어온 말".into()) }),
+                entry: Some(Entry { id: None, seq: 42, kind: EntryKind::Agent("들어온 말".into()) }),
                 todo: None,
                 plan: None,
             }),
@@ -937,7 +939,7 @@ fn the_head_keeps_breathing_while_nothing_else_changes() {
         &mut s,
         &Action::Frame(AppFrame::Event {
             cursor: 1,
-            entry: Some(Entry { seq: 1, kind: EntryKind::WorkStart("빌드하는 중".into()) }),
+            entry: Some(Entry { id: None, seq: 1, kind: EntryKind::WorkStart("빌드하는 중".into()) }),
             todo: None,
             plan: None,
         }),
@@ -980,7 +982,7 @@ fn clicking_a_work_card_toggles_it() {
         &mut s,
         &Action::Frame(AppFrame::Event {
             cursor: 1,
-            entry: Some(Entry { seq: 1, kind: EntryKind::WorkStart("작업".into()) }),
+            entry: Some(Entry { id: None, seq: 1, kind: EntryKind::WorkStart("작업".into()) }),
             todo: None,
             plan: None,
         }),
@@ -1032,6 +1034,7 @@ fn dragging_selects_text_and_the_selection_survives_the_release() {
         &Action::Frame(AppFrame::Event {
             cursor: 1,
             entry: Some(Entry {
+                id: None,
                 seq: 1, kind: EntryKind::Agent("안녕하세요 반갑습니다".into())
             }),
             todo: None,
@@ -1060,7 +1063,7 @@ fn a_click_without_moving_does_not_select() {
         &mut s,
         &Action::Frame(AppFrame::Event {
             cursor: 1,
-            entry: Some(Entry { seq: 1, kind: EntryKind::Agent("본문".into()) }),
+            entry: Some(Entry { id: None, seq: 1, kind: EntryKind::Agent("본문".into()) }),
             todo: None,
             plan: None,
         }),
@@ -1082,6 +1085,7 @@ fn the_selection_survives_releasing_the_mouse() {
         &Action::Frame(AppFrame::Event {
             cursor: 1,
             entry: Some(Entry {
+                id: None,
                 seq: 1, kind: EntryKind::Agent("안녕하세요 반갑습니다".into())
             }),
             todo: None,
@@ -1109,6 +1113,7 @@ fn moving_after_release_does_not_grow_the_selection() {
         &Action::Frame(AppFrame::Event {
             cursor: 1,
             entry: Some(Entry {
+                id: None,
                 seq: 1, kind: EntryKind::Agent("안녕하세요 반갑습니다".into())
             }),
             todo: None,
@@ -1136,6 +1141,7 @@ fn scrolling_keeps_the_selection() {
             &Action::Frame(AppFrame::Event {
                 cursor: i,
                 entry: Some(Entry {
+                    id: None,
                     seq: i, kind: EntryKind::Agent(format!("줄 {i} 내용입니다"))
                 }),
                 todo: None,
@@ -1171,7 +1177,7 @@ fn the_highlight_covers_only_the_selected_columns() {
         &mut s,
         &Action::Frame(AppFrame::Event {
             cursor: 1,
-            entry: Some(Entry { seq: 1, kind: EntryKind::Agent("abcdefghij".into()) }),
+            entry: Some(Entry { id: None, seq: 1, kind: EntryKind::Agent("abcdefghij".into()) }),
             todo: None,
             plan: None,
         }),
@@ -1211,6 +1217,7 @@ fn typing_drops_the_selection() {
         &Action::Frame(AppFrame::Event {
             cursor: 1,
             entry: Some(Entry {
+                id: None,
                 seq: 1, kind: EntryKind::Agent("안녕하세요 반갑습니다".into())
             }),
             todo: None,
@@ -1235,6 +1242,7 @@ fn question_event(seq: i64, result: serde_json::Value) -> AppFrame {
     AppFrame::Event {
         cursor: seq,
         entry: zyris_code::event::entry_from(&zyris_attacca::ZSessionEvent {
+            id: None,
             seq,
             cursor: seq,
             kind: "tool_call".into(),
@@ -1280,6 +1288,7 @@ fn an_open_ended_question_whose_wait_ran_out_is_still_answerable() {
     let asked = AppFrame::Event {
         cursor: 1,
         entry: zyris_code::event::entry_from(&zyris_attacca::ZSessionEvent {
+            id: None,
             seq: 1,
             cursor: 1,
             kind: "tool_call".into(),
@@ -1424,7 +1433,7 @@ fn the_picker_overlays_the_conversation_and_takes_the_keys() {
         &mut s,
         &Action::Frame(AppFrame::Event {
             cursor: 1,
-            entry: Some(Entry { seq: 1, kind: EntryKind::Agent("뒤에 있는 대화".into()) }),
+            entry: Some(Entry { id: None, seq: 1, kind: EntryKind::Agent("뒤에 있는 대화".into()) }),
             todo: None,
             plan: None,
         }),
@@ -1650,6 +1659,7 @@ fn the_picker_box_stays_inside_the_screen_with_wide_text_behind() {
             &Action::Frame(AppFrame::Event {
                 cursor: i,
                 entry: Some(Entry {
+                    id: None,
                     seq: i,
                     kind: EntryKind::Agent(
                         "한글이 잔뜩 들어간 아주 긴 줄입니다 계속 이어집니다".into(),
@@ -1686,6 +1696,7 @@ fn an_answer_is_one_line_under_its_question_and_a_typed_pick_is_marked() {
         &Action::Frame(AppFrame::Event {
             cursor: 2,
             entry: Some(Entry {
+                id: None,
                 seq: 2,
                 kind: EntryKind::User(
                     "어느 쪽으로 갈까요?\n  - A안 (빠르다)\n  - 직접 입력: 내가 쓴 답".into(),
@@ -1948,6 +1959,7 @@ fn state_with_edit_tool() -> State {
         &Action::Frame(AppFrame::Event {
             cursor: 1,
             entry: Some(Entry {
+                id: None,
                 seq: 1, kind: EntryKind::WorkStart("파일을 고치는 중".into())
             }),
             todo: None,
@@ -1959,6 +1971,7 @@ fn state_with_edit_tool() -> State {
         &Action::Frame(AppFrame::Event {
             cursor: 2,
             entry: Some(Entry {
+                id: None,
                 seq: 2,
                 kind: EntryKind::Tool {
                     name: "zyris__arch__code_edit__edit".into(),
@@ -2222,7 +2235,7 @@ fn the_enroll_window_overlays_the_conversation() {
         &mut s,
         &Action::Frame(AppFrame::Event {
             cursor: 1,
-            entry: Some(Entry { seq: 1, kind: EntryKind::Agent("뒤에 있는 대화".into()) }),
+            entry: Some(Entry { id: None, seq: 1, kind: EntryKind::Agent("뒤에 있는 대화".into()) }),
             todo: None,
             plan: None,
         }),
@@ -2497,6 +2510,7 @@ fn a_bare_url_in_an_answer_is_not_wrapped() {
 #[test]
 fn a_report_is_a_row_and_leaves_the_input_alone() {
     let event = zyris_attacca::ZSessionEvent {
+        id: None,
         seq: 1,
         cursor: 1,
         kind: "tool_call".into(),
@@ -2568,6 +2582,7 @@ fn show_a_work_card() {
     use zyris_code::timeline::Timeline;
 
     let ev = |seq: i64, kind: &str, payload: serde_json::Value| zyris_attacca::ZSessionEvent {
+        id: None,
         seq,
         cursor: seq,
         kind: kind.into(),

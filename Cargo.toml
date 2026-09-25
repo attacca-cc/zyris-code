@@ -14,12 +14,12 @@ members = ["crates/zyris-code"]
 # `cargo metadata` failed. At the time zyris-code leaned on code **only we knew about**, and with a
 # single copy there was nothing to recover with. Open a PR, merge it, and write that commit here — never attach by path.
 #
-# The `rev` below is `eefbde4`, the merge of zyris-protocol's credential/node redesign
-# (`docs/superpowers/specs/2026-09-23-credential-node-redesign-design.md`): one `zc_` credential per
-# program per system, with every window a node of its own named after its working directory.
+# The `rev` below is `733ae80`, which carries `ZSessionEvent.id` on top of the merge of
+# zyris-protocol's `cancel_turn` delivery point and `ZTurnFrame::Cancelled`
+# (zyris-protocol#44): a moved event can now be recognised by id.
 [workspace.dependencies]
-zyris = { git = "https://github.com/attacca-cc/zyris-protocol", rev = "eefbde4ce11635828eea871e79a685dedc0ea917", features = ["enroll"] }
-zyris-attacca = { git = "https://github.com/attacca-cc/zyris-protocol", rev = "eefbde4ce11635828eea871e79a685dedc0ea917" }
+zyris = { git = "https://github.com/attacca-cc/zyris-protocol", rev = "733ae807f540535fab9f6c3ae646e27e28f4b48b", features = ["enroll"] }
+zyris-attacca = { git = "https://github.com/attacca-cc/zyris-protocol", rev = "733ae807f540535fab9f6c3ae646e27e28f4b48b" }
 # The capability declarations (`zyris-caps`) and the two reference implementations this node serves
 # (`zyris-fs`, `zyris-terminal`). **All five must be the same rev** — otherwise the same crate gets
 # linked twice, causing a "same type but the types differ" error.
@@ -38,9 +38,9 @@ zyris-attacca = { git = "https://github.com/attacca-cc/zyris-protocol", rev = "e
 #   zyris_capkit::LocalFileIo  -> zyris_fs::LocalFileIo
 #   zyris_capkit::PtyTerminal  -> zyris_terminal::PtyTerminal
 #   zyris_capkit::resolve_under -> zyris_caps::resolve_under   (moved *down*, to the declarations)
-zyris-caps = { git = "https://github.com/attacca-cc/zyris-protocol", rev = "eefbde4ce11635828eea871e79a685dedc0ea917" }
-zyris-fs = { git = "https://github.com/attacca-cc/zyris-protocol", rev = "eefbde4ce11635828eea871e79a685dedc0ea917" }
-zyris-terminal = { git = "https://github.com/attacca-cc/zyris-protocol", rev = "eefbde4ce11635828eea871e79a685dedc0ea917" }
+zyris-caps = { git = "https://github.com/attacca-cc/zyris-protocol", rev = "733ae807f540535fab9f6c3ae646e27e28f4b48b" }
+zyris-fs = { git = "https://github.com/attacca-cc/zyris-protocol", rev = "733ae807f540535fab9f6c3ae646e27e28f4b48b" }
+zyris-terminal = { git = "https://github.com/attacca-cc/zyris-protocol", rev = "733ae807f540535fab9f6c3ae646e27e28f4b48b" }
 
 # **The repository was renamed** `attacca-cc/zyris` -> `attacca-cc/zyris-protocol`. GitHub redirects
 # the old name, so the old URL kept resolving — until somebody creates a repository at the name it
