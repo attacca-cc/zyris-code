@@ -125,7 +125,9 @@ fn a_user_message_appears_above_the_input() {
         &mut s,
         &Action::Frame(AppFrame::Event {
             cursor: 1,
-            entry: Some(Entry { id: None, seq: 1, kind: EntryKind::User("안녕하세요".into()) }),
+            entry: Some(Entry {
+                id: None, seq: 1, kind: EntryKind::User("안녕하세요".into())
+            }),
             todo: None,
             plan: None,
         }),
@@ -160,7 +162,9 @@ fn the_servers_copy_of_a_submitted_message_does_not_double_it() {
         &mut s,
         &Action::Frame(AppFrame::Event {
             cursor: 1,
-            entry: Some(Entry { id: None, seq: 1, kind: EntryKind::User("안녕하세요".into()) }),
+            entry: Some(Entry {
+                id: None, seq: 1, kind: EntryKind::User("안녕하세요".into())
+            }),
             todo: None,
             plan: None,
         }),
@@ -517,7 +521,8 @@ fn drawing_at_a_very_narrow_width_does_not_panic() {
             cursor: 1,
             entry: Some(Entry {
                 id: None,
-                seq: 1, kind: EntryKind::Agent("한글 **강조** `코드`".into())
+                seq: 1,
+                kind: EntryKind::Agent("한글 **강조** `코드`".into()),
             }),
             todo: None,
             plan: None,
@@ -792,7 +797,11 @@ fn a_form_being_open_does_not_swallow_what_the_server_says() {
             &mut s,
             &Action::Frame(AppFrame::Event {
                 cursor: 42,
-                entry: Some(Entry { id: None, seq: 42, kind: EntryKind::Agent("들어온 말".into()) }),
+                entry: Some(Entry {
+                    id: None,
+                    seq: 42,
+                    kind: EntryKind::Agent("들어온 말".into()),
+                }),
                 todo: None,
                 plan: None,
             }),
@@ -939,7 +948,11 @@ fn the_head_keeps_breathing_while_nothing_else_changes() {
         &mut s,
         &Action::Frame(AppFrame::Event {
             cursor: 1,
-            entry: Some(Entry { id: None, seq: 1, kind: EntryKind::WorkStart("빌드하는 중".into()) }),
+            entry: Some(Entry {
+                id: None,
+                seq: 1,
+                kind: EntryKind::WorkStart("빌드하는 중".into()),
+            }),
             todo: None,
             plan: None,
         }),
@@ -1035,7 +1048,8 @@ fn dragging_selects_text_and_the_selection_survives_the_release() {
             cursor: 1,
             entry: Some(Entry {
                 id: None,
-                seq: 1, kind: EntryKind::Agent("안녕하세요 반갑습니다".into())
+                seq: 1,
+                kind: EntryKind::Agent("안녕하세요 반갑습니다".into()),
             }),
             todo: None,
             plan: None,
@@ -1086,7 +1100,8 @@ fn the_selection_survives_releasing_the_mouse() {
             cursor: 1,
             entry: Some(Entry {
                 id: None,
-                seq: 1, kind: EntryKind::Agent("안녕하세요 반갑습니다".into())
+                seq: 1,
+                kind: EntryKind::Agent("안녕하세요 반갑습니다".into()),
             }),
             todo: None,
             plan: None,
@@ -1114,7 +1129,8 @@ fn moving_after_release_does_not_grow_the_selection() {
             cursor: 1,
             entry: Some(Entry {
                 id: None,
-                seq: 1, kind: EntryKind::Agent("안녕하세요 반갑습니다".into())
+                seq: 1,
+                kind: EntryKind::Agent("안녕하세요 반갑습니다".into()),
             }),
             todo: None,
             plan: None,
@@ -1142,7 +1158,8 @@ fn scrolling_keeps_the_selection() {
                 cursor: i,
                 entry: Some(Entry {
                     id: None,
-                    seq: i, kind: EntryKind::Agent(format!("줄 {i} 내용입니다"))
+                    seq: i,
+                    kind: EntryKind::Agent(format!("줄 {i} 내용입니다")),
                 }),
                 todo: None,
                 plan: None,
@@ -1218,7 +1235,8 @@ fn typing_drops_the_selection() {
             cursor: 1,
             entry: Some(Entry {
                 id: None,
-                seq: 1, kind: EntryKind::Agent("안녕하세요 반갑습니다".into())
+                seq: 1,
+                kind: EntryKind::Agent("안녕하세요 반갑습니다".into()),
             }),
             todo: None,
             plan: None,
@@ -1433,7 +1451,11 @@ fn the_picker_overlays_the_conversation_and_takes_the_keys() {
         &mut s,
         &Action::Frame(AppFrame::Event {
             cursor: 1,
-            entry: Some(Entry { id: None, seq: 1, kind: EntryKind::Agent("뒤에 있는 대화".into()) }),
+            entry: Some(Entry {
+                id: None,
+                seq: 1,
+                kind: EntryKind::Agent("뒤에 있는 대화".into()),
+            }),
             todo: None,
             plan: None,
         }),
@@ -1960,7 +1982,8 @@ fn state_with_edit_tool() -> State {
             cursor: 1,
             entry: Some(Entry {
                 id: None,
-                seq: 1, kind: EntryKind::WorkStart("파일을 고치는 중".into())
+                seq: 1,
+                kind: EntryKind::WorkStart("파일을 고치는 중".into()),
             }),
             todo: None,
             plan: None,
@@ -2235,7 +2258,11 @@ fn the_enroll_window_overlays_the_conversation() {
         &mut s,
         &Action::Frame(AppFrame::Event {
             cursor: 1,
-            entry: Some(Entry { id: None, seq: 1, kind: EntryKind::Agent("뒤에 있는 대화".into()) }),
+            entry: Some(Entry {
+                id: None,
+                seq: 1,
+                kind: EntryKind::Agent("뒤에 있는 대화".into()),
+            }),
             todo: None,
             plan: None,
         }),

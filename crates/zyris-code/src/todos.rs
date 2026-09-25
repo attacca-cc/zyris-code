@@ -162,7 +162,14 @@ mod tests {
     use serde_json::json;
 
     fn ev(seq: i64, payload: Value) -> ZSessionEvent {
-        ZSessionEvent { id: None, seq, cursor: seq, kind: "tool_call".into(), payload, created_at: None }
+        ZSessionEvent {
+            id: None,
+            seq,
+            cursor: seq,
+            kind: "tool_call".into(),
+            payload,
+            created_at: None,
+        }
     }
 
     fn item(id: &str, content: &str, status: &str) -> Value {

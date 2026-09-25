@@ -34,7 +34,9 @@ fn conversation(turns: usize, table_rows: usize) -> Timeline {
     let mut seq = 0i64;
     for i in 0..turns {
         seq += 1;
-        t.upsert(Entry { id: None, seq, kind: EntryKind::User(format!("{i}번째 질문입니다")) });
+        t.upsert(Entry {
+            id: None, seq, kind: EntryKind::User(format!("{i}번째 질문입니다"))
+        });
         seq += 1;
         t.upsert(Entry { id: None, seq, kind: EntryKind::WorkStart(format!("{i}번째 작업")) });
         seq += 1;
@@ -238,7 +240,8 @@ fn measure_bytes_on_the_wire() {
     let mut seq = 0i64;
     for i in 0..6 {
         seq += 1;
-        let entry = Entry { id: None, seq, kind: EntryKind::User(format!("{i}번째 질문입니다")) };
+        let entry =
+            Entry { id: None, seq, kind: EntryKind::User(format!("{i}번째 질문입니다")) };
         apply(
             &mut state,
             &Action::Frame(AppFrame::Event {

@@ -9237,7 +9237,9 @@ mod tests {
         let work = |seq: i64| {
             Action::Frame(Frame::Event {
                 cursor: seq,
-                entry: Some(Entry { id: None, seq, kind: EntryKind::WorkStart("빌드 중".into()) }),
+                entry: Some(Entry {
+                    id: None, seq, kind: EntryKind::WorkStart("빌드 중".into())
+                }),
                 todo: None,
                 plan: None,
             })
@@ -9582,7 +9584,11 @@ mod tests {
             &mut s,
             &Action::Frame(Frame::Event {
                 cursor: 2,
-                entry: Some(Entry { id: None, seq: 2, kind: EntryKind::Agent("먼저 볼게요".into()) }),
+                entry: Some(Entry {
+                    id: None,
+                    seq: 2,
+                    kind: EntryKind::Agent("먼저 볼게요".into()),
+                }),
                 todo: None,
                 plan: None,
             }),

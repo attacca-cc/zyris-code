@@ -74,7 +74,8 @@ fn full_screen() -> State {
                 cursor: seq,
                 entry: Some(Entry {
                     id: None,
-                    seq, kind: EntryKind::User(format!("{i}번째 질문입니다"))
+                    seq,
+                    kind: EntryKind::User(format!("{i}번째 질문입니다")),
                 }),
                 todo: None,
                 plan: None,
