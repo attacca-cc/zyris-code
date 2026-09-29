@@ -103,6 +103,7 @@ fn an_update_asked_for_by_name_installs_once() {
             ("ZYRIS_CODE_UPDATE_TAG", "v99.0.0".into()),
             ("ZYRIS_CODE_UPDATE_SCRIPT", script.display().to_string()),
             ("ZYRIS_CODE_LANG", "en".into()),
+            ("ZYRIS_CODE_LOG", dir.join("log").display().to_string()),
         ],
     );
     let output = output.expect("`--update` never ended — it is installing in a loop");
@@ -142,6 +143,9 @@ fn print_mode_never_updates() {
             ("ZYRIS_CREDENTIAL", "zc_update_test_not_a_real_token".into()),
             ("ZYRIS_SERVER_URL", "ws://127.0.0.1:1".into()),
             ("ZYRIS_CONFIG_DIR", dir.display().to_string()),
+            // **Not the default log.** That one belongs to whatever zyris-code session is running
+            // this suite, and the app empties it on start.
+            ("ZYRIS_CODE_LOG", dir.join("log").display().to_string()),
         ],
         Duration::from_secs(8),
     );
