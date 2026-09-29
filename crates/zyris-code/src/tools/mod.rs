@@ -8,6 +8,7 @@
 //! the `/config` directory-access setting (deny by default; `allow` runs it without asking).
 
 pub mod bridge;
+pub mod clean;
 pub mod diff;
 pub mod edit;
 pub mod gate;

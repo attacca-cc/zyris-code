@@ -16,6 +16,7 @@ use zyris::{
 
 use crate::app::Frame;
 use crate::tools::bridge::Bridge;
+use crate::tools::clean;
 use crate::tools::gate::{dangling_write, escaping_path, resolved_args, target_of, Call, Decision};
 
 pub struct Gate<C> {
@@ -88,7 +89,12 @@ impl<C: ServeCapability> ServeCapability for Gate<C> {
             return Err(WireError::invalid_params(why));
         }
 
-        let (call, cut) = self.clamp_exec(call, &args, exec_ceiling());
+        // **Most escape sequences never happen if the child is told not to colour.** Cleaning up
+        // afterwards (`tools::clean`) is the fallback, not the plan. Written in after the hooks, so
+        // a hook sees the arguments the agent sent and not ours.
+        let sent = quiet_env(&self.capability, &call.tool, args.clone());
+        call.params = Payload::from_json(sent.clone());
+        let (call, cut) = self.clamp_exec(call, &sent, exec_ceiling());
         // **Shows what's running while it runs.** `exec` gives its result only once at completion
         // (protocol §terminal), so without this a human waits out the whole command knowing nothing.
         // **Which window took this call.** With several windows up, it only goes to the one the server picked, and
@@ -116,6 +122,13 @@ impl<C: ServeCapability> ServeCapability for Gate<C> {
         // this file rather than from the capability that runs it.
         self.tell_the_screen_a_job_started(&gated, &out, session);
         self.note_the_shells(&gated, &args, &out);
+        // **`tools::clean` takes the terminal's own noise off here, before anything is added to
+        // the result.** Appended first, the sentence the cut writes would go through the cleaning
+        // as well.
+        let out = match (gated.capability.as_str(), gated.tool.as_str()) {
+            ("terminal", "exec") => clean_the_output(out),
+            _ => out,
+        };
         let out = match cut {
             Some(deadline) => note_the_cut(out, deadline),
             None => out,
@@ -175,6 +188,53 @@ impl ExecSize {
             command: command.chars().take(Self::COMMAND_LIMIT).collect(),
         })
     }
+}
+
+/// The result with both streams cleaned.
+///
+/// **Only `terminal.exec` gets this**, and the caller decides that (`Gate::dispatch`) — it is the
+/// one tool whose output nothing else bounds. Each stream goes through `clean::clean` — the
+/// cleaning itself lives in `tools::clean`. Anything that is not a plain response, or has no such
+/// field in it, passes through as it was.
+fn clean_the_output(out: Outgoing) -> Outgoing {
+    let Outgoing::Response(payload) = out else { return out };
+    let Ok(mut v) = payload.to_json() else { return Outgoing::Response(payload) };
+    let Some(obj) = v.as_object_mut() else { return Outgoing::Response(payload) };
+    for key in ["stdout", "stderr"] {
+        let cleaned = obj.get(key).and_then(Value::as_str).map(clean::clean);
+        if let Some(cleaned) = cleaned {
+            obj.insert(key.to_string(), Value::from(cleaned));
+        }
+    }
+    Outgoing::Response(Payload::from_json(v))
+}
+
+/// **Ask for no colour rather than strip it afterwards.** Most of what fills an `exec` result with
+/// escape sequences is a tool deciding to be colourful, and it has no reason to think anybody is
+/// watching. Saying so is cheaper at both ends than cleaning up after it, and some tools write
+/// nothing at all once they know.
+///
+/// The call's own `env` wins wherever it names the same key: this fills a default in, it does not
+/// overrule an instruction.
+fn quiet_env(capability: &str, tool: &str, mut args: Value) -> Value {
+    const QUIET: [(&str, &str); 2] = [("CARGO_TERM_COLOR", "never"), ("NO_COLOR", "1")];
+    if (capability, tool) != ("terminal", "exec") {
+        return args;
+    }
+    if let Some(obj) = args.as_object_mut() {
+        let env = obj.entry("env").or_insert_with(|| Value::Object(serde_json::Map::new()));
+        // `env` is a map on the wire, so anything else — a call that spelled it `null` — is
+        // replaced rather than merged into. The terminal would refuse the call otherwise.
+        if !env.is_object() {
+            *env = Value::Object(serde_json::Map::new());
+        }
+        if let Some(map) = env.as_object_mut() {
+            for (key, value) in QUIET {
+                map.entry(key).or_insert_with(|| Value::from(value));
+            }
+        }
+    }
+    args
 }
 
 impl<C: ServeCapability> Gate<C> {
@@ -752,5 +812,64 @@ mod tests {
 
         let read = Call::new("file_io", "read", String::new());
         assert_eq!(ExecSize::of(&read, &json!({}), &out), None);
+    }
+
+    /// Both streams of an `exec` answer, and nothing else in it.
+    #[test]
+    fn an_exec_results_streams_are_both_cleaned() {
+        let out = Outgoing::Response(Payload::from_json(json!({
+            "exit_code": 0,
+            "stdout": "a\u{1b}[0m\rb\n",
+            "stderr": "\u{1b}[31me\u{1b}[0m\n",
+            "timed_out": false,
+        })));
+        let Outgoing::Response(p) = clean_the_output(out) else { panic!("a unary response") };
+        let v = p.to_json().unwrap();
+        assert_eq!(v["stdout"], json!("b\n"));
+        assert_eq!(v["stderr"], json!("e\n"));
+        assert_eq!(v["exit_code"], json!(0));
+        assert_eq!(v["timed_out"], json!(false));
+    }
+
+    /// **The sentence a cut adds is not shaped along with the output.** Shaped first and noted
+    /// after, or the words the agent needs to read would go through the cleaning as well.
+    #[test]
+    fn the_note_a_cut_adds_survives_the_cleaning() {
+        let out = Outgoing::Response(Payload::from_json(json!({
+            "exit_code": -1,
+            "stdout": "",
+            "stderr": "a\u{1b}[0mb",
+            "timed_out": true,
+        })));
+        let out = clean_the_output(out);
+        let Outgoing::Response(p) = note_the_cut(out, Duration::from_secs(1800)) else {
+            panic!("a unary response")
+        };
+        let stderr = p.to_json().unwrap()["stderr"].as_str().unwrap().to_string();
+        assert!(stderr.starts_with("ab\n\n"), "{stderr}");
+        assert!(stderr.contains("wait.start"), "{stderr}");
+    }
+
+    /// **Colour is asked for off, not only stripped off.** And the call's own `env` is not
+    /// overruled — this fills a default in, it does not contradict an instruction.
+    #[test]
+    fn an_exec_is_asked_for_no_colour_and_other_calls_are_not() {
+        let args = quiet_env("terminal", "exec", json!({"command": "cargo test"}));
+        let env = args["env"].as_object().expect("an env map is written in");
+        assert_eq!(env["CARGO_TERM_COLOR"], json!("never"));
+        assert_eq!(env["NO_COLOR"], json!("1"));
+
+        let asked = quiet_env("terminal", "exec", json!({"env": {"CARGO_TERM_COLOR": "always"}}));
+        assert_eq!(asked["env"]["CARGO_TERM_COLOR"], json!("always"));
+        assert_eq!(asked["env"]["NO_COLOR"], json!("1"));
+        // Spelled `null`, the map is written rather than merged into: the terminal takes a map.
+        let nulled = quiet_env("terminal", "exec", json!({"env": null}));
+        assert_eq!(nulled["env"]["NO_COLOR"], json!("1"));
+
+        // Another tool of the same capability, and another call, are untouched.
+        let open = json!({"shell": "zsh"});
+        assert_eq!(quiet_env("terminal", "open", open.clone()), open);
+        let read = json!({"path": "a"});
+        assert_eq!(quiet_env("file_io", "read", read.clone()), read);
     }
 }
