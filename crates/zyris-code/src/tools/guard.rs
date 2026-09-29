@@ -116,9 +116,63 @@ impl<C: ServeCapability> ServeCapability for Gate<C> {
         // this file rather than from the capability that runs it.
         self.tell_the_screen_a_job_started(&gated, &out, session);
         self.note_the_shells(&gated, &args, &out);
-        Ok(match cut {
+        let out = match cut {
             Some(deadline) => note_the_cut(out, deadline),
             None => out,
+        };
+        // **How big an `exec` answer is, as the agent receives it.** `exec` is the costliest tool
+        // in tokens, and which commands make it so cannot be read from anywhere else. This is what
+        // an output budget for it gets sized from. `grep 'exec result'` in the log.
+        if let Some(size) = ExecSize::of(&gated, &args, &out) {
+            tracing::info!(
+                bytes = size.bytes,
+                stdout = size.stdout,
+                stderr = size.stderr,
+                exit_code = size.exit_code,
+                command = %size.command,
+                "exec result"
+            );
+        }
+        Ok(out)
+    }
+}
+
+/// The size of one `terminal.exec` answer, for the log.
+#[derive(Debug, PartialEq)]
+struct ExecSize {
+    /// The whole answer serialized — what actually goes on the wire and into the agent's context.
+    bytes: usize,
+    stdout: usize,
+    stderr: usize,
+    exit_code: i64,
+    /// The command on one line, clipped: enough to tell `cargo test` from `cat`, no more.
+    command: String,
+}
+
+impl ExecSize {
+    const COMMAND_LIMIT: usize = 120;
+
+    fn of(call: &Call, args: &Value, out: &Outgoing) -> Option<ExecSize> {
+        if (call.capability.as_str(), call.tool.as_str()) != ("terminal", "exec") {
+            return None;
+        }
+        let body = response_json(out)?;
+        let len = |k: &str| body.get(k).and_then(Value::as_str).map_or(0, str::len);
+        let command = match args.get("command").and_then(Value::as_str) {
+            Some(c) => c.to_string(),
+            None => args
+                .get("argv")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" "))
+                .unwrap_or_default(),
+        };
+        let command = command.split_whitespace().collect::<Vec<_>>().join(" ");
+        Some(ExecSize {
+            bytes: serde_json::to_string(&body).map_or(0, |s| s.len()),
+            stdout: len("stdout"),
+            stderr: len("stderr"),
+            exit_code: body.get("exit_code").and_then(Value::as_i64).unwrap_or(-1),
+            command: command.chars().take(Self::COMMAND_LIMIT).collect(),
         })
     }
 }
@@ -676,5 +730,27 @@ mod tests {
             panic!("it must be a unary response")
         };
         assert_eq!(p.to_json().unwrap()["stderr"], json!(""));
+    }
+
+    /// **The log measures what the agent receives**, names the command on one line, and says
+    /// nothing about any other tool.
+    #[test]
+    fn an_exec_answer_is_measured_and_nothing_else_is() {
+        let out = Outgoing::Response(Payload::from_json(
+            json!({"exit_code": 101, "stdout": "abc", "stderr": "é", "timed_out": false}),
+        ));
+        let exec = Call::new("terminal", "exec", String::new());
+        let size = ExecSize::of(&exec, &json!({"command": "cargo\n  test"}), &out).unwrap();
+        assert_eq!((size.stdout, size.stderr, size.exit_code), (3, 2, 101));
+        assert_eq!(size.command, "cargo test");
+        assert_eq!(size.bytes, serde_json::to_string(&response_json(&out).unwrap()).unwrap().len());
+
+        let argv = ExecSize::of(&exec, &json!({"argv": ["git", "log"]}), &out).unwrap();
+        assert_eq!(argv.command, "git log");
+        let long = ExecSize::of(&exec, &json!({"command": "x".repeat(500)}), &out).unwrap();
+        assert_eq!(long.command.len(), ExecSize::COMMAND_LIMIT);
+
+        let read = Call::new("file_io", "read", String::new());
+        assert_eq!(ExecSize::of(&read, &json!({}), &out), None);
     }
 }
