@@ -41,6 +41,8 @@ import tempfile
 MARK_CUT = "exec output cut"
 MARK_RESULT = "exec result"
 MARK_CALL = "took a tool call"
+MARK_ANSWER = "tool result"
+_ANSWER = re.compile(r"tool result capability=(\S+) tool=(\S+) bytes=(\d+) target=(.*)$")
 
 _INT = re.compile(r"\b(\w+)=(-?\d+)(?=\s|$)")
 _STR = re.compile(r'\b(\w+)="((?:[^"\\]|\\.)*)"')
@@ -132,6 +134,7 @@ def read_log(path: str, pid: int | None = None, everything: bool = False) -> dic
 
     results: list[dict] = []
     calls: dict = {}
+    answers: list[dict] = []
     first_ts = last_ts = None
     pending = None  # (job, full, line number)
 
@@ -149,6 +152,12 @@ def read_log(path: str, pid: int | None = None, everything: bool = False) -> dic
         if MARK_CUT in head and MARK_RESULT not in head:
             f = fields(head)
             pending = (f.get("job"), f.get("full"), number)
+        elif MARK_ANSWER in head:
+            m = _ANSWER.search(line)
+            if m:
+                answers.append(
+                    {"key": f"{m.group(1)}.{m.group(2)}", "bytes": int(m.group(3)), "target": m.group(4).strip()}
+                )
         elif MARK_CALL in head:
             f = fields(head)
             key = f"{f.get('capability', '?')}.{f.get('tool', '?')}"
@@ -173,6 +182,7 @@ def read_log(path: str, pid: int | None = None, everything: bool = False) -> dic
         "first": first_ts,
         "last": last_ts,
         "calls": calls,
+        "answers": answers,
         "results": results,
         "cut": cut,
         "delivered": delivered,
@@ -261,10 +271,35 @@ def render(log: dict, top: int) -> list[str]:
         )
     out.append("")
 
+    if log["answers"]:
+        per: dict = {}
+        for a in log["answers"]:
+            per.setdefault(a["key"], []).append(a["bytes"])
+        spent = sum(a["bytes"] for a in log["answers"])
+        out += [
+            "**What every tool's answers cost** (on the wire, as the agent receives them):",
+            "",
+            "| tool | answers | bytes | tokens | share | largest |",
+            "| --- | ---: | ---: | ---: | ---: | ---: |",
+        ]
+        for key, sizes in sorted(per.items(), key=lambda kv: -sum(kv[1]))[:12]:
+            out.append(
+                f"| `{key}` | {num(len(sizes))} | {num(sum(sizes))} | {tokens(sum(sizes))} |"
+                f" {pct(sum(sizes), spent)} | {num(max(sizes))} |"
+            )
+        out.append("")
+        reads = sorted((a for a in log["answers"] if a["key"] == "file_io.read"), key=lambda a: -a["bytes"])
+        if reads:
+            out += ["**The largest file reads:**", "", "| file | bytes |", "| --- | ---: |"]
+            out += [f"| `{clip(a['target'])}` | {num(a['bytes'])} |" for a in reads[:5]]
+            out.append("")
+
     if log["calls"]:
         total = sum(log["calls"].values())
         exec_calls = log["calls"].get("terminal.exec", 0)
-        follow = log["calls"].get("wait.logs", 0)
+        cut_jobs = {r["job"] for r in cut}
+        follow = sum(1 for a in log["answers"] if a["key"] == "wait.logs" and a["target"] in cut_jobs)
+        other_logs = sum(1 for a in log["answers"] if a["key"] == "wait.logs") - follow
         out += [
             "**Every tool call in the log** — and whether the agent pages back what was cut:",
             "",
@@ -283,10 +318,10 @@ def render(log: dict, top: int) -> list[str]:
         ]
         if exec_calls:
             out += [
-                f"`terminal.exec` is {pct(exec_calls, total)} of the calls. `wait.logs` was"
-                f" called {num(follow)} times against {num(len(cut))} cut answers — if the agent"
-                " pages the whole output back every time, the budget saves nothing and the"
-                " steering has to carry the weight.",
+                f"`terminal.exec` is {pct(exec_calls, total)} of the calls. `wait.logs`"
+                f" read a cut answer back {num(follow)} times against {num(len(cut))} cut answers"
+                f" (and a background job's log {num(other_logs)} times) — if the agent pages the"
+                " whole output back every time, the budget saves nothing.",
                 "",
             ]
     return out
