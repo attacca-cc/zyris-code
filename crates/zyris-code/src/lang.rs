@@ -2751,22 +2751,9 @@ const ACTIVITY_WIDTH: usize = 48;
 /// `chars().take(n)` is wrong here for the same reason it is wrong everywhere in this app: a
 /// Hangul syllable is one `char` and two columns, so counting characters buys twice the line.
 fn clip_columns(text: &str, width: usize) -> String {
-    if crate::markdown::display_width(text) <= width {
-        return text.to_string();
-    }
-    let mut out = String::new();
-    let mut used = 0;
-    // One column is kept for the ellipsis, so the result never reads as if it ended there.
-    for ch in text.chars() {
-        let w = crate::markdown::display_width(&ch.to_string()).max(1);
-        if used + w > width.saturating_sub(1) {
-            break;
-        }
-        out.push(ch);
-        used += w;
-    }
-    out.push('…');
-    out
+    // One column is kept for the ellipsis, so the result never reads as if it ended there — and
+    // the cut is by cluster, like everything else measured for the screen.
+    crate::markdown::truncate_to(text, width)
 }
 
 #[cfg(test)]

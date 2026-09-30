@@ -119,13 +119,14 @@ fn chip_title(t: &crate::timeline::Think, lang: crate::lang::Lang) -> String {
     // sentence to be worth reading, and the last one inside the budget wins.
     let mut cut = 0usize;
     let mut used = 0usize;
-    for (i, ch) in first.char_indices() {
-        used += markdown::display_width(&ch.to_string()).max(1);
+    // Walked by cluster and measured as drawn, like every other width here.
+    for (i, g) in unicode_segmentation::UnicodeSegmentation::grapheme_indices(first, true) {
+        used += markdown::display_width(g);
         if used > CHIP_TITLE_WIDTH {
             break;
         }
-        if used >= CHIP_TITLE_FLOOR && matches!(ch, '.' | '!' | '?' | '。' | '！' | '？') {
-            cut = i + ch.len_utf8();
+        if used >= CHIP_TITLE_FLOOR && matches!(g, "." | "!" | "?" | "。" | "！" | "？") {
+            cut = i + g.len();
         }
     }
     if cut > 0 {

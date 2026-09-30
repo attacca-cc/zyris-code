@@ -275,15 +275,10 @@ fn has_note(row: &crate::picker::Row) -> bool {
 /// box, so `truncate` would hand one back untouched and say nothing about what the note lost.
 fn mark_more(line: &str, limit: usize) -> String {
     let limit = limit.max(1);
-    let mut out = String::new();
-    for ch in line.chars() {
-        if display_width(&out) + display_width(&ch.to_string()) > limit.saturating_sub(1) {
-            break;
-        }
-        out.push(ch);
+    if display_width(line) < limit {
+        return format!("{line}…");
     }
-    out.push('…');
-    out
+    crate::markdown::truncate_to(line, limit)
 }
 
 /// The note under the list: the cursor's row's, wrapped to the box — empty when it has none.
@@ -304,20 +299,11 @@ fn label_to_fit(width: usize, label: &str, status: bool) -> String {
     truncate(label, width.saturating_sub(2 + dot))
 }
 
-/// Truncates to fit the column count. When cut, appends `…` to show it was cut.
+/// Truncates to fit the column count. When cut, appends `…` to show it was cut — by cluster,
+/// through the one implementation (`markdown::truncate_to`), so a cut never lands between a
+/// letter and its mark or inside an emoji sequence.
 fn truncate(s: &str, limit: usize) -> String {
-    if display_width(s) <= limit {
-        return s.to_string();
-    }
-    let mut out = String::new();
-    for ch in s.chars() {
-        if display_width(&out) + display_width(&ch.to_string()) > limit.saturating_sub(1) {
-            break;
-        }
-        out.push(ch);
-    }
-    out.push('…');
-    out
+    crate::markdown::truncate_to(s, limit)
 }
 
 /// Replaces the leading half of a wide character straddling the box's left edge with a space.
@@ -342,6 +328,17 @@ pub(crate) fn scrub_left_edge(frame: &mut Frame, box_area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A cut never splits a cluster.** Walked by `char`, a title could end on a letter whose
+    /// accent was dropped, or on half an emoji sequence.
+    #[test]
+    fn a_cut_label_keeps_whole_clusters() {
+        assert_eq!(truncate("e\u{301}\u{301}xyz", 2), "e\u{301}\u{301}…");
+        let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}";
+        assert_eq!(truncate(&format!("{family}abc"), 3), format!("{family}…"));
+        assert_eq!(mark_more("ab", 5), "ab…");
+        assert_eq!(mark_more("abcdef", 4), "abc…");
+    }
 
     /// **A long project name must not punch through the box.** ratatui draws an over-long
     /// title straight over its own border: the top-right corner disappears and the name ends
