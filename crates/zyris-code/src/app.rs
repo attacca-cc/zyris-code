@@ -176,6 +176,12 @@ pub enum Frame {
     /// not come up, authentication dropping and re-enrollment starting, and the like).
     /// Fades on its own after `STATUS_WINDOW`.
     Notice(String),
+    /// Something went wrong that nobody's keystroke caused — an MCP server that did not start.
+    /// **Painted as an error**, where `Notice` would read like "connected".
+    Problem(String),
+    /// The stop Esc asked for did not reach the server, and why. **The turn is still running**, so
+    /// the line stops saying it is stopping.
+    StopFailed(String),
     /// An enrollment code was issued. **From this moment the screen owns showing the code** —
     /// the upstream stdout box goes quiet (`enroll::ScreenEnroll`).
     Enroll(EnrollView),
@@ -1806,12 +1812,15 @@ pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
             vec![Action::RecallOlder]
         }
         KeyCode::Char('n') if ctrl && state.recalling() => vec![Action::RecallNewer],
-        // With a selection up, Esc clears it. This comes before cancelling a running turn —
-        // what is in front of you comes first.
-        KeyCode::Esc if state.selection.is_some() => vec![Action::ClearSelection],
         // **The one key that stops a turn.** Ctrl+C is the way out of the app (2026-09-15),
         // so there is no second key here to be pressed by mistake.
+        //
+        // **Before the highlight.** A selection outlives the mouse button, so one made while
+        // reading the answer turned the stop key into two presses, the first of them silent.
+        // Stopping drops the highlight as any other key does (`apply`).
         KeyCode::Esc if state.running => vec![Action::Cancel],
+        // With a selection up and nothing to stop, Esc clears it.
+        KeyCode::Esc if state.selection.is_some() => vec![Action::ClearSelection],
         // **Shift+Enter and Alt+Enter are newlines.** With the kitty keyboard protocol on
         // (`PushKeyboardEnhancementFlags` in `run()` below) Shift+Enter arrives separately as
         // Enter+SHIFT. Alt+Enter (ESC+\r) is the fallback for terminals without the
@@ -1952,6 +1961,23 @@ pub fn apply(state: &mut State, action: &Action) {
         && matches!(action, Action::Submit(_) | Action::OpenPicker | Action::OpenHistory)
     {
         return;
+    }
+
+    // **An armed quit is for the very next key.** Ctrl+C, a few keystrokes, Ctrl+C inside the
+    // window used to quit — the shell habit of Ctrl+C to drop a half-typed line, twice, is exactly
+    // that. Only a key disarms it: frames and the pointer moving are not somebody changing their
+    // mind.
+    if !matches!(
+        action,
+        Action::ArmQuit
+            | Action::Quit
+            | Action::Frame(_)
+            | Action::Wheel(_)
+            | Action::DragTo(..)
+            | Action::Release
+            | Action::Repaint
+    ) {
+        state.quit_armed_at = None;
     }
 
     // Editing a character leaves the recall right away. Otherwise one ↓ loses the edit —
@@ -3309,8 +3335,19 @@ fn apply_frame(state: &mut State, frame: &Frame) {
         // The answer to a `/update` that had to ask. **Only a release closes the screen**; being
         // current is said here and the conversation carries on.
         Frame::UpdateChecked(found) => {
-            state.clear_status();
+            // Only the "looking…" this answers — anything else on the line has its own reason.
+            if state.status() == Some(state.lang.update_checking()) {
+                state.clear_status();
+            }
             match found {
+                // **Leaving is only right if nothing was started meanwhile.** The check takes
+                // seconds and hands the keys back while it runs, so the screen closed mid-sentence
+                // and the draft went with it. With something being written the release is said
+                // instead, and the next `/update` goes straight out (the tag is known now).
+                Some(tag) if !state.input.text.trim().is_empty() => {
+                    state.update_tag = Some(tag.clone());
+                    state.timeline.say(state.lang.update_available(tag));
+                }
                 Some(tag) => {
                     state.update_tag = Some(tag.clone());
                     state.update_wanted = true;
@@ -3320,6 +3357,9 @@ fn apply_frame(state: &mut State, frame: &Frame) {
         }
         Frame::Disconnected(why) => {
             state.connected = false;
+            // **A call cut off with the connection never reports its end** — its `ExecDone` comes
+            // from the serving future the drop just took away — so "working" would stay up.
+            state.running_tool = None;
             // **Losing the connection is a failure, not news** — silent failure is the worst
             // kind, and this is the one line that gets to say it. Unless we asked for it.
             if std::mem::take(&mut state.reconnecting) {
@@ -3407,6 +3447,11 @@ fn apply_frame(state: &mut State, frame: &Frame) {
         // Approved, and the credential was stored. Close the window.
         Frame::EnrollDone => state.enroll = None,
         Frame::Notice(text) => state.set_status(text.clone()),
+        Frame::Problem(text) => state.set_error(text.clone()),
+        Frame::StopFailed(why) => {
+            state.stopping = false;
+            state.set_error(state.lang.stop_failed(why));
+        }
     }
 }
 
@@ -5290,11 +5335,21 @@ async fn run_inner(
                         Action::PickConfirm => {
                             pick(&api, &mut state, &mut session, &mut agent_id, &tx).await;
                         }
+                        // **Off the loop, and its failure said.** It was awaited here before `apply`
+                        // could mark the turn as stopping, so a slow link froze the screen for up to
+                        // the call's deadline with no sign the key had gone in — and a refusal was
+                        // thrown away, leaving "Stopping…" up over a turn that carried on.
                         Action::Cancel => {
-                            if let Some(id) = session.id() {
-                                let _ =
-                                    crate::conn::within(&api, api.cancel_turn(id.to_string(), None))
-                                        .await;
+                            if let Some(id) = session.id().map(str::to_string) {
+                                let (api, tx) = (Arc::clone(&api), tx.clone());
+                                tokio::spawn(async move {
+                                    let asked = api.cancel_turn(id.clone(), None);
+                                    if let Err(e) = crate::conn::within(&api, asked).await {
+                                        let failed = Frame::StopFailed(e.to_string());
+                                        let _ =
+                                            tx.send((Some(Origin::asked(id)), Action::Frame(failed)));
+                                    }
+                                });
                             }
                         }
                         // Only clears the screen. It is redrawn just below.
@@ -12035,5 +12090,111 @@ mod interaction {
         assert!(s.picker.as_ref().is_some_and(|p| p.loading));
         apply(&mut s, &Action::Frame(Frame::Files(vec![])));
         assert!(s.picker.is_none());
+    }
+
+    /// **A stop that did not reach the server says so, and stops saying "Stopping…".** The
+    /// failure was thrown away and the line claimed a stop over a turn that carried on (C10).
+    #[test]
+    fn a_stop_that_failed_is_said_and_released() {
+        let mut s = state();
+        s.running = true;
+        apply(&mut s, &Action::Cancel);
+        assert!(s.stopping);
+        apply(&mut s, &Action::Frame(Frame::StopFailed("scope missing".into())));
+        assert!(!s.stopping, "still claims to be stopping");
+        assert_eq!(s.status_severity(), Severity::Error);
+        assert!(s.status().is_some_and(|t| t.contains("scope missing")));
+    }
+
+    /// **Esc stops a turn on the first press, highlight or not** (C25). The highlight goes with it.
+    #[test]
+    fn esc_stops_a_turn_even_with_a_highlight_up() {
+        let mut s = state();
+        s.running = true;
+        s.selection = Some("copied".into());
+        let actions = on_key(&s, key(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(actions, vec![Action::Cancel]);
+        apply(&mut s, &Action::Cancel);
+        assert!(s.selection.is_none());
+    }
+
+    /// **Only the very next key confirms a quit.** Ctrl+C, some typing, Ctrl+C used to quit (C25).
+    #[test]
+    fn any_other_key_disarms_the_quit() {
+        let mut s = state();
+        press(&mut s, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(s.quit_pending());
+        press(&mut s, KeyCode::Char('x'), KeyModifiers::NONE);
+        assert!(!s.quit_pending(), "typing did not disarm it");
+        assert_eq!(
+            on_key(&s, key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            vec![Action::ArmQuit]
+        );
+        // The server's news is not somebody changing their mind.
+        press(&mut s, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        apply(&mut s, &Action::Frame(Frame::Status { running: false }));
+        assert!(s.quit_pending());
+    }
+
+    /// **The armed quit says what leaving takes with it** — background work that dies with the
+    /// app, and words that were never sent (C19).
+    #[test]
+    fn the_armed_quit_names_what_it_would_lose() {
+        let mut s = state();
+        s.lang = crate::lang::Lang::En;
+        s.jobs.push(JobRow {
+            id: "b1".into(),
+            label: "cargo build".into(),
+            since: Instant::now(),
+            session: None,
+        });
+        type_in(&mut s, "half a thought");
+        press(&mut s, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        let (_, text, _) = crate::widgets::activity::parts(&s);
+        assert!(text.contains("1 running job"), "{text}");
+        assert!(text.contains("1 unsent"), "{text}");
+    }
+
+    /// **"Esc stops" is not offered beside a question**, where Esc belongs to the card (C25).
+    #[test]
+    fn a_question_waiting_is_what_the_activity_line_says() {
+        let mut s = state();
+        s.running = true;
+        apply(&mut s, &question_frame(3));
+        let (_, text, hint) = crate::widgets::activity::parts(&s);
+        assert_eq!(text, s.lang.waiting_answer());
+        assert_ne!(hint, s.lang.esc_stops());
+    }
+
+    /// **`/update` does not close the screen over a message being written** (C20). The release is
+    /// said, and the next `/update` goes straight out.
+    #[test]
+    fn a_release_found_while_writing_waits_to_be_asked_again() {
+        let mut s = state();
+        run_command(&mut s, "/update");
+        type_in(&mut s, "쓰는 중인 긴 메시지");
+        apply(&mut s, &Action::Frame(Frame::UpdateChecked(Some("v9.9.9".into()))));
+        assert!(!s.update_wanted, "the screen closed mid-sentence");
+        assert_eq!(s.update_tag.as_deref(), Some("v9.9.9"));
+        run_command(&mut s, "/update");
+        assert!(s.update_wanted, "asked again, it still waits");
+    }
+
+    /// **A dropped connection takes the running call with it** — its end would never come, and
+    /// "working" would stay (C29).
+    #[test]
+    fn a_drop_ends_the_running_call() {
+        let mut s = state();
+        s.running_tool = Some((1, "exec".into(), Instant::now()));
+        apply(&mut s, &Action::Frame(Frame::Disconnected("reset".into())));
+        assert!(s.running_tool.is_none());
+    }
+
+    /// **An MCP server that did not start is an error, not news** (C26).
+    #[test]
+    fn a_problem_is_painted_as_an_error() {
+        let mut s = state();
+        apply(&mut s, &Action::Frame(Frame::Problem("MCP server 'x' did not start".into())));
+        assert_eq!(s.status_severity(), Severity::Error);
     }
 }

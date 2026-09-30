@@ -153,7 +153,7 @@ pub fn draw(frame: &mut Frame, state: &mut State) {
     if let Some(view) = &state.enroll {
         // **The window is drawn from a borrow of `state`**, so the link it hands back is stored
         // after that borrow ends.
-        let links = enroll::draw(frame, full, view, state.lang);
+        let links = enroll::draw(frame, full, view, state.lang, state.connected);
         state.screen_links.extend(links);
     }
 

@@ -43,7 +43,12 @@ pub fn parts_at(
     let lang = state.lang;
     // What you need to know now goes on top. The quit notice comes before anything else.
     if state.quit_pending() {
-        return (theme::warning(), lang.quit_armed().to_string(), "");
+        // **What leaving takes with it is said before it is taken.** Background jobs and shells
+        // are this process's children and die with it; a held message and a draft live nowhere
+        // else.
+        let unsent = state.queued.len() + usize::from(!state.input.text.trim().is_empty());
+        let children = state.jobs.len() + state.shells.len();
+        return (theme::warning(), lang.quit_armed(children, unsent), "");
     }
     // Notices disappear on their own after a while — `State::status` makes that call.
     //
@@ -72,6 +77,11 @@ pub fn parts_at(
     // while. Unsaid, the window looks stuck on the thread the person just left.
     if state.loading_history {
         return (theme::notice(), lang.loading().to_string(), "");
+    }
+    // **A question waiting is what the turn is waiting on**, and Esc belongs to its card — so
+    // "Esc stops" beside it offered a key that would not do what it said.
+    if state.asking.is_some() {
+        return (theme::warning(), lang.waiting_answer().to_string(), lang.waiting_answer_hint());
     }
     if state.running && state.stopping {
         return (theme::warning(), lang.stopping().to_string(), lang.ctrl_c_quits());
@@ -121,9 +131,6 @@ pub fn parts_at(
             return (colour, lang.reasoning(title) + &plan, stop);
         }
         return (theme::accent(), lang.working().to_string() + &plan, lang.esc_stops());
-    }
-    if state.asking.is_some() {
-        return (theme::warning(), lang.waiting_answer().to_string(), lang.waiting_answer_hint());
     }
     // No hint when idle. An always-on hint stops getting read.
     //

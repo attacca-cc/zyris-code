@@ -209,8 +209,41 @@ impl Lang {
             Lang::En => format!("{n} queued"),
         }
     }
-    pub fn quit_armed(self) -> &'static str {
-        self.pick("한 번 더 Ctrl+C를 누르면 끝냅니다", "Press Ctrl+C again to quit")
+    /// `children` — background jobs and shells that die with the app; `unsent` — held messages
+    /// and a draft that live nowhere else.
+    pub fn quit_armed(self, children: usize, unsent: usize) -> String {
+        let base = self.pick("한 번 더 Ctrl+C를 누르면 끝냅니다", "Press Ctrl+C again to quit");
+        let mut lost = Vec::new();
+        if children > 0 {
+            lost.push(match self {
+                Lang::Ko => format!("돌고 있는 작업 {children}개가 멈추고"),
+                Lang::En => format!("{children} running job(s) will stop"),
+            });
+        }
+        if unsent > 0 {
+            lost.push(match self {
+                Lang::Ko => format!("보내지 않은 글 {unsent}개가 사라집니다"),
+                Lang::En => format!("{unsent} unsent message(s) will be lost"),
+            });
+        }
+        if lost.is_empty() {
+            return base.to_string();
+        }
+        match self {
+            Lang::Ko => format!("{base} ‒ {}", lost.join(", ")),
+            Lang::En => format!("{base} ‒ {}", lost.join(", ")),
+        }
+    }
+    /// The stop Esc asked for did not reach the server.
+    pub fn stop_failed(self, why: &str) -> String {
+        match self {
+            Lang::Ko => {
+                format!("멈추지 못했습니다 ({why}). 턴은 계속 돕니다 ‒ Esc로 다시 시도하세요.")
+            }
+            Lang::En => {
+                format!("Could not stop ({why}). The turn is still running ‒ Esc tries again.")
+            }
+        }
     }
     /// Connected. The activity line shows this briefly, then settles to `idle()` —
     /// the transition a user sees is connecting → connected → taking a break.
@@ -606,8 +639,13 @@ impl Lang {
             "The request was declined in the browser. Press Esc to close.",
         )
     }
-    pub fn enroll_keys(self) -> &'static str {
-        self.pick("Esc 닫기", "Esc close")
+    /// **Says what Esc does here.** With nothing attached the window is the whole app, and Esc
+    /// quits (`on_key`) — the hint used to say "close" either way.
+    pub fn enroll_keys(self, attached: bool) -> &'static str {
+        match attached {
+            true => self.pick("Esc 닫기", "Esc close"),
+            false => self.pick("Esc 끝내기", "Esc quit"),
+        }
     }
 
     // ── The confirmation shown when the language is changed
@@ -2912,7 +2950,8 @@ mod tests {
             (ko.copy_not_sent(), en.copy_not_sent()),
             (ko.enroll_lapsed(), en.enroll_lapsed()),
             (ko.enroll_denied(), en.enroll_denied()),
-            (ko.enroll_keys(), en.enroll_keys()),
+            (ko.enroll_keys(true), en.enroll_keys(true)),
+            (ko.enroll_keys(false), en.enroll_keys(false)),
             (ko.clear_done(), en.clear_done()),
             (ko.undo_log_not_ready(), en.undo_log_not_ready()),
             (ko.nothing_to_undo(), en.nothing_to_undo()),
@@ -2966,7 +3005,6 @@ mod tests {
             en.mode_job(),
             en.esc_stops(),
             en.run_stopped(),
-            en.quit_armed(),
             en.lang_changed(),
             en.enroll_title(),
             en.enroll_steps(),
@@ -2974,7 +3012,8 @@ mod tests {
             en.copy_not_sent(),
             en.enroll_lapsed(),
             en.enroll_denied(),
-            en.enroll_keys(),
+            en.enroll_keys(true),
+            en.enroll_keys(false),
             en.connected(),
             en.waiting_answer(),
             en.project_form_title(),
@@ -3126,5 +3165,22 @@ mod tests {
     fn thread_reads_as_sseurede_in_korean() {
         assert!(Lang::Ko.new_thread().contains("쓰레드"), "{}", Lang::Ko.new_thread());
         assert!(Lang::Ko.threads_in("proj").contains("쓰레드"));
+    }
+
+    /// The sentences that carry a count or a cause are translated too, whatever they carry.
+    #[test]
+    fn the_sentences_with_a_cause_or_a_count_are_translated() {
+        let hangul = |t: &str| t.chars().any(|c| ('\u{AC00}'..='\u{D7A3}').contains(&c));
+        for (ko, en) in [
+            (Lang::Ko.quit_armed(0, 0), Lang::En.quit_armed(0, 0)),
+            (Lang::Ko.quit_armed(2, 1), Lang::En.quit_armed(2, 1)),
+            (Lang::Ko.stop_failed("timeout"), Lang::En.stop_failed("timeout")),
+            (Lang::Ko.agent_cannot_send("timeout"), Lang::En.agent_cannot_send("timeout")),
+        ] {
+            assert!(hangul(&ko), "{ko}");
+            assert!(!hangul(&en), "{en}");
+        }
+        assert!(Lang::En.quit_armed(2, 1).contains("2 running job"));
+        assert_eq!(Lang::En.quit_armed(0, 0), "Press Ctrl+C again to quit");
     }
 }

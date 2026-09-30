@@ -2301,6 +2301,10 @@ fn the_enroll_window_shows_the_code_and_the_address() {
         "주소가 안 보인다:\n{screen}"
     );
     assert!(screen.contains("Connect to Attacca"), "no title:\n{screen}");
+    // Nothing attached yet: the window is the whole app, and Esc quits it (C28).
+    assert!(screen.contains("Esc quit"), "no hint for the closing key:\n{screen}");
+    s.connected = true;
+    let screen = dump(&mut s, 80, 24);
     assert!(screen.contains("Esc close"), "no hint for the closing key:\n{screen}");
 }
 

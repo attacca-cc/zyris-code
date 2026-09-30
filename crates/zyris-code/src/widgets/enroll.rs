@@ -45,6 +45,7 @@ pub fn draw(
     area: Rect,
     view: &EnrollView,
     lang: crate::lang::Lang,
+    attached: bool,
 ) -> Vec<crate::app::ScreenLink> {
     // A box in the center of the screen. The code must show large, so give it more room than the list window.
     let w = 64.min(area.width.saturating_sub(4)).max(30.min(area.width));
@@ -94,7 +95,10 @@ pub fn draw(
     }
 
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(lang.enroll_keys(), Style::default().fg(theme::subtle()))));
+    lines.push(Line::from(Span::styled(
+        lang.enroll_keys(attached),
+        Style::default().fg(theme::subtle()),
+    )));
 
     // **The box is as tall as what it has to hold.** A fixed height cut the last lines off without
     // saying so; a short terminal still cuts, but only because there is no room left.
@@ -213,7 +217,7 @@ mod tests {
         };
         let mut term = Terminal::new(TestBackend::new(40, 40)).expect("terminal");
         let mut links = Vec::new();
-        term.draw(|f| links = draw(f, f.area(), &view, Lang::En)).expect("draw");
+        term.draw(|f| links = draw(f, f.area(), &view, Lang::En, true)).expect("draw");
         assert!(links.len() > 1, "{links:?}");
         assert!(links.iter().all(|l| l.url == uri && l.end <= 40));
         let buf = term.backend().buffer().clone();

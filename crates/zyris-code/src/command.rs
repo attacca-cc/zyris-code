@@ -436,8 +436,8 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "/quit",
         aliases: &["exit", "q"],
-        note_ko: "끝냅니다. 도는 턴이 있으면 서버에서도 멈춥니다",
-        note_en: "Quit. A running turn is stopped on the server too",
+        note_ko: "끝냅니다. 도는 턴은 서버에서 계속됩니다 (멈추는 건 Esc)",
+        note_en: "Quit. A running turn carries on on the server (Esc stops it)",
     },
 ];
 
