@@ -157,6 +157,65 @@ fn nearest_indexed(r: u8, g: u8, b: u8) -> u8 {
     }
 }
 
+/// A one-column stand-in for a cell a CJK-configured terminal would draw two columns wide, or
+/// `None` when the cell is drawn the same either way.
+///
+/// **The screen is laid out in ratatui's widths, and ratatui counts an Ambiguous character as one
+/// column.** A terminal set to draw them wide — PuTTY's "ambiguous as wide", iTerm2's and
+/// Terminal.app's double-width setting, common among Korean users — draws `—`, `…`, `“`, `·`, `×` or
+/// a box-drawing line in two, and the rest of the row slides right by one for each; the diff
+/// thinks those cells are right, so the damage stays until a full repaint. The app's own glyphs
+/// are policed by `tests/width.rs`; the agent's text cannot be. Swapping the cell for an ASCII
+/// look-alike keeps the row where it was measured. Letters (Greek, Cyrillic) are left alone: a row
+/// that slides is still readable, a word of question marks is not.
+///
+/// **Only the screen changes.** The swap happens on the finished frame, after the text a drag
+/// copies was taken from it, so a copy still carries the real characters.
+///
+/// **Opt-in, not guessed from the locale.** Most Korean terminals — Windows Terminal, iTerm2,
+/// GNOME Terminal — draw these narrow by default, and swapping them there would only coarsen text
+/// that was already right.
+pub fn narrow_stand_in(cell: &str) -> Option<&'static str> {
+    use unicode_width::UnicodeWidthStr;
+    if cell.width_cjk() <= cell.width() {
+        return None;
+    }
+    let mut chars = cell.chars();
+    let first = chars.next()?;
+    if first.is_alphabetic() {
+        return None;
+    }
+    // Written as escapes: these are what the agent's text may hold, never what the app draws, and
+    // `tests/width.rs` reads the app's literals for what it draws.
+    Some(match first {
+        // Dashes, and the horizontal and vertical lines of box drawing.
+        '\u{2010}'..='\u{2015}' => "-",
+        '\u{2500}' | '\u{2501}' | '\u{2504}' | '\u{2505}' | '\u{2508}' | '\u{2509}'
+        | '\u{254C}' | '\u{254D}' | '\u{2550}' => "-",
+        '\u{2502}' | '\u{2503}' | '\u{2506}' | '\u{2507}' | '\u{250A}' | '\u{250B}'
+        | '\u{254E}' | '\u{254F}' | '\u{2551}' => "|",
+        '\u{2500}'..='\u{257F}' => "+",
+        // Half and part blocks standing at an edge read as a bar; the rest as a fill.
+        '\u{258C}'..='\u{2590}' => "|",
+        '\u{2580}'..='\u{259F}' => "#",
+        // Quotes, primes, ellipsis and middle dots.
+        '\u{201C}' | '\u{201D}' | '\u{2033}' => "\"",
+        '\u{2018}' | '\u{2019}' | '\u{2032}' => "'",
+        '\u{2026}' | '\u{00B7}' | '\u{2027}' => ".",
+        // Arrows and pointing triangles keep their direction; other shapes are a bullet.
+        '\u{2192}' | '\u{21D2}' | '\u{25B6}' | '\u{25BA}' => ">",
+        '\u{2190}' | '\u{21D0}' | '\u{25C0}' | '\u{25C4}' => "<",
+        '\u{2191}' | '\u{25B2}' => "^",
+        '\u{2193}' | '\u{25BC}' => "v",
+        '\u{2022}' | '\u{203B}' | '\u{2605}' | '\u{2606}' | '\u{25A0}'..='\u{25FF}' => "*",
+        '\u{00D7}' => "x",
+        '\u{00F7}' => "/",
+        '\u{00B1}' => "+",
+        '\u{00B0}' | '\u{00BA}' => "o",
+        _ => "?",
+    })
+}
+
 /// What the app asks about a terminal. Taken from the environment once at startup — reading it per
 /// frame would put a `std::env` lookup inside the draw loop for an answer that cannot change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -169,6 +228,9 @@ pub struct Caps {
     pub mouse: bool,
     /// How the palette has to be sent.
     pub colours: Colours,
+    /// Whether this terminal draws East Asian Ambiguous characters two columns wide — see
+    /// [`narrow_stand_in`]. Only ever set by `$ZYRIS_CODE_AMBIGUOUS_WIDE`.
+    pub ambiguous_wide: bool,
 }
 
 impl Caps {
@@ -212,7 +274,10 @@ impl Caps {
 
         let colours = Colours::from_env(&var, named);
 
-        Caps { hyperlinks, osc52, mouse, colours }
+        let ambiguous_wide =
+            override_of(var("ZYRIS_CODE_AMBIGUOUS_WIDE").as_deref()).unwrap_or(false);
+
+        Caps { hyperlinks, osc52, mouse, colours, ambiguous_wide }
     }
 }
 
@@ -347,6 +412,24 @@ mod tests {
                 assert!(matches!(Colours::Sixteen.fit(c), Color::Indexed(0..=15)), "{c:?}");
             }
         }
+    }
+
+    /// **Only the cells a wide-ambiguous terminal would draw in two columns are swapped**, and only
+    /// for something one column wide. Hangul, ASCII and the app's own narrow glyphs are untouched.
+    #[test]
+    fn an_ambiguous_cell_gets_a_one_column_stand_in() {
+        assert_eq!(narrow_stand_in("—"), Some("-"));
+        assert_eq!(narrow_stand_in("…"), Some("."));
+        assert_eq!(narrow_stand_in("│"), Some("|"));
+        assert_eq!(narrow_stand_in("●"), Some("*"));
+        assert_eq!(narrow_stand_in("→"), Some(">"));
+        assert_eq!(narrow_stand_in("\u{2460}"), Some("?"), "① has no look-alike");
+        assert_eq!(narrow_stand_in("▌"), Some("|"));
+        for same in ["a", "한", " ", "-", "Ж", "α"] {
+            assert_eq!(narrow_stand_in(same), None, "{same:?} was swapped");
+        }
+        assert!(!caps(&[]).ambiguous_wide, "off unless asked for");
+        assert!(caps(&[("ZYRIS_CODE_AMBIGUOUS_WIDE", "1")]).ambiguous_wide);
     }
 
     /// A value that means nothing falls back to the guess rather than to `false` — `MOUSE=maybe`

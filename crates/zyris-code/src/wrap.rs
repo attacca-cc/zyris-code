@@ -20,6 +20,8 @@
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
+use unicode_segmentation::UnicodeSegmentation;
+
 use crate::markdown::display_width;
 
 /// The narrowest a wrapped column may get.
@@ -28,10 +30,10 @@ use crate::markdown::display_width;
 /// three cells — from turning every word into a column of single characters.
 const MIN: usize = 8;
 
-/// The width one character occupies, never zero: a combining mark still has to take a cell in our
-/// count, or the line we measure is shorter than the one the terminal draws.
+/// The width one character occupies on its own. Only for the margin's spaces and marker glyphs;
+/// text is measured a cluster at a time, the way it is drawn.
 fn cell_width(ch: char) -> usize {
-    display_width(&ch.to_string()).max(1)
+    display_width(ch.encode_utf8(&mut [0; 4]))
 }
 
 /// Splits prose to fit the width, breaking between words where it can.
@@ -52,13 +54,13 @@ pub fn words(text: &str, width: usize) -> Vec<String> {
         }
         if w > limit {
             // Longer than a line on its own — fill by column, since there is no break to find.
-            for ch in word.chars() {
-                let cw = cell_width(ch);
+            for g in word.graphemes(true) {
+                let cw = display_width(g);
                 if used + cw > limit {
                     out.push(std::mem::take(&mut cur));
                     used = 0;
                 }
-                cur.push(ch);
+                cur.push_str(g);
                 used += cw;
             }
             continue;
@@ -87,13 +89,13 @@ pub fn columns(text: &str, width: usize) -> Vec<String> {
         }
         let mut cur = String::new();
         let mut used = 0usize;
-        for ch in raw.chars() {
-            let cw = cell_width(ch);
+        for g in raw.graphemes(true) {
+            let cw = display_width(g);
             if used + cw > limit {
                 out.push(std::mem::take(&mut cur));
                 used = 0;
             }
-            cur.push(ch);
+            cur.push_str(g);
             used += cw;
         }
         out.push(cur);
@@ -121,31 +123,34 @@ pub fn line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
     if total <= limit {
         return vec![line];
     }
-    // Flattened so a break may fall inside a span; the style rides along with each character.
-    let mut cells: Vec<(char, Style)> = Vec::new();
+    // Flattened so a break may fall inside a span; the style rides along with each character, and
+    // so does its width: a cluster's whole width on its first character and none on the rest, so a
+    // break never lands inside one.
+    let mut cells: Vec<(char, Style, usize)> = Vec::new();
     for span in line.spans {
-        for ch in span.content.chars() {
-            cells.push((ch, span.style));
+        for g in span.content.graphemes(true) {
+            for (i, ch) in g.chars().enumerate() {
+                cells.push((ch, span.style, if i == 0 { display_width(g) } else { 0 }));
+            }
         }
     }
     // **The hang.** What the marker is painted in stays with it — these are spaces, so the only
     // thing it can show is a background, and a background that stops at the indent would be worse
     // than none.
-    let hang_style = cells.first().map_or_else(Style::default, |(_, style)| *style);
+    let hang_style = cells.first().map_or_else(Style::default, |(_, style, _)| *style);
     // Never so wide that nothing is left for the words: a continuation is still text.
     let hang = hang_width(&cells).min(limit.saturating_sub(MIN));
-    let indent = || -> Vec<(char, Style)> { vec![(' ', hang_style); hang] };
+    let indent = || -> Vec<(char, Style, usize)> { vec![(' ', hang_style, 1); hang] };
 
-    let mut whole: Vec<Vec<(char, Style)>> = Vec::new();
-    let mut cur: Vec<(char, Style)> = Vec::new();
+    let mut whole: Vec<Vec<(char, Style, usize)>> = Vec::new();
+    let mut cur: Vec<(char, Style, usize)> = Vec::new();
     let mut used = 0usize;
     // Where the last space we passed sits, held by index — the place to break at.
     let mut space: Option<usize> = None;
     // **Only the first line keeps the marker's own columns.** Every later one is short by the
     // hang, because it carries the indent instead.
     let mut first = true;
-    for (ch, style) in cells {
-        let w = cell_width(ch);
+    for (ch, style, w) in cells {
         let cap = if first { limit } else { limit.saturating_sub(hang) };
         if used + w > cap && !cur.is_empty() {
             match space.filter(|i| *i > 0) {
@@ -153,20 +158,20 @@ pub fn line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
                     let tail = cur.split_off(i);
                     whole.push(std::mem::take(&mut cur));
                     // `tail` starts on the space we broke at; a space is not content.
-                    cur = tail.into_iter().skip_while(|(c, _)| *c == ' ').collect();
+                    cur = tail.into_iter().skip_while(|(c, _, _)| *c == ' ').collect();
                 }
                 // Nowhere to break — a word wider than the line. Cut it here.
                 None => whole.push(std::mem::take(&mut cur)),
             }
             first = false;
             cur = indent().into_iter().chain(cur).collect();
-            used = cur.iter().map(|(c, _)| cell_width(*c)).sum();
+            used = cur.iter().map(|(_, _, w)| w).sum();
             space = None;
         }
         if ch == ' ' {
             space = Some(cur.len());
         }
-        cur.push((ch, style));
+        cur.push((ch, style, w));
         used += w;
     }
     whole.push(cur);
@@ -176,7 +181,7 @@ pub fn line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
         .map(|cells| {
             // Consecutive characters that share a style go back into one span.
             let mut spans: Vec<Span<'static>> = Vec::new();
-            for (ch, style) in cells {
+            for (ch, style, _) in cells {
                 match spans.last_mut() {
                     Some(last) if last.style == style => last.content.to_mut().push(ch),
                     _ => spans.push(Span::styled(ch.to_string(), style)),
@@ -197,7 +202,7 @@ pub fn line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
 ///
 /// The scan stops at the first text character: the hang is a margin, not the whole prefix, and a
 /// line is not indented by its own sentence.
-fn hang_width(cells: &[(char, Style)]) -> usize {
+fn hang_width(cells: &[(char, Style, usize)]) -> usize {
     let mut w = 0usize;
     let mut i = 0usize;
     loop {

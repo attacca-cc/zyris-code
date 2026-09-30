@@ -363,6 +363,7 @@ Messages typed while a turn is running are queued and sent in order when it ends
 | `ZYRIS_CODE_HYPERLINKS` | detected | Force OSC 8 link markup on or off. Only terminals known to read it are sent any, because one that does not prints the escape bytes across the screen. Links stay Ctrl+clickable either way — the app opens them itself |
 | `ZYRIS_CODE_OSC52` | detected | Force system-clipboard writes on or off. Terminals differ, and several that draw links keep clipboard writes switched off until told otherwise |
 | `RUST_LOG` | `zyris_code=info,zyris=warn` | Log filter |
+| `ZYRIS_CODE_AMBIGUOUS_WIDE` | off | `1` if your terminal draws East Asian Ambiguous characters two columns wide (PuTTY's "ambiguous as wide", the double-width setting in iTerm2 or Terminal.app). Characters such as `—`, `…`, `“` and box-drawing lines are then shown as one-column look-alikes, so a row does not slide right; copying still gives the real text |
 | `NO_COLOR` | — | No colour anywhere, the screen included. What colour alone marked keeps a stand-in: the drag's highlight is drawn reversed |
 | `COLORTERM` | set by your terminal | `truecolor` (or `24bit`) sends the palette as 24-bit colour. Without it, terminals known by name still get 24-bit, `TERM=*-256color` gets the nearest of 256 colours, and any other `TERM` (the Linux console, `screen`) the nearest of 16. Set it over SSH if your terminal has 24-bit colour and the palette looks coarse |
 

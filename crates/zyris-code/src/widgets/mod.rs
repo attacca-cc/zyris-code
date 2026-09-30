@@ -315,6 +315,16 @@ pub fn draw(frame: &mut Frame, state: &mut State) {
         }
     }
 
+    // **On a terminal that draws Ambiguous characters wide, they are swapped for narrow ones** —
+    // after the snapshot above, so a drag still copies the real text (`term::narrow_stand_in`).
+    if state.caps.ambiguous_wide {
+        for cell in frame.buffer_mut().content.iter_mut() {
+            if let Some(narrow) = crate::term::narrow_stand_in(cell.symbol()) {
+                cell.set_symbol(narrow);
+            }
+        }
+    }
+
     // **Make links Ctrl+clickable.** The terminal opens an OSC 8 hyperlink on Ctrl+click, so
     // the cells under a link get the hyperlink escape sequence. Runs after the `screen`
     // snapshot — the snapshot must hold plain text, not escape sequences, for mouse selection.

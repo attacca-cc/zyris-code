@@ -8,15 +8,37 @@
 //! treats the rest as code, so an "open code block" just comes out naturally.
 
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
+use ratatui::buffer::CellWidth;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use unicode_width::UnicodeWidthStr;
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::theme;
 
 /// The number of columns it occupies on screen. Fullwidth is 2 columns.
+///
+/// **Measured the way ratatui draws it**: by grapheme cluster, with ratatui's own cell width. It
+/// used to be counted by `char`, and wrapping, the cursor and selection each forced every `char` to
+/// at least one column — while the buffer puts a whole cluster in one cell. NFD Hangul (`ᄒ ᅡ ᆫ`,
+/// how macOS spells file names) counted four columns and drew two, and an emoji with a
+/// skin tone or a joiner counted twice what it drew, so lines wrapped early and the cursor stood
+/// off to the right of what was typed. A cluster holding a control character counts nothing,
+/// because the buffer drops it.
 pub fn display_width(s: &str) -> usize {
-    UnicodeWidthStr::width(s)
+    // Printable ASCII is one column a byte, and it is most of what is measured.
+    if s.bytes().all(|b| (0x20..0x7f).contains(&b)) {
+        return s.len();
+    }
+    s.graphemes(true).map(cluster_width).sum()
+}
+
+/// One cluster's columns — see [`display_width`].
+fn cluster_width(cluster: &str) -> usize {
+    if cluster.contains(char::is_control) {
+        0
+    } else {
+        cluster.cell_width() as usize
+    }
 }
 
 /// A link on one output line, in that line's display columns.
@@ -511,12 +533,12 @@ pub fn truncate_to(s: &str, limit: usize) -> String {
         return s.to_string();
     }
     let mut out = String::new();
-    for ch in s.chars() {
+    for g in s.graphemes(true) {
         // Leave one column for the `…`.
-        if display_width(&out) + display_width(&ch.to_string()) > limit.saturating_sub(1) {
+        if display_width(&out) + display_width(g) > limit.saturating_sub(1) {
             break;
         }
-        out.push(ch);
+        out.push_str(g);
     }
     out.push('…');
     out
@@ -635,16 +657,17 @@ fn flush(
 fn split_keeping_spaces(s: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
-    for ch in s.chars() {
-        if ch == ' ' {
+    // By cluster, so a cut never falls between a letter and its mark or inside an emoji sequence.
+    for g in s.graphemes(true) {
+        if g == " " {
             if !cur.is_empty() {
                 out.push(std::mem::take(&mut cur));
             }
             out.push(" ".to_string());
         } else {
-            cur.push(ch);
+            cur.push_str(g);
             // Fullwidth has no word boundaries — it must be cut per character to stay within width.
-            if ch.len_utf8() > 1 && display_width(&cur) >= 2 {
+            if g.len() > 1 && display_width(&cur) >= 2 {
                 out.push(std::mem::take(&mut cur));
             }
         }
@@ -664,6 +687,25 @@ mod tests {
     }
 
     /// A link's URL rides along so the drawing side can wrap the cells in OSC 8.
+    /// **Columns are counted the way the buffer fills cells**: a cluster at a time. Counted by
+    /// `char` these came out wider than they draw, and everything measured with them drifted.
+    #[test]
+    fn width_is_counted_per_cluster_as_ratatui_draws_it() {
+        // NFD Hangul: three scalars, one syllable, two columns.
+        assert_eq!(display_width("\u{1112}\u{1161}\u{11ab}"), 2);
+        // A letter and its combining accent share one cell.
+        assert_eq!(display_width("e\u{301}"), 1);
+        // Emoji with a joiner, a skin tone, a variation selector.
+        assert_eq!(display_width("\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}"), 2);
+        assert_eq!(display_width("\u{1f44d}\u{1f3fd}"), 2);
+        // Control characters are dropped by the buffer, so they take nothing.
+        assert_eq!(display_width("a\tb\r"), 2);
+        // And the same total as ratatui's own count of a drawn line.
+        for s in ["한글 abc", "e\u{301}x", "\u{1f44d}\u{1f3fd}!"] {
+            assert_eq!(display_width(s), ratatui::text::Line::raw(s).width(), "{s:?}");
+        }
+    }
+
     #[test]
     fn a_link_records_its_range_and_url() {
         let r = render_rich("[문서](https://example.com/x) 끝", 40);
