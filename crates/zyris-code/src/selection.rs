@@ -68,24 +68,45 @@ pub fn extract(rows: &[String], body: &[u16], drag: &Drag) -> String {
     // **A fence is not a line of the text, so it does not leave one behind.** Dropping it rather
     // than emptying it is the difference between pasting the code and pasting the code with a
     // blank line top and bottom.
-    let mut out = Vec::new();
-    if !is_code_fence(&rows[r0]) {
-        out.push(slice_cols(&rows[r0], from(r0, c0), usize::MAX));
-    }
-    for (i, row) in rows.iter().enumerate().take(r1).skip(r0 + 1) {
-        if !is_code_fence(row) {
-            out.push(slice_cols(row, start_of(body, i), usize::MAX));
+    //
+    // **A row the layout split off the one above goes back onto it** ([`JOINED`]): a URL or a code
+    // line wider than the screen is drawn over several rows, and it is one line of text.
+    let mut out = String::new();
+    let mut first = true;
+    for (i, row) in rows.iter().enumerate().take(r1 + 1).skip(r0) {
+        if is_code_fence(row) {
+            continue;
         }
+        let a = if i == r0 { from(r0, c0) } else { start_of(body, i) };
+        let b = if i == r1 { c1 + 1 } else { usize::MAX };
+        // The row a joined one continues keeps its trailing spaces: they are text, not padding.
+        let keep_tail = i < r1 && joined(body, i + 1);
+        let piece = slice_cols_keeping(row, a, b, keep_tail);
+        if !first && !joined(body, i) {
+            out.push('\n');
+        }
+        out.push_str(&piece);
+        first = false;
     }
-    if !is_code_fence(&rows[r1]) {
-        out.push(slice_cols(&rows[r1], start_of(body, r1), c1 + 1));
-    }
-    out.join("\n")
+    out
+}
+
+/// Set on a row's `body` entry when the row **continues the one above it without a break** — the
+/// layout cut a word or a code line there only because the screen ran out. A copy joins such a
+/// row back onto the one before rather than putting a line break the text never had.
+///
+/// A bit of the column it rides on, because the column is carried through every layer between
+/// the renderer and the clipboard already; no column is anywhere near this wide.
+pub const JOINED: u16 = 0x8000;
+
+/// Whether row `row` continues the one above it (see [`JOINED`]).
+pub fn joined(body: &[u16], row: usize) -> bool {
+    body.get(row).is_some_and(|b| b & JOINED != 0)
 }
 
 /// Where row `row`'s own text starts, from the layout's record — column zero when there is none.
 pub fn start_of(body: &[u16], row: usize) -> usize {
-    body.get(row).copied().unwrap_or(0) as usize
+    body.get(row).map_or(0, |b| b & !JOINED) as usize
 }
 
 /// Is this row the top or bottom edge the screen draws around a code block?
@@ -213,6 +234,11 @@ pub fn body_start(row: &str) -> usize {
 
 /// The characters in screen columns `[from, to)`. Full-width glyphs count as 2 cells.
 fn slice_cols(row: &str, from: usize, to: usize) -> String {
+    slice_cols_keeping(row, from, to, false)
+}
+
+/// [`slice_cols`], leaving trailing spaces on when `keep_tail` is set.
+fn slice_cols_keeping(row: &str, from: usize, to: usize, keep_tail: bool) -> String {
     use unicode_segmentation::UnicodeSegmentation;
 
     let mut out = String::new();
@@ -228,6 +254,9 @@ fn slice_cols(row: &str, from: usize, to: usize) -> String {
             out.push_str(g);
         }
         col += w;
+    }
+    if keep_tail {
+        return out;
     }
     out.trim_end().to_string()
 }
@@ -249,6 +278,17 @@ mod tests {
     fn pick(rows: &[String], drag: &Drag) -> String {
         let body: Vec<u16> = rows.iter().map(|r| body_start(r) as u16).collect();
         extract(rows, &body, drag)
+    }
+
+    /// **A row the layout split off the one above is copied back onto it**, space and all — a
+    /// URL or a line of code wrapped only because the screen ran out is one line of text.
+    #[test]
+    fn a_joined_row_is_copied_without_a_break() {
+        let rows = vec!["│ let a = ".to_string(), "┊ 1;".to_string(), "│ next".to_string()];
+        let body = [2, 2 | JOINED, 2];
+        let drag = Drag { from: (0, 0), to: (2, 20) };
+        assert_eq!(extract(&rows, &body, &drag), "let a = 1;\nnext");
+        assert_eq!(start_of(&body, 1), 2);
     }
 
     /// **The record beats reading the text.** A report's body and an opened tool's detail are

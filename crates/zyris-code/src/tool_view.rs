@@ -165,15 +165,14 @@ fn argv(args: Option<&Value>) -> Option<String> {
 }
 
 /// Folds all whitespace to single spaces. **A leftover newline turns one tool row into several.**
-fn one_line(s: &str) -> String {
+pub(crate) fn one_line(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Cut to `limit` columns — not chars, which let a CJK action run to twice the width. The row
+/// fits what is left of this to the screen (`rows::tool_row`).
 fn clip(s: &str, limit: usize) -> String {
-    if s.chars().count() <= limit {
-        return s.to_string();
-    }
-    s.chars().take(limit).chain(['…']).collect()
+    crate::markdown::truncate_to(s, limit)
 }
 
 fn clip_body(s: String) -> String {

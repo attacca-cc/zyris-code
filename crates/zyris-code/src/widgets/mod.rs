@@ -292,7 +292,7 @@ pub fn draw(frame: &mut Frame, state: &mut State) {
         // same slot as the terminal's own, so the drag would highlight nothing.
         let reverse = state.caps.colours.reduced();
         for (y, from, to) in selection::row_spans(&drag, area.width, band, moved) {
-            let from = from.max(body.get(y as usize).copied().unwrap_or(0));
+            let from = from.max(selection::start_of(&body, y as usize) as u16);
             for x in from..to {
                 let idx = y as usize * width + x as usize;
                 if let Some(cell) = cells.get_mut(idx) {

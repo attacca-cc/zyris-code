@@ -107,7 +107,9 @@ pub fn render_rich(src: &str, width: u16) -> Rendered {
         }
         None => src,
     };
-    let width = width.max(8) as usize;
+    // The room there is, however little: widened to a floor, every line of a narrow pane ran past
+    // its edge and was cut.
+    let width = width.max(1) as usize;
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut out_links: Vec<Vec<Link>> = Vec::new();
     // Where each line's own text starts, parallel to `out` (see [`Rendered::prefix`]).
@@ -205,7 +207,7 @@ pub fn render_rich(src: &str, width: u16) -> Rendered {
                     _ => String::new(),
                 };
                 out.push(Line::from(Span::styled(
-                    format!("┌─ {lang} "),
+                    truncate_to(&format!("┌─ {lang} "), width),
                     Style::default().fg(theme::border_light()),
                 )));
                 out_links.push(Vec::new());
@@ -233,15 +235,32 @@ pub fn render_rich(src: &str, width: u16) -> Rendered {
                     });
                 }
             }
+            // **A code line wider than the screen wraps by column** under a dotted rule, which
+            // says the row goes on from the one above. It used to run past the edge and be cut
+            // with no sign, and a drag copied the cut code. The wrapped rows are recorded as
+            // joined, so a copy gives the line back whole. Tabs become spaces first: the screen
+            // draws a tab as nothing.
             Event::Text(t) if in_code => {
-                for raw in t.lines() {
-                    out.push(Line::from(vec![
-                        Span::styled("│ ", Style::default().fg(theme::border_light())),
-                        Span::styled(raw.to_string(), Style::default().fg(theme::text())),
-                    ]));
-                    out_links.push(Vec::new());
-                    // The rule and the space after it; the code's own indent follows in `raw`.
-                    out_prefix.push(display_width("│ ") as u16);
+                let gutter = display_width("│ ");
+                for raw in crate::wrap::expand_tabs(&t).lines() {
+                    let mut parts = crate::wrap::columns(raw, width.saturating_sub(gutter));
+                    // A blank line of code is still a line of the block.
+                    if parts.is_empty() {
+                        parts.push(String::new());
+                    }
+                    for (i, part) in parts.into_iter().enumerate() {
+                        out.push(Line::from(vec![
+                            Span::styled(
+                                if i == 0 { "│ " } else { "┊ " },
+                                Style::default().fg(theme::border_light()),
+                            ),
+                            Span::styled(part, Style::default().fg(theme::text())),
+                        ]));
+                        out_links.push(Vec::new());
+                        // The rule and the space after it; the code's own indent follows.
+                        let joined = if i == 0 { 0 } else { crate::selection::JOINED };
+                        out_prefix.push(gutter as u16 | joined);
+                    }
                 }
             }
             // A link. Its text renders styled (underlined) and **its URL rides along** so the
@@ -490,7 +509,12 @@ impl Table {
 
         // Columns eaten by separators and padding: "│ " per column + "│" at the end
         let chrome = cols * 3 + 1;
-        let budget = width.saturating_sub(chrome).max(cols);
+        // **Too narrow for even one column a cell**, the grid would be cut at the right border
+        // with whole cells behind it. Each row is written out as a short list instead.
+        if width < chrome + cols {
+            return self.as_list(width);
+        }
+        let budget = width.saturating_sub(chrome);
         let total: usize = w.iter().sum();
         if total > budget {
             // Shave from the widest column. Leave at least one column.
@@ -518,35 +542,74 @@ impl Table {
 
         out.push(border("┌", "┬", "┐", &w));
         if !self.head.is_empty() {
-            out.push(row_line(&self.head, &w, theme::text_heading(), true));
+            out.extend(row_lines(&self.head, &w, theme::text_heading(), true));
             out.push(border("├", "┼", "┤", &w));
         }
         for r in &self.rows {
-            out.push(row_line(r, &w, theme::text(), false));
+            out.extend(row_lines(r, &w, theme::text(), false));
         }
         out.push(border("└", "┴", "┘", &w));
         out
     }
+
+    /// Every row as a few lines of `head: cell`, for a width the grid cannot fit in.
+    fn as_list(&self, width: usize) -> Vec<Line<'static>> {
+        let mut out = Vec::new();
+        for row in &self.rows {
+            for (i, cell) in row.iter().enumerate() {
+                let mut spans = vec![Span::styled(
+                    if i == 0 { "∙ " } else { "  " },
+                    Style::default().fg(theme::accent()),
+                )];
+                if let Some(head) = self.head.get(i).filter(|h| !h.is_empty()) {
+                    spans.push(Span::styled(
+                        format!("{head}: "),
+                        Style::default().fg(theme::text_heading()),
+                    ));
+                }
+                spans.push(Span::styled(cell.clone(), Style::default().fg(theme::text())));
+                out.extend(crate::wrap::line(Line::from(spans), width));
+            }
+        }
+        out
+    }
 }
 
-/// One row. Cells are cut to the width and padded right with spaces.
-fn row_line(cells: &[String], w: &[usize], fg: ratatui::style::Color, bold: bool) -> Line<'static> {
-    let mut spans = Vec::new();
+/// One row, as many lines as its tallest cell. **A cell wraps inside its column** rather than being
+/// cut with `…`: the table is the only copy of what the cell says, and a drag copies the screen.
+fn row_lines(
+    cells: &[String],
+    w: &[usize],
+    fg: ratatui::style::Color,
+    bold: bool,
+) -> Vec<Line<'static>> {
     let bar = Style::default().fg(theme::border_light());
     let mut text = Style::default().fg(fg);
     if bold {
         text = text.add_modifier(Modifier::BOLD);
     }
-    for (i, target) in w.iter().enumerate() {
-        spans.push(Span::styled("│ ", bar));
-        let cell = cells.get(i).map(String::as_str).unwrap_or("");
-        let shown = truncate_to(cell, *target);
-        let pad = target.saturating_sub(display_width(&shown));
-        spans.push(Span::styled(shown, text));
-        spans.push(Span::styled(" ".repeat(pad + 1), text));
-    }
-    spans.push(Span::styled("│", bar));
-    Line::from(spans)
+    let wrapped: Vec<Vec<String>> = w
+        .iter()
+        .enumerate()
+        .map(|(i, target)| {
+            crate::wrap::words(cells.get(i).map(String::as_str).unwrap_or(""), *target)
+        })
+        .collect();
+    let height = wrapped.iter().map(Vec::len).max().unwrap_or(0).max(1);
+    (0..height)
+        .map(|k| {
+            let mut spans = Vec::new();
+            for (target, lines) in w.iter().zip(&wrapped) {
+                spans.push(Span::styled("│ ", bar));
+                let shown = lines.get(k).cloned().unwrap_or_default();
+                let pad = target.saturating_sub(display_width(&shown));
+                spans.push(Span::styled(shown, text));
+                spans.push(Span::styled(" ".repeat(pad + 1), text));
+            }
+            spans.push(Span::styled("│", bar));
+            Line::from(spans)
+        })
+        .collect()
 }
 
 /// Cuts to not exceed the width. When cut, a `…` goes at the end — being cut must be visible.
@@ -595,86 +658,159 @@ fn flush(
     // **The margin comes out of the width, not on top of it.** A line that fits is a line that
     // fits with its indent.
     let limit = width.max(1);
-    let indent_w = display_width(indent);
-    let margin = || Span::styled(indent.to_string(), Style::default().fg(theme::border_light()));
-    let mut line: Vec<Span<'static>> = Vec::new();
-    let mut links: Vec<Link> = Vec::new();
-    let mut used = 0usize;
-    // **How much of this line's front is the margin**, which is what the caller records the line's
-    // own text starting after (see [`Rendered::prefix`]). Zero when no margin was drawn.
-    let mut margin_w = 0usize;
-    // **Words, not columns.** A line holding only the margin is not a line: a break must not be
-    // decided on one, or the first word of every item would be pushed a line down on its own.
-    let mut words = 0usize;
-    // The link currently being placed on this line, and the column it started at.
-    let mut open: Option<(usize, String)> = None;
-
-    if indent_first && indent_w > 0 {
-        line.push(margin());
-        used = indent_w;
-        margin_w = indent_w;
+    let mut f = Fill {
+        out,
+        out_links,
+        out_prefix,
+        indent,
+        indent_w: display_width(indent),
+        line: Vec::new(),
+        links: Vec::new(),
+        used: 0,
+        margin_w: 0,
+        words: 0,
+        open: None,
+        joined: false,
+    };
+    if indent_first {
+        f.margin();
     }
+    // The widest word a fresh line can take whole.
+    let room = limit.saturating_sub(f.indent_w).max(1);
 
     for piece in buf.drain(..) {
+        let style = piece.span.style;
         for word in split_keeping_spaces(&piece.span.content) {
             let w = display_width(&word);
             let blank = word.trim().is_empty();
-            if used + w > limit && words > 0 {
-                // Close the open link at the end of this line; the next line reopens it.
-                if let Some((start, url)) = open.take() {
-                    links.push(Link { start, end: used, url });
+            // **A word wider than any line is filled by column**, the way `wrap::words` does it.
+            // Kept whole, a long URL, path or hash ran past the right edge and ratatui cut it with
+            // no mark — and a drag copied only the part left on screen. Each break inside it is
+            // recorded as joined, so a copy puts it back together.
+            if w > room && !blank {
+                if f.words > 0 {
+                    f.break_line(false);
                 }
-                out.push(Line::from(std::mem::take(&mut line)));
-                out_links.push(std::mem::take(&mut links));
-                out_prefix.push(margin_w as u16);
-                used = 0;
-                words = 0;
+                let mut chunk = String::new();
+                let mut cw = 0usize;
+                for g in word.graphemes(true) {
+                    let gw = display_width(g);
+                    if f.used + cw + gw > limit && cw > 0 {
+                        f.place(std::mem::take(&mut chunk), cw, style, &piece.url);
+                        cw = 0;
+                        f.break_line(true);
+                    }
+                    chunk.push_str(g);
+                    cw += gw;
+                }
+                f.place(chunk, cw, style, &piece.url);
+                continue;
+            }
+            if f.used + w > limit && f.words > 0 {
+                f.break_line(false);
                 // Leading spaces carried onto a new line are dropped — they'd look like indentation.
                 if blank {
                     continue;
                 }
-                // **The margin opens the next line.** Dropped with the spaces above, the wrapped
-                // part would sit against the left edge it was told to stay away from.
-                margin_w = 0;
-                if indent_w > 0 {
-                    line.push(margin());
-                    used = indent_w;
-                    margin_w = indent_w;
-                }
             }
-            match (&open, &piece.url) {
-                // Same link continues. Nothing to record.
-                (Some((_, u)), Some(wurl)) if u == wurl => {}
-                // Opening a link at this word's column.
-                (None, Some(wurl)) => open = Some((used, wurl.clone())),
-                // A different link starts — close the previous one first.
-                (Some(_), Some(wurl)) => {
-                    if let Some((start, url)) = open.take() {
-                        links.push(Link { start, end: used, url });
-                    }
-                    open = Some((used, wurl.clone()));
-                }
-                // Non-link text closes any open link.
-                (_, None) => {
-                    if let Some((start, url)) = open.take() {
-                        links.push(Link { start, end: used, url });
-                    }
-                }
-            }
-            used += w;
-            if !blank {
-                words += 1;
-            }
-            line.push(Span::styled(word, piece.span.style));
+            f.place(word, w, style, &piece.url);
         }
     }
-    if let Some((start, url)) = open.take() {
-        links.push(Link { start, end: used, url });
+    f.finish();
+}
+
+/// One run of [`flush`]: the line being filled and where the finished ones go.
+struct Fill<'a> {
+    out: &'a mut Vec<Line<'static>>,
+    out_links: &'a mut Vec<Vec<Link>>,
+    out_prefix: &'a mut Vec<u16>,
+    indent: &'a str,
+    indent_w: usize,
+    line: Vec<Span<'static>>,
+    links: Vec<Link>,
+    used: usize,
+    /// **How much of this line's front is the margin**, which is what the caller records the
+    /// line's own text starting after (see [`Rendered::prefix`]). Zero when no margin was drawn.
+    margin_w: usize,
+    /// **Words, not columns.** A line holding only the margin is not a line: a break must not be
+    /// decided on one, or the first word of every item would be pushed a line down on its own.
+    words: usize,
+    /// The link currently being placed on this line, and the column it started at.
+    open: Option<(usize, String)>,
+    /// Whether this line continues the one above in the middle of a word
+    /// (`selection::JOINED`).
+    joined: bool,
+}
+
+impl Fill<'_> {
+    /// **The margin opens a line.** Without it the wrapped part would sit against the left edge
+    /// it was told to stay away from.
+    fn margin(&mut self) {
+        if self.indent_w > 0 {
+            self.line.push(Span::styled(
+                self.indent.to_string(),
+                Style::default().fg(theme::border_light()),
+            ));
+            self.used = self.indent_w;
+            self.margin_w = self.indent_w;
+        }
     }
-    if !line.is_empty() {
-        out.push(Line::from(line));
-        out_links.push(links);
-        out_prefix.push(margin_w as u16);
+
+    /// Closes the link open on this line at the column reached so far.
+    fn close_link(&mut self) {
+        if let Some((start, url)) = self.open.take() {
+            self.links.push(Link { start, end: self.used, url });
+        }
+    }
+
+    /// Ends this line and opens the next with the margin. `joined` says the next one carries on
+    /// in the middle of a word.
+    fn break_line(&mut self, joined: bool) {
+        // Close the open link at the end of this line; the next word reopens it.
+        self.close_link();
+        self.emit();
+        self.joined = joined;
+        self.margin();
+    }
+
+    fn emit(&mut self) {
+        self.out.push(Line::from(std::mem::take(&mut self.line)));
+        self.out_links.push(std::mem::take(&mut self.links));
+        let joined = if self.joined { crate::selection::JOINED } else { 0 };
+        self.out_prefix.push(self.margin_w as u16 | joined);
+        self.used = 0;
+        self.words = 0;
+        self.margin_w = 0;
+        self.joined = false;
+    }
+
+    /// Puts `text`, `w` columns wide, at the end of this line.
+    fn place(&mut self, text: String, w: usize, style: Style, url: &Option<String>) {
+        match (&self.open, url) {
+            // Same link continues. Nothing to record.
+            (Some((_, u)), Some(wurl)) if u == wurl => {}
+            // Opening a link at this word's column.
+            (None, Some(wurl)) => self.open = Some((self.used, wurl.clone())),
+            // A different link starts — close the previous one first.
+            (Some(_), Some(wurl)) => {
+                self.close_link();
+                self.open = Some((self.used, wurl.clone()));
+            }
+            // Non-link text closes any open link.
+            (_, None) => self.close_link(),
+        }
+        self.used += w;
+        if !text.trim().is_empty() {
+            self.words += 1;
+        }
+        self.line.push(Span::styled(text, style));
+    }
+
+    fn finish(mut self) {
+        self.close_link();
+        if !self.line.is_empty() {
+            self.emit();
+        }
     }
 }
 
@@ -1081,6 +1217,62 @@ mod tests {
         for line in out.iter().filter(|l| l.contains('│')) {
             assert!(display_width(line) <= 24, "{out:?}");
         }
+    }
+
+    /// **A word wider than the line is split across lines, not cut at the edge.** Long URLs,
+    /// paths and hashes used to run past the right border and lose their tail, on screen and in a
+    /// copy. The rows after the first are marked joined so a copy gives the word back whole.
+    #[test]
+    fn a_word_wider_than_the_line_is_split_and_marked_joined() {
+        let token = format!("https://example.com/{}", "a1b2c3d4".repeat(22));
+        let r = render_rich(&format!("see {token} end"), 40);
+        let out = plain(&r.lines);
+        assert!(out.len() > 3, "{out:?}");
+        assert!(out.iter().all(|l| display_width(l) <= 40), "{out:?}");
+        let squashed: String = out.concat().split_whitespace().collect();
+        assert_eq!(squashed, format!("see{token}end"));
+        let joined = r.prefix.iter().filter(|p| **p & crate::selection::JOINED != 0).count();
+        assert_eq!(joined, out.len() - 2, "{:?}", r.prefix);
+        // A link keeps its range on every row it was split over.
+        let r = render_rich(&format!("[{token}]({token})"), 40);
+        assert!(r.links.iter().all(|l| l.len() == 1), "{:?}", r.links);
+    }
+
+    /// **A code line wider than the screen wraps under a dotted rule**, and a tab is drawn as the
+    /// spaces it stands for rather than as nothing.
+    #[test]
+    fn a_long_code_line_wraps_and_a_tab_keeps_its_indent() {
+        let long = "x".repeat(50);
+        let r = render_rich(&format!("```\n\tif a {{\n{long}\n\n```"), 24);
+        let out = plain(&r.lines);
+        assert_eq!(out[1], "│     if a {", "{out:?}");
+        assert!(out.iter().all(|l| display_width(l) <= 24), "{out:?}");
+        assert!(out[2].starts_with("│ ") && out[3].starts_with("┊ "), "{out:?}");
+        assert_eq!(
+            out.iter().filter(|l| l.contains('x')).map(|l| &l[4..]).collect::<String>(),
+            long
+        );
+        assert_eq!(out[out.len() - 2], "│ ", "a blank code line went missing: {out:?}");
+    }
+
+    /// **A cell wraps in its column instead of losing its tail to `…`**, and a table too narrow
+    /// for its grid becomes a list rather than being cut at the right border.
+    #[test]
+    fn a_table_cell_wraps_and_a_too_narrow_table_becomes_a_list() {
+        let md = "| name | note |\n|---|---|\n| a | one two three four five six seven |";
+        let out = plain(&render(md, 24));
+        assert!(out.iter().all(|l| display_width(l) <= 24), "{out:?}");
+        let all = out.join(" ");
+        for word in ["one", "two", "three", "four", "five", "six", "seven"] {
+            assert!(all.contains(word), "{word} was cut: {out:?}");
+        }
+        assert!(!all.contains('…'), "{out:?}");
+
+        let wide = "| a | b | c | d |\n|---|---|---|---|\n| 1 | 2 | 3 | long cell |";
+        let out = plain(&render(wide, 12));
+        assert!(out.iter().all(|l| display_width(l) <= 12), "{out:?}");
+        assert!(out.join(" ").contains("long"), "{out:?}");
+        assert!(out[0].starts_with("∙ a: 1"), "{out:?}");
     }
 
     #[test]

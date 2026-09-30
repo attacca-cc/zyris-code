@@ -11,6 +11,7 @@ use ratatui::text::{Line, Span};
 use crate::markdown;
 use crate::theme;
 use crate::timeline::{Item, Part, Step};
+use crate::tool_view::one_line;
 
 /// Horizontal padding of the conversation.
 ///
@@ -605,18 +606,6 @@ fn text_start(own: usize, prefix: &[u16], line: usize) -> u16 {
 /// The person's bar and the space after it, in columns.
 const USER_BAR_W: usize = 2;
 
-/// Splits a line into the whitespace in front of it and the rest.
-///
-/// **A person's indentation is theirs.** Markdown reads four leading spaces — or a tab — as an
-/// indented code block, so a line of code somebody typed into a message was drawn as
-/// `┌─`/`│ …`/`└─` with the indent itself swallowed, and a drag could not copy it back out
-/// (2026-09-15 report). The whitespace comes off before the line is parsed and goes back in front
-/// of the result, where it is text: it stays on screen and stays inside a selection.
-fn split_indent(line: &str) -> (&str, &str) {
-    let rest = line.trim_start_matches([' ', '\t']);
-    line.split_at(line.len() - rest.len())
-}
-
 fn blank() -> Line<'static> {
     Line::from(Span::styled("", Style::default().fg(theme::text())))
 }
@@ -640,26 +629,35 @@ fn make(item: &Item, width: u16, folds: &Folds, turn: Turn, lang: crate::lang::L
             // **The person's own words, and nothing read into them.** An answer to a question does
             // not reach here at all — the timeline lays it under the question that asked it
             // (`Item::Question::answer`), so what arrives as this item is something they typed.
+            //
+            // **Drawn as typed, not read as markdown.** Parsed line by line, a blank line vanished,
+            // `# note` became a heading without its `#`, `*args` lost its star, `<T>` was dropped
+            // as HTML and a fence alone drew an empty box — the echo no longer matched what was
+            // sent. Each line is wrapped as it stands, hanging under its own indent (their
+            // indentation is theirs, and stays inside what a drag copies); tabs become spaces
+            // because the screen draws a tab as nothing.
+            let words = Style::default().fg(theme::text());
             for raw in text.lines() {
-                // **Their indentation is theirs** — see [`split_indent`].
-                let (indent, rest) = split_indent(raw);
-                let rendered = markdown::render_rich(rest, body_width(width));
-                let md = rendered.prefix.clone();
-                for (li, line) in rendered.lines.into_iter().enumerate() {
+                let raw = crate::wrap::expand_tabs(raw).into_owned();
+                let parts = crate::wrap::line(
+                    Line::from(Span::styled(raw, words)),
+                    body_width(width) as usize,
+                );
+                for (li, line) in parts.into_iter().enumerate() {
                     // **The bar stands on every line.** Set only on the first line, the second line
                     // onward wouldn't be distinguishable from the message before it — the longer
                     // the message, the longer that stretch.
-                    let bar = Span::styled("▌ ", Style::default().fg(theme::accent()));
-                    let mut prefix_w = markdown::display_width(&bar.content);
-                    let mut spans = vec![bar];
-                    // The indent the line was written with, in front of what markdown made of it.
-                    if li == 0 && !indent.is_empty() {
-                        spans.push(Span::styled(
-                            indent.to_string(),
-                            Style::default().fg(theme::text()),
-                        ));
-                        prefix_w += markdown::display_width(indent);
-                    }
+                    let mut spans = vec![Span::styled("▌ ", Style::default().fg(theme::accent()))];
+                    // A wrapped line opens with the hang the wrap drew, which is margin, not text.
+                    let hang = match li {
+                        0 => 0,
+                        _ => line
+                            .spans
+                            .iter()
+                            .flat_map(|s| s.content.chars())
+                            .take_while(|c| *c == ' ')
+                            .count(),
+                    };
                     spans.extend(line.spans);
                     // **The background rides on the line, not the spans.** Painted on a span it
                     // breaks at glyph widths into blotches, and padding with spaces to fill the
@@ -667,23 +665,8 @@ fn make(item: &Item, width: u16, folds: &Folds, turn: Turn, lang: crate::lang::L
                     // Stretching to the screen width is done where it draws
                     // (`widgets::transcript::stretch`).
                     out.push(Line::from(spans).style(Style::default().bg(theme::user_bg())));
-                    links.push(shift_links(&rendered.links[li], prefix_w));
-                    // **The bar's width, not the indent's.** The indent is the person's own text,
-                    // so it is inside what a drag may cover.
-                    body.push(text_start(USER_BAR_W, &md, li));
-                }
-                // A line that is nothing but whitespace has nothing for markdown to render, and
-                // dropping it would close the gap the person left in their own words.
-                if rest.trim().is_empty() && !indent.is_empty() {
-                    out.push(
-                        Line::from(vec![
-                            Span::styled("▌ ", Style::default().fg(theme::accent())),
-                            Span::styled(indent.to_string(), Style::default().fg(theme::text())),
-                        ])
-                        .style(Style::default().bg(theme::user_bg())),
-                    );
                     links.push(Vec::new());
-                    body.push(USER_BAR_W as u16);
+                    body.push((USER_BAR_W + hang) as u16);
                 }
             }
         }
@@ -709,14 +692,26 @@ fn make(item: &Item, width: u16, folds: &Folds, turn: Turn, lang: crate::lang::L
                 body.push(text_start(prefix_w, &md, i));
             }
         }
+        // **An error wraps, line by line, under its dot.** It was one line holding the whole
+        // message: a stack trace or a JSON error body was cut at the right edge, and its line
+        // breaks — which the screen draws as nothing — fused the words either side. What explains
+        // the failure is the part that was lost.
         Item::Error { message, .. } => {
-            out.push(Line::from(vec![
-                Span::styled("● ", Style::default().fg(theme::danger())),
-                Span::styled(message.clone(), Style::default().fg(theme::danger())),
-            ]));
-            links.push(Vec::new());
-            // The marker and the space after it, and nothing else on this line.
-            body.push(2);
+            let red = Style::default().fg(theme::danger());
+            let text = crate::wrap::expand_tabs(message);
+            // An empty message still leaves its dot: something failed.
+            let lines: Vec<&str> = if text.is_empty() { vec![""] } else { text.lines().collect() };
+            for (i, raw) in lines.into_iter().enumerate() {
+                let mark = if i == 0 { "● " } else { "  " };
+                let line =
+                    Line::from(vec![Span::styled(mark, red), Span::styled(raw.to_string(), red)]);
+                for part in crate::wrap::line(line, width as usize) {
+                    out.push(part);
+                    links.push(Vec::new());
+                    // The marker (or the hang under it) and the space after it.
+                    body.push(2);
+                }
+            }
         }
         // The question being answered doesn't come here — `layout` filters it out.
         Item::Question { steps, answered, answer, .. } => {
@@ -844,6 +839,29 @@ fn make(item: &Item, width: u16, folds: &Folds, turn: Turn, lang: crate::lang::L
             // it is exactly what the reasoning chips under it use, and the head stopped reading as
             // the thing they hang from. The fold marker goes on the end, where the tool rows put
             // theirs.
+            let mut tail: Vec<Span<'static>> = Vec::new();
+            if total > 0 {
+                tail.push(Span::styled(
+                    format!("  ∙  {}", lang.tool_count(total)),
+                    Style::default().fg(theme::text_muted()),
+                ));
+            }
+            if add + rem > 0 {
+                tail.extend(counts(add, rem));
+            }
+            tail.push(Span::styled(
+                if card_open { "  ▾" } else { "  ▸" },
+                Style::default().fg(theme::border_light()),
+            ));
+            // **The title gives way, not the counts and the marker.** It is the server's latest
+            // `work_summary`, of any length and possibly several lines; drawn whole it ran past
+            // the edge and took the fold marker with it. Folded to one line and cut with `…` to
+            // what the rest of the row leaves.
+            let tail_w: usize = tail.iter().map(|s| markdown::display_width(&s.content)).sum();
+            let head = markdown::truncate_to(
+                &one_line(head),
+                (width as usize).saturating_sub(2 + tail_w).max(1),
+            );
             let mut card = vec![Span::styled("✻ ", Style::default().fg(theme::topic()))];
             // **The head breathes as one thing, and it is coloured elsewhere.** The whole title
             // fades toward the background and back — the page this is modelled on does the same
@@ -853,30 +871,15 @@ fn make(item: &Item, width: u16, folds: &Folds, turn: Turn, lang: crate::lang::L
             // nothing else did. Only while the run goes — a finished card whose title kept
             // moving would say it still is.
             if running {
-                card.push(Span::styled(
-                    head.to_string(),
-                    Style::default().fg(theme::text_heading()),
-                ));
+                card.push(Span::styled(head, Style::default().fg(theme::text_heading())));
                 breathing.push((out.len(), card.len() - 1));
             } else {
                 card.push(Span::styled(
-                    head.to_string(),
+                    head,
                     Style::default().fg(theme::text_heading()).add_modifier(Modifier::BOLD),
                 ));
             }
-            if total > 0 {
-                card.push(Span::styled(
-                    format!("  ∙  {}", lang.tool_count(total)),
-                    Style::default().fg(theme::text_muted()),
-                ));
-            }
-            if add + rem > 0 {
-                card.extend(counts(add, rem));
-            }
-            card.push(Span::styled(
-                if card_open { "  ▾" } else { "  ▸" },
-                Style::default().fg(theme::border_light()),
-            ));
+            card.extend(tail);
             heads.push((out.len(), *seq));
             out.push(Line::from(card));
             links.push(Vec::new());
@@ -910,8 +913,13 @@ fn make(item: &Item, width: u16, folds: &Folds, turn: Turn, lang: crate::lang::L
                             .map(|s| markdown::display_width(&s.content))
                             .sum::<usize>();
                         // Not bold: the card head is the heading, and a chip is one step down.
-                        spans
-                            .push(Span::styled(title.clone(), Style::default().fg(theme::topic())));
+                        // A server title is any length and may hold line breaks, so it is folded
+                        // to one line and cut to the row with a mark rather than at the edge.
+                        let shown = markdown::truncate_to(
+                            &one_line(&title),
+                            (width as usize).saturating_sub(own).max(1),
+                        );
+                        spans.push(Span::styled(shown, Style::default().fg(theme::topic())));
                         heads.push((out.len(), t.seq));
                         out.push(Line::from(spans));
                         links.push(Vec::new());
@@ -923,9 +931,10 @@ fn make(item: &Item, width: u16, folds: &Folds, turn: Turn, lang: crate::lang::L
                         if !open || body_text.is_empty() || body_text == title {
                             continue;
                         }
-                        // The reasoning body, dim so the answer beside it keeps the eye.
+                        // The reasoning body, dim so the answer beside it keeps the eye. Its margin
+                        // is two pads and the rule — four columns past the body's own start.
                         let rendered =
-                            markdown::render_rich(&t.text, body_width(width).saturating_sub(2));
+                            markdown::render_rich(&t.text, body_width(width).saturating_sub(4));
                         let md = rendered.prefix.clone();
                         for (li, line) in rendered.lines.into_iter().enumerate() {
                             let mut spans = vec![
@@ -1029,17 +1038,12 @@ fn tool_row(
         step.name.clone(),
         Style::default().fg(theme::tool()).add_modifier(Modifier::BOLD),
     ));
-    if !step.action.is_empty() {
-        head.push(Span::styled(
-            format!("  {}", step.action),
-            Style::default().fg(theme::tool_arg()),
-        ));
-    }
+    let mut tail = Vec::new();
     let (add, rem) = step.counts();
     if add + rem > 0 {
-        head.extend(counts(add, rem));
+        tail.extend(counts(add, rem));
     }
-    head.push(Span::styled(
+    tail.push(Span::styled(
         match (can_open, open) {
             (false, _) => "",
             (true, false) => "  ▸",
@@ -1047,6 +1051,19 @@ fn tool_row(
         },
         Style::default().fg(theme::border_light()),
     ));
+    // **The action gives way to the counts and the fold marker.** They stood after it, so a long
+    // command or a deep path pushed them past the edge: the row stopped looking openable and what
+    // it changed could not be read. The action is cut to what the row leaves, in columns.
+    let used: usize =
+        head.iter().chain(&tail).map(|s| markdown::display_width(&s.content)).sum::<usize>() + 2;
+    let room = (width as usize).saturating_sub(used);
+    if !step.action.is_empty() && room >= 2 {
+        head.push(Span::styled(
+            format!("  {}", markdown::truncate_to(&step.action, room)),
+            Style::default().fg(theme::tool_arg()),
+        ));
+    }
+    head.extend(tail);
     out.push(Line::from(head));
     body.push(own as u16);
     if open {
@@ -1075,7 +1092,9 @@ fn detail_lines(
 ) -> (Vec<Line<'static>>, Vec<u16>) {
     use crate::tool_view::{Detail, ToolState};
     let failed = state == ToolState::Failed;
-    let inner = body_width(width).saturating_sub(DETAIL_PAD.len() as u16).max(8);
+    // The room there is, however little — a floor above it put the detail past a narrow screen's
+    // edge (4 + 8 columns on a 10-column terminal).
+    let inner = body_width(width).saturating_sub(DETAIL_PAD.len() as u16).max(1);
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut body: Vec<u16> = Vec::new();
     // The gutter that ties the detail to its row. Red when the call failed, so a failure is
@@ -1084,13 +1103,19 @@ fn detail_lines(
     let mut row = |mark: &str, spans: Vec<Span<'static>>| {
         // **Every detail line wears the same margin**: the indent and the mark that ties it to the
         // row above. Where the text starts is that width, whatever the text turns out to be.
-        body.push((DETAIL_PAD.len() + markdown::display_width(mark)) as u16);
+        //
+        // **A line too long for the screen wraps under its mark** — a headline, a label naming a
+        // deep path — rather than running past the edge. Text already fitted to `inner` comes
+        // back as it went in.
+        let start = (DETAIL_PAD.len() + markdown::display_width(mark)) as u16;
         let mut line = vec![
             Span::styled(DETAIL_PAD, Style::default()),
             Span::styled(mark.to_string(), Style::default().fg(rail)),
         ];
         line.extend(spans);
-        Line::from(line)
+        let lines = crate::wrap::line(Line::from(line), width as usize);
+        body.extend(std::iter::repeat_n(start, lines.len()));
+        lines
     };
     let plain = |text: &str, colour: ratatui::style::Color| {
         wrap_plain(text, inner)
@@ -1121,9 +1146,9 @@ fn detail_lines(
                     Some(c) => (lang.detail_exit_code(*c), theme::danger()),
                 }
             };
-            out.push(row("⎿ ", vec![Span::styled(label, Style::default().fg(colour))]));
+            out.extend(row("⎿ ", vec![Span::styled(label, Style::default().fg(colour))]));
             if stdout.trim().is_empty() && err.trim().is_empty() {
-                out.push(row(
+                out.extend(row(
                     "  ",
                     vec![Span::styled(
                         lang.detail_no_output().to_string(),
@@ -1132,10 +1157,10 @@ fn detail_lines(
                 ));
             }
             for spans in plain(stdout.trim_end(), theme::text()) {
-                out.push(row("  ", spans));
+                out.extend(row("  ", spans));
             }
             if !err.trim().is_empty() {
-                out.push(row(
+                out.extend(row(
                     "⎿ ",
                     vec![Span::styled(
                         "stderr".to_string(),
@@ -1143,12 +1168,12 @@ fn detail_lines(
                     )],
                 ));
                 for spans in plain(err.trim_end(), theme::danger()) {
-                    out.push(row("  ", spans));
+                    out.extend(row("  ", spans));
                 }
             }
         }
         Detail::Hits { scanned, hits, truncated } => {
-            out.push(row(
+            out.extend(row(
                 "⎿ ",
                 vec![Span::styled(
                     lang.detail_hits(hits.len(), *scanned),
@@ -1157,21 +1182,34 @@ fn detail_lines(
             ));
             for h in hits {
                 // `path:line` first, then the matched text — the eye scans down the left column.
-                let place = format!("{}:{}", h.path, h.line);
-                let room = (inner as usize).saturating_sub(markdown::display_width(&place) + 2);
-                out.push(row(
-                    "  ",
-                    vec![
-                        Span::styled(place, Style::default().fg(theme::tool_arg())),
-                        Span::styled(
-                            format!("  {}", clip_to(h.text.clone(), room.max(8))),
-                            Style::default().fg(theme::text_muted()),
-                        ),
-                    ],
-                ));
+                // Both are cut to the row: a deep path used to run past the edge whole. When the
+                // path leaves too little beside it, the text takes a row of its own.
+                let inner = inner as usize;
+                let place = markdown::truncate_to(&format!("{}:{}", h.path, h.line), inner);
+                let place_style = Style::default().fg(theme::tool_arg());
+                let text_style = Style::default().fg(theme::text_muted());
+                let room = inner.saturating_sub(markdown::display_width(&place) + 2);
+                if room >= 8 {
+                    out.extend(row(
+                        "  ",
+                        vec![
+                            Span::styled(place, place_style),
+                            Span::styled(
+                                format!("  {}", clip_to(h.text.clone(), room)),
+                                text_style,
+                            ),
+                        ],
+                    ));
+                } else {
+                    out.extend(row("  ", vec![Span::styled(place, place_style)]));
+                    out.extend(row(
+                        "  ",
+                        vec![Span::styled(clip_to(h.text.clone(), inner), text_style)],
+                    ));
+                }
             }
             if *truncated {
-                out.push(row(
+                out.extend(row(
                     "  ",
                     vec![Span::styled(
                         lang.detail_truncated().to_string(),
@@ -1181,7 +1219,7 @@ fn detail_lines(
             }
         }
         Detail::Paths { paths, truncated } => {
-            out.push(row(
+            out.extend(row(
                 "⎿ ",
                 vec![Span::styled(
                     lang.detail_found(paths.len()),
@@ -1189,7 +1227,7 @@ fn detail_lines(
                 )],
             ));
             for p in paths {
-                out.push(row(
+                out.extend(row(
                     "  ",
                     vec![Span::styled(
                         clip_to(p.clone(), inner as usize),
@@ -1198,7 +1236,7 @@ fn detail_lines(
                 ));
             }
             if *truncated {
-                out.push(row(
+                out.extend(row(
                     "  ",
                     vec![Span::styled(
                         lang.detail_truncated().to_string(),
@@ -1209,7 +1247,7 @@ fn detail_lines(
         }
         Detail::Body { label, text } => {
             if !label.is_empty() {
-                out.push(row(
+                out.extend(row(
                     "⎿ ",
                     vec![Span::styled(
                         label.clone(),
@@ -1218,7 +1256,7 @@ fn detail_lines(
                 ));
             }
             for spans in plain(text, theme::text()) {
-                out.push(row("  ", spans));
+                out.extend(row("  ", spans));
             }
         }
         // The fallback. **Not parsed as markdown** — JSON's `*` and `_` eaten as emphasis would
@@ -1235,7 +1273,7 @@ fn detail_lines(
                 if body.trim().is_empty() {
                     continue;
                 }
-                out.push(row(
+                out.extend(row(
                     "⎿ ",
                     vec![Span::styled(
                         head.to_string(),
@@ -1244,7 +1282,7 @@ fn detail_lines(
                 ));
                 let base = if failed { theme::danger() } else { theme::text_muted() };
                 for line in wrap_plain(body, inner) {
-                    out.push(row("  ", json_line(&line, base)));
+                    out.extend(row("  ", json_line(&line, base)));
                 }
             }
         }
@@ -1286,9 +1324,9 @@ pub(crate) fn diff_line(
 ) -> Line<'static> {
     use crate::tools::diff::DiffLine;
     let (text, colour) = match line {
-        DiffLine::Add(s) => (format!("+{s}"), theme::diff_add()),
-        DiffLine::Del(s) => (format!("-{s}"), theme::diff_del()),
-        DiffLine::Keep(s) => (format!(" {s}"), theme::text_muted()),
+        DiffLine::Add(s) => (format!("+{}", crate::wrap::expand_tabs(s)), theme::diff_add()),
+        DiffLine::Del(s) => (format!("-{}", crate::wrap::expand_tabs(s)), theme::diff_del()),
+        DiffLine::Keep(s) => (format!(" {}", crate::wrap::expand_tabs(s)), theme::text_muted()),
         DiffLine::Skip(n) => (lang.diff_skip(*n), theme::border_light()),
     };
     Line::from(vec![
@@ -1299,23 +1337,14 @@ pub(crate) fn diff_line(
 
 /// Clips when wider than the limit. **No wrapping** — if one code line grew into several screen lines,
 /// skimming what changed gets hard, and the wrapped tail reads like the next line's `+`/`-`.
+///
+/// By cluster and to the width given: it walked `char`s, so a cut could fall between a letter and
+/// its mark, and it widened anything under eight columns past a narrow screen's edge.
 fn clip_to(text: String, width: usize) -> String {
-    let limit = width.max(8);
-    if markdown::display_width(&text) <= limit {
+    if markdown::display_width(&text) <= width.max(1) {
         return text;
     }
-    let mut out = String::new();
-    let mut used = 0usize;
-    for ch in text.chars() {
-        let w = markdown::display_width(&ch.to_string()).max(1);
-        if used + w > limit - 1 {
-            break;
-        }
-        out.push(ch);
-        used += w;
-    }
-    out.push('…');
-    out
+    markdown::truncate_to(&text, width.max(1))
 }
 
 /// Wraps to fit the width. **Cuts only by column count** — tool detail is JSON or raw text, so it
@@ -1330,7 +1359,8 @@ fn wrap_plain(text: &str, width: u16) -> Vec<String> {
 /// block without parsing it.
 fn json_line(raw: &str, base: ratatui::style::Color) -> Vec<Span<'static>> {
     let trimmed = raw.trim_start();
-    let indent = raw.len() - trimmed.len();
+    // In columns: `trim_start` also takes an NBSP or an ideographic space, which is not one byte.
+    let indent = markdown::display_width(&raw[..raw.len() - trimmed.len()]);
     let mut spans = vec![Span::styled(" ".repeat(indent), Style::default().fg(base))];
     if let Some(after_quote) = trimmed.strip_prefix('"') {
         if let Some(end) = after_quote.find('"') {
@@ -1656,7 +1686,8 @@ mod tests {
         let r = live(&[body], 60, &folds, crate::lang::Lang::En);
         let rows = r.plain();
         let out = draggable(&rows, &r.body);
-        assert!(out.contains("\n\tif x {\n\t\tgo();"), "the tabs went: {out:?}");
+        // The screen draws a tab as nothing, so it is laid out as the spaces it stands for.
+        assert!(out.contains("\n    if x {\n        go();"), "the indent went: {out:?}");
     }
 
     /// **A person's own indentation survives**, on screen and in a copy. Markdown reads four
@@ -1669,7 +1700,7 @@ mod tests {
         let r = live(&items, 60, &Folds::new(), crate::lang::Lang::En);
         let rows = r.plain();
         assert!(!rows.iter().any(|l| l.contains('┌')), "their line became a code block: {rows:?}");
-        assert!(rows.iter().any(|l| l.contains("\tif x {")), "the tab is gone: {rows:?}");
+        assert!(rows.iter().any(|l| l.contains("    if x {")), "the tab is gone: {rows:?}");
         assert_eq!(r.body[1], 2, "the bar is what a drag may not cover: {rows:?}");
 
         let last = rows.len() - 1;
@@ -1678,7 +1709,7 @@ mod tests {
             &r.body,
             &crate::selection::Drag { from: (0, 0), to: (last, 200) },
         );
-        assert_eq!(out, "look:\n\tif x {\n\t\tgo();\n\t}", "{rows:?}");
+        assert_eq!(out, "look:\n    if x {\n        go();\n    }", "{rows:?}");
     }
 
     /// The first chip's fold key, so a test can open a single chip.
@@ -1760,7 +1791,9 @@ mod tests {
     fn a_folded_chip_hides_thinking_but_shows_tools() {
         let shut = Folds::from([(chip_key(&work()), Fold { open: false, user_touched: true })]);
         let out = plain(&live(&[work()], 40, &shut, crate::lang::Lang::Ko));
-        assert!(out[0].contains("스크롤 계산 위치를 찾는 중"), "no card head: {out:?}");
+        // At 40 columns the title is cut with a mark so the count and the marker stay.
+        assert!(out[0].contains("스크롤 계산 위치를 찾…"), "no card head: {out:?}");
+        assert!(out[0].ends_with('▾'), "{out:?}");
         assert!(out.iter().any(|l| l.contains("먼저 구조를 본다")), "no chip title: {out:?}");
         assert!(out.iter().any(|l| l.contains("grep")), "the tool row must show: {out:?}");
         assert!(
@@ -2099,6 +2132,96 @@ mod tests {
                 summary: "하위 에이전트가 끝났다".into(),
             },
         ]
+    }
+
+    /// **An error wraps, a line of the message to a line on screen.** It was one line: the tail was
+    /// cut at the edge and the message's own line breaks, drawn as nothing, fused its words.
+    #[test]
+    fn an_error_wraps_line_by_line_under_its_dot() {
+        let message = format!("request failed\ncaused by: {}", "connection reset ".repeat(6));
+        let r = rows(&[Item::Error { seq: 1, message }], 40, &Folds::new(), crate::lang::Lang::En);
+        let out = plain(&r);
+        assert_eq!(out[0], "● request failed", "{out:?}");
+        assert!(out[1].starts_with("  caused by:"), "{out:?}");
+        assert!(out.len() > 3, "{out:?}");
+        assert!(out.iter().all(|l| crate::markdown::display_width(l) <= 40), "{out:?}");
+        assert_eq!(out.join(" ").matches("reset").count(), 6, "{out:?}");
+    }
+
+    /// **The counts and the fold marker survive a long action.** They came after it, so an `exec`
+    /// of a long command lost `▸` and `+N −M` at 80 columns and stopped looking openable.
+    #[test]
+    fn a_tool_row_keeps_its_marker_when_the_action_is_long() {
+        let mut step = step_at(100, "exec");
+        step.action = format!("cargo test {}", "--features x ".repeat(12));
+        let item =
+            Item::Work { seq: 1, title: "t".into(), stopped: false, parts: vec![Part::Step(step)] };
+        let out = plain(&live(&[item], 80, &Folds::new(), crate::lang::Lang::En));
+        let row = out.iter().find(|l| l.contains("exec")).expect("{out:?}");
+        assert!(row.ends_with('▸'), "{out:?}");
+        assert!(row.contains('…'), "the cut is silent: {out:?}");
+        assert!(crate::markdown::display_width(row) <= 80, "{out:?}");
+    }
+
+    /// **A person's message is drawn as they typed it.** Parsed as markdown line by line, a blank
+    /// line vanished, `# note` lost its `#`, `*args` its star and `<T>` the whole word.
+    #[test]
+    fn a_users_message_is_drawn_as_typed() {
+        let text = "# note\n\ncall f(*args) with Vec<T>\n**not bold**";
+        let out = plain(&rows(
+            &[Item::User { seq: 1, text: text.into() }],
+            60,
+            &Folds::new(),
+            crate::lang::Lang::En,
+        ));
+        assert_eq!(out, ["▌ # note", "▌ ", "▌ call f(*args) with Vec<T>", "▌ **not bold**"]);
+    }
+
+    /// **Nothing is drawn past the right edge, at any width.** Every kind of row — with an opened
+    /// tool, a table, a code block, a long URL — laid out at every width from nothing up. Floors
+    /// above the real width (`max(8)`, `max(20)`) used to push text past narrow screens.
+    #[test]
+    fn every_row_fits_every_width() {
+        let url = format!("https://example.com/{}", "segment/".repeat(12));
+        let mut items = mixed();
+        items.push(Item::Agent {
+            seq: 10,
+            text: format!("see {url}\n\n```sh\n\techo {}\n```\n\n- item {url}\n\n| a | b | c |\n|---|---|---|\n| 1 | two words | {url} |", "x".repeat(90)),
+        });
+        items.push(Item::Error { seq: 11, message: format!("failed\n{url}") });
+        items
+            .push(Item::User { seq: 12, text: format!("\tlook at {url}\n\n{}", "가".repeat(70)) });
+        let mut step = step_at(1300, "grep");
+        step.action = url.clone();
+        step.detail = crate::tool_view::Detail::Hits {
+            scanned: 3,
+            hits: vec![crate::tool_view::Hit { path: url.clone(), line: 9, text: url.clone() }],
+            truncated: true,
+        };
+        items.push(Item::Work {
+            seq: 13,
+            title: url.clone(),
+            stopped: false,
+            parts: vec![Part::Step(step)],
+        });
+        let mut folds = open_all(&items[1]);
+        folds.insert(13, Fold { open: true, user_touched: true });
+        folds.insert(1300, Fold { open: true, user_touched: true });
+
+        for width in 0..=120u16 {
+            let out = plain(&live(&items, width, &folds, crate::lang::Lang::En));
+            // Below this a row's fixed furniture (a dot, a fold marker, a tool count) is itself
+            // wider than the screen; it is still laid out without a panic.
+            if width < 24 {
+                continue;
+            }
+            for line in &out {
+                assert!(
+                    crate::markdown::display_width(line) <= width as usize,
+                    "{line:?} is wider than {width}: {out:#?}",
+                );
+            }
+        }
     }
 
     /// **A subagent's answer says what it is and how it is getting on** (issue #32, 2026-09-18).
