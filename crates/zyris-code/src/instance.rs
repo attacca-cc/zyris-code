@@ -6,11 +6,17 @@
 //! one's work in ways neither of them can see. What was missing was any record of *which windows
 //! are running*; with one, "is another window already here?" becomes a question with an answer.
 //!
-//! **Liveness is a held lock, not a timer and not a pid table.** Each window writes
-//! `<cache>/instances/<pid>.json` and keeps an exclusive lock on it for as long as it lives. Any
-//! other window asks whether an entry's owner is still there by trying to take that lock — it
-//! succeeds only if the owner is gone. No clock, no `/proc`, no platform branch, and a machine
-//! that is rebooted leaves nothing behind, because the lock died with the process.
+//! **Liveness is a held lock, not a timer and not a pid table.** Each window keeps an exclusive
+//! lock on `<cache>/instances/<pid>.lock` for as long as it lives, and describes itself in
+//! `<pid>.json` beside it. Any other window asks whether an entry's owner is still there by trying
+//! to take that lock — it succeeds only if the owner is gone. No clock, no `/proc`, no platform
+//! branch, and a machine that is rebooted leaves nothing behind, because the lock died with the
+//! process.
+//!
+//! **The lock is not on the row itself.** On Windows a file lock is mandatory: a locked byte range
+//! cannot be read through any other handle, so a locked `<pid>.json` was a row nobody else could
+//! read, and every other window saw an empty registry. The row stays unlocked and readable; the
+//! lock lives on a file nobody ever reads.
 //!
 //! | what is at stake | who asks |
 //! |---|---|
@@ -47,9 +53,11 @@ pub struct Row {
     pub cwd: PathBuf,
 }
 
-/// One window's entry, held open and locked for as long as it lives. Dropping it releases both.
+/// One window's entry: the row, and the lock file held open and locked for as long as it lives.
+/// Dropping it releases both.
 pub struct Instance {
     path: PathBuf,
+    lock: PathBuf,
     /// Never read — it exists so the lock is held. Closing it releases the lock.
     _file: fs::File,
 }
@@ -64,22 +72,30 @@ impl Instance {
         // window believe the machine is busier than it is — and its basename would keep forcing the
         // `-<hash>` suffix on a name that no longer collides.
         prune(&dir);
-        let path = dir.join(format!("{}.json", std::process::id()));
-        let row = Row {
-            pid: std::process::id(),
-            node_name: node_name.to_string(),
-            cwd: cwd.to_path_buf(),
-        };
+        let pid = std::process::id();
+        let path = dir.join(format!("{pid}.json"));
+        let lock = lock_path(&path);
+        // **The lock first, then the row.** Written the other way round, another window's `prune`
+        // could find the row in the moment before it was locked, take the free lock, and delete a
+        // live window's row. Once the lock is held, `prune` leaves the row it guards alone.
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock)
+            .ok()?;
+        // Every stale row was just pruned, so nothing else should hold it. A failure here means the
+        // filesystem grew a lock this process cannot take, and the honest answer is then "not
+        // registered".
+        file.try_lock().ok()?;
+        let row = Row { pid, node_name: node_name.to_string(), cwd: cwd.to_path_buf() };
         let text = serde_json::to_vec(&row).ok()?;
         if crate::atomic::write_atomic(&path, &text, None).is_err() {
+            let _ = fs::remove_file(&lock);
             return None;
         }
-        let file = fs::OpenOptions::new().read(true).write(true).open(&path).ok()?;
-        // Written a moment ago, and every stale row was just pruned, so nothing else can hold it.
-        // A failure here means the filesystem grew a lock this process cannot take, and the honest
-        // answer is then "not registered".
-        file.try_lock().ok()?;
-        Some(Instance { path, _file: file })
+        Some(Instance { path, lock, _file: file })
     }
 
     /// Where the entry lives, so a test can look at it.
@@ -90,8 +106,28 @@ impl Instance {
 
 impl Drop for Instance {
     fn drop(&mut self) {
+        // The row goes before its lock, so nobody finds a row whose lock file is already gone.
+        // Removing a file this process still holds open works on Windows too — std opens every
+        // file with `FILE_SHARE_DELETE`.
         let _ = fs::remove_file(&self.path);
+        let _ = fs::remove_file(&self.lock);
     }
+}
+
+/// The lock file that says whether the row at `row` has a live owner.
+fn lock_path(row: &Path) -> PathBuf {
+    row.with_extension("lock")
+}
+
+/// Whether somebody holds the lock guarding the row at `row`. A lock file that does not exist, or
+/// that we can take ourselves, has no owner.
+fn is_held(row: &Path) -> bool {
+    // Opened without `create`: a missing lock file is an answer ("nobody"), not something to make.
+    let Ok(file) = fs::OpenOptions::new().read(true).write(true).open(lock_path(row)) else {
+        return false;
+    };
+    // Dropping the handle on return releases the lock again if we took it.
+    matches!(file.try_lock(), Err(fs::TryLockError::WouldBlock))
 }
 
 /// Every window currently alive, with what it said about itself.
@@ -104,11 +140,9 @@ pub fn live(cache_root: &Path) -> Vec<Row> {
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
-        // **A row is alive exactly while its lock is held.** We may take it ourselves only when
-        // nobody else has it — the same test `prune` uses to decide a row is stale. Dropping the
-        // handle at the end of the loop releases it again.
-        let Ok(file) = fs::OpenOptions::new().read(true).write(true).open(&path) else { continue };
-        if !matches!(file.try_lock(), Err(fs::TryLockError::WouldBlock)) {
+        // **A row is alive exactly while its lock is held** — the same test `prune` uses to decide
+        // a row is stale.
+        if !is_held(&path) {
             continue;
         }
         let Ok(text) = fs::read_to_string(&path) else { continue };
@@ -127,6 +161,9 @@ pub fn is_live(cache_root: &Path, pid: u32) -> bool {
 }
 
 /// Removes rows whose owner is gone, so the registry does not grow for ever.
+///
+/// ponytail: a pid reused in the instant between our lock release and a new window's lock could
+/// leave that window unregistered; pid reuse that fast is not worth an inode check.
 fn prune(dir: &Path) {
     let Ok(entries) = fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
@@ -134,14 +171,38 @@ fn prune(dir: &Path) {
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
-        let Ok(file) = fs::OpenOptions::new().read(true).write(true).open(&path) else { continue };
-        // **We could take the lock, so nobody holds it, so nobody is there.** The handle is let go
-        // before the file is removed, so the removal is not fought by our own lock.
-        if !matches!(file.try_lock(), Err(fs::TryLockError::WouldBlock)) {
-            drop(file);
-            let _ = fs::remove_file(&path);
+        let lock = lock_path(&path);
+        // **Only a row whose lock we could take ourselves is deleted**, and the lock is held across
+        // both removals, so a window registering under that pid waits until both are gone.
+        match fs::OpenOptions::new().read(true).write(true).open(&lock) {
+            Ok(file) => {
+                if file.try_lock().is_ok() {
+                    let _ = fs::remove_file(&path);
+                    let _ = fs::remove_file(&lock);
+                }
+            }
+            // No lock file at all: a row left by a build that locked the row itself, or one whose
+            // owner died between the two removals in `Drop`. Nobody can be holding it.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let _ = fs::remove_file(&path);
+            }
+            Err(_) => {}
         }
     }
+}
+
+/// A stand-in for another live window, for tests anywhere in the crate: a row under `pid` and its
+/// lock, held by this process until the returned handle is dropped.
+#[cfg(test)]
+pub(crate) fn fake_live(cache_root: &Path, pid: u32, cwd: &str) -> fs::File {
+    let dir = cache_root.join("instances");
+    fs::create_dir_all(&dir).unwrap();
+    let row = dir.join(format!("{pid}.json"));
+    let file = fs::File::create(lock_path(&row)).unwrap();
+    file.try_lock().unwrap();
+    let text = serde_json::json!({ "pid": pid, "node_name": "app", "cwd": cwd });
+    fs::write(&row, text.to_string()).unwrap();
+    file
 }
 
 /// An advisory lock over a path, **shared between processes** — the in-process `Mutex` beside it
@@ -227,8 +288,10 @@ mod tests {
         drop(me);
     }
 
-    /// **The lock is held while the window lives and free afterwards.** A second window asking
-    /// cannot take it in the first case and can in the second.
+    /// **The lock is held while the window lives and free afterwards, and the row stays readable
+    /// throughout.** A second window asking cannot take the lock in the first case and can in the
+    /// second. The row being readable is the Windows half: a locked file there cannot be read
+    /// through another handle, and a locked row was a window nobody else could see.
     #[test]
     fn the_registry_lock_is_held_for_the_windows_life() {
         let dir = tempfile::tempdir().unwrap();
@@ -236,32 +299,49 @@ mod tests {
         let me = Instance::register(dir.path(), "app", here.path()).unwrap();
         let at = dir.path().join("instances").join(format!("{}.json", std::process::id()));
 
-        let held = fs::OpenOptions::new().read(true).write(true).open(&at).unwrap();
+        let held = fs::OpenOptions::new().read(true).write(true).open(lock_path(&at)).unwrap();
         assert!(held.try_lock().is_err(), "another handle took a live window's lock");
         drop(held);
+        let text = fs::read_to_string(&at).expect("a live window's row must be readable");
+        assert!(text.contains("\"app\""), "{text}");
 
         drop(me);
-        let free = fs::OpenOptions::new().read(true).write(true).open(&at);
-        // The row is removed on drop, so the file itself is gone — which is the same answer.
-        assert!(free.is_err());
+        // Both files are removed on drop, so there is nothing left to hold — the same answer.
+        assert!(!at.exists());
+        assert!(!lock_path(&at).exists());
+    }
+
+    /// **A row whose lock file nobody holds is stale**, and the next registration clears both.
+    #[test]
+    fn a_row_with_a_free_lock_is_pruned() {
+        let root = tempfile::tempdir().unwrap();
+        // Written by hand and never locked: a lock taken and released here could still be held
+        // for a moment by a child another test forks, which inherits the descriptor until exec.
+        fs::create_dir_all(root.path().join("instances")).unwrap();
+        let row = root.path().join("instances").join("4243.json");
+        fs::write(&row, br#"{"pid":4243,"node_name":"gone","cwd":"/gone"}"#).unwrap();
+        fs::write(lock_path(&row), b"").unwrap();
+        assert!(!is_live(root.path(), 4243));
+
+        let here = tempfile::tempdir().unwrap();
+        let me = Instance::register(root.path(), "app", here.path()).unwrap();
+        assert!(!row.exists() && !lock_path(&row).exists(), "a stale row was left behind");
+        drop(me);
     }
 
     /// Two different directories register side by side; the registry is keyed by pid, not by path,
-    /// so both are visible at once.
+    /// so both are visible at once. The other window is there **before** this one registers, so
+    /// this one's `prune` must leave a row whose lock is held alone.
     #[test]
     fn two_windows_are_both_visible() {
         let root = tempfile::tempdir().unwrap();
+        let other = fake_live(root.path(), 4242, "/elsewhere/app");
         let a = tempfile::tempdir().unwrap();
         let me = Instance::register(root.path(), "app", a.path()).unwrap();
-        // A second row, written and locked by hand, stands in for a second process.
-        let at = root.path().join("instances").join("4242.json");
-        fs::write(&at, br#"{"pid":4242,"node_name":"app","cwd":"/elsewhere/app"}"#).unwrap();
-        let file = fs::OpenOptions::new().read(true).write(true).open(&at).unwrap();
-        file.try_lock().unwrap();
 
         let rows = live(root.path());
         assert_eq!(rows.len(), 2, "{rows:?}");
-        drop(file);
+        drop(other);
         drop(me);
     }
 }

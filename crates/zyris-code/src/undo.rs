@@ -581,16 +581,10 @@ mod tests {
         undo.snapshot(&ours);
         write(&ours, "after\n");
 
-        // A second live window, as the registry sees one: a row held open by this process under a
-        // pid that is not this one's.
-        let instances = cache.path().join("zyris-code").join("instances");
-        std::fs::create_dir_all(&instances).unwrap();
+        // A second live window, as the registry sees one: a row whose lock this process holds
+        // under a pid that is not this one's.
         let other: u32 = std::process::id() + 1;
-        let row = instances.join(format!("{other}.json"));
-        std::fs::write(&row, format!("{{\"pid\":{other},\"node_name\":\"x\",\"cwd\":\"/tmp\"}}"))
-            .unwrap();
-        let held = std::fs::OpenOptions::new().read(true).write(true).open(&row).unwrap();
-        held.try_lock().unwrap();
+        let held = crate::instance::fake_live(&cache.path().join("zyris-code"), other, "/tmp");
 
         // Their edit sits on top of ours: a backup and a log line of their own.
         let theirs = work.path().join("theirs.rs");
@@ -618,6 +612,5 @@ mod tests {
         assert!(undo.revert_last().is_err(), "it reverted another live window's edit");
 
         drop(held);
-        let _ = std::fs::remove_file(&row);
     }
 }
