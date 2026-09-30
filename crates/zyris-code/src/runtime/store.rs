@@ -114,6 +114,13 @@ pub trait CredentialStore: Send + Sync + 'static {
     async fn lock(&self) -> Result<CredentialLock, CredentialStoreError> {
         Ok(CredentialLock { file: None })
     }
+    /// Claim the one enrollment this store may have in flight across processes, **without
+    /// waiting**: `None` while another process holds the claim. Held for as long as an enrollment
+    /// takes — a person walking to a browser — which is why it is not `lock`, whose waiters give
+    /// up. Stores with no other process to share with always get it.
+    async fn claim_enrollment(&self) -> Result<Option<CredentialLock>, CredentialStoreError> {
+        Ok(Some(CredentialLock { file: None }))
+    }
     /// The stored credential, or `None` when this node has never enrolled.
     async fn load(&self) -> Result<Option<Credential>, CredentialStoreError>;
     /// Write, replacing whatever was there. Callers persist *before* using a credential, so a
@@ -328,6 +335,27 @@ impl CredentialStore for FileCredentialStore {
                     return Err(CredentialStoreError::other(error))
                 }
             }
+        }
+    }
+
+    async fn claim_enrollment(&self) -> Result<Option<CredentialLock>, CredentialStoreError> {
+        // A file of its own, not the credential lock: that one is taken for a read-check-write and
+        // waited on with a timeout, and holding it across a browser trip is what issue 02 was.
+        let path = self.path.with_extension("enrolling");
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(CredentialStoreError::other)?;
+        }
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(CredentialStoreError::other)?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(CredentialLock { file: Some(file) })),
+            Err(fs::TryLockError::WouldBlock) => Ok(None),
+            Err(fs::TryLockError::Error(error)) => Err(CredentialStoreError::other(error)),
         }
     }
 

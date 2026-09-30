@@ -22,6 +22,9 @@ use crate::runtime::{
 };
 use crate::tools::bridge::Bridge;
 
+/// How often a window waiting on another window's enrollment looks for the credential it writes.
+const ENROLL_POLL: Duration = Duration::from_millis(500);
+
 /// The credentials this node will use.
 ///
 /// What a person explicitly gives always wins, and the path that has to ask a person comes last:
@@ -145,16 +148,47 @@ impl DeviceGrant {
         // **The file is locked for the read, and no longer.** Whoever holds the lock is mid-
         // enrollment and puts the new credential down before letting go, so this sees either the
         // finished file or nothing — without waiting out a browser trip the way it used to.
-        let found = {
-            let _transaction = self.store.lock().await.map_err(store_trouble)?;
-            self.stored().await?
-        };
-        let credential = match found {
+        let credential = match self.stored_now().await? {
             Some(credential) => credential,
-            None => self.enroll().await?,
+            None => self.enroll_or_adopt().await?,
         };
         *self.held.lock().await = Some(credential.clone());
         Ok(credential)
+    }
+
+    /// `stored`, under the credential file's lock for the read and no longer.
+    async fn stored_now(&self) -> Result<Option<zyris::Credential>, CredentialsError> {
+        let _transaction = self.store.lock().await.map_err(store_trouble)?;
+        self.stored().await
+    }
+
+    /// Enrolls — **unless another window already is**, in which case this one waits for the
+    /// credential that window will write and adopts it.
+    ///
+    /// Two windows started fresh used to enroll side by side: two codes, two browser approvals,
+    /// and a second credential on the account for the one the person approved second. The claim
+    /// is held for the whole enrollment and never waited on with a timeout; a window that does not
+    /// get it keeps running and looks at the credential file every `ENROLL_POLL`. If the enrolling
+    /// window goes away without a credential — declined, or closed — the claim is free again and
+    /// the next look takes it and enrolls here instead.
+    async fn enroll_or_adopt(&self) -> Result<zyris::Credential, CredentialsError> {
+        let mut said = false;
+        loop {
+            if let Some(_claim) = self.store.claim_enrollment().await.map_err(store_trouble)? {
+                // Whoever held the claim may have finished between our read and taking it.
+                if let Some(credential) = self.stored_now().await? {
+                    return Ok(credential);
+                }
+                return self.enroll().await;
+            }
+            if !std::mem::replace(&mut said, true) {
+                tracing::info!("another window is enrolling; waiting for its credential");
+            }
+            tokio::time::sleep(ENROLL_POLL).await;
+            if let Some(credential) = self.stored_now().await? {
+                return Ok(credential);
+            }
+        }
     }
 
     /// Whether the credential carried in memory has since been cleared from the store — which is
@@ -313,7 +347,8 @@ impl Credentials for DeviceGrant {
         // second window during a first run killed it instead of letting it wait. What actually
         // needs serialising is the credential **file**, and that is locked inside `credential`,
         // `enroll` and `forget_refused` — each for a read-check-write and no longer. One enrollment
-        // per *window* is still enforced by the in-process `enrolling` mutex.
+        // per *window* is still enforced by the in-process `enrolling` mutex, and one per *machine*
+        // by the enrollment claim (`enroll_or_adopt`), which is waited on without a timeout.
         Ok(self.credential().await?.secret().to_string())
     }
 
@@ -710,6 +745,30 @@ mod tests_discard {
 
         store.clear().await.unwrap();
         assert!(reauth.grant.released_elsewhere().await, "the cleared file was not noticed");
+    }
+
+    /// **A window starting while another enrolls waits for that credential instead of enrolling
+    /// too.** Both used to show a code, and the second approval put a second credential on the
+    /// account. The waiting window keeps running — no timeout, no exit — and adopts the file the
+    /// other one writes. The server here does not exist, so enrolling would have failed.
+    #[tokio::test]
+    async fn a_window_waits_for_another_windows_enrollment_and_adopts_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("creds.json");
+        let other = FileCredentialStore::at(&path);
+        let claim = other.claim_enrollment().await.unwrap().expect("the first claim is free");
+        let ours = FileCredentialStore::at(&path);
+        assert!(ours.claim_enrollment().await.unwrap().is_none(), "two windows both enrolling");
+
+        let reauth = Reauth::for_test(Arc::new(ours));
+        let waiting = tokio::spawn(async move { reauth.grant.bearer().await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!waiting.is_finished(), "it gave up instead of waiting");
+
+        other.save(&a_credential("zc_theirs")).await.unwrap();
+        drop(claim);
+        let got = tokio::time::timeout(Duration::from_secs(5), waiting).await;
+        assert_eq!(got.unwrap().unwrap().unwrap(), "zc_theirs");
     }
 }
 
