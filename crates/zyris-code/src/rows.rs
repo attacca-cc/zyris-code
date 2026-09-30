@@ -337,6 +337,11 @@ impl Slot {
 #[derive(Debug, Default)]
 pub struct Cache {
     width: u16,
+    /// **The palette and the language the made lines were built in.** Both are baked into every
+    /// span as it is made, and `/config` changes them through atomics without touching an item, so
+    /// a width-only key kept the whole conversation in the old colours (dark text on a light
+    /// background, 1.2:1) and the old words until each item happened to change.
+    look: Option<(theme::Theme, crate::lang::Lang)>,
     made: HashMap<i64, (Item, Affecting, Made)>,
     slots: Vec<Slot>,
     total: usize,
@@ -433,9 +438,12 @@ impl Cache {
         turn: Turn,
         lang: crate::lang::Lang,
     ) {
-        // A width change moves every wrap point. Throw it all away.
-        if self.width != width {
+        // A width change moves every wrap point, and a theme or language change repaints every
+        // span. Throw it all away.
+        let look = Some((theme::current(), lang));
+        if self.width != width || self.look != look {
             self.width = width;
+            self.look = look;
             self.made.clear();
         }
         self.slots.clear();
@@ -2230,6 +2238,22 @@ mod tests {
         cache.layout(&items, 80, &folds, None, Turn { running: false }, crate::lang::Lang::Ko);
         assert_eq!(cache.renders(), before + items.len() as u64);
         assert_eq!(cache.plain(), rows(&items, 80, &folds, crate::lang::Lang::Ko).plain());
+    }
+
+    /// **A language switch redraws what is already on screen.** The words are baked in as each item
+    /// is made, so keying the cache on width alone left old rows in the old language (and, the same
+    /// way, in the old theme's colours) until each one happened to change.
+    #[test]
+    fn a_language_change_redraws_everything() {
+        let items = mixed();
+        let folds = Folds::new();
+        let mut cache = Cache::new();
+        cache.layout(&items, 40, &folds, None, Turn { running: false }, crate::lang::Lang::Ko);
+        let before = cache.renders();
+
+        cache.layout(&items, 40, &folds, None, Turn { running: false }, crate::lang::Lang::En);
+        assert_eq!(cache.renders(), before + items.len() as u64);
+        assert_eq!(cache.plain(), rows(&items, 40, &folds, crate::lang::Lang::En).plain());
     }
 
     /// The question being answered isn't drawn in the transcript — it's in the lower panel.
