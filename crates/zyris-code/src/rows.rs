@@ -132,7 +132,7 @@ fn chip_title(t: &crate::timeline::Think, lang: crate::lang::Lang) -> String {
     if cut > 0 {
         return first[..cut].to_string();
     }
-    clip_to(first.to_string(), CHIP_TITLE_WIDTH)
+    markdown::truncate_to(first, CHIP_TITLE_WIDTH)
 }
 
 /// How wide a fallback chip title may get before it is cut.
@@ -1262,7 +1262,7 @@ fn detail_lines(
                         vec![
                             Span::styled(place, place_style),
                             Span::styled(
-                                format!("  {}", clip_to(h.text.clone(), room)),
+                                format!("  {}", markdown::truncate_to(&h.text, room)),
                                 text_style,
                             ),
                         ],
@@ -1271,7 +1271,10 @@ fn detail_lines(
                     out.extend(row("  ", vec![Span::styled(place, place_style)]));
                     out.extend(row(
                         "  ",
-                        vec![Span::styled(clip_to(h.text.clone(), inner), text_style)],
+                        vec![Span::styled(
+                            markdown::truncate_to(&h.text, inner.max(1)),
+                            text_style,
+                        )],
                     ));
                 }
             }
@@ -1297,7 +1300,7 @@ fn detail_lines(
                 out.extend(row(
                     "  ",
                     vec![Span::styled(
-                        clip_to(p.clone(), inner as usize),
+                        markdown::truncate_to(p, (inner as usize).max(1)),
                         Style::default().fg(theme::text_muted()),
                     )],
                 ));
@@ -1398,20 +1401,8 @@ pub(crate) fn diff_line(
     };
     Line::from(vec![
         Span::styled(DETAIL_PAD, Style::default().fg(theme::border_light())),
-        Span::styled(clip_to(text, width), Style::default().fg(colour)),
+        Span::styled(markdown::truncate_to(&text, width.max(1)), Style::default().fg(colour)),
     ])
-}
-
-/// Clips when wider than the limit. **No wrapping** — if one code line grew into several screen lines,
-/// skimming what changed gets hard, and the wrapped tail reads like the next line's `+`/`-`.
-///
-/// By cluster and to the width given: it walked `char`s, so a cut could fall between a letter and
-/// its mark, and it widened anything under eight columns past a narrow screen's edge.
-fn clip_to(text: String, width: usize) -> String {
-    if markdown::display_width(&text) <= width.max(1) {
-        return text;
-    }
-    markdown::truncate_to(&text, width.max(1))
 }
 
 /// Wraps to fit the width. **Cuts only by column count** — tool detail is JSON or raw text, so it

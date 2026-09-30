@@ -322,7 +322,7 @@ impl Lang {
     /// agent on, or is it working. A tool call and a background job both answer that with the same
     /// word (`working`); while nothing is running, this is the title of the thought being written.
     pub fn reasoning(self, title: &str) -> String {
-        clip_columns(title.trim(), ACTIVITY_WIDTH)
+        crate::markdown::truncate_to(title.trim(), ACTIVITY_WIDTH)
     }
     /// Says once, on the status line, that a background job finished. **It says so on success
     /// too** — not knowing it is done leaves a person waiting.
@@ -2808,16 +2808,6 @@ impl Lang {
 /// server wrote, short enough to leave the line's hint room — the point of the line is that a
 /// person takes it in at a glance.
 const ACTIVITY_WIDTH: usize = 48;
-
-/// Cuts text to a column budget, **counting a wide character as the two columns it takes up**.
-///
-/// `chars().take(n)` is wrong here for the same reason it is wrong everywhere in this app: a
-/// Hangul syllable is one `char` and two columns, so counting characters buys twice the line.
-fn clip_columns(text: &str, width: usize) -> String {
-    // One column is kept for the ellipsis, so the result never reads as if it ended there — and
-    // the cut is by cluster, like everything else measured for the screen.
-    crate::markdown::truncate_to(text, width)
-}
 
 #[cfg(test)]
 mod tests {

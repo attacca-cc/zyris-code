@@ -224,7 +224,7 @@ pub fn body_start(row: &str) -> usize {
     // comes after that is the row's own, indentation included.
     if chars.peek().is_some_and(|c| MARGIN_GLYPHS.contains(c)) {
         let c = chars.next().expect("just peeked at it");
-        col += display_width(&c.to_string()).max(1);
+        col += display_width(c.encode_utf8(&mut [0; 4])).max(1);
         if chars.peek() == Some(&' ') {
             col += 1;
         }
