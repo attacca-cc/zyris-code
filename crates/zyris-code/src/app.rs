@@ -5163,6 +5163,8 @@ async fn run_inner(
     // `select!` arm.
     let mut heal = tokio::time::interval(heal_interval().unwrap_or(Duration::from_secs(86400)));
     let healing = heal_interval().is_some();
+    // Read once, like the interval above: the environment does not change under a running app.
+    let heal_shape = heal_mode();
     // Has the screen been touched since the last self-heal? Not having drawn means nothing
     // new can have broken.
     let mut drew_since_heal = false;
@@ -5752,12 +5754,12 @@ async fn run_inner(
                 // flicker this heal was reported as. The two older shapes are still here by
                 // name (`$ZYRIS_CODE_HEAL=blank|full`) for a terminal that needs them.
                 if drew_since_heal {
-                    match heal_mode() {
+                    match heal_shape {
                         Heal::Wide => {}
                         Heal::Blank => state.force_update_blank = true,
                         Heal::Full => state.force_update = true,
                     }
-                    if heal_mode() != Heal::Wide {
+                    if heal_shape != Heal::Wide {
                         // **Force cells out again without clearing.** clear is what causes
                         // the flicker — `AlwaysUpdate` bypasses the diff and overwrites.
                         // The next draw goes back to the normal diff.

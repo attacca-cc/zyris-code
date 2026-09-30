@@ -47,14 +47,6 @@ impl Notice {
         self.0.connected.store(true, Ordering::SeqCst);
     }
 
-    /// Stop saying we're waiting. **Failures are still spoken.**
-    ///
-    /// Called when the enrollment-code box appears. The box already says up to "it will continue automatically once you approve", and
-    /// adding another line of the same meaning under it would only blur the box's border.
-    pub fn hush(&self) {
-        self.0.hushed.store(true, Ordering::SeqCst);
-    }
-
     /// A layer that also routes failures flowing to the log through here.
     ///
     /// **It doesn't select by message text** — if the upstream changes the wording, it would silently not be caught.
@@ -86,14 +78,6 @@ impl Notice {
     /// A spot that ends things but is **not an error**. Red is used sparingly — if everything is red, the real error
     /// gets buried.
     pub fn fatal_plain(&self, what: &str) {
-        plain(&format!("\n{what}"));
-    }
-
-    /// Something that doesn't kill but should be known. **Only used before the screen appears.**
-    ///
-    /// If it cuts into stderr after the screen is up, it covers where ratatui drew and that cell is treated as "unchanged"
-    /// and never redrawn.
-    pub fn warn_plain(&self, what: &str) {
         plain(&format!("\n{what}"));
     }
 
