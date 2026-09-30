@@ -225,8 +225,8 @@ impl Lang {
     /// works everywhere) is the way to insert a newline.
     pub fn kitty_shift_enter_hint(self) -> &'static str {
         self.pick(
-            "연결됨 ‒ 이 터미널은 Shift+Enter를 구별하지 못합니다. 줄바꿈은 Alt+Enter를 쓰세요.",
-            "Connected ‒ this terminal can't tell Shift+Enter apart from Enter. Use Alt+Enter for a newline.",
+            "연결됨 ‒ 이 터미널은 Shift+Enter를 구별하지 못합니다. 줄바꿈은 Ctrl+J나 Alt+Enter를 쓰세요.",
+            "Connected ‒ this terminal can't tell Shift+Enter apart from Enter. Use Ctrl+J or Alt+Enter for a newline.",
         )
     }
     /// A span of seconds, in at most two units.

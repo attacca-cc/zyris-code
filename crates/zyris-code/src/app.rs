@@ -1290,6 +1290,110 @@ pub struct ScreenLink {
     pub url: String,
 }
 
+/// **`Ctrl+H` is Backspace**, as it is to every readline program.
+///
+/// A terminal whose Backspace key sends `^H` rather than `DEL` — serial consoles, PuTTY and
+/// MobaXterm profiles set that way, Terminal.app with "Delete sends Ctrl-H" — reaches crossterm as
+/// the byte `0x08`, which it reports as `Ctrl+h`. Nothing here was bound to that, so on those
+/// terminals nothing could be deleted at all. Mapped once, here, so the input, the forms and every
+/// list's query all get it.
+fn backspace_as_sent(key: KeyEvent) -> KeyEvent {
+    if key.code == KeyCode::Char('h') && key.modifiers == KeyModifiers::CONTROL {
+        KeyEvent { code: KeyCode::Backspace, modifiers: KeyModifiers::NONE, ..key }
+    } else {
+        key
+    }
+}
+
+/// What a pasted text becomes before it reaches a field.
+///
+/// **Only what a field can show goes in.** Line endings come as `\r\n` from Windows clipboards and
+/// as `\r` from terminals that turn LF into CR inside a bracketed paste; both become `\n`, the one
+/// line break the fields know. A tab is spaces, because the screen draws a tab as nothing while
+/// the width count took it for a column, which put the cursor off by one per tab. Any other
+/// control character is dropped for the same reason.
+pub fn paste_text(text: &str) -> String {
+    text.replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .chars()
+        .flat_map(|c| match c {
+            '\t' => TAB.chars().collect::<Vec<_>>(),
+            '\n' => vec!['\n'],
+            c if c.is_control() => vec![],
+            c => vec![c],
+        })
+        .collect()
+}
+
+/// What `Tab` puts into a draft, and what a pasted tab becomes (`paste_text`).
+const TAB: &str = "    ";
+
+/// How long an `Esc` that would stop a turn waits for a key behind it — see `esc_follower`.
+#[cfg(unix)]
+const ESC_WAIT: Duration = Duration::from_millis(50);
+
+/// The key that arrives within `ESC_WAIT` of an `Esc`, if one does.
+///
+/// **An Alt chord can arrive in two reads.** Without the kitty protocol, Alt+B is `ESC b`, and
+/// crossterm reports a lone `ESC` as `Esc` whenever nothing else is waiting behind it in the same
+/// read. Over a congested SSH link or a slow tmux pane the `b` can land in the next read, and Esc
+/// is the key that stops a running turn — so a word jump cancelled the agent's work and typed a
+/// stray letter. Terminals have waited out this ambiguity for ever (vim's `ttimeout`, tmux's
+/// `escape-time`); this does the same, only for the one `Esc` that does something that cannot be
+/// taken back. A person pressing Esc alone waits fifty milliseconds for the stop.
+#[cfg(unix)]
+async fn esc_follower(
+    keys: &mut futures_util::stream::Peekable<EventStream>,
+) -> Option<crossterm::event::KeyEvent> {
+    let next = tokio::time::timeout(ESC_WAIT, std::pin::Pin::new(&mut *keys).peek()).await;
+    if !matches!(next, Ok(Some(Ok(TermEvent::Key(_))))) {
+        return None;
+    }
+    match keys.next().await {
+        Some(Ok(TermEvent::Key(k))) => {
+            Some(KeyEvent { modifiers: k.modifiers | KeyModifiers::ALT, ..k })
+        }
+        _ => None,
+    }
+}
+
+/// `actions` for `key`, unless the key is an `Esc` that would stop the turn and turns out to be the
+/// first half of an Alt chord (`esc_follower`) — then the chord's actions.
+///
+/// Only on unix without the kitty protocol: with the protocol an Alt chord is one sequence, and
+/// the Windows console reads keys as records, so neither can split.
+async fn esc_or_chord(
+    actions: Vec<Action>,
+    state: &State,
+    key: KeyEvent,
+    kitty: bool,
+    keys: &mut futures_util::stream::Peekable<EventStream>,
+) -> Vec<Action> {
+    #[cfg(unix)]
+    if !kitty && key.code == KeyCode::Esc && matches!(actions.as_slice(), [Action::Cancel]) {
+        if let Some(chord) = esc_follower(keys).await {
+            return on_key(state, chord);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (state, key, kitty, keys);
+    actions
+}
+
+/// Whether keys arriving at paste speed can be a paste at all — see `PasteBurst`.
+///
+/// **Only where bracketed paste may be missing.** The burst rule reads an Enter inside a fast run
+/// of keys as a newline, and the clock it reads is when the loop got to each key, not when it was
+/// pressed — so a stall on the link or a slow frame delivers a person's `fix it` and Enter
+/// microseconds apart, and the message did not send. A terminal that has already delivered a
+/// bracketed paste delivers every paste that way, and one that speaks the kitty keyboard protocol
+/// has bracketed paste too, so neither needs the guess. Windows has no bracketed paste at all
+/// (crossterm cannot switch it on there), and its kitty answer is assumed rather than asked, so
+/// there the rule always stands.
+fn keys_can_be_a_paste(kitty: bool, seen_paste: bool) -> bool {
+    !(seen_paste || cfg!(unix) && kitty)
+}
+
 pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
     // **Windows sends a KeyEvent for both press and release.** Without filtering on kind,
     // one press types twice — the bug where `/exit` comes out as `//eexxitit` (ratatui
@@ -1298,6 +1402,7 @@ pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
     if key.kind == KeyEventKind::Release {
         return vec![];
     }
+    let key = backspace_as_sent(key);
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
@@ -1638,6 +1743,10 @@ pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
         // Enter+SHIFT. Alt+Enter (ESC+\r) is the fallback for terminals without the
         // protocol — it has to come before the submit arm.
         KeyCode::Enter if alt || shift => vec![Action::Insert('\n')],
+        // **`Ctrl+J` is the newline every terminal delivers.** It is the line-feed byte itself, so
+        // it needs no protocol and no Meta key: Terminal.app sends Option+Enter as a plain `\r`,
+        // and Windows Terminal and mintty keep Alt+Enter for full screen.
+        KeyCode::Char('j') if ctrl => vec![Action::Insert('\n')],
         // **Enter on an empty draft approves the plan.** With a plan up, Enter with nothing typed
         // had no meaning at all, and approval is the one thing that must be a single key — typing
         // is how changes are asked for, so the two cannot both be "press Enter with words".
@@ -1689,6 +1798,10 @@ pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
         KeyCode::PageUp => vec![Action::Page(1)],
         KeyCode::PageDown => vec![Action::Page(-1)],
         KeyCode::Char(c) if !ctrl => vec![Action::Insert(c)],
+        // **A tab is text here.** No list or form is up (they return above), so nothing else
+        // claims it — and on Windows, where a paste arrives as keys, dropping it took the
+        // indentation out of pasted code.
+        KeyCode::Tab => vec![Action::Paste(TAB.to_string())],
         _ => vec![],
     }
 }
@@ -4048,6 +4161,11 @@ pub async fn run(
     // as if it were typed, the newlines in the content get read as Enter, and the first
     // line of a multi-line prompt gets sent as-is. With it on, the paste is wrapped in
     // ESC[200~…ESC[201~ and arrives as one `Event::Paste`.
+    //
+    // **Not on Windows.** crossterm cannot switch it on through the console API and its reader never
+    // turns `ESC[200~` into a paste there, so under Windows Terminal the only effect of sending it
+    // is that the markers may come back as literal keys.
+    #[cfg(not(windows))]
     terminal_feature("bracketed paste", crossterm::event::EnableBracketedPaste);
     // **Makes Shift+Enter distinguishable from Enter.** With the kitty keyboard protocol
     // on, modified keys arrive separately as CSI-u sequences. A terminal that does not
@@ -4491,7 +4609,7 @@ async fn run_inner(
                         }
                     }
                     TermEvent::Paste(text) => {
-                        apply(&mut state, &Action::Paste(text));
+                        apply(&mut state, &Action::Paste(paste_text(&text)));
                     }
                     // **This screen is selectable too.** Dropping mouse events here left the
                     // enrolment window — the one thing on it worth copying — impossible to drag
@@ -4659,7 +4777,10 @@ async fn run_inner(
     // `select!`s — handing a stream from one to the other leaves its in-flight read to be
     // cancelled and re-polled by a different waker.
     drop(keys);
-    let mut keys = EventStream::new();
+    // Peekable for `esc_follower`, which looks at the next key before deciding on an `Esc`.
+    let mut keys = EventStream::new().peekable();
+    // Whether this terminal has ever delivered a bracketed paste — see `keys_can_be_a_paste`.
+    let mut seen_paste = false;
     let (frame, stream_min_gap) = render_cadence();
     state.frame_ms = frame.as_millis().max(1) as u64;
     let mut ticker = tokio::time::interval(frame);
@@ -4736,18 +4857,23 @@ async fn run_inner(
                         // is read from — one key beside it is a person typing, or an input
                         // method committing a syllable, and both of those send
                         // (`PasteBurst`).
-                        let in_burst = burst.key(&k, Instant::now());
+                        let in_burst = burst.key(&k, Instant::now())
+                            && keys_can_be_a_paste(kitty, seen_paste);
                         if enter_becomes_newline(&state, &k, in_burst) {
                             // An Enter that arrived mid-burst is a newline — and the
                             // decision is `enter_becomes_newline`'s, so an approval,
                             // list, form or question keeps its confirm key.
                             vec![Action::Insert('\n')]
                         } else {
-                            on_key(&state, k)
+                            let actions = on_key(&state, k);
+                            esc_or_chord(actions, &state, k, kitty, &mut keys).await
                         }
                     }
                     // A paste is not a key — it goes in as one chunk, not split on Enter.
-                    TermEvent::Paste(text) => vec![Action::Paste(text)],
+                    TermEvent::Paste(text) => {
+                        seen_paste = true;
+                        vec![Action::Paste(paste_text(&text))]
+                    }
                     // **The click that gave the window focus back is not a click in the app.**
                     // On Windows the activating click is delivered to us as well, and a press
                     // with no movement toggles the fold of whatever card head it lands on — so
@@ -7507,6 +7633,54 @@ mod tests {
         let all = b"\x1b]11;rgb:ffff/ffff/ffff\x1b\\\x1b[?1u\x1b[?62c";
         assert_eq!(kitty_verdict(all), Supported);
         assert_eq!(private_replies(all), b"uc");
+    }
+
+    /// **A paste arrives as the fields can show it.** CRLF and a bare CR are one line break, a tab
+    /// is spaces, and other control characters — drawn as nothing but counted as a column — go.
+    #[test]
+    fn a_paste_is_brought_to_what_a_field_can_show() {
+        assert_eq!(paste_text("a\r\nb\rc\nd"), "a\nb\nc\nd");
+        assert_eq!(paste_text("\tx"), "    x");
+        assert_eq!(paste_text("a\x1b[31mb\x07\u{85}c"), "a[31mbc");
+        assert_eq!(paste_text("한글 그대로"), "한글 그대로");
+    }
+
+    /// **`Ctrl+H` is Backspace** — the byte a `^H` Backspace key sends — in the input and in a list's
+    /// query alike, and `Ctrl+J` is a newline where Shift+Enter cannot be told apart.
+    #[test]
+    fn the_legacy_backspace_and_newline_bytes_do_what_they_say() {
+        let mut s = state();
+        for c in "ab".chars() {
+            apply(&mut s, &Action::Insert(c));
+        }
+        assert_eq!(
+            on_key(&s, key(KeyCode::Char('h'), KeyModifiers::CONTROL)),
+            vec![Action::Backspace]
+        );
+        assert_eq!(
+            on_key(&s, key(KeyCode::Char('j'), KeyModifiers::CONTROL)),
+            vec![Action::Insert('\n')]
+        );
+        // A plain `h` is still a letter.
+        assert_eq!(
+            on_key(&s, key(KeyCode::Char('h'), KeyModifiers::NONE)),
+            vec![Action::Insert('h')]
+        );
+        // Tab in the draft is text, and the same text a pasted tab becomes.
+        assert_eq!(
+            on_key(&s, key(KeyCode::Tab, KeyModifiers::NONE)),
+            vec![Action::Paste(TAB.into())]
+        );
+    }
+
+    /// **The burst guess is only made where a paste can arrive as keys.** Once a terminal has
+    /// delivered a bracketed paste, or speaks the kitty protocol on unix, a fast Enter is a person's.
+    #[test]
+    fn only_a_terminal_without_bracketed_paste_has_its_keys_read_as_one() {
+        assert!(keys_can_be_a_paste(false, false));
+        assert!(!keys_can_be_a_paste(false, true), "a bracketed paste was already seen");
+        assert!(!keys_can_be_a_paste(true, true));
+        assert_eq!(keys_can_be_a_paste(true, false), !cfg!(unix), "Windows assumes kitty");
     }
 
     /// A paste keeps its newlines — splitting on Enter would fire off the first line of a
