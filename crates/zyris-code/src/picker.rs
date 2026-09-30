@@ -611,17 +611,11 @@ impl Picker {
     }
 
     pub fn up(&mut self) {
-        if self.rows.is_empty() {
-            return;
-        }
-        self.cursor = (self.cursor + self.rows.len() - 1) % self.rows.len();
+        self.cursor = crate::panel::step(self.cursor, -1, self.rows.len());
     }
 
     pub fn down(&mut self) {
-        if self.rows.is_empty() {
-            return;
-        }
-        self.cursor = (self.cursor + 1) % self.rows.len();
+        self.cursor = crate::panel::step(self.cursor, 1, self.rows.len());
     }
 
     /// Picks the current row.

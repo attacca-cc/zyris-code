@@ -34,14 +34,9 @@ const PAD: &str = "  ";
 /// it is typed; taking the input's rows to show more of the plan would take away the way to answer.
 pub fn height(state: &State, avail: u16) -> u16 {
     let Some(plan) = &state.plan else { return 0 };
-    if avail == 0 {
-        return 0;
-    }
-    // One for the header, and one for the "N more" line when something is held back.
-    let room = (avail as usize).saturating_sub(1);
-    let shown = plan.shown(room);
-    let more = usize::from(plan.hidden(room) > 0 && shown + 1 < room + 1);
-    (1 + shown + more).min(avail as usize) as u16
+    // **Counted off the rows themselves**, so the room reserved and what is drawn in it cannot
+    // come apart. The width only decides where a line is cut, never how many there are.
+    lines(plan, state.lang, 0, avail as usize).len() as u16
 }
 
 /// The rows. Pure, so what is drawn and how tall it is cannot disagree.

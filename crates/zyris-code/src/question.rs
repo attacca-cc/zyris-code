@@ -215,10 +215,6 @@ impl Answering {
         self.rows().get(i).cloned()
     }
 
-    pub fn is_free_row(&self) -> bool {
-        matches!(self.row_at(self.cursor), Some(RowKind::Free))
-    }
-
     pub fn is_chosen(&self, i: usize) -> bool {
         self.chosen[self.step].contains(&i)
     }
@@ -227,15 +223,14 @@ impl Answering {
         if self.typing {
             return;
         }
-        let n = self.rows().len();
-        self.cursor = (self.cursor + n - 1) % n;
+        self.cursor = crate::panel::step(self.cursor, -1, self.rows().len());
     }
 
     pub fn down(&mut self) {
         if self.typing {
             return;
         }
-        self.cursor = (self.cursor + 1) % self.rows().len();
+        self.cursor = crate::panel::step(self.cursor, 1, self.rows().len());
     }
 
     /// What was typed directly into this step. The screen shows it.
@@ -295,11 +290,6 @@ impl Answering {
         } else {
             self.to_review();
         }
-    }
-
-    /// Whether anything has been answered. It's the criterion for being able to submit.
-    pub fn any_answered(&self) -> bool {
-        (0..self.steps.len()).any(|i| !self.chosen[i].is_empty() || !self.free[i].trim().is_empty())
     }
 
     /// Whether this step has an answer. Without one, it can't move to the next.

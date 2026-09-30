@@ -1,9 +1,9 @@
 //! The project/session list. Overlaid in the center of the screen.
 
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::markdown::display_width;
@@ -70,36 +70,7 @@ pub fn draw(
     let want_h =
         (picker.rows.len() as u16).saturating_add(5 + rule as u16 + detail_rows as u16).max(6);
     let h = want_h.min(area.height.saturating_sub(2)).max(3);
-    let box_area = Rect {
-        x: area.x + (area.width.saturating_sub(w)) / 2,
-        y: area.y + (area.height.saturating_sub(h)) / 2,
-        width: w,
-        height: h,
-    };
-
-    // Without clearing behind, the conversation shows through.
-    frame.render_widget(Clear, box_area);
-    // **Also scrub wide characters straddling the border.** If the leading half of a wide
-    // character remains just outside the box's left edge, it bleeds into the box and breaks the
-    // border. `Clear` only clears inside the box, so we must remove this half ourselves.
-    scrub_left_edge(frame, box_area);
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::accent()))
-        // **The title is cut to fit, with a `…`.** A project name is arbitrary text, and
-        // ratatui draws an over-long title straight over its own border — the box loses its
-        // top-right corner and the row ends mid-word with nothing saying it was cut.
-        // Four columns go to the two corners and the space either side of the title.
-        .title(Span::styled(
-            format!(
-                " {} ",
-                crate::markdown::truncate_to(&picker.title(lang), w.saturating_sub(4) as usize)
-            ),
-            Style::default().fg(theme::text_heading()).add_modifier(Modifier::BOLD),
-        ));
-    let inner = block.inner(box_area);
-    frame.render_widget(block, box_area);
+    let inner = super::overlay(frame, area, w, h, &picker.title(lang));
 
     let mut lines: Vec<Line<'static>> = Vec::new();
     if picker.loading {
@@ -271,8 +242,8 @@ fn has_note(row: &crate::picker::Row) -> bool {
 
 /// `line` with a `…` on the end, cut to `limit` columns so that the mark fits inside the box.
 ///
-/// **Unconditional, unlike [`truncate`].** These lines came out of the wrapper already fitting the
-/// box, so `truncate` would hand one back untouched and say nothing about what the note lost.
+/// **Unconditional, unlike `truncate_to`.** These lines came out of the wrapper already fitting the
+/// box, so `truncate_to` would hand one back untouched and say nothing about what the note lost.
 fn mark_more(line: &str, limit: usize) -> String {
     let limit = limit.max(1);
     if display_width(line) < limit {
@@ -296,46 +267,16 @@ fn cursor_detail(picker: &Picker, width: usize) -> Vec<String> {
 fn label_to_fit(width: usize, label: &str, status: bool) -> String {
     // The status dot and its trailing space take two columns on the left, before the label.
     let dot = if status { 2 } else { 0 };
-    truncate(label, width.saturating_sub(2 + dot))
-}
-
-/// Truncates to fit the column count. When cut, appends `…` to show it was cut — by cluster,
-/// through the one implementation (`markdown::truncate_to`), so a cut never lands between a
-/// letter and its mark or inside an emoji sequence.
-fn truncate(s: &str, limit: usize) -> String {
-    crate::markdown::truncate_to(s, limit)
-}
-
-/// Replaces the leading half of a wide character straddling the box's left edge with a space.
-///
-/// The enrollment-code window (`enroll.rs`) does the same — every overlaid window uses this path.
-pub(crate) fn scrub_left_edge(frame: &mut Frame, box_area: Rect) {
-    if box_area.x == 0 {
-        return;
-    }
-    let x = box_area.x - 1;
-    let buf = frame.buffer_mut();
-    for y in box_area.y..box_area.y.saturating_add(box_area.height) {
-        if !buf.area.contains((x, y).into()) {
-            continue;
-        }
-        if display_width(buf[(x, y)].symbol()) > 1 {
-            buf[(x, y)].set_symbol(" ");
-        }
-    }
+    crate::markdown::truncate_to(label, width.saturating_sub(2 + dot))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// **A cut never splits a cluster.** Walked by `char`, a title could end on a letter whose
-    /// accent was dropped, or on half an emoji sequence.
+    /// **The note's last line is marked even when it fits** — see `mark_more`.
     #[test]
-    fn a_cut_label_keeps_whole_clusters() {
-        assert_eq!(truncate("e\u{301}\u{301}xyz", 2), "e\u{301}\u{301}…");
-        let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}";
-        assert_eq!(truncate(&format!("{family}abc"), 3), format!("{family}…"));
+    fn a_held_back_note_is_marked() {
         assert_eq!(mark_more("ab", 5), "ab…");
         assert_eq!(mark_more("abcdef", 4), "abc…");
     }

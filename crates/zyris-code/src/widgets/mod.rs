@@ -45,7 +45,10 @@ pub mod todos;
 /// — the same reason `activity`, `status` and `todos` are.
 pub mod transcript;
 
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::{Modifier, Style};
+use ratatui::text::Span;
+use ratatui::widgets::{Block, Borders, Clear};
 use ratatui::Frame;
 
 use crate::app::State;
@@ -493,4 +496,85 @@ pub fn ask_row_at(
     lang: crate::lang::Lang,
 ) -> Option<usize> {
     ask::row_at(a, area, y, lang)
+}
+
+/// Lays a bordered box of `w`×`h` in the middle of `area`, over whatever is drawn there, and gives
+/// back the inside.
+///
+/// **Every overlay — the lists, the panel, the forms, the enrolment window — is framed here**, so
+/// they cannot drift apart: it was five pasted copies, and only the list's cut its title to fit.
+/// Each window still decides its own size; this only places and frames it.
+///
+/// - **Never larger than `area`.** A floor under a window's height used to push it past the
+///   bottom of a very short terminal, where the border was lost and the last row drawn over it.
+/// - **What is under it is cleared**, or the conversation shows through, and so is the leading
+///   half of a wide character straddling the left edge (`scrub_left_edge`).
+/// - **The title is cut to fit, with a `…`.** ratatui draws an over-long title straight over its
+///   own border — the box loses its top-right corner and the title ends mid-word with nothing
+///   saying it was cut. Four columns go to the two corners and the space either side of it.
+pub(crate) fn overlay(frame: &mut Frame, area: Rect, w: u16, h: u16, title: &str) -> Rect {
+    let (w, h) = (w.min(area.width), h.min(area.height));
+    let box_area = Rect {
+        x: area.x + (area.width - w) / 2,
+        y: area.y + (area.height - h) / 2,
+        width: w,
+        height: h,
+    };
+    frame.render_widget(Clear, box_area);
+    scrub_left_edge(frame, box_area);
+    let title = crate::markdown::truncate_to(title, w.saturating_sub(4) as usize);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(crate::theme::accent()))
+        .title(Span::styled(
+            format!(" {title} "),
+            Style::default().fg(crate::theme::text_heading()).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(box_area);
+    frame.render_widget(block, box_area);
+    inner
+}
+
+/// Replaces the leading half of a wide character straddling the box's left edge with a space.
+///
+/// If the leading half of a wide character remains just outside the box's left edge, it bleeds
+/// into the box and breaks the border. `Clear` only clears inside the box, so this half has to be
+/// removed separately.
+fn scrub_left_edge(frame: &mut Frame, box_area: Rect) {
+    if box_area.x == 0 {
+        return;
+    }
+    let x = box_area.x - 1;
+    let buf = frame.buffer_mut();
+    for y in box_area.y..box_area.y.saturating_add(box_area.height) {
+        if !buf.area.contains((x, y).into()) {
+            continue;
+        }
+        if display_width(buf[(x, y)].symbol()) > 1 {
+            buf[(x, y)].set_symbol(" ");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    /// **An overlay stays inside the screen with its whole border, and its title fits.** The
+    /// windows asked for heights with a floor above a very short terminal's, and four of the five
+    /// let a long title run over the corner.
+    #[test]
+    fn an_overlay_fits_the_screen_and_its_title_fits_the_box() {
+        let mut term = Terminal::new(TestBackend::new(20, 3)).unwrap();
+        let mut inner = Rect::default();
+        term.draw(|f| inner = overlay(f, f.area(), 60, 9, &"긴 제목".repeat(10))).unwrap();
+        assert_eq!(inner, Rect { x: 1, y: 1, width: 18, height: 1 });
+        let buf = term.backend().buffer().clone();
+        let row = |y: u16| (0..20).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>();
+        assert!(row(0).starts_with('┌') && row(0).ends_with('┐'), "{:?}", row(0));
+        assert!(row(0).contains('…'), "{:?}", row(0));
+        assert!(row(2).starts_with('└') && row(2).ends_with('┘'), "{:?}", row(2));
+    }
 }

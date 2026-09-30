@@ -10,30 +10,21 @@
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::app::{EnrollPhase, EnrollView};
 use crate::markdown::display_width;
 use crate::theme;
 
-/// Splits prose to fit the width, breaking between words where it can.
+/// Appends `text` as however many lines it takes at this width, broken between words.
 ///
 /// **Nothing in this box may be cut.** `Paragraph` drops whatever runs past the edge without a
 /// mark, so both of the sentences here — the one saying what to do with the code, and the one
 /// saying whose account to approve with — ended mid-word against the right border. Every line of
 /// this window is the only copy of what it says; there is no scrolling back for the rest.
-///
-/// A word longer than the width is cut by column instead, so an unbroken run cannot loop.
-fn wrap_words(text: &str, width: u16) -> Vec<String> {
-    // The one implementation lives in `crate::wrap` now; this name stays because the callers and
-    // tests here read better for it.
-    crate::wrap::words(text, width as usize)
-}
-
-/// Appends `text` as however many lines it takes at this width.
 fn wrapped(lines: &mut Vec<Line<'static>>, text: &str, width: u16, colour: ratatui::style::Color) {
-    for row in wrap_words(text, width) {
+    for row in crate::wrap::words(text, width as usize) {
         lines.push(Line::from(Span::styled(row, Style::default().fg(colour))));
     }
 }
@@ -103,27 +94,7 @@ pub fn draw(
     // **The box is as tall as what it has to hold.** A fixed height cut the last lines off without
     // saying so; a short terminal still cuts, but only because there is no room left.
     let h = (lines.len() as u16 + 2).min(area.height.saturating_sub(2)).max(5);
-    let box_area = Rect {
-        x: area.x + (area.width.saturating_sub(w)) / 2,
-        y: area.y + (area.height.saturating_sub(h)) / 2,
-        width: w,
-        height: h,
-    };
-
-    // Without clearing the back, the conversation shows through.
-    frame.render_widget(Clear, box_area);
-    // Scrub the rest of wide characters straddling the border — same reason as the picker.
-    crate::widgets::picker::scrub_left_edge(frame, box_area);
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::accent()))
-        .title(Span::styled(
-            format!(" {} ", lang.enroll_title()),
-            Style::default().fg(theme::text_heading()).add_modifier(Modifier::BOLD),
-        ));
-    let inner = block.inner(box_area);
-    frame.render_widget(block, box_area);
+    let inner = super::overlay(frame, area, w, h, lang.enroll_title());
 
     let links = uri_row.map_or_else(Vec::new, |row| link_rows(inner, row, &uri_rows, &view.uri));
     frame.render_widget(Paragraph::new(lines), inner);
@@ -183,7 +154,7 @@ mod tests {
         let width = 62u16;
         for lang in [Lang::Ko, Lang::En] {
             for text in [lang.enroll_steps(), lang.enroll_warning(), lang.enroll_denied()] {
-                let rows = wrap_words(text, width);
+                let rows = crate::wrap::words(text, width as usize);
                 assert!(!rows.is_empty(), "{text}");
                 for row in &rows {
                     assert!(
@@ -226,13 +197,5 @@ mod tests {
             .map(|l| (l.start..l.end).map(|x| buf[(x, l.row)].symbol()).collect::<String>())
             .collect();
         assert_eq!(drawn, uri);
-    }
-
-    /// A run with no space in it cannot make the line grow, nor loop looking for a break.
-    #[test]
-    fn an_unbroken_run_is_cut_by_column_instead() {
-        let rows = wrap_words(&"x".repeat(40), 10);
-        assert_eq!(rows.len(), 4);
-        assert!(rows.iter().all(|r| display_width(r) <= 10));
     }
 }

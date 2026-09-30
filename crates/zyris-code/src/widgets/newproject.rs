@@ -4,7 +4,7 @@
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::markdown::display_width;
@@ -16,28 +16,7 @@ pub fn draw(frame: &mut Frame, area: Rect, form: &Form, lang: crate::lang::Lang)
     let h = 5u16.saturating_add(form.error.is_some() as u16);
     let h = h.min(area.height.saturating_sub(2)).max(5);
     let w = 60.min(area.width.saturating_sub(4)).max(24.min(area.width));
-    let box_area = Rect {
-        x: area.x + (area.width.saturating_sub(w)) / 2,
-        y: area.y + (area.height.saturating_sub(h)) / 2,
-        width: w,
-        height: h,
-    };
-
-    // Without clearing the back, the list shows through.
-    frame.render_widget(Clear, box_area);
-    // **Scrub the rest of wide characters straddling the border.** If the list's text leaves only
-    // its first half outside the box's left edge, the border looks broken.
-    crate::widgets::picker::scrub_left_edge(frame, box_area);
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::accent()))
-        .title(Span::styled(
-            format!(" {} ", lang.project_form_title()),
-            Style::default().fg(theme::text_heading()).add_modifier(Modifier::BOLD),
-        ));
-    let inner = block.inner(box_area);
-    frame.render_widget(block, box_area);
+    let inner = super::overlay(frame, area, w, h, lang.project_form_title());
 
     let width = inner.width as usize;
     let mut lines: Vec<Line<'static>> = Vec::new();

@@ -135,8 +135,10 @@ pub fn card(a: &Answering, width: u16, room: usize, lang: crate::lang::Lang) -> 
     let over = body.len() > body_room;
     let top = if over {
         let at = owners.iter().position(|o| *o == Some(a.cursor)).unwrap_or(0);
-        // One line of context above, so the cursor's row does not sit against the rule.
-        at.saturating_sub(1).min(body.len() - body_room)
+        // One line of context above, so the cursor's row does not sit against the rule — when
+        // there is a second line to spare for it. With room for one, that line was the context and
+        // the cursor's row was not on screen at all.
+        at.saturating_sub(usize::from(body_room > 1)).min(body.len() - body_room)
     } else {
         0
     };
@@ -366,6 +368,19 @@ mod tests {
         // `  ` + `✎ ` + the text: the caret is right after it, and the rule is drawn above the body
         // — hence the `+ 1` on the line.
         assert_eq!(card.caret, Some((8, 2)), "the caret is not where the typing is");
+    }
+
+    /// **The cursor's row is on screen however little room there is.** The window kept one line of
+    /// context above the cursor, and with room for one body line that line was all it showed.
+    #[test]
+    fn the_cursor_row_is_shown_when_only_one_line_fits() {
+        let mut a = asking(vec![long_step()]);
+        a.cursor = 1;
+        for room in 3..8 {
+            let card = card(&a, 40, room, crate::lang::Lang::Ko);
+            let shown = &card.owners[card.top..card.top + card.lines.len() - 2];
+            assert!(shown.contains(&Some(1)), "room {room}: {shown:?}");
+        }
     }
 
     /// Renders the card and gives back its rows, wide characters not double-counted.

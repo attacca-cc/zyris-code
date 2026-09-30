@@ -916,6 +916,35 @@ fn split_keeping_spaces(s: &str) -> Vec<String> {
 mod tests {
     use super::*;
 
+    /// **The one cut every label on the screen goes through.** It never runs past the limit,
+    /// never splits a cluster (an accent from its letter, half an emoji sequence) and always says
+    /// that it cut.
+    #[test]
+    fn truncate_to_fits_marks_and_keeps_clusters() {
+        let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}";
+        assert_eq!(truncate_to("e\u{301}\u{301}xyz", 2), "e\u{301}\u{301}…");
+        assert_eq!(truncate_to(&format!("{family}abc"), 3), format!("{family}…"));
+        assert_eq!(truncate_to("가나다", 4), "가…");
+        assert_eq!(truncate_to("fits", 4), "fits");
+        let texts = ["가나다라마바사", "abc가나다def", "e\u{301}e\u{301}e\u{301}e\u{301}x", family];
+        for text in texts {
+            for limit in 0..12 {
+                let out = truncate_to(text, limit);
+                if display_width(text) <= limit {
+                    assert_eq!(out, text);
+                    continue;
+                }
+                let kept = out.strip_suffix('…').expect("a cut is marked");
+                assert!(display_width(&out) <= limit.max(1), "{text:?} at {limit}: {out:?}");
+                assert!(
+                    text.starts_with(kept)
+                        && text.grapheme_indices(true).any(|(at, _)| at == kept.len()),
+                    "{text:?} at {limit}: {out:?}"
+                );
+            }
+        }
+    }
+
     fn plain(lines: &[ratatui::text::Line<'static>]) -> Vec<String> {
         lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect()).collect()
     }

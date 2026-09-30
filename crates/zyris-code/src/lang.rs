@@ -198,13 +198,6 @@ impl Lang {
     pub fn todo_count(self, done: usize, total: usize) -> String {
         format!(" ({done}/{total})")
     }
-    /// The line that stands in for the tasks that did not fit.
-    pub fn todo_more(self, n: usize) -> String {
-        match self {
-            Lang::Ko => format!("↓ {n}개 더"),
-            Lang::En => format!("↓ {n} more"),
-        }
-    }
     pub fn queued(self, n: usize) -> String {
         match self {
             Lang::Ko => format!("대기 {n}개"),
@@ -324,7 +317,7 @@ impl Lang {
     /// agent on, or is it working. A tool call and a background job both answer that with the same
     /// word (`working`); while nothing is running, this is the title of the thought being written.
     pub fn reasoning(self, title: &str) -> String {
-        clip_columns(title.trim(), ACTIVITY_WIDTH)
+        crate::markdown::truncate_to(title.trim(), ACTIVITY_WIDTH)
     }
     /// Says once, on the status line, that a background job finished. **It says so on success
     /// too** — not knowing it is done leaves a person waiting.
@@ -388,18 +381,6 @@ impl Lang {
         self.pick("↑↓ 이동 ∙ Enter 고르기", "↑↓ move ∙ Enter choose")
     }
 
-    pub fn mode_now(self, mode: &str) -> String {
-        match self {
-            Lang::Ko => format!(
-                "지금은 **{mode}** 모드입니다. Shift+Tab으로 돌리거나 \
-                 `/mode 일반`∙`/mode 계획`∙`/mode 일`∙`/mode 작업`으로 바꿉니다."
-            ),
-            Lang::En => format!(
-                "Mode is **{mode}**. Cycle it with Shift+Tab, or set it with \
-                 `/mode normal`, `/mode plan`, `/mode work`, `/mode job`."
-            ),
-        }
-    }
     pub fn mode_changed(self, mode: &str) -> String {
         match self {
             Lang::Ko => format!("**{mode}** 모드로 바꿨습니다."),
@@ -782,49 +763,6 @@ impl Lang {
         }
     }
     // ── Commands (`/account`)
-    /// What `/account` prints — who the connection is: name, email, id, billing, scopes.
-    /// `plan` and `credits` are absent on deployments that don't meter.
-    pub fn account_text(
-        self,
-        name: &str,
-        email: &str,
-        user_id: &str,
-        plan: Option<&str>,
-        credits: Option<&str>,
-        scopes: &[String],
-    ) -> String {
-        let scopes = if scopes.is_empty() {
-            match self {
-                Lang::Ko => "없음".into(),
-                Lang::En => "none".into(),
-            }
-        } else {
-            scopes.join(", ")
-        };
-        match self {
-            Lang::Ko => format!(
-                "**{name}** ({email})\n\n\
-                 아이디: `{user_id}`\n\
-                 {plan_line}\
-                 {credits_line}\
-                 부여된 권한: {scopes}\n\n\
-                 `/account logout` ‒ 이 기기에서 로그아웃합니다. \
-                 다음 실행 때 다시 승인을 받습니다.",
-                plan_line = plan.map(|p| format!("플랜: {p}\n")).unwrap_or_default(),
-                credits_line = credits.map(|c| format!("크레딧: {c}\n")).unwrap_or_default(),
-            ),
-            Lang::En => format!(
-                "**{name}** ({email})\n\n\
-                 User ID: `{user_id}`\n\
-                 {plan_line}\
-                 {credits_line}\
-                 Granted scopes: {scopes}\n\n\
-                 `/account logout` ‒ log out on this device. The next launch asks for approval again.",
-                plan_line = plan.map(|p| format!("Plan: {p}\n")).unwrap_or_default(),
-                credits_line = credits.map(|c| format!("Credits: {c}\n")).unwrap_or_default(),
-            ),
-        }
-    }
     /// What to say when `/account` couldn't reach the server.
     pub fn account_error(self, why: &str) -> String {
         match self {
@@ -1181,14 +1119,6 @@ impl Lang {
             ),
         }
     }
-    pub fn plugin_project_state(self, on: bool) -> &'static str {
-        match (self, on) {
-            (Lang::Ko, true) => " (프로젝트 ∙ 다음 실행에 켬)",
-            (Lang::Ko, false) => " (프로젝트 ∙ 꺼짐)",
-            (Lang::En, true) => " (project ∙ on next launch)",
-            (Lang::En, false) => " (project ∙ off)",
-        }
-    }
     pub fn plugin_switched(self, name: &str, on: bool) -> String {
         match (self, on) {
             (Lang::Ko, true) => format!("`{name}`을 켰습니다. 다시 띄우면 적용됩니다."),
@@ -1398,46 +1328,6 @@ impl Lang {
     }
 
     // ── GitHub (`/github`)
-    /// Both slots. **The reviewer is named even when there isn't one** — which account a review
-    /// goes out under is the whole point of having two, and silence there reads as "the same one".
-    pub fn github_signed_in(self, login: &str, reviewer: Option<&str>) -> String {
-        match (self, reviewer) {
-            (Lang::Ko, Some(r)) => format!(
-                "GitHub에 `{login}`으로 이어져 있습니다.\n리뷰는 `{r}` 이름으로 나갑니다.\n\n\
-                 `/github logout`∙`/github logout reviewer`로 끊습니다."
-            ),
-            (Lang::Ko, None) => format!(
-                "GitHub에 `{login}`으로 이어져 있습니다.\n리뷰어를 따로 잇지 않아 리뷰도 \
-                 `{login}` 이름으로 나갑니다 ‒ 자기 PR은 승인할 수 없습니다.\n\n\
-                 `/github login reviewer`로 리뷰 전용 계정을 잇습니다."
-            ),
-            (Lang::En, Some(r)) => format!(
-                "Connected to GitHub as `{login}`.\nReviews go out as `{r}`.\n\n\
-                 `/github logout` and `/github logout reviewer` disconnect."
-            ),
-            (Lang::En, None) => format!(
-                "Connected to GitHub as `{login}`.\nNo separate reviewer is connected, so reviews \
-                 go out as `{login}` too ‒ and nobody can approve their own pull request.\n\n\
-                 `/github login reviewer` connects an account just for reviews."
-            ),
-        }
-    }
-    pub fn github_signed_out(self) -> &'static str {
-        self.pick(
-            "GitHub에 이어져 있지 않습니다. `/github login`으로 잇습니다.",
-            "Not connected to GitHub. `/github login` connects it.",
-        )
-    }
-    /// **A build with no OAuth app registered.** Saying "not signed in" here would send someone
-    /// looking for a browser page that is never going to appear.
-    pub fn github_no_app(self) -> &'static str {
-        self.pick(
-            "이 빌드에는 GitHub 앱이 등록돼 있지 않아 로그인할 수 없습니다. \
-             GitHub에서 OAuth App을 만들고 `ZYRIS_CODE_GITHUB_CLIENT_ID`에 client id를 주세요.",
-            "This build has no GitHub app registered, so there is nothing to log in to. Create an \
-             OAuth App on GitHub and give its client id as `ZYRIS_CODE_GITHUB_CLIENT_ID`.",
-        )
-    }
     /// The code to type, and where. **Both, together** — a code with nowhere to put it is no use.
     pub fn github_code(self, code: &str, url: &str, role: crate::github::auth::Role) -> String {
         use crate::github::auth::Role;
@@ -1809,17 +1699,6 @@ impl Lang {
             Lang::En => "↑↓ row ∙ ←→ value ∙ Enter save ∙ Esc cancel".into(),
         }
     }
-    /// The hint line of the `/config` panel — everything here is settable by command too.
-    pub fn config_keys(self) -> String {
-        match self {
-            Lang::Ko => "`/config dir allow∙deny` ∙ `/config lang ko∙en` ∙ \
-                 `/config mode 일반∙계획∙일∙작업∙off`"
-                .into(),
-            Lang::En => "`/config dir allow|deny` ∙ `/config lang ko|en` ∙ \
-                 `/config mode normal|plan|work|job|off`"
-                .into(),
-        }
-    }
     /// Said while `/reconnect` is reattaching.
     /// Said **once** when a selection could not reach the system clipboard: this terminal was not
     /// found to read OSC 52 and no clipboard tool was found either. The highlight looks like a copy
@@ -1956,16 +1835,6 @@ impl Lang {
             Lang::En => format!("couldn't start it: {why}"),
         }
     }
-    pub fn mcp_config_hint(self) -> &'static str {
-        self.pick(
-            "`.mcp.json` ∙ `~/.config/zyris-code/mcp.json`에 적습니다.",
-            "Write in `.mcp.json` or `~/.config/zyris-code/mcp.json`.",
-        )
-    }
-    /// Heading over repository and external-client servers that need approval.
-    pub fn mcp_found_heading(self) -> &'static str {
-        self.pick("승인이 필요한 서버", "Servers requiring approval")
-    }
     /// Where one was found, and whether this machine said yes to it.
     pub fn mcp_found_from(self, source: &str, on: bool) -> String {
         match (self, on) {
@@ -1974,12 +1843,6 @@ impl Lang {
             (Lang::En, true) => format!("{source} ∙ on from the next launch"),
             (Lang::En, false) => format!("{source} ∙ off"),
         }
-    }
-    pub fn mcp_switch_hint(self) -> &'static str {
-        self.pick(
-            "`/mcp on <이름>`으로 켜고 `/mcp off <이름>`으로 끕니다. 찾은 것은 켜기 전에는 돌지 않습니다.",
-            "`/mcp on <name>` turns one on, `/mcp off <name>` turns it off. Nothing found here runs until you do.",
-        )
     }
     /// What `/mcp on|off` answers. **It says to restart** — servers are started once, at launch.
     pub fn mcp_switched(self, slug: &str, on: bool) -> String {
@@ -2067,18 +1930,19 @@ impl Lang {
         use crate::panel::ManagerKind;
         match (self, kind) {
             (Lang::Ko, ManagerKind::Mcp) => {
-                "↑↓ 고르기 ‒ Enter 켜기/끄기 ‒ a 추가 ‒ d 지우기 ‒ r 다시 읽기 ‒ Esc 닫기"
+                "↑↓ 고르기 ∙ Enter 켜기/끄기 ∙ a 추가 ∙ d 지우기 ∙ r 다시 읽기 ∙ Esc 닫기"
                     .to_string()
             }
             (Lang::En, ManagerKind::Mcp) => {
-                "↑↓ pick ‒ Enter on/off ‒ a add ‒ d remove ‒ r re-read ‒ Esc close".to_string()
+                "↑↓ pick ∙ Enter on/off ∙ a add ∙ d remove ∙ r re-read ∙ Esc close".to_string()
             }
             (Lang::Ko, ManagerKind::Plugins) => {
-                "↑↓ 고르기 ‒ Enter 켜기/끄기 ‒ a 받기 ‒ u 갱신 ‒ d 지우기 ‒ r 다시 읽기 ‒ Esc 닫기"
+                "↑↓ 고르기 ∙ Enter 켜기/끄기 ∙ a 받기 ∙ u 갱신 ∙ d 지우기 ∙ r 다시 읽기 ∙ Esc 닫기"
                     .to_string()
             }
             (Lang::En, ManagerKind::Plugins) => {
-                "↑↓ pick ‒ Enter on/off ‒ u update ‒ d remove ‒ r re-read ‒ Esc close".to_string()
+                "↑↓ pick ∙ Enter on/off ∙ a fetch ∙ u update ∙ d remove ∙ r re-read ∙ Esc close"
+                    .to_string()
             }
         }
     }
@@ -2142,9 +2006,6 @@ impl Lang {
     /// Where a server written in one of our own files came from.
     pub fn mcp_from_user(self) -> &'static str {
         self.pick("이 앱의 설정", "this app's settings")
-    }
-    pub fn mcp_from_project(self) -> &'static str {
-        self.pick("이 저장소", "this repository")
     }
     pub fn mcp_from_plugin(self, name: &str) -> String {
         match self {
@@ -2352,12 +2213,6 @@ impl Lang {
             Lang::En => format!("`{token}` is not a `KEY=value` pair."),
         }
     }
-    pub fn f_name_taken(self, name: &str) -> String {
-        match self {
-            Lang::Ko => format!("`{name}`은(는) 이미 있습니다. `r`로 다시 읽어 보세요."),
-            Lang::En => format!("`{name}` already exists. Press `r` to read the list again."),
-        }
-    }
     /// A server written into one of our files. **Says that it takes effect on the next launch** —
     /// servers are started once, at announce time.
     pub fn f_mcp_added(self, name: &str, at: &str) -> String {
@@ -2391,18 +2246,6 @@ impl Lang {
             "플러그인이 없습니다. `/plugin add owner/repo`로 받습니다.",
             "No plugins. Install one with `/plugin add owner/repo`.",
         )
-    }
-    pub fn plugin_hand_placed(self) -> &'static str {
-        self.pick(" (직접 둔 것)", " (hand-placed)")
-    }
-    pub fn plugin_mcp_line(self, slug: &str, command: &str) -> String {
-        match self {
-            Lang::Ko => format!("MCP `{slug}` ‒ `{command}`"),
-            Lang::En => format!("MCP `{slug}` ‒ runs `{command}`"),
-        }
-    }
-    pub fn plugin_skills_line(self) -> &'static str {
-        self.pick("스킬이 딸려 있습니다", "ships a skill")
     }
 
     // ── Account panel
@@ -2550,11 +2393,6 @@ impl Lang {
     pub fn detail_error(self) -> &'static str {
         self.pick("오류", "Error")
     }
-    /// The section heads in the order `tool_detail` writes them. **rows.rs styles by these names,
-    /// so the writer and the reader must agree** — both sides use the same lang.
-    pub fn tool_sections(self) -> [&'static str; 4] {
-        [self.detail_args(), self.detail_output(), self.detail_result(), self.detail_error()]
-    }
     pub fn detail_timed_out(self) -> &'static str {
         self.pick("시간이 다 됐습니다", "Timed out")
     }
@@ -2646,6 +2484,8 @@ impl Lang {
     }
 
     // ── Lists (picker)
+    /// `  ↑ 3 more`: how many rows a list holds back above or below. The todo list says the same
+    /// thing on a line of its own, without the two leading spaces.
     pub fn pick_more(self, up: bool, n: usize) -> String {
         let arrow = if up { "↑" } else { "↓" };
         match self {
@@ -2820,16 +2660,6 @@ impl Lang {
 /// server wrote, short enough to leave the line's hint room — the point of the line is that a
 /// person takes it in at a glance.
 const ACTIVITY_WIDTH: usize = 48;
-
-/// Cuts text to a column budget, **counting a wide character as the two columns it takes up**.
-///
-/// `chars().take(n)` is wrong here for the same reason it is wrong everywhere in this app: a
-/// Hangul syllable is one `char` and two columns, so counting characters buys twice the line.
-fn clip_columns(text: &str, width: usize) -> String {
-    // One column is kept for the ellipsis, so the result never reads as if it ended there — and
-    // the cut is by cluster, like everything else measured for the screen.
-    crate::markdown::truncate_to(text, width)
-}
 
 #[cfg(test)]
 mod tests {
@@ -3213,5 +3043,21 @@ mod tests {
         }
         assert!(Lang::En.quit_armed(2, 1).contains("2 running job"));
         assert_eq!(Lang::En.quit_armed(0, 0), "Press Ctrl+C again to quit");
+    }
+
+    /// **Both languages name the same keys.** The English plugin line left out `a`, which `on_key`
+    /// maps for both managers, so the two hints said different things (D12).
+    #[test]
+    fn the_manager_hints_name_the_same_keys_in_both_languages() {
+        use crate::panel::ManagerKind;
+        let keys = |hint: String| {
+            hint.split(" ∙ ")
+                .map(|part| part.split(' ').next().unwrap_or_default().to_string())
+                .collect::<Vec<_>>()
+        };
+        for kind in [ManagerKind::Mcp, ManagerKind::Plugins] {
+            assert_eq!(keys(Lang::Ko.manager_keys(kind)), keys(Lang::En.manager_keys(kind)));
+        }
+        assert!(keys(Lang::En.manager_keys(ManagerKind::Plugins)).contains(&"a".to_string()));
     }
 }

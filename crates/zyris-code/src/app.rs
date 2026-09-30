@@ -1492,12 +1492,16 @@ pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    // **Ctrl+C passes every surface below.** Stopping or quitting must never be trapped behind a
+    // window, a form or a list — each of them is skipped for this key, and it reaches the arm at
+    // the bottom.
+    let quits = ctrl && matches!(key.code, KeyCode::Char('c'));
 
     // **The enrollment code window is topmost.** No other key may do something unexpected
     // while the code is up — Esc closes it, and only Ctrl+C (quit) passes through.
     // Enrollment itself keeps running in the background, so closing with Esc does not
     // interrupt it.
-    if state.enroll.is_some() && !(ctrl && matches!(key.code, KeyCode::Char('c'))) {
+    if state.enroll.is_some() && !quits {
         return match key.code {
             // **With nothing attached, this window is the whole app.** Putting it away then left a
             // dead shell — nothing to type into, no list that would open, and no way back to the
@@ -1510,64 +1514,20 @@ pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
 
     // With a question open, keys go there. The turn is blocked waiting for the answer, so
     // that is the one thing to do right now. Only quitting always works.
-    if let Some((_, a)) = &state.asking {
-        if !(ctrl && matches!(key.code, KeyCode::Char('c'))) {
-            return ask_key(a, key, ctrl);
-        }
+    if let Some((_, a)) = state.asking.as_ref().filter(|_| !quits) {
+        return ask_key(a, key, ctrl);
     }
 
-    // **The GitHub screen takes the keys the same way the new-project form does.** Ctrl+C is the
-    // one exception everywhere: stopping or quitting must never be trapped behind a screen.
-    if state.github_form.is_some() && !(ctrl && matches!(key.code, KeyCode::Char('c'))) {
+    // **The GitHub screen and the new-project form take the keys the same way.** The new-project
+    // form sits on top of the list, which stays open underneath, so closing with Esc returns right
+    // to that spot. Characters go to the form's active field.
+    if (state.github_form.is_some() || state.new_project.is_some()) && !quits {
         return match key.code {
             KeyCode::Enter => vec![Action::FormConfirm],
             KeyCode::Esc => vec![Action::FormCancel],
             KeyCode::Tab | KeyCode::Down => vec![Action::FormNext],
             KeyCode::BackTab | KeyCode::Up => vec![Action::FormPrev],
-            KeyCode::Backspace => vec![Action::Backspace],
-            KeyCode::Delete => vec![Action::Delete],
-            KeyCode::Left => vec![Action::Left],
-            KeyCode::Right => vec![Action::Right],
-            KeyCode::Home => vec![Action::Home],
-            KeyCode::End => vec![Action::End],
-            // **The same editing keys as the main input.** Retyping a pasted token that went in
-            // wrong is not a thing anyone should have to do character by character, and a field
-            // that answers `Ctrl+W` in one place and ignores it in another is worse than one
-            // that never answered it.
-            KeyCode::Char('u') if ctrl => vec![Action::KillToStart],
-            KeyCode::Char('k') if ctrl => vec![Action::KillToEnd],
-            KeyCode::Char('w') if ctrl => vec![Action::DeleteWord],
-            KeyCode::Char('y') if ctrl => vec![Action::Yank],
-            KeyCode::Char('a') if ctrl => vec![Action::Home],
-            KeyCode::Char('e') if ctrl => vec![Action::End],
-            KeyCode::Char(c) if !ctrl => vec![Action::Insert(c)],
-            _ => vec![],
-        };
-    }
-
-    // **The new-project form sits on top of the list.** The list stays open underneath, so
-    // closing with Esc returns right to that spot. Characters go to the form's active field.
-    if state.new_project.is_some() && !(ctrl && matches!(key.code, KeyCode::Char('c'))) {
-        return match key.code {
-            KeyCode::Enter => vec![Action::FormConfirm],
-            KeyCode::Esc => vec![Action::FormCancel],
-            KeyCode::Tab | KeyCode::Down => vec![Action::FormNext],
-            KeyCode::BackTab | KeyCode::Up => vec![Action::FormPrev],
-            KeyCode::Backspace => vec![Action::Backspace],
-            KeyCode::Delete => vec![Action::Delete],
-            KeyCode::Left => vec![Action::Left],
-            KeyCode::Right => vec![Action::Right],
-            KeyCode::Home => vec![Action::Home],
-            KeyCode::End => vec![Action::End],
-            // Same editing keys as everywhere else — see the GitHub form above.
-            KeyCode::Char('u') if ctrl => vec![Action::KillToStart],
-            KeyCode::Char('k') if ctrl => vec![Action::KillToEnd],
-            KeyCode::Char('w') if ctrl => vec![Action::DeleteWord],
-            KeyCode::Char('y') if ctrl => vec![Action::Yank],
-            KeyCode::Char('a') if ctrl => vec![Action::Home],
-            KeyCode::Char('e') if ctrl => vec![Action::End],
-            KeyCode::Char(c) if !ctrl => vec![Action::Insert(c)],
-            _ => vec![],
+            _ => field_key(key, ctrl),
         };
     }
 
@@ -1575,7 +1535,7 @@ pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
     // button (Tab) or close it — typing must not leak into the input behind it.
     // Esc closes; Enter activates the button when it is focused, otherwise closes.
     // ↑↓ · j·k scroll by one row, PageUp·PageDown by a page. Only quitting always works.
-    if state.panel.is_some() && !(ctrl && matches!(key.code, KeyCode::Char('c'))) {
+    if state.panel.is_some() && !quits {
         let has_button = state.panel.as_ref().is_some_and(|p| p.button.is_some());
         let button_focused = state.panel.as_ref().is_some_and(|p| p.button_focused);
         // **A form is edited, not scrolled.** ↑↓ pick the row, ←→ pick the value, Enter
@@ -1608,19 +1568,7 @@ pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
                 KeyCode::Down | KeyCode::Tab => vec![Action::ManagerFormMove(1)],
                 KeyCode::Left => vec![Action::ManagerFormShift(-1)],
                 KeyCode::Right => vec![Action::ManagerFormShift(1)],
-                KeyCode::Backspace => vec![Action::Backspace],
-                KeyCode::Delete => vec![Action::Delete],
-                KeyCode::Home => vec![Action::Home],
-                KeyCode::End => vec![Action::End],
-                // The same editing keys as every other field in this app.
-                KeyCode::Char('u') if ctrl => vec![Action::KillToStart],
-                KeyCode::Char('k') if ctrl => vec![Action::KillToEnd],
-                KeyCode::Char('w') if ctrl => vec![Action::DeleteWord],
-                KeyCode::Char('y') if ctrl => vec![Action::Yank],
-                KeyCode::Char('a') if ctrl => vec![Action::Home],
-                KeyCode::Char('e') if ctrl => vec![Action::End],
-                KeyCode::Char(c) if !ctrl => vec![Action::Insert(c)],
-                _ => vec![],
+                _ => field_key(key, ctrl),
             };
         }
         // **A manager acts on the row under its cursor.** ↑↓ walk it, Enter/Space switches it,
@@ -1667,7 +1615,7 @@ pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
         };
     }
 
-    if state.picker.is_some() && !(ctrl && matches!(key.code, KeyCode::Char('c'))) {
+    if state.picker.is_some() && !quits {
         // **A pending deletion takes every key, and only Enter says yes.** Anything else backs
         // out. Leaving the other keys to do their usual work would mean the question stays up
         // while the cursor walks away from the row it names, and then Enter deletes something
@@ -1837,8 +1785,12 @@ pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
         // reading the answer turned the stop key into two presses, the first of them silent.
         // Stopping drops the highlight as any other key does (`apply`).
         KeyCode::Esc if state.running => vec![Action::Cancel],
-        // With a selection up and nothing to stop, Esc clears it.
-        KeyCode::Esc if state.selection.is_some() => vec![Action::ClearSelection],
+        // With a highlight up and nothing to stop, Esc clears it. **The highlight, not the copied
+        // text:** a drag over blank cells copies nothing (`selection` stays `None`) and is still
+        // drawn, and asking only about the text left Esc doing nothing to it.
+        KeyCode::Esc if state.drag.is_some() || state.selection.is_some() => {
+            vec![Action::ClearSelection]
+        }
         // **Shift+Enter and Alt+Enter are newlines.** With the kitty keyboard protocol on
         // (`PushKeyboardEnhancementFlags` in `run()` below) Shift+Enter arrives separately as
         // Enter+SHIFT. Alt+Enter (ESC+\r) is the fallback for terminals without the
@@ -1917,20 +1869,7 @@ fn ask_key(a: &crate::question::Answering, key: KeyEvent, ctrl: bool) -> Vec<Act
         return match key.code {
             KeyCode::Enter => vec![Action::AskConfirm],
             KeyCode::Esc => vec![Action::AskCancel],
-            KeyCode::Backspace => vec![Action::Backspace],
-            KeyCode::Delete => vec![Action::Delete],
-            KeyCode::Left => vec![Action::Left],
-            KeyCode::Right => vec![Action::Right],
-            KeyCode::Home => vec![Action::Home],
-            KeyCode::End => vec![Action::End],
-            KeyCode::Char('u') if ctrl => vec![Action::KillToStart],
-            KeyCode::Char('k') if ctrl => vec![Action::KillToEnd],
-            KeyCode::Char('w') if ctrl => vec![Action::DeleteWord],
-            KeyCode::Char('y') if ctrl => vec![Action::Yank],
-            KeyCode::Char('a') if ctrl => vec![Action::Home],
-            KeyCode::Char('e') if ctrl => vec![Action::End],
-            KeyCode::Char(c) if !ctrl => vec![Action::Insert(c)],
-            _ => vec![],
+            _ => field_key(key, ctrl),
         };
     }
     match key.code {
@@ -1940,6 +1879,31 @@ fn ask_key(a: &crate::question::Answering, key: KeyEvent, ctrl: bool) -> Vec<Act
         // that instead.
         KeyCode::Enter | KeyCode::Char(' ') => vec![Action::AskConfirm],
         KeyCode::Esc => vec![Action::AskCancel],
+        _ => vec![],
+    }
+}
+
+/// The editing keys of a one-line field — a form's, the manager's add form's, a question's free
+/// text. Each of them maps its own Enter, Esc and moves first and hands the rest here.
+///
+/// **One table, so a field cannot drift from the others.** It was pasted four times, and the
+/// copies had already come apart from what `apply` did with them (`edit`).
+fn field_key(key: KeyEvent, ctrl: bool) -> Vec<Action> {
+    match key.code {
+        KeyCode::Backspace => vec![Action::Backspace],
+        KeyCode::Delete => vec![Action::Delete],
+        KeyCode::Left => vec![Action::Left],
+        KeyCode::Right => vec![Action::Right],
+        KeyCode::Home => vec![Action::Home],
+        KeyCode::End => vec![Action::End],
+        // The readline keys the draft answers to, where a one-line field has a use for them.
+        KeyCode::Char('u') if ctrl => vec![Action::KillToStart],
+        KeyCode::Char('k') if ctrl => vec![Action::KillToEnd],
+        KeyCode::Char('w') if ctrl => vec![Action::DeleteWord],
+        KeyCode::Char('y') if ctrl => vec![Action::Yank],
+        KeyCode::Char('a') if ctrl => vec![Action::Home],
+        KeyCode::Char('e') if ctrl => vec![Action::End],
+        KeyCode::Char(c) if !ctrl => vec![Action::Insert(c)],
         _ => vec![],
     }
 }
@@ -1971,6 +1935,62 @@ fn enter_becomes_newline(state: &State, key: &KeyEvent, in_burst: bool) -> bool 
         && state.panel.is_none()
         && state.picker.is_none()
         && !state.input.text.is_empty()
+}
+
+/// Applies one editing action to a text field. `false` when `action` is not an editing one.
+///
+/// **Every field edits through this**, the draft included — the forms each had their own
+/// `match` and had come apart: `Ctrl+K` and `Ctrl+Y` were mapped in two forms and did nothing
+/// there, and `Ctrl+U` wiped the whole GitHub token where everywhere else it keeps what is ahead
+/// of the cursor. `field` is `None` when the form's cursor is on a row that takes no text; the
+/// action is still one of these, and still that form's to swallow.
+fn edit(field: Option<&mut Input>, action: &Action) -> bool {
+    let Some(field) = field else {
+        return is_editing(action);
+    };
+    match action {
+        Action::Insert(c) => field.insert(*c),
+        Action::Paste(text) => field.insert_str(text),
+        Action::Backspace => field.backspace(),
+        Action::Delete => field.delete(),
+        Action::DeleteWord => field.delete_word(),
+        Action::DeleteWordBefore => field.delete_word_before(),
+        Action::DeleteWordAfter => field.delete_word_after(),
+        Action::KillToStart => field.kill_to_start(),
+        Action::KillToEnd => field.kill_to_end(),
+        Action::Yank => field.yank(),
+        Action::Left => field.left(),
+        Action::Right => field.right(),
+        Action::WordLeft => field.word_left(),
+        Action::WordRight => field.word_right(),
+        Action::Home => field.home(),
+        Action::End => field.end(),
+        _ => return false,
+    }
+    true
+}
+
+/// Whether `action` is one [`edit`] applies.
+fn is_editing(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::Insert(_)
+            | Action::Paste(_)
+            | Action::Backspace
+            | Action::Delete
+            | Action::DeleteWord
+            | Action::DeleteWordBefore
+            | Action::DeleteWordAfter
+            | Action::KillToStart
+            | Action::KillToEnd
+            | Action::Yank
+            | Action::Left
+            | Action::Right
+            | Action::WordLeft
+            | Action::WordRight
+            | Action::Home
+            | Action::End
+    )
 }
 
 pub fn apply(state: &mut State, action: &Action) {
@@ -2020,6 +2040,7 @@ pub fn apply(state: &mut State, action: &Action) {
             | Action::DeleteWord
             | Action::DeleteWordBefore
             | Action::DeleteWordAfter
+            | Action::KillToStart
             | Action::KillToEnd
             | Action::Yank
     ) {
@@ -2073,56 +2094,12 @@ pub fn apply(state: &mut State, action: &Action) {
     // person's row is a button, so a keystroke there is not swallowed into an invisible field.
     if let Some(form) = state.github_form.as_mut().filter(|_| forms_have_it) {
         match action {
-            Action::Insert(c) => {
-                if let Some(field) = form.typing() {
-                    field.insert(*c);
-                }
-            }
             // **A pasted token arrives whole** (`EnableBracketedPaste`), so a token with a newline
-            // on the end does not submit halfway through.
+            // on the end does not submit halfway through. The one field that trims a paste: a
+            // token has no meaningful whitespace, and a stray newline would make it wrong.
             Action::Paste(text) => {
                 if let Some(field) = form.typing() {
                     field.insert_str(text.trim());
-                }
-            }
-            Action::Backspace => {
-                if let Some(field) = form.typing() {
-                    field.backspace();
-                }
-            }
-            Action::Delete => {
-                if let Some(field) = form.typing() {
-                    field.delete();
-                }
-            }
-            Action::DeleteWord => {
-                if let Some(field) = form.typing() {
-                    field.delete_word();
-                }
-            }
-            Action::Left => {
-                if let Some(field) = form.typing() {
-                    field.left();
-                }
-            }
-            Action::Right => {
-                if let Some(field) = form.typing() {
-                    field.right();
-                }
-            }
-            Action::Home => {
-                if let Some(field) = form.typing() {
-                    field.home();
-                }
-            }
-            Action::End => {
-                if let Some(field) = form.typing() {
-                    field.end();
-                }
-            }
-            Action::KillToStart => {
-                if let Some(field) = form.typing() {
-                    field.take();
                 }
             }
             Action::FormNext => form.next(),
@@ -2135,7 +2112,9 @@ pub fn apply(state: &mut State, action: &Action) {
                 }
             }
             Action::FormCancel => state.github_form = None,
-            _ => {}
+            _ => {
+                edit(form.typing(), action);
+            }
         }
         return;
     }
@@ -2154,98 +2133,14 @@ pub fn apply(state: &mut State, action: &Action) {
     // is open would lose timeline events.
     if state.panel.as_ref().is_some_and(|p| p.manager.as_ref().is_some_and(|m| m.form.is_some()))
         && forms_have_it
+        && edit(manager_form(state).and_then(|f| f.editor()), action)
     {
-        let mut handled = true;
-        match action {
-            Action::Insert(c) => {
-                if let Some(field) = manager_form(state).and_then(|f| f.editor()) {
-                    field.insert(*c);
-                }
-            }
-            Action::Paste(text) => {
-                if let Some(field) = manager_form(state).and_then(|f| f.editor()) {
-                    field.insert_str(text);
-                }
-            }
-            Action::Backspace => {
-                if let Some(field) = manager_form(state).and_then(|f| f.editor()) {
-                    field.backspace();
-                }
-            }
-            Action::Delete => {
-                if let Some(field) = manager_form(state).and_then(|f| f.editor()) {
-                    field.delete();
-                }
-            }
-            Action::DeleteWord => {
-                if let Some(field) = manager_form(state).and_then(|f| f.editor()) {
-                    field.delete_word();
-                }
-            }
-            Action::KillToStart => {
-                if let Some(field) = manager_form(state).and_then(|f| f.editor()) {
-                    field.kill_to_start();
-                }
-            }
-            Action::KillToEnd => {
-                if let Some(field) = manager_form(state).and_then(|f| f.editor()) {
-                    field.kill_to_end();
-                }
-            }
-            Action::Yank => {
-                if let Some(field) = manager_form(state).and_then(|f| f.editor()) {
-                    field.yank();
-                }
-            }
-            Action::Left => {
-                if let Some(field) = manager_form(state).and_then(|f| f.editor()) {
-                    field.left();
-                }
-            }
-            Action::Right => {
-                if let Some(field) = manager_form(state).and_then(|f| f.editor()) {
-                    field.right();
-                }
-            }
-            Action::Home => {
-                if let Some(field) = manager_form(state).and_then(|f| f.editor()) {
-                    field.home();
-                }
-            }
-            Action::End => {
-                if let Some(field) = manager_form(state).and_then(|f| f.editor()) {
-                    field.end();
-                }
-            }
-            _ => handled = false,
-        }
-        if handled {
-            refresh_the_manager_body(state);
-            return;
-        }
+        refresh_the_manager_body(state);
+        return;
     }
 
     if state.new_project.is_some() && forms_have_it {
         match action {
-            Action::Insert(c) => {
-                state.new_project.as_mut().expect("just checked it").active().insert(*c)
-            }
-            Action::Paste(text) => {
-                state.new_project.as_mut().expect("just checked it").active().insert_str(text)
-            }
-            Action::Backspace => {
-                state.new_project.as_mut().expect("just checked it").active().backspace()
-            }
-            Action::Delete => {
-                state.new_project.as_mut().expect("just checked it").active().delete()
-            }
-            Action::DeleteWord => {
-                state.new_project.as_mut().expect("just checked it").active().delete_word()
-            }
-            Action::Left => state.new_project.as_mut().expect("just checked it").active().left(),
-            Action::Right => state.new_project.as_mut().expect("just checked it").active().right(),
-            Action::Home => state.new_project.as_mut().expect("just checked it").active().home(),
-            Action::End => state.new_project.as_mut().expect("just checked it").active().end(),
             Action::FormNext => state.new_project.as_mut().expect("just checked it").next(),
             Action::FormPrev => state.new_project.as_mut().expect("just checked it").prev(),
             Action::FormConfirm => {
@@ -2255,12 +2150,13 @@ pub fn apply(state: &mut State, action: &Action) {
                 }
             }
             Action::FormCancel => state.new_project = None,
-            _ => {}
+            _ => {
+                edit(state.new_project.as_mut().map(|f| f.active()), action);
+            }
         }
         return;
     }
     match action {
-        Action::Insert(c) => state.editor().insert(*c),
         Action::Paste(text) => {
             // **A paste goes where a key would have gone.** It does not pass through `on_key`, so
             // it used to land in the draft whatever was up — behind a history search it was meant
@@ -2287,13 +2183,25 @@ pub fn apply(state: &mut State, action: &Action) {
             // paste must not change the mode. The matches! above releases the recall.
             state.editor().insert_str(text);
         }
-        Action::Backspace => state.editor().backspace(),
-        Action::Delete => state.editor().delete(),
-        Action::DeleteWord => state.editor().delete_word(),
-        Action::DeleteWordBefore => state.editor().delete_word_before(),
-        Action::DeleteWordAfter => state.editor().delete_word_after(),
-        Action::KillToEnd => state.editor().kill_to_end(),
-        Action::Yank => state.editor().yank(),
+        // Every other editing key, into the draft or the question's free text. Spelled out
+        // rather than `_` so that this match stays exhaustive over `Action`.
+        Action::Insert(_)
+        | Action::Backspace
+        | Action::Delete
+        | Action::DeleteWord
+        | Action::DeleteWordBefore
+        | Action::DeleteWordAfter
+        | Action::KillToStart
+        | Action::KillToEnd
+        | Action::Yank
+        | Action::Left
+        | Action::Right
+        | Action::WordLeft
+        | Action::WordRight
+        | Action::Home
+        | Action::End => {
+            edit(Some(state.editor()), action);
+        }
         // **Nothing sent yet means nothing to search.** An empty box reads as broken, and there
         // is no wrong guess to make here — the key simply has nothing to do.
         Action::OpenHistory => {
@@ -2328,12 +2236,6 @@ pub fn apply(state: &mut State, action: &Action) {
                 state.input.cursor = at;
             }
         }
-        Action::Left => state.editor().left(),
-        Action::Right => state.editor().right(),
-        Action::WordLeft => state.editor().word_left(),
-        Action::WordRight => state.editor().word_right(),
-        Action::Home => state.editor().home(),
-        Action::End => state.editor().end(),
         Action::Submit(text) => {
             state.input.take();
             state.recall = None;
@@ -2951,10 +2853,6 @@ pub fn apply(state: &mut State, action: &Action) {
         // happened.
         Action::PickBack => {}
         Action::CycleMode => state.mode = state.mode.next(),
-        Action::KillToStart => {
-            state.editor().kill_to_start();
-            state.recall = None;
-        }
         // Recall. **A queued message comes first** — it is the only one still editable.
         Action::RecallOlder => {
             if let Some(text) = state.queued.pop() {
@@ -3023,26 +2921,7 @@ pub fn apply(state: &mut State, action: &Action) {
     //
     // Neither list opens before the first connection, for the reason at the top of this function —
     // the commands behind one of them have no session to act on.
-    if state.ever_connected
-        && matches!(
-            action,
-            Action::Insert(_)
-                | Action::Backspace
-                | Action::Delete
-                | Action::DeleteWord
-                | Action::DeleteWordBefore
-                | Action::DeleteWordAfter
-                | Action::KillToStart
-                | Action::KillToEnd
-                | Action::Yank
-                | Action::Left
-                | Action::Right
-                | Action::WordLeft
-                | Action::WordRight
-                | Action::Home
-                | Action::End
-        )
-    {
+    if state.ever_connected && is_editing(action) && !matches!(action, Action::Paste(_)) {
         follow_the_slash(state);
         follow_the_at(state);
     }
@@ -4066,6 +3945,22 @@ pub fn heal_mode() -> Heal {
         "full" => Heal::Full,
         _ => Heal::Wide,
     }
+}
+
+/// What the settings form's Enter does once `apply` has set `config_out`: the settings reach the
+/// disk, and the language and palette the app runs with. Both event loops drain it through here, so
+/// a setting cannot be saved by one loop and only shown by the other. The palette applies to the
+/// very next frame — the same promise the directory policy makes to the gate, which each loop
+/// tells itself (`bridge.sync`).
+///
+/// `before` is the settings the change was made from (`bridge.screen_config()`): only the keys
+/// that differ from it are written, so a stale copy of another window's setting is not put back
+/// (`Config::save_changes`).
+fn save_config(state: &State, before: &crate::config::Config) {
+    state.config.save_changes(before);
+    crate::lang::set(state.lang);
+    crate::lang::save(state.lang);
+    crate::theme::set(state.config.theme.resolve());
 }
 
 /// The sequence that changes the terminal window title.
@@ -5138,10 +5033,7 @@ async fn run_inner(
                 // The main loop's full block also stages work/job sessions; there is nothing to
                 // stage yet, so carrying the decision material is the whole job here.
                 if std::mem::take(&mut state.config_out) {
-                    state.config.save_changes(&bridge.screen_config());
-                    crate::lang::set(state.lang);
-                    crate::lang::save(state.lang);
-                    crate::theme::set(state.config.theme.resolve());
+                    save_config(&state, &bridge.screen_config());
                 }
                 bridge.sync(state.mode, &state.config, state.plan_decided);
                 // A gesture is drawn by the tick it is waiting for; everything else draws here,
@@ -5284,6 +5176,8 @@ async fn run_inner(
     // `select!` arm.
     let mut heal = tokio::time::interval(heal_interval().unwrap_or(Duration::from_secs(86400)));
     let healing = heal_interval().is_some();
+    // Read once, like the interval above: the environment does not change under a running app.
+    let heal_shape = heal_mode();
     // Has the screen been touched since the last self-heal? Not having drawn means nothing
     // new can have broken.
     let mut drew_since_heal = false;
@@ -5522,12 +5416,7 @@ async fn run_inner(
                     // stopping short of any of them is how a setting changes on screen and
                     // nowhere else.
                     if std::mem::take(&mut state.config_out) {
-                        state.config.save_changes(&bridge.screen_config());
-                        crate::lang::set(state.lang);
-                        crate::lang::save(state.lang);
-                        // The palette applies to the very next frame — the same promise the
-                        // directory policy makes to the gate.
-                        crate::theme::set(state.config.theme.resolve());
+                        save_config(&state, &bridge.screen_config());
                         bridge.sync(state.mode, &state.config, state.plan_decided);
                     }
 
@@ -5873,12 +5762,12 @@ async fn run_inner(
                 // flicker this heal was reported as. The two older shapes are still here by
                 // name (`$ZYRIS_CODE_HEAL=blank|full`) for a terminal that needs them.
                 if drew_since_heal {
-                    match heal_mode() {
+                    match heal_shape {
                         Heal::Wide => {}
                         Heal::Blank => state.force_update_blank = true,
                         Heal::Full => state.force_update = true,
                     }
-                    if heal_mode() != Heal::Wide {
+                    if heal_shape != Heal::Wide {
                         // **Force cells out again without clearing.** clear is what causes
                         // the flicker — `AlwaysUpdate` bypasses the diff and overwrites.
                         // The next draw goes back to the normal diff.
@@ -7696,9 +7585,8 @@ async fn flush_queue(
 /// `Mode::next` would tie the panel's cursor to whatever order the cycle happens to use.
 fn step_mode(from: crate::mode::Mode, dir: i32) -> crate::mode::Mode {
     let all = crate::mode::Mode::ALL;
-    let at = all.iter().position(|m| *m == from).unwrap_or(0) as i32;
-    let n = all.len() as i32;
-    all[(((at + dir) % n + n) % n) as usize]
+    let at = all.iter().position(|m| *m == from).unwrap_or(0);
+    all[crate::panel::step(at, dir, all.len())]
 }
 
 /// Sets the session staging so the next message goes where the mode decided. **It only runs
@@ -12197,6 +12085,41 @@ mod interaction {
         assert_eq!(s.input.text, "");
     }
 
+    /// **Every field edits the way the draft does.** `Ctrl+K` and `Ctrl+Y` were mapped in the
+    /// GitHub screen and the new-project form and then dropped by `apply`, and `Ctrl+U` wiped the
+    /// whole token where everywhere else it keeps what is ahead of the cursor (D3).
+    #[test]
+    fn the_forms_answer_the_same_editing_keys_as_the_draft() {
+        let ctrl = KeyModifiers::CONTROL;
+        let mut s = state();
+        s.new_project = Some(crate::newproject::Form::new());
+        type_in(&mut s, "alpha beta");
+        for _ in 0..4 {
+            press(&mut s, KeyCode::Left, KeyModifiers::NONE);
+        }
+        press(&mut s, KeyCode::Char('k'), ctrl);
+        assert_eq!(s.new_project.as_ref().unwrap().name.text, "alpha ");
+        press(&mut s, KeyCode::Char('u'), ctrl);
+        press(&mut s, KeyCode::Char('y'), ctrl);
+        assert_eq!(s.new_project.as_ref().unwrap().name.text, "alpha ");
+
+        let mut s = state();
+        s.github_form = Some(crate::githubform::Form::default());
+        press(&mut s, KeyCode::Down, KeyModifiers::NONE);
+        type_in(&mut s, "ghp_old");
+        for _ in 0..3 {
+            press(&mut s, KeyCode::Left, KeyModifiers::NONE);
+        }
+        press(&mut s, KeyCode::Char('u'), ctrl);
+        let token = |s: &mut State| s.github_form.as_mut().unwrap().typing().unwrap().text.clone();
+        assert_eq!(token(&mut s), "old", "Ctrl+U keeps what is ahead of the cursor");
+        press(&mut s, KeyCode::Char('k'), ctrl);
+        assert_eq!(token(&mut s), "");
+        press(&mut s, KeyCode::Char('y'), ctrl);
+        assert_eq!(token(&mut s), "old");
+        assert!(s.input.text.is_empty(), "it leaked into the draft: {:?}", s.input.text);
+    }
+
     /// **An `@` that matches nothing is not a list.** The empty box ate Enter, so `ping @bob`
     /// could not be sent (C23).
     #[test]
@@ -12245,6 +12168,17 @@ mod interaction {
         assert_eq!(actions, vec![Action::Cancel]);
         apply(&mut s, &Action::Cancel);
         assert!(s.selection.is_none());
+    }
+
+    /// **Esc clears a highlight that copied nothing.** A drag over blank cells is drawn but leaves
+    /// no text, and Esc asked only about the text (D9).
+    #[test]
+    fn esc_clears_a_highlight_over_blank_cells() {
+        let mut s = state();
+        s.drag = Some(crate::selection::Drag::new((0, 0)));
+        assert!(s.selection.is_none());
+        press(&mut s, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(s.drag.is_none(), "the highlight is still drawn");
     }
 
     /// **Only the very next key confirms a quit.** Ctrl+C, some typing, Ctrl+C used to quit (C25).

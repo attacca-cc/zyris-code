@@ -7,7 +7,7 @@
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::markdown::display_width;
@@ -80,27 +80,7 @@ pub fn draw(frame: &mut Frame, area: Rect, panel: &mut Panel, lang: crate::lang:
     let fixed = hint.len() as u16 + u16::from(has_button);
     let want_h = (body.len() as u16).saturating_add(2 + fixed).max(5);
     let h = want_h.min(area.height.saturating_mul(4) / 5).max(3);
-    let box_area = Rect {
-        x: area.x + (area.width.saturating_sub(w)) / 2,
-        y: area.y + (area.height.saturating_sub(h)) / 2,
-        width: w,
-        height: h,
-    };
-
-    // Without clearing behind, the conversation shows through.
-    frame.render_widget(Clear, box_area);
-    // Also scrub wide characters straddling the border — same as the picker.
-    crate::widgets::picker::scrub_left_edge(frame, box_area);
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::accent()))
-        .title(Span::styled(
-            format!(" {} ", panel.title),
-            Style::default().fg(theme::text_heading()).add_modifier(Modifier::BOLD),
-        ));
-    let inner = block.inner(box_area);
-    frame.render_widget(block, box_area);
+    let inner = super::overlay(frame, area, w, h, &panel.title);
 
     let width = inner.width as usize;
     // The last rows are the hint; the button (when present) sits above it; everything above that

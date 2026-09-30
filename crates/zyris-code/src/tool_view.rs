@@ -144,7 +144,9 @@ pub fn action(name: &str, args: Option<&Value>, result: Option<&Value>) -> Strin
                 args.and_then(Value::as_object)?.values().find_map(Value::as_str).map(one_line)
             }),
     };
-    clip(&text.unwrap_or_default(), ACTION_LIMIT)
+    // Cut to columns, not chars, which let a CJK action run to twice the width. The row fits
+    // what is left of this to the screen (`rows::tool_row`).
+    crate::markdown::truncate_to(&text.unwrap_or_default(), ACTION_LIMIT)
 }
 
 /// `a · b`, dropping whichever side is missing so no separator is left dangling.
@@ -167,12 +169,6 @@ fn argv(args: Option<&Value>) -> Option<String> {
 /// Folds all whitespace to single spaces. **A leftover newline turns one tool row into several.**
 pub(crate) fn one_line(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-/// Cut to `limit` columns — not chars, which let a CJK action run to twice the width. The row
-/// fits what is left of this to the screen (`rows::tool_row`).
-fn clip(s: &str, limit: usize) -> String {
-    crate::markdown::truncate_to(s, limit)
 }
 
 fn clip_body(s: String) -> String {
