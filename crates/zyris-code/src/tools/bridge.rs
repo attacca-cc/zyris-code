@@ -7,7 +7,7 @@
 //! **The constraint that `apply` must stay pure shaped this file.** Moving screen state here
 //! is done by the I/O site (`run_inner`); the only thing going from here to the screen is `Action`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -28,8 +28,13 @@ struct Inner {
     /// Whether the plan this session is working to has been decided. **Only plan mode reads it**,
     /// and only to know whether the fence is still up.
     plan_decided: std::sync::atomic::AtomicBool,
-    /// The current settings. Same — the screen is the only place they change.
-    config: Mutex<Config>,
+    /// The settings, with the mtime they were read at.
+    ///
+    /// **Re-read when the file changes under this window.** `/config dir deny` in one window has to
+    /// reach every other window — the gate is what enforces it, and a copy taken at startup would
+    /// go on honouring the old value until that window restarted, which is a lock that only looks
+    /// locked.
+    settings: Mutex<Settings>,
     /// The working directory. **It's the yardstick for whether something leaves it.**
     root: Mutex<PathBuf>,
     /// What the plugins want run around a tool call (`hooks.rs`). Empty is the usual case.
@@ -73,6 +78,68 @@ struct Inner {
     next_id: AtomicU64,
 }
 
+/// The settings in force, and when they were read.
+#[derive(Default)]
+struct Settings {
+    config: Config,
+    /// The `config.json` mtime this copy came from. `None` when there is no file to stat.
+    at: Option<std::time::SystemTime>,
+    /// Whether the screen side has ever pushed its copy in.
+    ///
+    /// **Before that there is nothing to re-read for.** A window that has not synced knows only the
+    /// defaults, and reading the file on its first decision would make what the gate does depend on
+    /// whatever happens to be written on the machine — which is also what would make a test's answer
+    /// depend on the person running it.
+    synced: bool,
+    /// The screen's copy as it was last pushed in, so the next push can tell what it changed.
+    pushed: Config,
+}
+
+/// Takes in the screen's copy of the settings.
+///
+/// **Only what the screen changed is taken.** The screen's copy is read once and then only edited,
+/// so it goes stale the moment another window writes the file — and `sync` runs on every mode
+/// change, not only on a settings change. Copying it over whole, stamped with the file's current
+/// mtime, put a `/config dir deny` from another window back to `allow` at this window's next
+/// Shift+Tab, and marked the file as read so nothing ever corrected it. A push that changes nothing
+/// now leaves the gate's copy — and its mtime, so a newer file still wins — alone.
+fn push_settings(settings: &mut Settings, screen: &Config) {
+    if !settings.synced {
+        *settings = Settings { config: *screen, at: config_mtime(), synced: true, pushed: *screen };
+    } else if *screen != settings.pushed {
+        // `at` is left as it was: the save that goes with this change moved the mtime, so the
+        // next decision re-reads the file, which by then holds this change and every other.
+        settings.config = settings.config.overlay(&settings.pushed, screen);
+        settings.pushed = *screen;
+    }
+}
+
+/// The `config.json` mtime right now, if the file is there.
+fn config_mtime() -> Option<std::time::SystemTime> {
+    crate::conn::credential_dir()
+        .map(|dir| dir.join("config.json"))
+        .and_then(|at| std::fs::metadata(at).and_then(|meta| meta.modified()).ok())
+}
+
+/// This window's copy of the settings, **re-read when the file at `at` has changed since**.
+///
+/// Split out from `Bridge::config` so a test can hand in a path it controls: the real path comes
+/// from `$ZYRIS_CONFIG_DIR`, and a test that moved that variable would be read by every other test
+/// in the process (see `conn::credential_dir`).
+fn settings_at(at: Option<&Path>, settings: &mut Settings) -> Config {
+    let mtime = at.and_then(|path| std::fs::metadata(path).and_then(|meta| meta.modified()).ok());
+    if settings.synced && mtime != settings.at {
+        // **From the file this window means**, not from wherever `Config::load` would look — the
+        // caller passed a path precisely so the answer comes from that one.
+        settings.config = match at {
+            Some(path) => Config::load_from(path),
+            None => settings.config,
+        };
+        settings.at = mtime;
+    }
+    settings.config
+}
+
 impl Bridge {
     pub fn new() -> Bridge {
         Bridge::default()
@@ -107,8 +174,14 @@ impl Bridge {
     /// I/O site touches state.
     pub fn sync(&self, mode: Mode, config: &Config, plan_decided: bool) {
         *self.0.mode.lock().unwrap() = mode;
-        *self.0.config.lock().unwrap() = *config;
+        push_settings(&mut self.0.settings.lock().unwrap(), config);
         self.0.plan_decided.store(plan_decided, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The settings as the screen last pushed them — the copy its next change is made from, and
+    /// so the `before` its `Config::save_changes` compares against.
+    pub fn screen_config(&self) -> Config {
+        self.0.settings.lock().unwrap().pushed
     }
 
     /// Records what the plugins want run around a tool call. `tools::announce` calls it once,
@@ -145,9 +218,17 @@ impl Bridge {
 
     pub fn decide(&self, call: &Call) -> Decision {
         let mode = *self.0.mode.lock().unwrap();
-        let config = *self.0.config.lock().unwrap();
+        let config = self.config();
         let decided = self.0.plan_decided.load(std::sync::atomic::Ordering::SeqCst);
         decide(mode, &config, call, decided)
+    }
+
+    /// The settings in force **right now** — re-read when the file changed since this window last
+    /// looked at it. The rule is in `settings_at`, so a test can drive it with a path it owns.
+    fn config(&self) -> Config {
+        let at = crate::conn::credential_dir().map(|dir| dir.join("config.json"));
+        let mut settings = self.0.settings.lock().unwrap();
+        settings_at(at.as_deref(), &mut settings)
     }
 
     /// Whether the screen is attached.
@@ -345,5 +426,70 @@ mod tests {
         b.note_mcp("github", Err("아직".into()));
         b.note_mcp("github", Ok(3));
         assert_eq!(b.mcp_report(), vec![("github".to_string(), Ok(3))]);
+    }
+
+    /// **A setting changed in another window reaches this one.** The gate is what enforces
+    /// `/config dir`, so a copy read once at startup would keep honouring the old value until that
+    /// window restarted — a lock that only looks locked.
+    #[test]
+    fn a_settings_file_changed_under_us_is_read_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let at = dir.path().join("config.json");
+        // `synced: true` is what a window that has pushed its copy in looks like; before that there
+        // is nothing to re-read for (see the field).
+        let mut settings = Settings {
+            config: Config::default(),
+            at: None,
+            synced: true,
+            pushed: Config::default(),
+        };
+
+        // Nothing on disk: the cached copy stands, which is where a fresh window starts.
+        assert_eq!(settings_at(None, &mut settings).dir_access, crate::config::DirAccess::Deny);
+
+        // Written through the same serialization the app uses, so the test does not depend on how a
+        // variant happens to be spelled on disk.
+        let allow = Config { dir_access: crate::config::DirAccess::Allow, ..Config::default() };
+        std::fs::write(&at, serde_json::to_string(&allow).unwrap()).unwrap();
+        // The mtime is parked a second back, so the change is one this window has not seen — a
+        // filesystem with coarse timestamps would otherwise hide it, which is the case the `at`
+        // stamp exists to catch.
+        let written = std::fs::metadata(&at).unwrap().modified().unwrap();
+        settings.at = Some(written - std::time::Duration::from_secs(1));
+        assert_eq!(
+            settings_at(Some(&at), &mut settings).dir_access,
+            crate::config::DirAccess::Allow
+        );
+
+        // Read once, kept: an unchanged file is not re-read on every tool call.
+        settings.config =
+            Config { dir_access: crate::config::DirAccess::Deny, ..Config::default() };
+        assert_eq!(
+            settings_at(Some(&at), &mut settings).dir_access,
+            crate::config::DirAccess::Deny
+        );
+    }
+
+    /// **A mode change does not put the screen's stale settings back.** Window B's screen still
+    /// says `allow` after the gate re-read window A's `deny`; B's next Shift+Tab pushes that stale
+    /// copy, and the gate used to take it whole — and stamp the file as read.
+    #[test]
+    fn a_push_that_changes_no_setting_keeps_what_the_gate_reread() {
+        use crate::config::{DirAccess, ThemeChoice};
+        let stale = Config { dir_access: DirAccess::Allow, ..Config::default() };
+        let mut settings = Settings::default();
+        push_settings(&mut settings, &stale);
+        let read_at = settings.at;
+        // What `settings_at` does when the file changed: the gate now holds A's `deny`.
+        settings.config.dir_access = DirAccess::Deny;
+
+        push_settings(&mut settings, &stale);
+        assert_eq!(settings.config.dir_access, DirAccess::Deny, "a mode change undid `deny`");
+        assert_eq!(settings.at, read_at, "the push marked the file as read");
+
+        // A setting B did change is taken — and only that one.
+        push_settings(&mut settings, &Config { theme: ThemeChoice::Dark, ..stale });
+        assert_eq!(settings.config.dir_access, DirAccess::Deny);
+        assert_eq!(settings.config.theme, ThemeChoice::Dark);
     }
 }

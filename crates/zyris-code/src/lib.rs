@@ -7,6 +7,7 @@
 //! Integration tests (`tests/`) can't see the binary, so the modules are made public here.
 
 pub mod app;
+pub mod atomic;
 pub mod cli;
 pub mod clipboard;
 pub mod command;
@@ -19,6 +20,7 @@ pub mod github;
 pub mod githubform;
 pub mod hooks;
 pub mod input;
+pub mod instance;
 pub mod instructions;
 pub mod lang;
 pub mod markdown;

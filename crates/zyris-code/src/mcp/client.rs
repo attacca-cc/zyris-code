@@ -169,14 +169,18 @@ impl StdioClient {
         env: &HashMap<String, String>,
         request_timeout: std::time::Duration,
     ) -> Result<StdioClient> {
-        let mut child = spawner(command, args)
+        let name = command.to_string();
+        let mut started = spawner(command, args);
+        // **An MCP server has no business knowing which node started it.** See `tools::scrub_identity`.
+        crate::tools::scrub_identity(&mut started);
+        let mut child = started
             .envs(env)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
-            .with_context(|| format!("could not start the MCP server: {command}"))?;
+            .with_context(|| format!("could not start the MCP server: {name}"))?;
 
         let stdin = child.stdin.take().context("no stdin")?;
         let stdout = child.stdout.take().context("no stdout")?;

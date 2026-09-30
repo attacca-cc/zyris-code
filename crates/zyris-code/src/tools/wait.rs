@@ -534,6 +534,8 @@ async fn probe_once(
 ) -> (bool, String) {
     // The same shell `wait.start` uses — and on Windows that is `cmd /C`, not `/bin/sh`.
     let mut cmd = crate::tools::jobs::shell_running(command);
+    // A probe runs somebody's command in this node's own process tree; see `tools::scrub_identity`.
+    crate::tools::scrub_identity(&mut cmd);
     cmd.current_dir(root);
     cmd.env("TERM", "dumb").env("NO_COLOR", "1");
     cmd.stdin(std::process::Stdio::null());

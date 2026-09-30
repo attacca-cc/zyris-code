@@ -324,6 +324,9 @@ fn build(spec: &Spec, root: &Path) -> Result<tokio::process::Command, String> {
         }
     };
     cmd.current_dir(spec.cwd.clone().unwrap_or_else(|| root.to_path_buf()));
+    // **A background job is not this node.** Without this, a `zyris-code` an agent starts from one
+    // inherits this window's name, scopes and credential. See `tools::scrub_identity`.
+    crate::tools::scrub_identity(&mut cmd);
     cmd.env("TERM", "dumb").env("NO_COLOR", "1").env("CARGO_TERM_COLOR", "never");
     for (k, v) in &spec.env {
         cmd.env(k, v);

@@ -3952,8 +3952,12 @@ pub fn heal_mode() -> Heal {
 /// a setting cannot be saved by one loop and only shown by the other. The palette applies to the
 /// very next frame — the same promise the directory policy makes to the gate, which each loop
 /// tells itself (`bridge.sync`).
-fn save_config(state: &State) {
-    state.config.save();
+///
+/// `before` is the settings the change was made from (`bridge.screen_config()`): only the keys
+/// that differ from it are written, so a stale copy of another window's setting is not put back
+/// (`Config::save_changes`).
+fn save_config(state: &State, before: &crate::config::Config) {
+    state.config.save_changes(before);
     crate::lang::set(state.lang);
     crate::lang::save(state.lang);
     crate::theme::set(state.config.theme.resolve());
@@ -5029,7 +5033,7 @@ async fn run_inner(
                 // The main loop's full block also stages work/job sessions; there is nothing to
                 // stage yet, so carrying the decision material is the whole job here.
                 if std::mem::take(&mut state.config_out) {
-                    save_config(&state);
+                    save_config(&state, &bridge.screen_config());
                 }
                 bridge.sync(state.mode, &state.config, state.plan_decided);
                 // A gesture is drawn by the tick it is waiting for; everything else draws here,
@@ -5412,7 +5416,7 @@ async fn run_inner(
                     // stopping short of any of them is how a setting changes on screen and
                     // nowhere else.
                     if std::mem::take(&mut state.config_out) {
-                        save_config(&state);
+                        save_config(&state, &bridge.screen_config());
                         bridge.sync(state.mode, &state.config, state.plan_decided);
                     }
 
@@ -6432,7 +6436,7 @@ async fn finish_command(
             None => state.set_error(state.lang.reconnect_not_attached()),
         },
         Command::Config(Some(action)) => {
-            state.config.save();
+            state.config.save_changes(&bridge.screen_config());
             // The palette applies to the very next frame — the same promise the directory
             // policy makes to the gate. Missing it is how a setting changes on screen and
             // nowhere else.
