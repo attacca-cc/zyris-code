@@ -100,6 +100,21 @@ impl Git {
         })
     }
 
+    /// Whether a merge, cherry-pick, revert or rebase is stopped and waiting for a commit.
+    ///
+    /// Asked of `rev-parse --git-path`, not by joining `.git/`: in a linked worktree or a
+    /// submodule `.git` is a file, and the state lives wherever it points.
+    async fn concluding(&self) -> bool {
+        const MARKERS: [&str; 5] =
+            ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply"];
+        let mut args = vec!["rev-parse"];
+        for marker in MARKERS {
+            args.extend(["--git-path", marker]);
+        }
+        let Ok(out) = self.read(&args).await else { return false };
+        out.lines().any(|line| self.cwd.join(line.trim()).exists())
+    }
+
     /// A read. Answers the text or a failure carrying git's own words.
     async fn read(&self, args: &[&str]) -> zyris::Result<String> {
         let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
@@ -191,6 +206,35 @@ pub fn sha_from_commit(out: &str) -> Option<String> {
     let (inside, _) = rest.split_once(']')?;
     let sha = inside.split_whitespace().last()?;
     (sha.len() >= 7 && sha.chars().all(|c| c.is_ascii_hexdigit())).then(|| sha.to_string())
+}
+
+/// The other half of each staged rename that one of `paths` belongs to, read from
+/// `git diff --cached -M --name-status -z`.
+///
+/// A named path covers itself and, as a pathspec does, everything under it. **Only renames**:
+/// a copy leaves its source untouched, so there is nothing of it to commit.
+pub fn rename_partners(name_status: &str, paths: &[String]) -> Vec<String> {
+    let named: Vec<String> = paths
+        .iter()
+        .map(|p| p.replace('\\', "/").trim_start_matches("./").trim_end_matches('/').to_string())
+        .collect();
+    let covered =
+        |n: &str| named.iter().any(|p| p == "." || n == p || n.starts_with(&format!("{p}/")));
+    let mut out = Vec::new();
+    let mut fields = name_status.split('\0').filter(|f| !f.is_empty());
+    while let Some(status) = fields.next() {
+        let two = status.starts_with('R') || status.starts_with('C');
+        let Some(old) = fields.next() else { break };
+        let new = if two { fields.next() } else { None };
+        if let (true, Some(new)) = (status.starts_with('R'), new) {
+            match (covered(old), covered(new)) {
+                (false, true) => out.push(old.to_string()),
+                (true, false) => out.push(new.to_string()),
+                _ => {}
+            }
+        }
+    }
+    out
 }
 
 /// One line of `git log --format=…`, as the agent sees it.
@@ -644,9 +688,22 @@ impl GitCap for Git {
         // window and with whatever the person did at a shell — so one window's commit swept in
         // another's staged file under its own message, and the other's commit then found nothing
         // to do. `-- <paths>` takes the named files and leaves the rest of the index alone.
-        if !paths.is_empty() {
+        //
+        // **Except while a merge, cherry-pick, revert or rebase is stopped.** git refuses a partial
+        // commit then ("cannot do a partial commit during a merge"), and the commit that concludes
+        // one has to take the whole index anyway — that index *is* the resolution. The named paths
+        // were added above, so they are in it.
+        if !paths.is_empty() && !self.concluding().await {
             args.push("--".into());
             args.extend(paths.iter().cloned());
+            // **A rename is two paths.** After `git mv a b`, naming only `b` committed the new
+            // file and left the deletion of `a` staged behind it. The other half of every staged
+            // rename a named path belongs to goes into the commit too.
+            let staged = self
+                .read(&["diff", "--cached", "--relative", "-M", "--name-status", "-z"])
+                .await
+                .unwrap_or_default();
+            args.extend(rename_partners(&staged, &paths));
         }
         let ran = self.git(&args, None).await?;
         if !ran.ok {
@@ -1001,6 +1058,68 @@ mod against_a_real_repository {
         assert!(why.to_string().to_lowercase().contains("nothing"), "{why}");
         // And a commit with no message never reaches git at all.
         assert!(git.commit("  ".into(), vec![], false).await.is_err());
+    }
+
+    /// Runs git in `dir` and answers its stdout, for a test setting up a repository by hand.
+    fn sh(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .expect("git has to be installed to run these");
+        String::from_utf8_lossy(&out.stdout).to_string()
+    }
+
+    /// **Naming the resolved file concludes a merge.** git refuses a partial commit while a merge
+    /// is stopped, so `commit -- <paths>` failed on exactly the commit a conflict resolution needs.
+    #[tokio::test]
+    async fn a_commit_naming_a_resolved_file_concludes_a_merge() {
+        let (dir, git) = repo().await;
+        let at = dir.path();
+        sh(at, &["switch", "-q", "-c", "side"]);
+        std::fs::write(at.join("first.txt"), "side\n").unwrap();
+        sh(at, &["commit", "-qam", "side"]);
+        sh(at, &["switch", "-q", "main"]);
+        std::fs::write(at.join("first.txt"), "main\n").unwrap();
+        sh(at, &["commit", "-qam", "main"]);
+        sh(at, &["merge", "side"]);
+        assert!(at.join(".git/MERGE_HEAD").exists(), "the merge was meant to stop on a conflict");
+
+        std::fs::write(at.join("first.txt"), "both\n").unwrap();
+        git.commit("merge side".into(), vec!["first.txt".into()], false)
+            .await
+            .expect("the merge commit");
+        assert_eq!(sh(at, &["rev-list", "--parents", "-n1", "HEAD"]).split_whitespace().count(), 3);
+        assert_eq!(git.status().await.expect("status")["clean"], true);
+    }
+
+    /// **A rename is committed whole.** Naming only the new path used to commit the addition and
+    /// leave the deletion of the old one staged behind it.
+    #[tokio::test]
+    async fn a_commit_naming_a_renamed_file_takes_the_old_name_too() {
+        let (dir, git) = repo().await;
+        let at = dir.path();
+        std::fs::write(at.join("other.txt"), "other\n").unwrap();
+        sh(at, &["add", "other.txt"]);
+        sh(at, &["mv", "first.txt", "moved.txt"]);
+
+        git.commit("move".into(), vec!["moved.txt".into()], false).await.expect("commit");
+        let staged = sh(at, &["diff", "--cached", "--name-only"]);
+        assert_eq!(staged.trim(), "other.txt", "the rename was left half-committed");
+    }
+
+    #[test]
+    fn a_rename_partner_is_found_from_either_side() {
+        let staged = "R100\0a.txt\0b.txt\0M\0c.txt\0C090\0d.txt\0e.txt\0R100\0src/x\0lib/x\0";
+        let names = |paths: &[&str]| {
+            let paths: Vec<String> = paths.iter().map(|p| p.to_string()).collect();
+            rename_partners(staged, &paths)
+        };
+        assert_eq!(names(&["b.txt"]), vec!["a.txt"]);
+        assert_eq!(names(&["./a.txt"]), vec!["b.txt"]);
+        assert_eq!(names(&["a.txt", "b.txt"]), Vec::<String>::new());
+        assert_eq!(names(&["e.txt", "c.txt"]), Vec::<String>::new(), "a copy has no partner");
+        assert_eq!(names(&["lib/"]), vec!["src/x"]);
     }
 
     /// Making a branch, and being on it afterwards. **`branches` has to agree** — the two answers
