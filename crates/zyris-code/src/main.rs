@@ -261,7 +261,7 @@ async fn main() -> ExitCode {
     };
     if let Some(ended) = died_before_screen {
         // The app may have died mid-raw-mode; restore the terminal so the reason is readable.
-        ratatui::restore();
+        app::restore_terminal();
         let why = match ended {
             Ok(Ok(())) => "the screen ended before it attached".to_string(),
             Ok(Err(e)) => e.to_string(),
@@ -409,8 +409,14 @@ async fn main() -> ExitCode {
         app_result = &mut app_task => RunnerEnded::App(app_result),
     };
     match outcome {
-        // The runner ended cleanly (SIGINT).
-        RunnerEnded::Runner(Ok(())) => ExitCode::SUCCESS,
+        // The runner ended cleanly (SIGINT). **The screen is closed before leaving**, exactly as on
+        // the error arm below: returning straight away dropped the app mid-raw-mode, with the
+        // alternate screen, mouse tracking and line-wrap-off all left on, and exit 0 hid it.
+        RunnerEnded::Runner(Ok(())) => {
+            let _ = die_tx.send(true);
+            let _ = tokio::time::timeout(Duration::from_secs(3), app_task).await;
+            ExitCode::SUCCESS
+        }
         RunnerEnded::Runner(Err(e)) => {
             // Close the screen first if it's alive — the reason is visible only after the terminal
             // is restored. If it can't be closed (app already dead), just say it.

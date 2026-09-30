@@ -4003,6 +4003,15 @@ pub async fn run(
     die: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let mut terminal = ratatui::init();
+    // **A panic gives the terminal back whole, not half.** `ratatui::init` hooks panics too, but
+    // its restore is raw mode and the alternate screen only — the mouse kept reporting and line
+    // wrap stayed off, so the backtrace itself printed cut at the right edge. Installed after it,
+    // this hook runs first; ratatui's then repeats two of the steps, which costs nothing.
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore_terminal();
+        previous(info);
+    }));
     // Turn terminal features on **one at a time** — if any one fails, the screen still
     // comes up (see `terminal_feature`). On Windows the kitty keyboard protocol always
     // fails, so the line-wrap-off below must still be reached.
@@ -4061,20 +4070,41 @@ pub async fn run(
         ),
     );
 
-    let result = run_inner(&mut terminal, api_rx, bridge, die, kitty).await;
-
     // **Leave no orphans.** When the app ends, background jobs end with it — left alive, a
     // cargo on this machine keeps eating RAM. `/quit` and Ctrl+C both funnel into the same
-    // `break 'app`, so the way out is this one place.
-    if let Some(jobs) = for_exit.jobs() {
-        jobs.stop_all();
-    }
+    // `break 'app`, so the way out is this one place — and a panic unwinds through here too,
+    // which is why this is a guard dropped on the way out rather than a call after the await.
+    let stop_jobs = StopJobs(for_exit);
+    let result = run_inner(&mut terminal, api_rx, bridge, die, kitty).await;
+    drop(stop_jobs);
 
-    // Turn off one by one. Restoring also tolerates failure — if one command dies
-    // (on Windows `PopKeyboardEnhancementFlags` fails), the ones after it must still go
-    // out, or line wrap stays off in the shell and long lines look cut.
-    // Turned off whether or not we turned it on — a previous run that died without restoring
-    // leaves the terminal tracking, and one more `l` costs nothing.
+    restore_terminal();
+    result
+}
+
+/// Stops the agent's background jobs when dropped — see `run`.
+struct StopJobs(crate::tools::bridge::Bridge);
+
+impl Drop for StopJobs {
+    fn drop(&mut self) {
+        if let Some(jobs) = self.0.jobs() {
+            jobs.stop_all();
+        }
+    }
+}
+
+/// Undoes everything `run` switched on: **the one teardown every way out goes through.**
+///
+/// The normal exit, the panic hook, the loop watchdog, the forced exit after a signal and `main`'s
+/// early-death path all call this. Each of them used to carry its own shorter list — raw mode and
+/// the alternate screen at most — so any exit but the tidy one left the shell with mouse reports
+/// arriving as text and line wrap off.
+///
+/// Turned off one by one: restoring tolerates failure too, and if one command dies (on Windows
+/// `PopKeyboardEnhancementFlags` does) the ones after it must still go out. Everything is turned
+/// off whether or not it was turned on — a previous run that died without restoring leaves the
+/// terminal tracking, and one more `l` costs nothing.
+pub fn restore_terminal() {
     take_the_mouse(false);
     terminal_feature("focus change off", crossterm::event::DisableFocusChange);
     terminal_feature("bracketed paste off", crossterm::event::DisableBracketedPaste);
@@ -4083,7 +4113,6 @@ pub async fn run(
     // look cut off in the shell.
     terminal_feature("line wrap on", crossterm::terminal::EnableLineWrap);
     ratatui::restore();
-    result
 }
 
 /// The channel carrying the handle to the currently live connection.
@@ -4373,6 +4402,8 @@ async fn run_inner(
     // new version, and under `notify` the tag arrives as a frame through the bridge.
 
     let mut keys = EventStream::new();
+    // **Armed before the wait, not after it** — see `shutdown_signals`.
+    let mut shutdown = shutdown_signals();
     let frame = frame_interval();
     state.frame_ms = frame.as_millis().max(1) as u64;
     let mut ticker = tokio::time::interval(frame);
@@ -4411,6 +4442,8 @@ async fn run_inner(
                 }
             }
             _ = die.changed() => {}
+            // Nothing to stop yet: closing is the whole job, and `run` restores the terminal.
+            Some(()) = shutdown.recv() => return Ok(()),
             Some((sid, action)) = rx.recv() => {
                 // There is no session yet (first enrollment). A stream frame arriving now
                 // is a stale one.
@@ -4644,7 +4677,6 @@ async fn run_inner(
     // `tick_draws_for_the_breath` and `picker_dot_moved`.
     let mut last_breath_step = crate::widgets::transcript::breath_step(state.breath_ms());
     let mut last_blink = crate::widgets::activity::blink_on(state.blink_ms());
-    let mut shutdown = shutdown_signals();
     // **If the loop stalls, nobody finds out.** An await on a dead connection is released by
     // its deadline, but other blocking (a stuck terminal write, say) can remain. Then keys
     // and signals alike need a live loop to reach anything, and with the loop dead nothing
@@ -4663,7 +4695,7 @@ async fn run_inner(
                     "the app loop stalled for {}s ‒ restoring the screen and ending",
                     LOOP_WATCHDOG_STALL.as_secs()
                 );
-                ratatui::restore();
+                restore_terminal();
                 std::process::exit(1);
             }
         }
@@ -5267,9 +5299,11 @@ async fn run_inner(
 
 /// Gathers the shutdown signals sent from outside into one channel.
 ///
-/// Ctrl+C does not come here — raw mode makes it arrive as a byte rather than a signal, and
-/// `on_key` receives it. This side is `kill` (SIGTERM) and the terminal window closing
-/// (SIGHUP).
+/// Ctrl+C the key does not come here — raw mode makes it arrive as a byte rather than a signal,
+/// and `on_key` receives it. This side is `kill` (SIGTERM), the terminal window closing (SIGHUP),
+/// and a real SIGINT or SIGQUIT from outside — `kill -INT`, `timeout --signal=INT`, an IDE's stop
+/// button. **Any of them used to kill the process with the terminal still raw** while the app sat
+/// on its first-connection screen, so this is armed before that wait, not after it.
 ///
 /// Off unix there is no sender, so `recv()` is immediately `None` and `select!` disables
 /// that arm — quieter than removing the arm with cfg.
@@ -5284,7 +5318,12 @@ fn shutdown_signals() -> mpsc::Receiver<()> {
     {
         use tokio::signal::unix::{signal, SignalKind};
 
-        for kind in [SignalKind::terminate(), SignalKind::hangup()] {
+        for kind in [
+            SignalKind::terminate(),
+            SignalKind::hangup(),
+            SignalKind::interrupt(),
+            SignalKind::quit(),
+        ] {
             let Ok(mut sig) = signal(kind) else { continue };
             let tx = tx.clone();
             tokio::spawn(async move {
@@ -5296,16 +5335,8 @@ fn shutdown_signals() -> mpsc::Receiver<()> {
                 // exit — so `kill` always works. A normal exit finishes before that, so
                 // this line never runs first.
                 tokio::time::sleep(SHUTDOWN_FORCE).await;
-                // Even on a forced exit, bracketed paste and the kitty keyboard protocol
-                // are restored on the way out — otherwise the shell keeps wrapping pastes
-                // in one chunk and Shift+Enter stays CSI-u. Restoring also tolerates
-                // failure (Windows' kitty commands always fail — see `terminal_feature`).
-                terminal_feature("bracketed paste off", crossterm::event::DisableBracketedPaste);
-                terminal_feature(
-                    "kitty keyboard protocol off",
-                    crossterm::event::PopKeyboardEnhancementFlags,
-                );
-                ratatui::restore();
+                // Even a forced exit gives the whole terminal back, not just raw mode.
+                restore_terminal();
                 std::process::exit(0);
             });
         }

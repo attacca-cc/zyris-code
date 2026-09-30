@@ -80,6 +80,9 @@ impl Session {
             .expect("could not open a pseudo-terminal");
 
         let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_zyris-code"));
+        // **A terminal type of our own**, not whatever the runner has: CI can hand down
+        // `TERM=dumb`, and the screen declines to start on that. An `extra` can still override it.
+        cmd.env("TERM", "xterm-256color");
         for (name, value) in extra {
             cmd.env(name, value);
         }
@@ -404,6 +407,39 @@ fn quitting_gives_the_terminal_back() {
     }
 
     assert!(app.wait_for_exit().is_some(), "the app did not end after Ctrl+C:\n{}", app.text());
+}
+
+/// **A signal from outside gives the terminal back too, even before the first connection.**
+///
+/// The first-connection screen is where first enrolment waits for somebody to reach a browser,
+/// and the signal handlers used to be armed only after it: `kill`, `pkill` or a supervisor's stop
+/// there ended the process with the pane left raw, on the alternate screen and reporting the
+/// mouse. This pty's server refuses, so the app is sitting on exactly that screen.
+#[cfg(unix)]
+#[test]
+fn a_signal_on_the_first_connection_screen_gives_the_terminal_back() {
+    for signal in [libc::SIGTERM, libc::SIGINT] {
+        let _turn = one_at_a_time();
+        let mut app = Session::start();
+        app.wait_until_ready();
+
+        let pid = app.child.process_id().expect("the app has a pid") as libc::pid_t;
+        // SAFETY: a plain kill(2) to the child this test started and still holds.
+        assert_eq!(unsafe { libc::kill(pid, signal) }, 0);
+
+        for (what, seq) in [
+            ("the alternate screen", "\x1b[?1049l"),
+            ("mouse tracking", "\x1b[?1000l"),
+            ("line wrapping", "\x1b[?7h"),
+        ] {
+            assert!(
+                app.wait_for(seq),
+                "signal {signal}: {what} was left switched on ({seq:?}):\n{}",
+                app.text()
+            );
+        }
+        assert!(app.wait_for_exit().is_some(), "signal {signal} did not end the app");
+    }
 }
 
 /// **The app must not stop waiting for an answer this terminal will never give.**
