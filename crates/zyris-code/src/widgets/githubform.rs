@@ -139,7 +139,7 @@ pub fn draw(
     }
     lines.push(Line::from(Span::styled(
         lang.github_form_keys(),
-        Style::default().fg(theme::border_light()),
+        Style::default().fg(theme::subtle()),
     )));
 
     // Only the rows really on screen — a short terminal cuts the box, and a link on a row that was

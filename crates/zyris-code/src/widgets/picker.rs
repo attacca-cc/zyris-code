@@ -197,7 +197,7 @@ fn row_line(
 ) -> Line<'static> {
     use crate::picker::ThreadStatus;
     let fg = match (row.enabled, create, on) {
-        (false, _, _) => theme::border_light(),
+        (false, _, _) => theme::subtle(),
         (true, true, _) => theme::accent(),
         (true, false, true) => theme::text_heading(),
         (true, false, false) => theme::text(),

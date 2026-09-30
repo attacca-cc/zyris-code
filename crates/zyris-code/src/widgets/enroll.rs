@@ -94,10 +94,7 @@ pub fn draw(
     }
 
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        lang.enroll_keys(),
-        Style::default().fg(theme::border_light()),
-    )));
+    lines.push(Line::from(Span::styled(lang.enroll_keys(), Style::default().fg(theme::subtle()))));
 
     // **The box is as tall as what it has to hold.** A fixed height cut the last lines off without
     // saying so; a short terminal still cuts, but only because there is no room left.

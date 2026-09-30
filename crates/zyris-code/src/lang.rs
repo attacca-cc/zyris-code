@@ -178,13 +178,13 @@ impl Lang {
         self.pick("작업 중…", "Working…")
     }
     pub fn stopping(self) -> &'static str {
-        self.pick("멈추는 중…", "Stopping…")
+        self.pick("중단하는 중…", "Stopping…")
     }
     pub fn idle(self) -> &'static str {
         self.pick("쉬는 중", "Taking a break")
     }
     pub fn esc_stops(self) -> &'static str {
-        self.pick("Esc 정지", "Esc stops")
+        self.pick("Esc 중단", "Esc stops")
     }
     pub fn ctrl_c_quits(self) -> &'static str {
         self.pick("Ctrl+C 종료", "Ctrl+C quits")
@@ -274,9 +274,9 @@ impl Lang {
     /// alone is not a message.
     pub fn report_head(self, ok: bool) -> &'static str {
         match (self, ok) {
-            (Lang::Ko, true) => "작업 결과 ∙ 성공",
+            (Lang::Ko, true) => "작업 결과 ∙ 완료",
             (Lang::Ko, false) => "작업 결과 ∙ 실패",
-            (Lang::En, true) => "Job result ∙ ok",
+            (Lang::En, true) => "Job result ∙ done",
             (Lang::En, false) => "Job result ∙ failed",
         }
     }
@@ -296,10 +296,10 @@ impl Lang {
     pub fn job_ended(self, id: &str, ok: bool, secs: u64) -> String {
         let took = self.duration(secs);
         match (self, ok) {
-            (Lang::Ko, true) => format!("배경 {id} 끝남 ∙ 성공 ∙ {took}"),
-            (Lang::Ko, false) => format!("배경 {id} 끝남 ∙ 실패 ∙ {took}"),
-            (Lang::En, true) => format!("background {id} done ∙ ok ∙ {took}"),
-            (Lang::En, false) => format!("background {id} done ∙ failed ∙ {took}"),
+            (Lang::Ko, true) => format!("배경 {id} 완료 ∙ {took}"),
+            (Lang::Ko, false) => format!("배경 {id} 실패 ∙ {took}"),
+            (Lang::En, true) => format!("background {id} done ∙ {took}"),
+            (Lang::En, false) => format!("background {id} failed ∙ {took}"),
         }
     }
     // **A background job no longer takes the activity line** (user decision, 2026-09-18, issue

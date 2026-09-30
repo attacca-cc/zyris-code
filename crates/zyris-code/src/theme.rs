@@ -184,6 +184,10 @@ impl Palette {
         self.pick((0x4a, 0x3e, 0x36), (0xb3, 0xa6, 0x97))
     }
 
+    pub fn subtle(self) -> Color {
+        self.pick((0x85, 0x7d, 0x76), (0x7a, 0x70, 0x66))
+    }
+
     pub fn fade(self, colour: Color, amount: f64) -> Color {
         let amount = amount.clamp(0.0, 1.0);
         let (Color::Rgb(r, g, b), Color::Rgb(br, bg, bb)) = (colour, self.bg()) else {
@@ -362,9 +366,18 @@ pub fn border() -> Color {
     selected().border()
 }
 
-/// Divider glyphs, disabled rows, placeholders, an unlit blink.
+/// Divider glyphs, rules and gutters — lines, not words. An unlit blink.
 pub fn border_light() -> Color {
     selected().border_light()
+}
+
+/// **The quietest colour that can still be read**: key hints, placeholders, a disabled row, the
+/// `▸` that says a row opens, a "cut short here" notice. These used to wear `border_light`, which
+/// is a divider's colour at 1.9:1 on the dark background and 2.2:1 on the light one — there, but
+/// not readable. This sits just past the 4.5:1 text needs, below `text_muted`, so the order of
+/// emphasis stays.
+pub fn subtle() -> Color {
+    selected().subtle()
 }
 
 /// A colour mixed `amount` of the way toward the background, where 0 is the colour untouched and 1
@@ -659,6 +672,7 @@ mod tests {
             for (name, colour) in [
                 ("text", palette.text()),
                 ("text_muted", palette.text_muted()),
+                ("subtle", palette.subtle()),
                 ("text_heading", palette.text_heading()),
                 ("accent", palette.accent()),
                 ("success", palette.success()),
@@ -675,6 +689,20 @@ mod tests {
                 let ratio = contrast(colour, on);
                 assert!(ratio >= 4.0, "{theme:?} {name} is {ratio:.2}:1 — too close to read");
             }
+        }
+    }
+
+    /// **`subtle` is readable and still the quietest text.** It replaced `border_light` on hints,
+    /// placeholders and fold markers, which measured 1.9:1 and 2.2:1; it must clear 4.5:1 and stay
+    /// below `text_muted`, or the order of emphasis is lost.
+    #[test]
+    fn subtle_is_readable_and_quieter_than_muted() {
+        for (theme, palette) in palettes() {
+            let on = palette.bg();
+            let ratio = contrast(palette.subtle(), on);
+            assert!(ratio >= 4.5, "{theme:?} subtle is {ratio:.2}:1");
+            assert!(ratio < contrast(palette.text_muted(), on), "{theme:?}");
+            assert!(contrast(palette.border_light(), on) < 3.0, "{theme:?}");
         }
     }
 

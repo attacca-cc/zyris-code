@@ -91,7 +91,7 @@ fn field_line(
     let caret = Style::default().fg(theme::accent());
     if input.text.is_empty() {
         let shown = crate::markdown::truncate_to(placeholder, room.saturating_sub(on as usize));
-        spans.push(Span::styled(shown, Style::default().fg(theme::text_muted())));
+        spans.push(Span::styled(shown, Style::default().fg(theme::subtle())));
         if on {
             spans.push(Span::styled("▮", caret));
         }

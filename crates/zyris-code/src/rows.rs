@@ -851,7 +851,7 @@ fn make(item: &Item, width: u16, folds: &Folds, turn: Turn, lang: crate::lang::L
             }
             tail.push(Span::styled(
                 if card_open { "  ▾" } else { "  ▸" },
-                Style::default().fg(theme::border_light()),
+                Style::default().fg(theme::subtle()),
             ));
             // **The title gives way, not the counts and the marker.** It is the server's latest
             // `work_summary`, of any length and possibly several lines; drawn whole it ran past
@@ -1049,7 +1049,7 @@ fn tool_row(
             (true, false) => "  ▸",
             (true, true) => "  ▾",
         },
-        Style::default().fg(theme::border_light()),
+        Style::default().fg(theme::subtle()),
     ));
     // **The action gives way to the counts and the fold marker.** They stood after it, so a long
     // command or a deep path pushed them past the edge: the row stopped looking openable and what
@@ -1213,7 +1213,7 @@ fn detail_lines(
                     "  ",
                     vec![Span::styled(
                         lang.detail_truncated().to_string(),
-                        Style::default().fg(theme::border_light()),
+                        Style::default().fg(theme::subtle()),
                     )],
                 ));
             }
@@ -1240,7 +1240,7 @@ fn detail_lines(
                     "  ",
                     vec![Span::styled(
                         lang.detail_truncated().to_string(),
-                        Style::default().fg(theme::border_light()),
+                        Style::default().fg(theme::subtle()),
                     )],
                 ));
             }
@@ -1327,7 +1327,7 @@ pub(crate) fn diff_line(
         DiffLine::Add(s) => (format!("+{}", crate::wrap::expand_tabs(s)), theme::diff_add()),
         DiffLine::Del(s) => (format!("-{}", crate::wrap::expand_tabs(s)), theme::diff_del()),
         DiffLine::Keep(s) => (format!(" {}", crate::wrap::expand_tabs(s)), theme::text_muted()),
-        DiffLine::Skip(n) => (lang.diff_skip(*n), theme::border_light()),
+        DiffLine::Skip(n) => (lang.diff_skip(*n), theme::subtle()),
     };
     Line::from(vec![
         Span::styled(DETAIL_PAD, Style::default().fg(theme::border_light())),
@@ -1855,7 +1855,7 @@ mod tests {
         let out = plain(&r);
         assert!(out[0].starts_with("◆ "), "{out:?}");
         assert!(out[0].contains("작업 결과"), "{out:?}");
-        assert!(out[0].contains("성공"), "{out:?}");
+        assert!(out[0].contains("완료"), "{out:?}");
         assert!(
             out.iter().any(|l| l.contains("남은 것은 커밋입니다")),
             "the sentence was cut: {out:?}"

@@ -88,7 +88,7 @@ pub fn parts_at(
     // busy, but dimmed and without a hint that would not do what it says.
     let ours = state.running;
     let colour = if ours { theme::accent() } else { theme::text_muted() };
-    // **`Esc 정지` stops this session's turn and nothing else.** Beside work that belongs to
+    // **`Esc 중단` stops this session's turn and nothing else.** Beside work that belongs to
     // another conversation it is a lie, and pressing it would look broken.
     let stop = if ours { lang.esc_stops() } else { "" };
     // **Two states and no narration** (user decision, 2026-09-18, issue #34).
@@ -169,7 +169,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &State) {
     if !hint.is_empty() && used + display_width(hint) + 2 <= room {
         let gap = room - used - display_width(hint);
         spans.push(Span::styled(" ".repeat(gap), Style::default().fg(theme::text())));
-        spans.push(Span::styled(hint, Style::default().fg(theme::border_light())));
+        spans.push(Span::styled(hint, Style::default().fg(theme::subtle())));
     }
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);

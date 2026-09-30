@@ -72,7 +72,7 @@ pub enum Frame {
         /// **The tool's name — `exec` — not the command it was given.**
         ///
         /// The activity line does not print the command any more: it is as long as the agent
-        /// wrote it, and one heredoc filled the line end to end and pushed the `Esc 정지` hint
+        /// wrote it, and one heredoc filled the line end to end and pushed the `Esc 중단` hint
         /// off it (2026-09-15). What the line shows is this name and the run's own subtitle, so
         /// the command is not carried here at all — a string nobody draws goes stale and reads
         /// as if something used it.
@@ -3244,7 +3244,7 @@ fn apply_frame(state: &mut State, frame: &Frame) {
         //
         // **The row goes from every conversation; the word goes to the one that asked.** The
         // process really is gone, so leaving the row up anywhere would be a lie. But "배경 b1
-        // 끝남" landing in a thread that never started it is news about somebody else's work, on
+        // 완료" landing in a thread that never started it is news about somebody else's work, on
         // the one line that exists to say what is happening *here*.
         Frame::JobEnded { id, ok, secs } => {
             let owner = state.jobs.iter().find(|j| j.id == *id).and_then(|j| j.session.clone());
@@ -10156,7 +10156,7 @@ mod tests {
         assert!(!text.contains("위젯"), "a finished run's title was still up: {text}");
     }
 
-    /// **`Esc 정지` stops this session's turn and nothing else.** A tool call reaches this node
+    /// **`Esc 중단` stops this session's turn and nothing else.** A tool call reaches this node
     /// with no session on it — attacca sends `zyris__node__cap__tool` and nothing more — and
     /// another window on the same directory shares the node besides. So work running here while
     /// this conversation is idle belongs to somebody else: shown, because the machine really is
