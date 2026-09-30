@@ -1785,8 +1785,12 @@ pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
         // reading the answer turned the stop key into two presses, the first of them silent.
         // Stopping drops the highlight as any other key does (`apply`).
         KeyCode::Esc if state.running => vec![Action::Cancel],
-        // With a selection up and nothing to stop, Esc clears it.
-        KeyCode::Esc if state.selection.is_some() => vec![Action::ClearSelection],
+        // With a highlight up and nothing to stop, Esc clears it. **The highlight, not the copied
+        // text:** a drag over blank cells copies nothing (`selection` stays `None`) and is still
+        // drawn, and asking only about the text left Esc doing nothing to it.
+        KeyCode::Esc if state.drag.is_some() || state.selection.is_some() => {
+            vec![Action::ClearSelection]
+        }
         // **Shift+Enter and Alt+Enter are newlines.** With the kitty keyboard protocol on
         // (`PushKeyboardEnhancementFlags` in `run()` below) Shift+Enter arrives separately as
         // Enter+SHIFT. Alt+Enter (ESC+\r) is the fallback for terminals without the
@@ -12154,6 +12158,17 @@ mod interaction {
         assert_eq!(actions, vec![Action::Cancel]);
         apply(&mut s, &Action::Cancel);
         assert!(s.selection.is_none());
+    }
+
+    /// **Esc clears a highlight that copied nothing.** A drag over blank cells is drawn but leaves
+    /// no text, and Esc asked only about the text (D9).
+    #[test]
+    fn esc_clears_a_highlight_over_blank_cells() {
+        let mut s = state();
+        s.drag = Some(crate::selection::Drag::new((0, 0)));
+        assert!(s.selection.is_none());
+        press(&mut s, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(s.drag.is_none(), "the highlight is still drawn");
     }
 
     /// **Only the very next key confirms a quit.** Ctrl+C, some typing, Ctrl+C used to quit (C25).
