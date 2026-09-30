@@ -3783,17 +3783,39 @@ fn title_for_osc(title: &str) -> String {
 /// cells in OSC 8, but with mouse capture on some terminals (Alacritty) forward the
 /// Ctrl+click to the app instead of opening the hyperlink themselves (alacritty#8129). So
 /// the app opens it itself, and Ctrl+click behaves the same in every emulator.
-fn open_url(url: &str) {
-    let result = if cfg!(target_os = "macos") {
-        std::process::Command::new("open").arg(url).spawn()
-    } else if cfg!(target_os = "windows") {
-        std::process::Command::new("cmd").args(["/C", "start", "", url]).spawn()
-    } else {
-        std::process::Command::new("xdg-open").arg(url).spawn()
+///
+/// **The opener gets no terminal.** With the app's stdio it could print `xdg-open:` or `gio:`
+/// errors into the screen — cells ratatui's diff never repairs — or, with no desktop, start a
+/// text browser that takes the terminal from the app. All three handles are null, and a thread
+/// waits on the child so it does not stay behind as a zombie.
+///
+/// **Not through `cmd` on Windows.** `cmd /C start "" <url>` reads `&` as a command separator,
+/// so an agent's link could carry a command after one; `url.dll` is handed the URL as it is.
+///
+/// Only what `markdown::safe_url` passes is opened, checked here as well because every link on
+/// screen comes through this.
+fn open_url(url: &str) -> std::io::Result<()> {
+    use std::process::{Command, Stdio};
+    let Some(url) = crate::markdown::safe_url(url) else {
+        return Err(std::io::Error::other("not a web or mail link"));
     };
-    if let Err(e) = result {
-        tracing::warn!(error = %e, url, "could not open link");
-    }
+    let mut command = if cfg!(target_os = "macos") {
+        let mut c = Command::new("open");
+        c.arg(url);
+        c
+    } else if cfg!(target_os = "windows") {
+        let mut c = Command::new("rundll32");
+        c.args(["url.dll,FileProtocolHandler", url]);
+        c
+    } else {
+        let mut c = Command::new("xdg-open");
+        c.arg(url);
+        c
+    };
+    let mut child =
+        command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()?;
+    std::thread::spawn(move || child.wait());
+    Ok(())
 }
 
 /// The backstop for the kitty question, for a terminal that answers **neither** of the two
@@ -5071,7 +5093,10 @@ async fn run_inner(
                         // I/O, so it happens here — `apply` ignores the action. Spawned so
                         // the loop is not blocked on the browser.
                         Action::OpenLink(url) => {
-                            open_url(url);
+                            if let Err(e) = open_url(url) {
+                                tracing::warn!(error = %e, url, "could not open link");
+                                state.set_status(state.lang.link_not_opened());
+                            }
                         }
                         // **While work is running we do not send here.** `apply` puts it on
                         // the queue and `flush_queue` below sends them in order when the

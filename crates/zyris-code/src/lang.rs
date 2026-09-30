@@ -674,6 +674,13 @@ impl Lang {
             ),
         }
     }
+    /// Ctrl+click on a link that nothing on this machine would open (`app::open_url`).
+    pub fn link_not_opened(self) -> &'static str {
+        self.pick(
+            "링크를 열지 못했습니다 ‒ 이 컴퓨터에 브라우저를 여는 프로그램이 없습니다.",
+            "Could not open the link ‒ nothing on this machine would open a browser.",
+        )
+    }
     pub fn screen_failed(self, why: &str) -> String {
         match self {
             Lang::Ko => format!("화면을 띄우지 못했습니다: {why}"),
