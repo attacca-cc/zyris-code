@@ -134,7 +134,9 @@ impl Stripper {
                 // A carriage return moves the cursor and erases nothing on its own. `\r\n` is one
                 // line ending, and a `\r` followed by another `\r` writes nothing at all.
                 '\r' => self.returned = true,
-                c if ((c as u32) < 0x20 && c != '\t') || c as u32 == 0x7f => {}
+                // C0 and DEL, and the C1 block (U+0080..U+009F, CSI among them): the screen drops
+                // them, and the agent would read them as if they were text.
+                c if (c.is_control() && c != '\t') => {}
                 c => {
                     if std::mem::take(&mut self.returned) {
                         self.line.clear();
@@ -216,6 +218,19 @@ fn escape_end(bytes: &[u8], text: &str, at: usize) -> Option<usize> {
                 i += 1;
             }
         }
+        // **Intermediate bytes, then a final one** (ECMA-48 `nF`): `ESC ( B` picks a character set
+        // and is three bytes, not two. `tput sgr0` and ncurses send it after every colour reset,
+        // and read as ESC plus one character it left a `B` behind each one.
+        0x20..=0x2F => {
+            loop {
+                i += 1;
+                let c = *bytes.get(i)?;
+                if !(0x20..=0x2F).contains(&c) {
+                    // A character that is not a final byte ends the sequence before itself.
+                    return Some(if (0x30..=0x7E).contains(&c) { i + 1 } else { i });
+                }
+            }
+        }
         _ => {
             let next = text.get(at + 1..)?.chars().next()?;
             Some(at + 1 + next.len_utf8())
@@ -270,6 +285,17 @@ mod tests {
         assert_eq!(clean("abc\u{1b}[0"), "abc");
         assert_eq!(clean("abc\u{1b}"), "abc");
         assert!(!clean("\u{1b}[1m\u{1b}[0m").contains('\u{1b}'));
+    }
+
+    /// **A character-set pick is three bytes**, and a C1 control is not text. `tput sgr0` ends in
+    /// `ESC ( B`, which left a `B` after every colour reset; U+009B is CSI in one character.
+    #[test]
+    fn a_charset_pick_and_c1_controls_are_removed() {
+        assert_eq!(clean("ok\u{1b}[m\u{1b}(B done"), "ok done");
+        assert_eq!(clean("\u{1b})0\u{1b}#8x"), "x");
+        assert_eq!(clean("a\u{9b}31mb\u{85}c"), "a31mbc");
+        // Held across a chunk boundary like any other sequence.
+        assert_eq!(clean("a\u{1b}("), "a");
     }
 
     /// **A CSI is whatever lies between `ESC [` and its final byte.** SGR written with colons

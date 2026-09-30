@@ -24,11 +24,51 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::markdown::display_width;
 
-/// The narrowest a wrapped column may get.
+/// The narrowest a wrapped continuation leaves for text after its hang ([`line`]).
 ///
-/// Nothing is readable below this, and it also stops a pathological width — a pane squeezed to
-/// three cells — from turning every word into a column of single characters.
+/// **Not a floor on the width itself.** `words` and `columns` used to widen anything narrower
+/// than this to eight columns, so on a screen (or in a box) narrower than that every line ran
+/// past the edge and ratatui cut it with no mark. The width a caller passes is the room there
+/// is; a column of single characters on a pane squeezed to three cells is ugly but complete.
 const MIN: usize = 8;
+
+/// Columns between tab stops when a tab is turned into spaces ([`expand_tabs`]).
+///
+/// Four rather than the terminal's eight: the text sits inside a margin already, and eight per
+/// level pushed tab-indented code off the right edge by the third level.
+pub const TAB: usize = 4;
+
+/// Turns each tab into the spaces that reach the next tab stop, counting columns from the start
+/// of `text` and again after every line break.
+///
+/// **A tab is drawn as nothing.** ratatui drops every cluster holding a control character, so a
+/// tab-indented Makefile, Go file or diff lost its indentation entirely, and anything aligned by
+/// tabs after the first one collapsed. Text that can hold one is expanded where it becomes a line.
+pub fn expand_tabs(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains('\t') {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len() + 8);
+    let mut col = 0usize;
+    for g in text.graphemes(true) {
+        match g {
+            "\t" => {
+                let n = TAB - col % TAB;
+                out.extend(std::iter::repeat_n(' ', n));
+                col += n;
+            }
+            "\n" | "\r\n" => {
+                out.push_str(g);
+                col = 0;
+            }
+            _ => {
+                out.push_str(g);
+                col += display_width(g);
+            }
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
 
 /// The width one character occupies on its own. Only for the margin's spaces and marker glyphs;
 /// text is measured a cluster at a time, the way it is drawn.
@@ -41,7 +81,7 @@ fn cell_width(ch: char) -> usize {
 /// A word wider than a whole line is filled by column instead, so an unbroken run — a URL, a
 /// base64 blob — cannot loop on one line for ever.
 pub fn words(text: &str, width: usize) -> Vec<String> {
-    let limit = width.max(MIN);
+    let limit = width.max(1);
     let mut out: Vec<String> = Vec::new();
     let mut cur = String::new();
     let mut used = 0usize;
@@ -80,9 +120,9 @@ pub fn words(text: &str, width: usize) -> Vec<String> {
 
 /// Splits by column, keeping every character — and every line break that was already there.
 pub fn columns(text: &str, width: usize) -> Vec<String> {
-    let limit = width.max(MIN);
+    let limit = width.max(1);
     let mut out = Vec::new();
-    for raw in text.lines() {
+    for raw in expand_tabs(text).lines() {
         if raw.is_empty() {
             out.push(String::new());
             continue;
@@ -139,7 +179,8 @@ pub fn line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
     // than none.
     let hang_style = cells.first().map_or_else(Style::default, |(_, style, _)| *style);
     // Never so wide that nothing is left for the words: a continuation is still text.
-    let hang = hang_width(&cells).min(limit.saturating_sub(MIN));
+    let margin = hang_width(&cells);
+    let hang = margin.min(limit.saturating_sub(MIN));
     let indent = || -> Vec<(char, Style, usize)> { vec![(' ', hang_style, 1); hang] };
 
     let mut whole: Vec<Vec<(char, Style, usize)>> = Vec::new();
@@ -153,7 +194,16 @@ pub fn line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
     for (ch, style, w) in cells {
         let cap = if first { limit } else { limit.saturating_sub(hang) };
         if used + w > cap && !cur.is_empty() {
-            match space.filter(|i| *i > 0) {
+            // **A space is a place to break only when what follows it fits the next line.** The
+            // margin's own spaces used to count, so a line that was all one long word broke after
+            // its indent, left a blank row, and carried a tail wider than the screen.
+            let lead = if first { margin } else { hang };
+            let next = limit.saturating_sub(hang);
+            let fits = |i: &usize| {
+                let tail: usize = cur[*i..].iter().skip_while(|c| c.0 == ' ').map(|c| c.2).sum();
+                hang + tail + w <= next
+            };
+            match space.filter(|i| *i > lead).filter(fits) {
                 Some(i) => {
                     let tail = cur.split_off(i);
                     whole.push(std::mem::take(&mut cur));
@@ -229,7 +279,8 @@ fn hang_width(cells: &[(char, Style, usize)]) -> usize {
 fn is_marker(ch: char) -> bool {
     matches!(
         ch,
-        '❯' | '▸'
+        '❯' | '⎿'
+            | '▸'
             | '▾'
             | '●'
             | '○'
@@ -372,12 +423,30 @@ mod tests {
     }
 
     /// `columns` keeps every character, including a line break that was already there.
-    ///
-    /// The width is floored at [`MIN`], so a request narrower than that gets eight columns —
-    /// never one column of single characters.
     #[test]
     fn columns_keeps_every_character() {
         let out = columns("abcdefghij\nsecond", 8);
         assert_eq!(out, vec!["abcdefgh", "ij", "second"]);
+    }
+
+    /// **The width given is the room there is.** It used to be widened to eight, so a box or a
+    /// screen narrower than that got lines that ran past its edge and were cut without a mark.
+    #[test]
+    fn a_narrow_width_is_kept_rather_than_widened() {
+        assert_eq!(columns("abcdefghij", 3), vec!["abc", "def", "ghi", "j"]);
+        let out = words("one two three", 4);
+        assert!(out.iter().all(|l| display_width(l) <= 4), "{out:?}");
+        assert_eq!(out.concat(), "onetwothree");
+    }
+
+    /// **A tab becomes the spaces to the next stop**, because the screen draws a tab as nothing
+    /// and a tab-indented block would lose its whole shape.
+    #[test]
+    fn tabs_are_expanded_to_the_next_stop() {
+        assert_eq!(expand_tabs("\tx"), "    x");
+        assert_eq!(expand_tabs("ab\tc"), "ab  c");
+        assert_eq!(expand_tabs("한\tc\n\td"), "한  c\n    d");
+        assert!(matches!(expand_tabs("plain"), std::borrow::Cow::Borrowed(_)));
+        assert_eq!(columns("\tif x {", 40), vec!["    if x {"]);
     }
 }

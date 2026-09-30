@@ -20,14 +20,18 @@ pub fn draw(
     area: Rect,
     form: &Form,
     lang: crate::lang::Lang,
-) -> Option<crate::app::ScreenLink> {
+) -> Vec<crate::app::ScreenLink> {
     // Three rows, a blank, the hint, and a note when there is one — plus the two border lines. A
     // code being waited on takes three more.
+    let w = 66.min(area.width.saturating_sub(4)).max(28.min(area.width));
+    // The address wraps inside the box, so it takes as many rows as that needs.
+    let uri_extra = form.pending.as_ref().map_or(0, |(_, uri)| {
+        crate::wrap::columns(uri, w.saturating_sub(2) as usize).len().saturating_sub(1)
+    }) as u16;
     let h = 8u16
         .saturating_add(form.note.is_some() as u16)
-        .saturating_add(if form.pending.is_some() { 3 } else { 0 });
+        .saturating_add(if form.pending.is_some() { 3 + uri_extra } else { 0 });
     let h = h.min(area.height.saturating_sub(2)).max(6);
-    let w = 66.min(area.width.saturating_sub(4)).max(28);
     let box_area = Rect {
         x: area.x + (area.width.saturating_sub(w)) / 2,
         y: area.y + (area.height.saturating_sub(h)) / 2,
@@ -102,11 +106,8 @@ pub fn draw(
             format!("   {code}   "),
             Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD),
         )));
-        uri_row = Some(lines.len());
-        lines.push(Line::from(Span::styled(
-            uri.clone(),
-            Style::default().fg(theme::tool()).add_modifier(Modifier::UNDERLINED),
-        )));
+        uri_row =
+            Some((lines.len(), crate::widgets::enroll::uri_lines(&mut lines, uri, width as u16)));
     }
 
     lines.push(Line::from(""));
@@ -138,27 +139,20 @@ pub fn draw(
     }
     lines.push(Line::from(Span::styled(
         lang.github_form_keys(),
-        Style::default().fg(theme::border_light()),
+        Style::default().fg(theme::subtle()),
     )));
 
-    let link = uri_row.zip(form.pending.as_ref()).and_then(|(row, (_, uri))| {
-        let y = inner.y.checked_add(row as u16)?;
-        // Only when it really is on screen — a short terminal cuts the box, and a link on a row
-        // that was never drawn would fire on a click over whatever is there instead.
-        if y >= inner.y.saturating_add(inner.height) {
-            return None;
+    // Only the rows really on screen — a short terminal cuts the box, and a link on a row that was
+    // never drawn would fire on a click over whatever is there instead.
+    let links = match (uri_row, form.pending.as_ref()) {
+        (Some((row, widths)), Some((_, uri))) => {
+            crate::widgets::enroll::link_rows(inner, row, &widths, uri)
         }
-        let width = display_width(uri).min(inner.width as usize) as u16;
-        Some(crate::app::ScreenLink {
-            row: y,
-            start: inner.x,
-            end: inner.x.saturating_add(width),
-            url: uri.clone(),
-        })
-    });
+        _ => Vec::new(),
+    };
 
     frame.render_widget(Paragraph::new(lines), inner);
-    link
+    links
 }
 
 /// One row: a fixed-width label, then the value.

@@ -74,7 +74,7 @@ pub fn card(a: &Answering, width: u16, room: usize, lang: crate::lang::Lang) -> 
                         Span::styled(
                             ans,
                             Style::default().fg(if skipped {
-                                theme::border_light()
+                                theme::subtle()
                             } else {
                                 theme::text()
                             }),
@@ -252,11 +252,7 @@ fn row_lines(
                 caret,
                 Span::styled(
                     mark,
-                    Style::default().fg(if chosen {
-                        theme::success()
-                    } else {
-                        theme::border_light()
-                    }),
+                    Style::default().fg(if chosen { theme::success() } else { theme::subtle() }),
                 ),
                 Span::styled(
                     opt.label.clone(),
@@ -277,10 +273,8 @@ fn row_lines(
                 spans.push(Span::styled("✎ ", Style::default().fg(theme::accent())));
                 if a.input.text.is_empty() {
                     // When the field is empty, say what this spot is for.
-                    spans.push(Span::styled(
-                        lang.type_here(),
-                        Style::default().fg(theme::border_light()),
-                    ));
+                    spans
+                        .push(Span::styled(lang.type_here(), Style::default().fg(theme::subtle())));
                 } else {
                     spans.push(Span::styled(
                         a.input.text.clone(),

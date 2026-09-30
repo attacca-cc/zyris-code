@@ -146,20 +146,29 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut State) {
     // moved. Sticking to the bottom needs no anchor; the bottom is its own anchor.
     let anchor =
         (!state.scroll.stick).then(|| state.rows_cache.anchor_at(state.scroll.top)).flatten();
+    // The item before it, for when the anchored one does not survive (`Cache::anchor_before`).
+    let fallback =
+        (!state.scroll.stick).then(|| state.rows_cache.anchor_before(state.scroll.top)).flatten();
 
-    {
+    let laid_out = {
         // Borrow the fields separately — `timeline` and `rows_cache` must be held at the same time.
         let State { timeline, rows_cache, folds, running, lang, .. } = &mut *state;
         let turn = crate::rows::Turn { running: *running };
-        rows_cache.layout(timeline.items(), area.width, folds, skip, turn, *lang);
-    }
+        // Built first, so the version read next is the build these items are.
+        timeline.items();
+        let version = timeline.version();
+        rows_cache.layout_keyed(version, timeline.items(), area.width, folds, skip, turn, *lang)
+    };
 
     // Put the view back on the same words. When nothing was relaid out this resolves to the line
     // it already held, so it costs a lookup and changes nothing.
-    if let Some((seq, offset)) = anchor {
-        if let Some(line) = state.rows_cache.line_of(seq, offset) {
-            state.scroll.top = line;
-        }
+    let placed = anchor.and_then(|(seq, offset)| state.rows_cache.line_of(seq, offset));
+    let placed = placed.or_else(|| {
+        let (seq, offset) = fallback?;
+        state.rows_cache.line_after(seq, offset)
+    });
+    if let Some(line) = placed {
+        state.scroll.top = line;
     }
 
     let total = state.rows_cache.total();
@@ -168,8 +177,12 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut State) {
     state.view_total = total;
     state.view_height = height;
     state.view_origin = (area.x, area.y);
-    state.view_cards = state.rows_cache.cards().clone();
-    state.view_open = state.rows_cache.open_states().clone();
+    // **Copied only when the layout moved.** Both maps cover the whole conversation, and cloning
+    // them every frame was work proportional to its length for an answer that had not changed.
+    if laid_out {
+        state.view_cards = state.rows_cache.cards().clone();
+        state.view_open = state.rows_cache.open_states().clone();
+    }
 
     state.scroll.on_content(total, height);
     let (start, end) = state.scroll.window(total, height);

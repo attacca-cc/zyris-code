@@ -137,10 +137,8 @@ pub fn draw(frame: &mut Frame, state: &mut State) {
     // **The GitHub screen sits at the same level as the new-project form** — both are opened from
     // one place, and neither can be open while the other is.
     if let Some(form) = &state.github_form {
-        let link = githubform::draw(frame, full, form, state.lang);
-        if let Some(link) = link {
-            state.screen_links.push(link);
-        }
+        let links = githubform::draw(frame, full, form, state.lang);
+        state.screen_links.extend(links);
     }
 
     // **The enrollment code window overlaps on top of that.** Nothing else may be done while viewing
@@ -148,10 +146,8 @@ pub fn draw(frame: &mut Frame, state: &mut State) {
     if let Some(view) = &state.enroll {
         // **The window is drawn from a borrow of `state`**, so the link it hands back is stored
         // after that borrow ends.
-        let link = enroll::draw(frame, full, view, state.lang);
-        if let Some(link) = link {
-            state.screen_links.push(link);
-        }
+        let links = enroll::draw(frame, full, view, state.lang);
+        state.screen_links.extend(links);
     }
 
     // **The popup panel is drawn on top of everything.** It only opens from a slash
@@ -292,7 +288,7 @@ pub fn draw(frame: &mut Frame, state: &mut State) {
         // same slot as the terminal's own, so the drag would highlight nothing.
         let reverse = state.caps.colours.reduced();
         for (y, from, to) in selection::row_spans(&drag, area.width, band, moved) {
-            let from = from.max(body.get(y as usize).copied().unwrap_or(0));
+            let from = from.max(selection::start_of(&body, y as usize) as u16);
             for x in from..to {
                 let idx = y as usize * width + x as usize;
                 if let Some(cell) = cells.get_mut(idx) {
@@ -324,6 +320,15 @@ pub fn draw(frame: &mut Frame, state: &mut State) {
             }
         }
     }
+    // **And where the font has none of the app's marks, they are drawn in ASCII** — the same
+    // swap, after the same snapshot (`term::ascii_stand_in`).
+    if state.caps.ascii {
+        for cell in frame.buffer_mut().content.iter_mut() {
+            if let Some(plain) = crate::term::ascii_stand_in(cell.symbol()) {
+                cell.set_symbol(plain);
+            }
+        }
+    }
 
     // **Make links Ctrl+clickable.** The terminal opens an OSC 8 hyperlink on Ctrl+click, so
     // the cells under a link get the hyperlink escape sequence. Runs after the `screen`
@@ -333,6 +338,9 @@ pub fn draw(frame: &mut Frame, state: &mut State) {
     let transcript_links = inject_links(frame, state);
     state.screen_links.extend(transcript_links);
 }
+
+/// The longest URL written into OSC 8, in bytes. See [`inject_links`].
+const OSC8_URL_MAX: usize = 512;
 
 /// Wraps the cells under each visible link in an OSC 8 hyperlink sequence, so the terminal
 /// opens the URL on Ctrl+click.
@@ -358,7 +366,12 @@ fn inject_links(frame: &mut Frame, state: &State) -> Vec<crate::app::ScreenLink>
     for (i, links) in state.view_links.iter().enumerate() {
         let y = oy + i as u16;
         for link in links {
-            let open = state.caps.hyperlinks.then(|| format!("\x1b]8;;{}\x1b\\", link.url));
+            // **Every cell carries the whole URL**, since the diff writes cells one at a time and
+            // each has to open its own link — so a very long one is not sent at all. A 2 KB signed
+            // URL on a 40-cell link was 80 KB on every full repaint; left as underlined text, it
+            // still opens on Ctrl+click through `open_url`.
+            let open = (state.caps.hyperlinks && link.url.len() <= OSC8_URL_MAX)
+                .then(|| format!("\x1b]8;;{}\x1b\\", link.url));
             let mut col = link.start;
             let mut run_start = None;
             let mut run_end = 0;

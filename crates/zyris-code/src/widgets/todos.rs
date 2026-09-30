@@ -75,7 +75,7 @@ pub fn lines(items: &[Todo], lang: Lang, width: usize, rows: usize) -> Vec<Line<
     out
 }
 
-/// One task: `  ● 3. what it says`.
+/// One task: `  ● 3. what it says`, the mark telling its state.
 fn row(todo: &Todo, number: usize, width: usize) -> Line<'static> {
     // **The title says it too, not only the dot** (2026-08-18 user request). A dot is two cells at
     // the far left of a row that can run the width of the screen; the eye reading down a plan is on
@@ -85,15 +85,21 @@ fn row(todo: &Todo, number: usize, width: usize) -> Line<'static> {
     // Waiting is plain text, in hand is blue, and a finished task is struck through and dimmed —
     // the one state where the words themselves are no longer worth reading, said in the way every
     // checklist everywhere says it.
-    let (dot, title_style) = match todo.status {
-        Status::Pending => (theme::border_light(), Style::default().fg(theme::text())),
+    //
+    // **The mark's shape says it as well** — `○` waiting, `●` in hand, `✓` done. Colour and bold
+    // alone told waiting from in hand, and a strike alone told done, which the Linux console,
+    // several multiplexers and old Windows consoles do not draw.
+    let (mark, dot, title_style) = match todo.status {
+        Status::Pending => ("○ ", theme::subtle(), Style::default().fg(theme::text())),
         Status::Doing => (
+            "● ",
             theme::accent(),
             Style::default().fg(theme::in_progress()).add_modifier(Modifier::BOLD),
         ),
         // **A finished task dims but stays.** Dropping it would make the list shrink as work goes
         // on, and the count on the activity line would have nothing to point at.
         Status::Done => (
+            "✓ ",
             theme::success(),
             Style::default().fg(theme::text_muted()).add_modifier(Modifier::CROSSED_OUT),
         ),
@@ -104,7 +110,7 @@ fn row(todo: &Todo, number: usize, width: usize) -> Line<'static> {
     let room = width.saturating_sub(PAD.len() + 2 + head.len());
     Line::from(vec![
         Span::raw(PAD),
-        Span::styled("● ", Style::default().fg(dot)),
+        Span::styled(mark, Style::default().fg(dot)),
         Span::styled(head, Style::default().fg(theme::text_muted())),
         Span::styled(truncate_to(&title, room), title_style),
     ])
@@ -134,18 +140,31 @@ mod tests {
     fn every_task_is_numbered_and_says_only_its_title() {
         let items = [todo("첫 번째", Status::Done), todo("두 번째", Status::Doing)];
         let out = lines(&items, Lang::Ko, 40, 5);
-        assert_eq!(plain(&out[0]), "  ● 1. 첫 번째");
+        assert_eq!(plain(&out[0]), "  ✓ 1. 첫 번째");
         assert_eq!(plain(&out[1]), "  ● 2. 두 번째");
     }
 
-    /// **A task changing status must not move anything.** The dot is one glyph in every state and
-    /// only its colour changes — the trap the thread list already fell into once.
+    /// **A task changing status must not move anything.** The mark is one column in every state
+    /// — the trap the thread list already fell into once — and it is a different mark in each, so
+    /// the state does not rest on colour and strike alone.
     #[test]
     fn finishing_a_task_moves_its_title_not_at_all() {
         let before = plain(&row(&todo("빌드", Status::Pending), 1, 40));
+        let mut marks = vec![before.chars().nth(2)];
         for status in [Status::Doing, Status::Done] {
-            assert_eq!(plain(&row(&todo("빌드", status), 1, 40)), before);
+            let now = plain(&row(&todo("빌드", status), 1, 40));
+            assert_eq!(
+                now.chars().skip(3).collect::<String>(),
+                before.chars().skip(3).collect::<String>()
+            );
+            assert_eq!(
+                crate::markdown::display_width(&now),
+                crate::markdown::display_width(&before)
+            );
+            marks.push(now.chars().nth(2));
         }
+        marks.dedup();
+        assert_eq!(marks.len(), 3, "{marks:?}");
     }
 
     /// **The words say the state as well as the dot does** (2026-08-18 user request). Reading down
@@ -218,9 +237,9 @@ mod tests {
             todo("셋째", Status::Pending),
         ];
         let fits = lines(&items, Lang::Ko, 40, 3);
-        assert_eq!(plain(&fits[0]), "  ● 1. 첫째");
+        assert_eq!(plain(&fits[0]), "  ✓ 1. 첫째");
         assert_eq!(plain(&fits[1]), "  ● 2. 둘째");
-        assert_eq!(plain(&fits[2]), "  ● 3. 셋째");
+        assert_eq!(plain(&fits[2]), "  ○ 3. 셋째");
 
         // Overflow: the done one goes below the not-done ones, which keep their relative order.
         let many = [
@@ -281,7 +300,7 @@ mod tests {
     #[test]
     fn a_title_with_newlines_stays_on_one_row() {
         let items = [todo("첫 줄\n둘째 줄", Status::Pending)];
-        assert_eq!(plain(&lines(&items, Lang::Ko, 40, 3)[0]), "  ● 1. 첫 줄 둘째 줄");
+        assert_eq!(plain(&lines(&items, Lang::Ko, 40, 3)[0]), "  ○ 1. 첫 줄 둘째 줄");
     }
 
     #[test]

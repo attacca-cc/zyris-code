@@ -236,6 +236,33 @@ fn a_scrolled_view_keeps_its_place_when_the_width_changes() {
     assert_eq!(before, after, "the top of the viewport moved to a different message:\n{narrow}");
 }
 
+/// **Reading back up a streaming answer keeps its place as it grows.** The live answer is given a
+/// fresh seq on every build, so the anchor on it was never found again and the view kept the old
+/// absolute line; it now falls back to the item before it, which keeps its seq.
+#[test]
+fn a_view_scrolled_into_a_streaming_answer_stays_on_its_words() {
+    let mut s = State::new();
+    // Long enough to wrap differently at the two widths below, so the lines above the answer
+    // change in number and an absolute line index points somewhere else.
+    said(&mut s, 1, EntryKind::User("질문 ".repeat(60)));
+    let delta = |s: &mut State, text: String| {
+        let kind = zyris_attacca::ZDeltaKind::Assistant;
+        apply(s, &Action::Frame(AppFrame::Delta { kind, text }));
+    };
+    let lines: String = (0..40).map(|i| format!("line {i:02} of the answer\n\n")).collect();
+    delta(&mut s, lines);
+    dump(&mut s, 60, 12);
+    apply(&mut s, &Action::Wheel(10));
+    let before = dump(&mut s, 60, 12);
+    let top = before.lines().next().unwrap().trim_end().to_string();
+    assert!(top.contains("line"), "not scrolled into the answer:\n{before}");
+
+    // More of the answer arrives (a new seq for it) in the same frame as a resize.
+    delta(&mut s, "more text arriving\n\n".repeat(5));
+    let after = dump(&mut s, 46, 12);
+    assert_eq!(after.lines().next().unwrap().trim_end(), top, "the view moved:\n{after}");
+}
+
 /// Sticking to the bottom is unaffected — the bottom is its own anchor.
 #[test]
 fn a_view_stuck_to_the_bottom_stays_there_when_the_width_changes() {
@@ -1948,6 +1975,14 @@ fn the_bottom_bar_says_how_many_messages_are_waiting() {
     let bottom = screen.lines().last().unwrap();
     assert!(bottom.contains("대기 1개"), "the queued marker is missing: {bottom:?}");
 
+    // **A long agent name and a project do not push it off a narrow line.** It was the last thing
+    // on the line, and the end of the line is what a narrow terminal cuts.
+    s.agent = "An Agent With A Really Very Long Name Indeed".into();
+    s.project_name = Some("some-project".into());
+    let screen = dump(&mut s, 40, 12);
+    let bottom = screen.lines().last().unwrap();
+    assert!(bottom.contains("대기 1개"), "the queued marker was cut: {bottom:?}");
+
     // When the queue empties, the indicator disappears too.
     s.queued.clear();
     let screen = dump(&mut s, 60, 12);
@@ -2542,6 +2577,23 @@ fn link_buffer(hyperlinks: bool) -> ratatui::buffer::Buffer {
 
 fn link_cells(hyperlinks: bool) -> Vec<String> {
     link_buffer(hyperlinks).content.iter().map(|c| c.symbol().to_string()).collect()
+}
+
+/// **A very long URL is not written into every cell of its link.** Each cell carries the whole
+/// URL, so a 2 KB one cost 2 KB a cell on every repaint; it stays an underlined link that
+/// Ctrl+click opens through the app.
+#[test]
+fn a_very_long_url_is_not_sent_as_osc8() {
+    let mut s = State::new();
+    s.caps.hyperlinks = true;
+    let url = format!("https://example.com/{}", "a".repeat(2000));
+    said(&mut s, 1, EntryKind::Agent(format!("[문서]({url})")));
+    let mut term = Terminal::new(TestBackend::new(60, 12)).unwrap();
+    term.draw(|f| widgets::draw(f, &mut s)).unwrap();
+    let buf = term.backend().buffer().clone();
+    assert!(buf.content.iter().all(|c| !c.symbol().contains("\u{1b}]8;;")));
+    let cell = buf.content.iter().find(|c| c.symbol() == "문").expect("the link text is gone");
+    assert!(cell.modifier.contains(ratatui::style::Modifier::UNDERLINED));
 }
 
 /// A bare URL in plain text is not wrapped — the terminal detects those itself.
