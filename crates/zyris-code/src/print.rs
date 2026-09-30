@@ -25,6 +25,27 @@ use zyris_attacca::{AttaccaApi, AttaccaApiClient, ZDeltaKind};
 use crate::app::Frame;
 use crate::conn::{self, Session};
 
+/// The agent's text as this stdout should receive it.
+///
+/// **A console gets what a console needs; a pipe gets the text.** On a Windows console in VT mode
+/// a bare `\n` drops a row without returning to the left, so a multi-line answer staircased — the
+/// bug `cli::ended` fixed for `--help`. And the text is the model's, so on a terminal it is written
+/// without the control characters that would make the terminal act on it (a colour, a title, a
+/// clipboard write); a line break and a tab are all it needs. Piped, nothing changes: a script
+/// reading the answer wants the bytes and LF.
+pub fn for_stdout(text: &str, console: bool, windows: bool) -> String {
+    if !console {
+        return text.to_string();
+    }
+    let clean: String =
+        text.chars().filter(|c| matches!(c, '\n' | '\t') || !c.is_control()).collect();
+    if windows {
+        clean.replace('\n', "\r\n")
+    } else {
+        clean
+    }
+}
+
 /// Reads the prompt from stdin, for `zyris -p` with nothing after it.
 pub fn prompt_from_stdin() -> anyhow::Result<String> {
     use std::io::Read;
@@ -69,6 +90,11 @@ pub async fn run(
         .map_err(|e| anyhow::anyhow!("could not follow the turn: {e}"))?;
 
     let mut out = std::io::stdout();
+    let console = {
+        use std::io::IsTerminal;
+        out.is_terminal()
+    };
+    let shown = |text: &str| for_stdout(text, console, cfg!(windows));
     // **Whether anything was streamed decides what the durable event is for.** The agent's words
     // arrive twice: as deltas while they are produced, and again as the settled event. Printing
     // both would say everything twice; printing only the settled one would sit silent through a
@@ -107,7 +133,7 @@ pub async fn run(
             Frame::Delta { kind: ZDeltaKind::Assistant, text } => {
                 streamed = true;
                 started = true;
-                write!(out, "{text}")?;
+                write!(out, "{}", shown(&text))?;
                 // **Flushed as it goes.** stdout to a pipe is block-buffered, so without this a
                 // reader on the other end sees nothing until the turn ends.
                 out.flush()?;
@@ -126,9 +152,9 @@ pub async fn run(
                         let lang = crate::lang::current();
                         // Straight to stderr, and flushed with it: stdout is being written to at
                         // the same time and belongs to the answer alone.
-                        eprintln!("{}", lang.question_unattended_notice());
+                        crate::cli::warn(lang.question_unattended_notice());
                         for step in &steps {
-                            eprintln!("  {}", describe(step));
+                            crate::cli::warn(&format!("  {}", describe(step)));
                         }
                         // The reply is an ordinary message — the server's question waiter takes
                         // the next one as the answer. There is no separate response API.
@@ -151,10 +177,10 @@ pub async fn run(
     }
 
     if !streamed && !settled.is_empty() {
-        write!(out, "{settled}")?;
+        write!(out, "{}", shown(&settled))?;
     }
     // One newline at the end, so a shell prompt does not land on the last line of the answer.
-    writeln!(out)?;
+    write!(out, "{}", shown("\n"))?;
     out.flush()?;
 
     // **Unsuccessful, even though the turn finished and said something.** What came back was
@@ -187,7 +213,17 @@ fn describe(step: &crate::question::Step) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::describe;
+    use super::{describe, for_stdout};
+
+    /// **A console gets CRLF on Windows and no control characters; a pipe gets the bytes.**
+    #[test]
+    fn the_answer_is_written_for_where_it_goes() {
+        let answer = "one\ntwo\x1b]52;c;aGk=\x07\tend";
+        assert_eq!(for_stdout(answer, false, true), answer, "piped output is left alone");
+        assert_eq!(for_stdout(answer, true, false), "one\ntwo]52;c;aGk=\tend");
+        assert_eq!(for_stdout(answer, true, true), "one\r\ntwo]52;c;aGk=\tend");
+        assert_eq!(for_stdout("a\r\nb", true, true), "a\r\nb", "CRLF is not doubled");
+    }
     use crate::question::{Opt, Step};
 
     fn step(header: Option<&str>, question: &str, options: &[&str]) -> Step {
