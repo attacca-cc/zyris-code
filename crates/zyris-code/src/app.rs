@@ -3943,6 +3943,16 @@ fn tick_draws_for_the_breath(state: &State, last_step: u64) -> bool {
     state.running && crate::widgets::transcript::breath_step(state.breath_ms()) != last_step
 }
 
+/// The second the enrolment window's countdown shows, `None` with no window up.
+///
+/// **The countdown moves once a second, so it is drawn once a second.** It used to mark every tick
+/// dirty — sixty frames a second, twenty over SSH, for a number that changes once — which is
+/// bytes over the link for nothing and a screen reader fed the same window without end.
+fn enroll_second(state: &State) -> Option<u64> {
+    let view = state.enroll.as_ref()?;
+    Some(view.expires_at.saturating_duration_since(Instant::now()).as_secs())
+}
+
 /// Whether the picker's dot has moved — the only animated thing left when no turn is running.
 ///
 /// It is a tempo as well: it changes twice an 800ms (`activity::BLINK_HALF_MS`), so it is drawn
@@ -5019,6 +5029,8 @@ async fn run_inner(
     // screen too, and dragging across the enrollment code is how that code gets copied out.
     let mut gesture_dirty = false;
     let mut dirty = true;
+    // The enrolment countdown's second as last drawn — see `enroll_second`.
+    let mut shown_second = enroll_second(&state);
 
     // **Wait for the first handle while drawing the screen.** This stretch is the first
     // enrollment — the enrollment code window comes up over "connecting…". `on_connect`
@@ -5131,9 +5143,12 @@ async fn run_inner(
                 }
             }
             _ = ticker.tick() => {
-                // With the enrollment code window up, the time left is ticking down, so
-                // keep drawing. A gesture waiting for a frame is the other reason.
-                if state.enroll.is_some() || gesture_dirty {
+                // With the enrollment code window up, the time left is ticking down — drawn
+                // when the second it shows changes (`enroll_second`). A gesture waiting for a
+                // frame is the other reason.
+                let second = enroll_second(&state);
+                if second != shown_second || gesture_dirty {
+                    shown_second = second;
                     dirty = true;
                     gesture_dirty = false;
                 }
@@ -5793,9 +5808,11 @@ async fn run_inner(
                 if state.opening() {
                     dirty = true;
                 }
-                // With the enrollment code window up, the time left is ticking down, so keep
-                // drawing.
-                if state.enroll.is_some() {
+                // With the enrollment code window up, the time left is ticking down, so it is
+                // drawn when the second it shows changes.
+                let second = enroll_second(&state);
+                if second != shown_second {
+                    shown_second = second;
                     dirty = true;
                 }
                 // While a turn runs, batch the drawing of what the turn is sending. One streaming
@@ -12487,5 +12504,22 @@ mod interaction {
         });
         run_command(&mut s, "/review 123");
         assert_eq!(s.outbox.as_deref(), Some("Review the pull request.\n\n123"));
+    }
+
+    /// **The enrolment countdown asks for a frame when its second changes, not on every tick**
+    /// (C31). Two reads within one second agree, so the tick between them draws nothing.
+    #[test]
+    fn the_enrolment_countdown_moves_by_the_second() {
+        let mut s = state();
+        assert_eq!(enroll_second(&s), None);
+        s.enroll = Some(EnrollView {
+            code: "ABCD".into(),
+            uri: "https://example.com".into(),
+            expires_at: Instant::now() + Duration::from_millis(90_500),
+            phase: EnrollPhase::Waiting,
+        });
+        let first = enroll_second(&s);
+        assert_eq!(first, Some(90));
+        assert_eq!(enroll_second(&s), first, "a tick inside the same second would redraw");
     }
 }

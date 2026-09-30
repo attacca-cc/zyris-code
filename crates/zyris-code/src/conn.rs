@@ -37,6 +37,26 @@ pub(crate) async fn within<T>(
     }
 }
 
+/// A background poll under a timeout **that leaves the connection alone.**
+///
+/// `within` closes the connection when its deadline passes, which is right for what a person is
+/// waiting on — a dead connection is the likeliest reason — and wrong for the usage, title and
+/// status polls that run every few seconds with nobody waiting: one slow answer to one of them
+/// reconnected the node and cut every tool call it was serving. A poll that times out is simply
+/// skipped; the next one asks again.
+pub(crate) async fn quietly<T>(
+    fut: impl std::future::Future<Output = zyris::Result<T>>,
+) -> Option<T> {
+    bounded(CALL_TIMEOUT, fut).await
+}
+
+async fn bounded<T>(
+    limit: std::time::Duration,
+    fut: impl std::future::Future<Output = zyris::Result<T>>,
+) -> Option<T> {
+    tokio::time::timeout(limit, fut).await.ok()?.ok()
+}
+
 /// The name of the agent we currently attach to.
 ///
 /// **The intended destination is `zyris-code`** (the `name` in `prompts/agents/zyris_code.yml`). But that
@@ -789,7 +809,9 @@ pub async fn session_status(
     api: &AttaccaApiClient,
     session_id: &str,
 ) -> Option<crate::picker::ThreadStatus> {
-    let events = history(api, session_id).await.ok()?;
+    // A poll, run for every thread in a list: `quietly`, not `within`.
+    let query = ZHistoryQuery::default();
+    let events = quietly(api.session_history(session_id.to_string(), query)).await?;
     status_from_events(&events)
 }
 
@@ -836,7 +858,7 @@ pub async fn session_awaiting_answer(api: &AttaccaApiClient) -> Option<String> {
 /// Session usage. If the deployment doesn't meter, `capability_not_announced` comes back ‒
 /// that's not an error but "this deployment lacks the feature", so it's quietly emptied.
 pub async fn usage(api: &AttaccaApiClient, session_id: &str) -> Option<crate::usage::Usage> {
-    let u = within(api, api.session_usage(session_id.to_string())).await.ok()?;
+    let u = quietly(api.session_usage(session_id.to_string())).await?;
     Some(crate::usage::Usage {
         model: u.model,
         context_tokens: u.context_tokens,
@@ -848,9 +870,7 @@ pub async fn usage(api: &AttaccaApiClient, session_id: &str) -> Option<crate::us
 /// This session's title. `None` when not yet present ‒ it attaches after the first message.
 pub async fn session_title(api: &AttaccaApiClient, session_id: &str) -> Option<String> {
     let sessions =
-        within(api, api.list_sessions(ZSessionFilter { project_id: None, limit: Some(100) }))
-            .await
-            .ok()?;
+        quietly(api.list_sessions(ZSessionFilter { project_id: None, limit: Some(100) })).await?;
     sessions
         .into_iter()
         .find(|s| s.id == session_id)
@@ -860,6 +880,16 @@ pub async fn session_title(api: &AttaccaApiClient, session_id: &str) -> Option<S
 
 #[cfg(test)]
 mod tests {
+    /// **A poll that runs out of time is skipped, not escalated** — `quietly` has no connection
+    /// to close, which is the whole of the difference from `within` (C18).
+    #[tokio::test]
+    async fn a_poll_that_runs_out_of_time_is_skipped() {
+        let never = std::future::pending::<zyris::Result<()>>();
+        assert_eq!(super::bounded(std::time::Duration::from_millis(5), never).await, None);
+        let now = std::future::ready(Ok::<_, zyris::Error>(7));
+        assert_eq!(super::bounded(std::time::Duration::from_millis(5), now).await, Some(7));
+    }
+
     /// **The block names the path every tool is called with.** The agent sees every node's tools
     /// under one name and picks a computer with `node_path`; naming this one any other way —
     /// "this node", a display name — leaves it nothing to pass.
