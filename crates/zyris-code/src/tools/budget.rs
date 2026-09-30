@@ -27,9 +27,24 @@ const ERROR_LINE_CHARS: usize = 200;
 /// What separates stdout from stderr in the recorded full output.
 pub const STDERR_SEPARATOR: &str = "\n--- stderr ---\n";
 
+/// The budget when the agent asks for `output: "full"`. **Still a budget**: an answer the agent
+/// asked to see whole is exactly the kind that would otherwise arrive at 1 MiB.
+pub const FULL_BUDGET: usize = 32_000;
+
 /// The budget in bytes: `ZYRIS_CODE_EXEC_BUDGET`, or [`BUDGET`]. **`0` turns shaping off.**
 pub fn budget() -> usize {
     std::env::var("ZYRIS_CODE_EXEC_BUDGET").ok().and_then(|v| v.parse().ok()).unwrap_or(BUDGET)
+}
+
+/// The budget for an answer the agent asked to see in `full`: [`FULL_BUDGET`], or `brief` if
+/// that is larger, and off when shaping is off.
+pub fn budget_for(full: bool) -> usize {
+    let brief = budget();
+    if full && brief > 0 {
+        brief.max(FULL_BUDGET)
+    } else {
+        brief
+    }
 }
 
 /// Whether an answer has to be cut at all: over the budget by at least [`MIN_SAVING`].
@@ -154,6 +169,17 @@ mod tests {
 
     fn lines(n: usize, width: usize) -> String {
         (0..n).map(|i| format!("{i:0width$}\n")).collect()
+    }
+
+    /// `full` is a larger budget, **never an unlimited one**, and nothing when shaping is off.
+    #[test]
+    fn full_asks_for_more_but_not_for_everything() {
+        if std::env::var_os("ZYRIS_CODE_EXEC_BUDGET").is_some() {
+            return; // the defaults are what this pins down
+        }
+        assert_eq!(budget_for(false), BUDGET);
+        assert_eq!(budget_for(true), FULL_BUDGET);
+        assert!(over(&"x".repeat(FULL_BUDGET + 2_001), "", budget_for(true)));
     }
 
     /// **Under budget, nothing changes** — and a budget of 0 means no budget at all.

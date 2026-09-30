@@ -171,8 +171,8 @@ pub fn clip_schema(value: &mut Value) {
 pub const LONG_HINT: &str =
     " A long run is fine; this node waits for it. Use wait.start to leave one running in the \
       background while you do something else. Output over 8 KB comes back as its head and tail, \
-      the rest readable with wait.logs; read files with file_io.read and search code with \
-      search.grep, which page.";
+      the rest readable with wait.logs; pass output: \"full\" to get up to 32 KB when you need \
+      the whole of it. Read files with file_io.read and search code with search.grep, which page.";
 
 /// What this node adds to `file_io.read`'s description. **It sits outside the budget** — it is added
 /// after trimming, exactly like `LONG_HINT` above.
@@ -184,6 +184,24 @@ pub const LONG_HINT: &str =
 pub const READ_HINT: &str = " This node adds `version` to the answer (pass it straight as \
                               code_edit's base_version) and `next_offset` when the file was cut \
                               short (pass it as offset to read on).";
+
+/// Adds `output` to `exec`'s arguments: how much of a long answer to send.
+///
+/// **It is this node's argument, not upstream's.** `Gate::dispatch` reads it and takes it out
+/// before the call reaches the terminal (`guard::take_output_choice`), so the capability never
+/// sees a field it does not declare.
+fn add_output_choice(schema: &mut Value) {
+    if let Some(Value::Object(properties)) = schema.get_mut("properties") {
+        properties.insert(
+            "output".to_string(),
+            serde_json::json!({
+                "type": "string",
+                "enum": ["brief", "full"],
+                "description": "brief (default): up to 8 KB. full: up to 32 KB.",
+            }),
+        );
+    }
+}
 
 /// Fits one capability descriptor to the budget.
 pub fn trim_descriptor(descriptor: &mut CapabilityDescriptor) {
@@ -198,6 +216,9 @@ pub fn trim_descriptor(descriptor: &mut CapabilityDescriptor) {
             tool.description.push_str(READ_HINT);
         }
         clip_schema(&mut tool.request_schema);
+        if terminal && tool.name == "exec" {
+            add_output_choice(&mut tool.request_schema);
+        }
         if let Some(schema) = &mut tool.response_schema {
             clip_schema(schema);
         }
@@ -265,6 +286,21 @@ mod tests {
         // It isn't attached to other tools — putting it on ones that finish quickly is just noise.
         let read = d.tools.iter().find(|t| t.name == "read").expect("read must exist");
         assert!(!read.description.contains("wait.start"), "{}", read.description);
+    }
+
+    /// **`exec` offers `output`, and only `exec` does.** The agent can only choose a longer answer
+    /// if the argument is announced.
+    #[test]
+    fn exec_offers_a_choice_of_output_length() {
+        let mut d = zyris::ServeCapability::descriptor(&zyris_caps::TerminalServer(
+            zyris_terminal::PtyTerminal::default(),
+        ));
+        trim_descriptor(&mut d);
+        let exec = d.tools.iter().find(|t| t.name == "exec").expect("exec must exist");
+        assert_eq!(exec.request_schema["properties"]["output"]["enum"], json!(["brief", "full"]));
+        assert!(exec.description.contains("output: \"full\""), "{}", exec.description);
+        let read = d.tools.iter().find(|t| t.name == "read").expect("read must exist");
+        assert!(read.request_schema["properties"].get("output").is_none());
     }
 
     /// Does the actually-announced file_io description fit the budget? Gate calls this function,

@@ -93,7 +93,8 @@ impl<C: ServeCapability> ServeCapability for Gate<C> {
         // **Most escape sequences never happen if the child is told not to colour.** Cleaning up
         // afterwards (`tools::clean`) is the fallback, not the plan. Written in after the hooks, so
         // a hook sees the arguments the agent sent and not ours.
-        let sent = quiet_env(&self.capability, &call.tool, args.clone());
+        let (sent, full) = take_output_choice(&self.capability, &call.tool, args.clone());
+        let sent = quiet_env(&self.capability, &call.tool, sent);
         call.params = Payload::from_json(sent.clone());
         let (call, cut) = self.clamp_exec(call, &sent, exec_ceiling());
         // **Shows what's running while it runs.** `exec` gives its result only once at completion
@@ -129,7 +130,12 @@ impl<C: ServeCapability> ServeCapability for Gate<C> {
         let out = match (gated.capability.as_str(), gated.tool.as_str()) {
             ("terminal", "exec") => {
                 let jobs = self.bridge.jobs();
-                fit_the_output(clean_the_output(out), &args, jobs.as_ref(), budget::budget())
+                fit_the_output(
+                    clean_the_output(out),
+                    &args,
+                    jobs.as_ref(),
+                    budget::budget_for(full),
+                )
             }
             _ => out,
         };
@@ -272,6 +278,17 @@ fn clean_the_output(out: Outgoing) -> Outgoing {
         }
     }
     Outgoing::Response(Payload::from_json(v))
+}
+
+/// Whether the agent asked for `output: "full"`, **with the argument taken out.** It is this
+/// node's (`trim::add_output_choice`), and the terminal behind it does not declare it.
+fn take_output_choice(capability: &str, tool: &str, mut args: Value) -> (Value, bool) {
+    if (capability, tool) != ("terminal", "exec") {
+        return (args, false);
+    }
+    let asked = args.as_object_mut().and_then(|obj| obj.remove("output"));
+    let full = asked.as_ref().and_then(Value::as_str) == Some("full");
+    (args, full)
 }
 
 /// **Ask for no colour rather than strip it afterwards.** Most of what fills an `exec` result with
@@ -989,5 +1006,25 @@ mod tests {
             p.to_json().unwrap(),
             json!({"exit_code": 0, "stdout": "", "stderr": "", "stdout_truncated": true})
         );
+    }
+
+    /// **`output` is read and taken out**, so the terminal never sees an argument it does not
+    /// declare; anything but `"full"` is the brief default, and other tools are left alone.
+    #[test]
+    fn the_output_choice_is_read_and_removed() {
+        let (sent, full) = take_output_choice(
+            "terminal",
+            "exec",
+            json!({"command": "git diff", "output": "full"}),
+        );
+        assert!(full);
+        assert_eq!(sent, json!({"command": "git diff"}));
+        let (_, full) =
+            take_output_choice("terminal", "exec", json!({"command": "x", "output": "brief"}));
+        assert!(!full);
+        let (_, full) = take_output_choice("terminal", "exec", json!({"command": "x"}));
+        assert!(!full);
+        let other = json!({"path": "a", "output": "full"});
+        assert_eq!(take_output_choice("file_io", "read", other.clone()), (other, false));
     }
 }
