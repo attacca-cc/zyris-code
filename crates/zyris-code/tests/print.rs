@@ -30,6 +30,9 @@ fn print_mode_gives_up_instead_of_waiting_for_ever() {
         .env("ZYRIS_CREDENTIAL", "zc_print_test_not_a_real_token")
         .env("ZYRIS_SERVER_URL", "ws://127.0.0.1:1")
         .env("ZYRIS_CONFIG_DIR", &dir)
+        // **Not the default log.** That one belongs to whatever zyris-code session is running this
+        // suite, and the app empties it on start.
+        .env("ZYRIS_CODE_LOG", dir.join("log"))
         .env("ZYRIS_CODE_CONNECT_WAIT_SECS", "3")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
