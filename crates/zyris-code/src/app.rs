@@ -733,6 +733,12 @@ pub struct State {
     /// Without it the deliberate reconnect reports itself in red as "the connection was lost" —
     /// true, but it reads as something having gone wrong when it is the thing that was asked for.
     pub reconnecting: bool,
+    /// Why the connection last dropped, while it is still down.
+    ///
+    /// **"Connecting…" with no reason, for minutes, is the whole of what a person used to see.**
+    /// The reason went by once as a six-second notice and then lived only in the log; kept here,
+    /// the activity line goes on saying it until the connection is back.
+    pub dropped_because: Option<String>,
     /// Raised when the settings changed and the disk and the gate have yet to hear about it.
     ///
     /// **`apply` is pure, so it cannot save.** The I/O loop takes this down the same way it
@@ -867,6 +873,7 @@ impl Default for State {
             lang: crate::lang::current(),
             config: crate::config::Config::default(),
             reconnecting: false,
+            dropped_because: None,
             config_out: false,
             files: Vec::new(),
             files_wanted: false,
@@ -3436,6 +3443,7 @@ fn apply_frame(state: &mut State, frame: &Frame) {
                 state.set_status(state.lang.reconnecting());
             } else {
                 state.set_error(state.lang.disconnected(why));
+                state.dropped_because = Some(why.clone());
             }
         }
         // The time is not carried in the frame but stamped where it is received — same way
@@ -5681,6 +5689,7 @@ async fn run_inner(
                 if let Some(fresh) = api_of(&api_rx) {
                     api = fresh;
                     state.connected = true;
+                    state.dropped_because = None;
                     state.ever_connected = true;
                     // A drop and reattach shows on screen too — connecting → connected →
                     // idle.
@@ -7857,7 +7866,13 @@ fn spawn_stream(
                 // finished, and the activity line would go idle in the middle of one.
                 let _ = tx.send((tag(), Action::Frame(Frame::Status { running: false })));
             }
-            Err(e) => tracing::error!(error = %e, "could not open the turn stream"),
+            // **Said, not only logged.** The line reads "connected" either way, and a stream that
+            // never opened means none of the turn's answers will ever appear.
+            Err(e) => {
+                tracing::error!(error = %e, "could not open the turn stream");
+                let said = crate::lang::current().stream_failed(&e.to_string());
+                let _ = tx.send((tag(), Action::Frame(Frame::Problem(said))));
+            }
         }
     });
     session.holds_stream(task.abort_handle());
@@ -12521,5 +12536,23 @@ mod interaction {
         let first = enroll_second(&s);
         assert_eq!(first, Some(90));
         assert_eq!(enroll_second(&s), first, "a tick inside the same second would redraw");
+    }
+
+    /// **Why the connection dropped stays said while it is down** — it used to go by in six
+    /// seconds and leave "Connecting…" alone for as long as the outage lasted (C17).
+    #[test]
+    fn the_reason_for_a_drop_outlives_its_notice() {
+        let mut s = state();
+        s.lang = crate::lang::Lang::En;
+        apply(&mut s, &Action::Frame(Frame::Disconnected("connection refused".into())));
+        let later = Instant::now() + STATUS_WINDOW + Duration::from_secs(1);
+        let (_, text, _) = crate::widgets::activity::parts_at(&s, later);
+        assert!(text.contains("connection refused"), "{text}");
+
+        // A drop somebody asked for is not a failure, and has no reason to keep saying.
+        let mut s = state();
+        s.reconnecting = true;
+        apply(&mut s, &Action::Frame(Frame::Disconnected("reconnect requested".into())));
+        assert!(s.dropped_because.is_none());
     }
 }

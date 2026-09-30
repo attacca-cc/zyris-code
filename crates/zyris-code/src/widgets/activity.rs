@@ -65,7 +65,11 @@ pub fn parts_at(
     // **Waiting is not failing.** Before the first enrolment is approved there is nothing wrong
     // yet — the code is on screen and a person is walking to a browser.
     if !state.connected {
-        return (theme::notice(), lang.connecting().to_string(), "");
+        let text = match &state.dropped_because {
+            Some(why) => lang.connecting_after(why),
+            None => lang.connecting().to_string(),
+        };
+        return (theme::notice(), text, "");
     }
     // **More specific than "working…".** A command gives its result once, when done, so unless
     // we say here what is running, people wait it out blind — and a command is no longer cut at a

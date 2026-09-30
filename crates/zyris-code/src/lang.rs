@@ -469,6 +469,22 @@ impl Lang {
     pub fn connecting(self) -> &'static str {
         self.pick("연결 중…", "Connecting…")
     }
+    /// Reconnecting, with why the connection went — **for as long as it stays down**.
+    pub fn connecting_after(self, why: &str) -> String {
+        match self {
+            Lang::Ko => format!("다시 연결 중… (끊긴 까닭: {why})"),
+            Lang::En => format!("Reconnecting… (dropped: {why})"),
+        }
+    }
+    /// The live turn stream could not be opened, so nothing the turn says will arrive.
+    pub fn stream_failed(self, why: &str) -> String {
+        match self {
+            Lang::Ko => {
+                format!("대화 흐름을 열지 못했습니다 ({why}). /reconnect 로 다시 시도하세요.")
+            }
+            Lang::En => format!("Could not open the conversation stream ({why}). Try /reconnect."),
+        }
+    }
     pub fn disconnected(self, why: &str) -> String {
         match self {
             Lang::Ko => format!("연결이 끊겼습니다 ({why}). 다시 붙는 중입니다."),
@@ -3176,6 +3192,8 @@ mod tests {
             (Lang::Ko.quit_armed(2, 1), Lang::En.quit_armed(2, 1)),
             (Lang::Ko.stop_failed("timeout"), Lang::En.stop_failed("timeout")),
             (Lang::Ko.agent_cannot_send("timeout"), Lang::En.agent_cannot_send("timeout")),
+            (Lang::Ko.connecting_after("reset"), Lang::En.connecting_after("reset")),
+            (Lang::Ko.stream_failed("reset"), Lang::En.stream_failed("reset")),
         ] {
             assert!(hangul(&ko), "{ko}");
             assert!(!hangul(&en), "{en}");
