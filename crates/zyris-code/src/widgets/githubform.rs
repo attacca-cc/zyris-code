@@ -6,7 +6,7 @@
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::githubform::{masked, Field, Form};
@@ -32,27 +32,7 @@ pub fn draw(
         .saturating_add(form.note.is_some() as u16)
         .saturating_add(if form.pending.is_some() { 3 + uri_extra } else { 0 });
     let h = h.min(area.height.saturating_sub(2)).max(6);
-    let box_area = Rect {
-        x: area.x + (area.width.saturating_sub(w)) / 2,
-        y: area.y + (area.height.saturating_sub(h)) / 2,
-        width: w,
-        height: h,
-    };
-
-    frame.render_widget(Clear, box_area);
-    // **Scrub the rest of wide characters straddling the border**, or the frame looks broken where
-    // the conversation's text is cut in half by the left edge.
-    crate::widgets::picker::scrub_left_edge(frame, box_area);
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::accent()))
-        .title(Span::styled(
-            format!(" {} ", lang.github_form_title()),
-            Style::default().fg(theme::text_heading()).add_modifier(Modifier::BOLD),
-        ));
-    let inner = block.inner(box_area);
-    frame.render_widget(block, box_area);
+    let inner = super::overlay(frame, area, w, h, lang.github_form_title());
 
     let width = inner.width as usize;
     let mut lines: Vec<Line<'static>> = Vec::new();

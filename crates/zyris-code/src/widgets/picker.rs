@@ -1,9 +1,9 @@
 //! The project/session list. Overlaid in the center of the screen.
 
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::markdown::display_width;
@@ -70,36 +70,7 @@ pub fn draw(
     let want_h =
         (picker.rows.len() as u16).saturating_add(5 + rule as u16 + detail_rows as u16).max(6);
     let h = want_h.min(area.height.saturating_sub(2)).max(3);
-    let box_area = Rect {
-        x: area.x + (area.width.saturating_sub(w)) / 2,
-        y: area.y + (area.height.saturating_sub(h)) / 2,
-        width: w,
-        height: h,
-    };
-
-    // Without clearing behind, the conversation shows through.
-    frame.render_widget(Clear, box_area);
-    // **Also scrub wide characters straddling the border.** If the leading half of a wide
-    // character remains just outside the box's left edge, it bleeds into the box and breaks the
-    // border. `Clear` only clears inside the box, so we must remove this half ourselves.
-    scrub_left_edge(frame, box_area);
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::accent()))
-        // **The title is cut to fit, with a `…`.** A project name is arbitrary text, and
-        // ratatui draws an over-long title straight over its own border — the box loses its
-        // top-right corner and the row ends mid-word with nothing saying it was cut.
-        // Four columns go to the two corners and the space either side of the title.
-        .title(Span::styled(
-            format!(
-                " {} ",
-                crate::markdown::truncate_to(&picker.title(lang), w.saturating_sub(4) as usize)
-            ),
-            Style::default().fg(theme::text_heading()).add_modifier(Modifier::BOLD),
-        ));
-    let inner = block.inner(box_area);
-    frame.render_widget(block, box_area);
+    let inner = super::overlay(frame, area, w, h, &picker.title(lang));
 
     let mut lines: Vec<Line<'static>> = Vec::new();
     if picker.loading {
@@ -297,25 +268,6 @@ fn label_to_fit(width: usize, label: &str, status: bool) -> String {
     // The status dot and its trailing space take two columns on the left, before the label.
     let dot = if status { 2 } else { 0 };
     crate::markdown::truncate_to(label, width.saturating_sub(2 + dot))
-}
-
-/// Replaces the leading half of a wide character straddling the box's left edge with a space.
-///
-/// The enrollment-code window (`enroll.rs`) does the same — every overlaid window uses this path.
-pub(crate) fn scrub_left_edge(frame: &mut Frame, box_area: Rect) {
-    if box_area.x == 0 {
-        return;
-    }
-    let x = box_area.x - 1;
-    let buf = frame.buffer_mut();
-    for y in box_area.y..box_area.y.saturating_add(box_area.height) {
-        if !buf.area.contains((x, y).into()) {
-            continue;
-        }
-        if display_width(buf[(x, y)].symbol()) > 1 {
-            buf[(x, y)].set_symbol(" ");
-        }
-    }
 }
 
 #[cfg(test)]

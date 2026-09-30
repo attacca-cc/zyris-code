@@ -10,7 +10,7 @@
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::app::{EnrollPhase, EnrollView};
@@ -94,27 +94,7 @@ pub fn draw(
     // **The box is as tall as what it has to hold.** A fixed height cut the last lines off without
     // saying so; a short terminal still cuts, but only because there is no room left.
     let h = (lines.len() as u16 + 2).min(area.height.saturating_sub(2)).max(5);
-    let box_area = Rect {
-        x: area.x + (area.width.saturating_sub(w)) / 2,
-        y: area.y + (area.height.saturating_sub(h)) / 2,
-        width: w,
-        height: h,
-    };
-
-    // Without clearing the back, the conversation shows through.
-    frame.render_widget(Clear, box_area);
-    // Scrub the rest of wide characters straddling the border — same reason as the picker.
-    crate::widgets::picker::scrub_left_edge(frame, box_area);
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::accent()))
-        .title(Span::styled(
-            format!(" {} ", lang.enroll_title()),
-            Style::default().fg(theme::text_heading()).add_modifier(Modifier::BOLD),
-        ));
-    let inner = block.inner(box_area);
-    frame.render_widget(block, box_area);
+    let inner = super::overlay(frame, area, w, h, lang.enroll_title());
 
     let links = uri_row.map_or_else(Vec::new, |row| link_rows(inner, row, &uri_rows, &view.uri));
     frame.render_widget(Paragraph::new(lines), inner);
