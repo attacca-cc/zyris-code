@@ -905,8 +905,17 @@ impl Lang {
             Lang::En => format!("Couldn't read the agent list: {e}"),
         }
     }
-    pub fn agent_cannot_send(self) -> &'static str {
-        self.pick("에이전트를 찾지 못해 보낼 수 없습니다.", "No agent ‒ can't send.")
+    /// **Says why and what to do.** "No agent" alone was all it used to say, on every Enter, with
+    /// the cause gone by in a notice at startup and no way out but a restart.
+    pub fn agent_cannot_send(self, why: &str) -> String {
+        match self {
+            Lang::Ko => format!(
+                "에이전트가 없어 보내지 못했습니다 ({why}). 다시 보내 보거나 /agent 이름 으로 고르세요."
+            ),
+            Lang::En => {
+                format!("No agent to send to ({why}). Send again, or pick one with /agent <name>.")
+            }
+        }
     }
     pub fn send_failed(self, e: &str) -> String {
         match self {
@@ -2905,7 +2914,6 @@ mod tests {
             (ko.enroll_denied(), en.enroll_denied()),
             (ko.enroll_keys(), en.enroll_keys()),
             (ko.clear_done(), en.clear_done()),
-            (ko.agent_cannot_send(), en.agent_cannot_send()),
             (ko.undo_log_not_ready(), en.undo_log_not_ready()),
             (ko.nothing_to_undo(), en.nothing_to_undo()),
             (ko.action_back(), en.action_back()),
@@ -2979,7 +2987,6 @@ mod tests {
             en.connection_lost(),
             en.waiting_for_approval(),
             en.clear_done(),
-            en.agent_cannot_send(),
             en.undo_log_not_ready(),
             en.nothing_to_undo(),
             en.action_back(),

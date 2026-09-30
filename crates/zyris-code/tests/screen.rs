@@ -1405,6 +1405,8 @@ fn choosing_then_submitting_fills_the_answer_and_marks_it_for_sending() {
     use zyris_code::question::{Act, RowKind};
 
     let mut s = State::new();
+    // Attached: with nowhere to send it, an answer is held rather than handed over.
+    s.connected = true;
     apply(&mut s, &Action::Frame(question_event(1, serde_json::Value::Null)));
 
     let press = |s: &mut State, code| {
@@ -1439,13 +1441,10 @@ fn choosing_then_submitting_fills_the_answer_and_marks_it_for_sending() {
     press(&mut s, KeyCode::Enter);
 
     assert!(s.asking.is_none(), "submitting closes the question");
-    assert!(s.submit_now, "the send-now flag must be set");
-    assert!(
-        s.input.text.contains("어느 쪽으로 갈까요?"),
-        "the question must be carried: {}",
-        s.input.text
-    );
-    assert!(s.input.text.contains("B안"), "{}", s.input.text);
+    let answer = s.outbox.clone().expect("the answer must be handed over to send");
+    assert!(answer.contains("어느 쪽으로 갈까요?"), "the question must be carried: {answer}");
+    assert!(answer.contains("B안"), "{answer}");
+    assert!(s.input.text.is_empty(), "the answer went through the draft: {}", s.input.text);
 }
 
 /// The submit row is always at the bottom, and the question UI is drawn in the input box's place.
