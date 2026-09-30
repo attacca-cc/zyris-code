@@ -442,6 +442,20 @@ fn a_signal_on_the_first_connection_screen_gives_the_terminal_back() {
     }
 }
 
+/// **What is typed while the app starts is kept.** The startup probe reads the terminal's replies
+/// off the same input, and everything it consumed used to be thrown away with them; this pty
+/// answers nothing, so the probe waits out its whole window and the keys land inside it.
+#[cfg(unix)]
+#[test]
+fn keys_typed_during_startup_reach_the_input() {
+    let _turn = one_at_a_time();
+    let mut app = Session::start();
+    std::thread::sleep(Duration::from_millis(50));
+    app.send(b"early");
+    app.wait_until_ready();
+    assert!(app.wait_for_text("early"), "typeahead was lost:\n{}", app.text());
+}
+
 /// **The app must not stop waiting for an answer this terminal will never give.**
 ///
 /// Asking the terminal something and blocking on the reply is what `Terminal::clear()`'s cursor

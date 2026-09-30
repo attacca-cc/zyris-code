@@ -654,6 +654,26 @@ impl Lang {
     }
     /// The screen never came up — the shell notice is all the person gets. `main` says this and
     /// exits instead of sitting on the waiting line with a frozen cursor (the 2026-08-07 report).
+    /// The screen was asked for where there is no terminal to draw it on (`term::no_screen`).
+    pub fn no_screen(self, program: &str, why: crate::term::NoScreen) -> String {
+        use crate::term::NoScreen;
+        match (self, why) {
+            (Lang::Ko, NoScreen::NotATerminal) => format!(
+                "{program}: 화면은 터미널에서만 뜹니다 ‒ 입력이나 출력이 터미널이 아닙니다. \
+                 스크립트에서는 `{program} -p <요청>`을 쓰세요 (ssh라면 `ssh -t`)."
+            ),
+            (Lang::En, NoScreen::NotATerminal) => format!(
+                "{program}: the screen needs a terminal, and stdin or stdout is not one. \
+                 From a script use `{program} -p <prompt>` (over ssh, `ssh -t`)."
+            ),
+            (Lang::Ko, NoScreen::Dumb) => format!(
+                "{program}: TERM=dumb인 곳에서는 화면을 그릴 수 없습니다. `{program} -p <요청>`을 쓰세요."
+            ),
+            (Lang::En, NoScreen::Dumb) => format!(
+                "{program}: cannot draw the screen where TERM=dumb. Use `{program} -p <prompt>`."
+            ),
+        }
+    }
     pub fn screen_failed(self, why: &str) -> String {
         match self {
             Lang::Ko => format!("화면을 띄우지 못했습니다: {why}"),

@@ -126,6 +126,18 @@ async fn main() -> ExitCode {
     // Order: `$ZYRIS_CODE_LANG` → last choice → locale.
     zyris_code::lang::set(zyris_code::lang::startup());
 
+    // **No screen without a terminal to draw it on** (`term::no_screen`). Said before anything
+    // else starts, in a sentence that points at print mode.
+    if printing.is_none() {
+        use std::io::IsTerminal;
+        let term = std::env::var("TERM").ok();
+        let tty = (std::io::stdin().is_terminal(), std::io::stdout().is_terminal());
+        if let Some(why) = zyris_code::term::no_screen(tty.0, tty.1, term.as_deref()) {
+            zyris_code::cli::warn(&lang::current().no_screen(&program, why));
+            return ExitCode::FAILURE;
+        }
+    }
+
     // **Updating happens here, on the terminal, before anything else is built.**
     //
     // It used to happen from inside the screen: the app asked for an update, wrote a script out,

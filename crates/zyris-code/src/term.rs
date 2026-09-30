@@ -216,6 +216,30 @@ pub fn narrow_stand_in(cell: &str) -> Option<&'static str> {
     })
 }
 
+/// Why the screen cannot be drawn here, if it cannot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoScreen {
+    /// stdin or stdout is not a terminal: `ssh host zyris-code` without `-t`, cron, CI, a pipe.
+    NotATerminal,
+    /// `TERM=dumb`: Emacs `M-x shell`, CI logs. A full-screen app there is escape soup.
+    Dumb,
+}
+
+/// Whether the screen can be drawn, before anything tries to.
+///
+/// **Asked in `main`, not found out by `ratatui::init`.** Without a terminal that call panicked,
+/// and the person saw a Rust panic and "task N panicked" instead of a sentence pointing at `-p`;
+/// with only stdout redirected the screen ran and every frame went into the pipe.
+pub fn no_screen(stdin_tty: bool, stdout_tty: bool, term: Option<&str>) -> Option<NoScreen> {
+    if !(stdin_tty && stdout_tty) {
+        Some(NoScreen::NotATerminal)
+    } else if term == Some("dumb") {
+        Some(NoScreen::Dumb)
+    } else {
+        None
+    }
+}
+
 /// What the app asks about a terminal. Taken from the environment once at startup — reading it per
 /// frame would put a `std::env` lookup inside the draw loop for an answer that cannot change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -430,6 +454,15 @@ mod tests {
         }
         assert!(!caps(&[]).ambiguous_wide, "off unless asked for");
         assert!(caps(&[("ZYRIS_CODE_AMBIGUOUS_WIDE", "1")]).ambiguous_wide);
+    }
+
+    #[test]
+    fn the_screen_is_not_drawn_without_a_terminal_to_draw_on() {
+        assert_eq!(no_screen(true, true, Some("xterm-256color")), None);
+        assert_eq!(no_screen(true, true, None), None, "the Windows console sets no TERM");
+        assert_eq!(no_screen(false, true, None), Some(NoScreen::NotATerminal));
+        assert_eq!(no_screen(true, false, Some("xterm")), Some(NoScreen::NotATerminal));
+        assert_eq!(no_screen(true, true, Some("dumb")), Some(NoScreen::Dumb));
     }
 
     /// A value that means nothing falls back to the guess rather than to `false` — `MOUSE=maybe`

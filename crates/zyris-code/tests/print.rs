@@ -64,3 +64,32 @@ fn print_mode_gives_up_instead_of_waiting_for_ever() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// **No terminal, no screen — and a sentence saying so.** Without one the screen used to panic in
+/// `ratatui::init` (a Rust backtrace and "task N panicked"), and with only stdout redirected it ran
+/// and wrote every frame into the pipe. `ssh host zyris-code` without `-t`, cron and CI all land
+/// here.
+#[test]
+fn the_screen_is_not_started_without_a_terminal() {
+    let dir = std::env::temp_dir().join(format!("zyris-notty-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+
+    let out = Command::new(env!("CARGO_BIN_EXE_zyris-code"))
+        .env("ZYRIS_CREDENTIAL", "zc_print_test_not_a_real_token")
+        .env("ZYRIS_SERVER_URL", "ws://127.0.0.1:1")
+        .env("ZYRIS_CONFIG_DIR", &dir)
+        .env("ZYRIS_CODE_LOG", dir.join("log"))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .expect("could not start the app");
+
+    assert!(!out.status.success(), "it had no terminal and called that success");
+    assert!(out.stdout.is_empty(), "escape bytes went into the pipe: {:?}", out.stdout);
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(said.contains("-p <"), "it did not point at print mode:\n{said}");
+    assert!(!said.contains("panicked"), "a panic reached the person:\n{said}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

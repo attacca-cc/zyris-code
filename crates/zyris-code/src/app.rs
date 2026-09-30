@@ -289,6 +289,8 @@ pub enum Action {
     ClearSelection,
     /// Redraw the whole screen. Changes no state at all — only the I/O side handles it.
     Repaint,
+    /// Stop the process for the shell's job control (Ctrl+Z). I/O only, like `Repaint`.
+    Suspend,
     /// Operating the question screen.
     AskUp,
     AskDown,
@@ -1674,6 +1676,9 @@ pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
         // Ctrl+L means "redraw the screen" in shells, vim and less alike. It is the key
         // people press reflexively when the screen breaks, so it gets no other meaning.
         KeyCode::Char('l') if ctrl => vec![Action::Repaint],
+        // **Ctrl+Z is the shell's, as in vim and less** — see `suspend`. Unix only: nothing else
+        // has job control to hand the terminal to.
+        KeyCode::Char('z') if ctrl && cfg!(unix) => vec![Action::Suspend],
         KeyCode::Char('o') if ctrl => vec![Action::ToggleFold],
         // **t for tasks.** Nothing else claims Ctrl+T here, and the terminal sends it through
         // untouched — it is not one of the bytes a tty reserves.
@@ -2454,7 +2459,7 @@ pub fn apply(state: &mut State, action: &Action) {
         }
         // Repainting is the screen's business alone. No state changes, so there is nothing
         // to do here.
-        Action::Repaint => {}
+        Action::Repaint | Action::Suspend => {}
         // **The box goes up empty and the rows arrive later.** The I/O side only starts the
         // fetch; it no longer waits for it, so putting the placeholder here is safe (`apply`
         // runs after that arm) and it is what makes ← respond the instant it is pressed.
@@ -3842,6 +3847,43 @@ fn kitty_verdict(resp: &[u8]) -> KittyVerdict {
     }
 }
 
+/// What a person typed among the terminal's replies: every escape sequence taken out (the replies
+/// themselves, and any arrow or Alt chord, which mean nothing in an empty draft), and the rest
+/// brought to what a field can show (`paste_text`) — an Enter becomes a line break, never a send.
+#[cfg(unix)]
+fn typed_ahead(resp: &[u8]) -> String {
+    let mut kept = Vec::new();
+    let mut i = 0;
+    while i < resp.len() {
+        if resp[i] != 0x1b {
+            kept.push(resp[i]);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        match resp.get(i) {
+            // CSI: parameters, then one final byte in `@`..`~`.
+            Some(b'[') => {
+                i += 1;
+                while i < resp.len() && !(0x40..=0x7e).contains(&resp[i]) {
+                    i += 1;
+                }
+                i += 1;
+            }
+            // OSC: up to BEL, or ESC `\`.
+            Some(b']') => {
+                while i < resp.len() && resp[i] != 0x07 && resp[i] != 0x1b {
+                    i += 1;
+                }
+                i += if resp.get(i) == Some(&0x1b) { 2 } else { 1 };
+            }
+            // Alt and a key.
+            _ => i += 1,
+        }
+    }
+    paste_text(&String::from_utf8_lossy(&kept))
+}
+
 /// The final byte of every complete `CSI ? … <final>` reply in `resp`, in the order they came.
 /// One still mid-sequence ends the list — its final byte has not arrived yet.
 #[cfg(unix)]
@@ -3884,15 +3926,21 @@ fn private_replies(resp: &[u8]) -> Vec<u8> {
 /// **This reads stdin directly rather than going through crossterm.** At this point the event
 /// source is not open yet (`EventStream` is built in `run_inner`), so there is no competitor for
 /// the bytes. If an answer arrives after we stop reading, crossterm quietly skips it.
-pub fn probe_kitty_keyboard() -> bool {
+///
+/// **A byte at a time with `read(2)`, not through `io::stdin()`.** std's stdin is buffered, and its
+/// first read pulled up to 8 KB — everything typed after the verdict went into a buffer crossterm
+/// never reads. And what *was* typed during the exchange, which it has to consume to find the
+/// replies, is handed back as the second value (`typed_ahead`) for the draft, rather than lost:
+/// typing straight after a launch chained with `&&`, or over a slow SSH round trip, is not rare.
+pub fn probe_kitty_keyboard() -> (bool, String) {
     #[cfg(unix)]
     {
-        use std::io::{Read, Write};
+        use std::io::Write;
         use std::os::fd::AsRawFd;
 
         let mut out = io::stdout();
         if write!(out, "\x1b]11;?\x1b\\\x1b[?u\x1b[c").is_err() || out.flush().is_err() {
-            return false;
+            return (false, String::new());
         }
 
         let fd = io::stdin().as_raw_fd();
@@ -3906,9 +3954,10 @@ pub fn probe_kitty_keyboard() -> bool {
             if unsafe { libc::poll(&mut pfd, 1, left.as_millis() as libc::c_int) } <= 0 {
                 break;
             }
-            match io::stdin().read(&mut byte) {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {
+            // SAFETY: one byte into a one-byte buffer from a descriptor that poll just said is ready.
+            match unsafe { libc::read(fd, byte.as_mut_ptr().cast(), 1) } {
+                n if n <= 0 => break,
+                _ => {
                     resp.push(byte[0]);
                     // The device attributes are always answered, and answered last.
                     if byte[0] == b'c' && private_replies(&resp).contains(&b'c') {
@@ -3919,7 +3968,7 @@ pub fn probe_kitty_keyboard() -> bool {
         }
         crate::theme::answered(crate::theme::background_from_reply(&resp));
         // Silence reads as "no": a terminal with the protocol would have replied to the question.
-        kitty_verdict(&resp) == KittyVerdict::Supported
+        (kitty_verdict(&resp) == KittyVerdict::Supported, typed_ahead(&resp))
     }
     #[cfg(not(unix))]
     {
@@ -3929,7 +3978,7 @@ pub fn probe_kitty_keyboard() -> bool {
         //
         // crossterm's `supports_keyboard_enhancement()` answers a flat `Ok(false)` here, which
         // would take Shift+Enter away on the platform where it actually works.
-        true
+        (true, String::new())
     }
 }
 
@@ -4125,32 +4174,18 @@ fn terminal_feature(label: &'static str, command: impl crossterm::Command) {
     }
 }
 
-/// The only place that talks to the terminal.
+/// Switches on what the screen needs beyond raw mode and the alternate screen.
 ///
-/// `ratatui::init()` takes raw mode and the alternate screen together — we don't take them again.
-pub async fn run(
-    api_rx: ApiRx,
-    bridge: crate::tools::bridge::Bridge,
-    die: tokio::sync::watch::Receiver<bool>,
-) -> anyhow::Result<()> {
-    let mut terminal = ratatui::init();
-    // **A panic gives the terminal back whole, not half.** `ratatui::init` hooks panics too, but
-    // its restore is raw mode and the alternate screen only — the mouse kept reporting and line
-    // wrap stayed off, so the backtrace itself printed cut at the right edge. Installed after it,
-    // this hook runs first; ratatui's then repeats two of the steps, which costs nothing.
-    let previous = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        restore_terminal();
-        previous(info);
-    }));
+/// **Only settings that take the same value however often they are sent** — `run` calls this once,
+/// and a resume after a stop (`resume`) calls it again without knowing what the shell did in
+/// between. The two that stack are in `push_stacks`.
+fn switch_on(caps: crate::term::Caps) {
     // Turn terminal features on **one at a time** — if any one fails, the screen still
-    // comes up (see `terminal_feature`). On Windows the kitty keyboard protocol always
-    // fails, so the line-wrap-off below must still be reached.
+    // comes up (see `terminal_feature`).
     // **Taking the mouse takes the terminal's own selection with it.** While tracking is on the
     // emulator hands every click and drag to us instead of highlighting text, so copy-on-select
     // and the scrollback drag stop working — that is the price of click-to-fold and drag-to-copy,
     // and `$ZYRIS_CODE_MOUSE=0` is how somebody declines to pay it.
-    let caps = crate::term::Caps::detect();
     if caps.mouse {
         take_the_mouse(true);
     }
@@ -4167,6 +4202,17 @@ pub async fn run(
     // is that the markers may come back as literal keys.
     #[cfg(not(windows))]
     terminal_feature("bracketed paste", crossterm::event::EnableBracketedPaste);
+    // **Turn off line wrapping.** If the width we counted and the width the terminal
+    // draws differ by even one cell (glyphs like `●`, `·`, `─` become two cells
+    // depending on terminal settings) the end of the line overflows and **spills onto
+    // the line below**, pushing everything under it down. With it off, the overflowing
+    // glyph is merely cut at that line, keeping the damage to one line.
+    terminal_feature("line wrap off", crossterm::terminal::DisableLineWrap);
+}
+
+/// The two settings that are pushed onto a stack in the terminal, and popped by `restore_terminal`:
+/// the kitty keyboard flags and the window title.
+fn push_stacks() {
     // **Makes Shift+Enter distinguishable from Enter.** With the kitty keyboard protocol
     // on, modified keys arrive separately as CSI-u sequences. A terminal that does not
     // know it simply ignores this, so turning it on does no harm. On Windows crossterm
@@ -4179,17 +4225,99 @@ pub async fn run(
             crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
         ),
     );
-    // **Turn off line wrapping.** If the width we counted and the width the terminal
-    // draws differ by even one cell (glyphs like `●`, `·`, `─` become two cells
-    // depending on terminal settings) the end of the line overflows and **spills onto
-    // the line below**, pushing everything under it down. With it off, the overflowing
-    // glyph is merely cut at that line, keeping the damage to one line.
-    terminal_feature("line wrap off", crossterm::terminal::DisableLineWrap);
+    // **The shell's title is kept to be given back.** `set_terminal_title` writes the
+    // conversation's title — which can hold the prompt a person typed — and it stayed on the tab
+    // and in tmux's status line after quitting. xterm's title stack (`CSI 22 ; 0 t`, popped with
+    // `CSI 23 ; 0 t`) is what vim and less use for the same; a terminal without it ignores both.
+    write_raw("\x1b[22;0t");
+}
+
+/// Writes a sequence crossterm has no command for, the way `set_terminal_title` does.
+fn write_raw(sequence: &str) {
+    use std::io::Write;
+    let mut out = io::stdout();
+    let _ = out.write_all(sequence.as_bytes());
+    let _ = out.flush();
+}
+
+/// **Ctrl+Z hands the shell back, the way vim and less do.**
+///
+/// Raw mode clears ISIG, so the key arrives as a byte and the terminal never stops the process by
+/// itself; it used to do nothing at all. The whole terminal is given back first, the process stops
+/// itself with SIGTSTP — the signal a shell's job control expects — and on `fg` everything is put
+/// back and the screen drawn whole. In a process group with no job control the stop is discarded
+/// and this returns at once, which puts the screen straight back.
+#[cfg(unix)]
+fn suspend(terminal: &mut ratatui::DefaultTerminal, caps: crate::term::Caps) {
+    restore_terminal();
+    // SAFETY: raise(3) with a standard signal number has no preconditions.
+    unsafe { libc::raise(libc::SIGTSTP) };
+    resume(terminal, caps);
+    push_stacks();
+}
+
+/// No job control off unix: Ctrl+Z is never bound there (`on_key`).
+#[cfg(not(unix))]
+fn suspend(_: &mut ratatui::DefaultTerminal, _: crate::term::Caps) {}
+
+/// Puts the screen back after the process was stopped and continued.
+///
+/// **Raw mode is taken again, not assumed.** A shell resets the terminal to its own modes while a
+/// job is stopped, and crossterm would otherwise believe raw mode were still on. The alternate
+/// screen and the settings in `switch_on` are harmless to repeat; `repaint` makes the next frame
+/// draw every cell, since whatever the shell printed meanwhile is on the screen.
+fn resume(terminal: &mut ratatui::DefaultTerminal, caps: crate::term::Caps) {
+    let _ = crossterm::terminal::disable_raw_mode();
+    if let Err(e) = crossterm::terminal::enable_raw_mode() {
+        tracing::warn!(error = %e, "raw mode could not be taken back after a stop");
+    }
+    terminal_feature("alternate screen", crossterm::terminal::EnterAlternateScreen);
+    switch_on(caps);
+    repaint(terminal);
+}
+
+/// Repaints when the size the screen is drawn at really changed.
+///
+/// **The event's payload is not the geometry on Windows.** crossterm reports the console
+/// *screen-buffer* size there, while ratatui lays out with the *window* rect — two different
+/// quantities that drift apart. Deduping on the payload therefore skips repaints that were needed
+/// and performs ones that were not, so both loops ask the backend what it is about to draw into.
+fn repaint_if_resized(terminal: &mut ratatui::DefaultTerminal, last: &mut Option<(u16, u16)>) {
+    use ratatui::backend::Backend;
+    let now = terminal.backend().size().ok().map(|s| (s.width, s.height));
+    if now.is_some() && *last != now {
+        *last = now;
+        repaint(terminal);
+    }
+}
+
+/// The only place that talks to the terminal.
+///
+/// `ratatui::init()` takes raw mode and the alternate screen together — we don't take them again.
+pub async fn run(
+    api_rx: ApiRx,
+    bridge: crate::tools::bridge::Bridge,
+    die: tokio::sync::watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    // `try_init`, not `init`: a terminal that cannot be set up is an error to report, not a panic.
+    let mut terminal = ratatui::try_init()?;
+    // **A panic gives the terminal back whole, not half.** `ratatui::try_init` hooks panics too, but
+    // its restore is raw mode and the alternate screen only — the mouse kept reporting and line
+    // wrap stayed off, so the backtrace itself printed cut at the right edge. Installed after it,
+    // this hook runs first; ratatui's then repeats two of the steps, which costs nothing.
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore_terminal();
+        previous(info);
+    }));
+    let caps = crate::term::Caps::detect();
+    switch_on(caps);
+    push_stacks();
 
     // **Find out now whether this terminal takes Shift+Enter as a newline.** On a terminal
     // without support we point at Alt+Enter from the start — otherwise the user does not
     // know how to make a newline and just fires the message off.
-    let kitty = probe_kitty_keyboard();
+    let (kitty, typed) = probe_kitty_keyboard();
 
     let for_exit = bridge.clone();
     // **What this terminal says it is, once.** The first line of any trace: two traces are only
@@ -4211,7 +4339,7 @@ pub async fn run(
     // `break 'app`, so the way out is this one place — and a panic unwinds through here too,
     // which is why this is a guard dropped on the way out rather than a call after the await.
     let stop_jobs = StopJobs(for_exit);
-    let result = run_inner(&mut terminal, api_rx, bridge, die, kitty).await;
+    let result = run_inner(&mut terminal, api_rx, bridge, die, kitty, typed).await;
     drop(stop_jobs);
 
     restore_terminal();
@@ -4248,6 +4376,8 @@ pub fn restore_terminal() {
     // Line wrapping is something the shell uses. Not restoring it makes long commands
     // look cut off in the shell.
     terminal_feature("line wrap on", crossterm::terminal::EnableLineWrap);
+    // The shell's own title, kept by `push_stacks`.
+    write_raw("\x1b[23;0t");
     ratatui::restore();
 }
 
@@ -4491,9 +4621,12 @@ async fn run_inner(
     bridge: crate::tools::bridge::Bridge,
     mut die: tokio::sync::watch::Receiver<bool>,
     kitty: bool,
+    typed: String,
 ) -> anyhow::Result<()> {
     let mut state = State::new();
     state.caps = crate::term::Caps::detect();
+    // What was typed while the terminal was being asked about itself (`probe_kitty_keyboard`).
+    state.input.insert_str(&typed);
     // Read once, from the environment: what to trace, if anything. See `crate::trace`.
     let trace = crate::trace::Trace::detect();
     // **The saved settings come in here.** `State::default` keeps the built-in defaults so
@@ -4541,6 +4674,7 @@ async fn run_inner(
     let mut keys = EventStream::new();
     // **Armed before the wait, not after it** — see `shutdown_signals`.
     let mut shutdown = shutdown_signals();
+    let mut resumed = resumed_signal();
     let frame = frame_interval();
     state.frame_ms = frame.as_millis().max(1) as u64;
     let mut ticker = tokio::time::interval(frame);
@@ -4605,6 +4739,9 @@ async fn run_inner(
                                 quit = true;
                                 break;
                             }
+                            if matches!(action, Action::Suspend) {
+                                suspend(terminal, state.caps);
+                            }
                             apply(&mut state, &action);
                         }
                     }
@@ -4638,10 +4775,7 @@ async fn run_inner(
                     // Coming back to the window, redraw without clearing — the same trick the
                     // main loop uses, for a wait that can last as long as a walk to a browser.
                     TermEvent::FocusGained => state.force_update = true,
-                    TermEvent::Resize(w, h) if last_size != Some((w, h)) => {
-                        last_size = Some((w, h));
-                        repaint(terminal);
-                    }
+                    TermEvent::Resize(..) => repaint_if_resized(terminal, &mut last_size),
                     _ => {}
                 }
                 if quit {
@@ -4917,19 +5051,8 @@ async fn run_inner(
                     // Clear and redraw whole only when the size actually changed. With
                     // same-size resizes arriving back to back, clearing everything each
                     // time flickers.
-                    //
-                    // **The payload is not the geometry on Windows.** crossterm reports the
-                    // console *screen-buffer* size there, while ratatui lays out with the
-                    // *window* rect — two different quantities that drift apart. Deduping on
-                    // the payload therefore skips repaints that were needed and performs ones
-                    // that were not. Ask the backend what it is about to draw into instead.
                     TermEvent::Resize(..) => {
-                        use ratatui::backend::Backend;
-                        let now = terminal.backend().size().ok().map(|s| (s.width, s.height));
-                        if now.is_some() && last_size != now {
-                            last_size = now;
-                            repaint(terminal);
-                        }
+                        repaint_if_resized(terminal, &mut last_size);
                         dirty = true;
                         vec![]
                     }
@@ -4998,6 +5121,7 @@ async fn run_inner(
                         Action::Repaint => {
                             repaint(terminal);
                         }
+                        Action::Suspend => suspend(terminal, state.caps),
                         // **A gesture is drawn by the frame tick, not once per event.** The wheel
                         // and the pointer both arrive in bursts — dozens of notches, hundreds of
                         // motion samples — and each one only moves the screen a little. Drawn per
@@ -5380,6 +5504,12 @@ async fn run_inner(
             // terminal window (SIGHUP) arrives here — dying by that path would leave a turn
             // running on the server.
             Some(()) = shutdown.recv() => break 'app,
+            // **Continued after a stop from outside** (`kill -STOP`, a wrapper's SIGTSTP): the
+            // shell had the terminal meanwhile, so the screen is taken back and drawn whole.
+            Some(()) = resumed.recv() => {
+                resume(terminal, state.caps);
+                dirty = true;
+            }
             // **The runner ended.** When `main` signals this channel (a fatal error) the
             // screen closes quietly too — `main` says the reason after the terminal is
             // restored.
@@ -5450,13 +5580,39 @@ async fn run_inner(
 /// button. **Any of them used to kill the process with the terminal still raw** while the app sat
 /// on its first-connection screen, so this is armed before that wait, not after it.
 ///
-/// Off unix there is no sender, so `recv()` is immediately `None` and `select!` disables
-/// that arm — quieter than removing the arm with cfg.
+/// On Windows it is the console's close, Ctrl+Break, logoff and shutdown events. Anywhere with none
+/// of these there is no sender, so `recv()` is immediately `None` and `select!` disables that arm —
+/// quieter than removing the arm with cfg.
 fn shutdown_signals() -> mpsc::Receiver<()> {
     let (tx, rx) = mpsc::channel(1);
-    // **Off unix, letting go of the only sender is what makes the promise above true**: the
-    // channel closes, `recv()` answers `None` at once, and `select!` disables that arm. Said out
-    // loud rather than left to the end of the function, where it also reads as an unused binding.
+    // **Windows: the console closing, Ctrl+Break, logoff and shutdown.** None of them used to
+    // reach the normal way out, so background jobs the agent started could outlive the window.
+    // tokio holds the console's handler open while a listener exists, which gives the loop the
+    // few seconds Windows allows to leave through `run`.
+    #[cfg(windows)]
+    {
+        use tokio::signal::windows;
+        macro_rules! forward {
+            ($listen:expr) => {
+                if let Ok(mut sig) = $listen {
+                    let tx = tx.clone();
+                    tokio::spawn(async move {
+                        if sig.recv().await.is_some() {
+                            let _ = tx.send(()).await;
+                        }
+                    });
+                }
+            };
+        }
+        forward!(windows::ctrl_close());
+        forward!(windows::ctrl_break());
+        forward!(windows::ctrl_logoff());
+        forward!(windows::ctrl_shutdown());
+    }
+    // **Off unix, letting go of this sender is what closes the channel** once the listeners above
+    // are gone (or, elsewhere, at once): `recv()` then answers `None` and `select!` disables that
+    // arm. Said out loud rather than left to the end of the function, where it also reads as an
+    // unused binding.
     #[cfg(not(unix))]
     drop(tx);
     #[cfg(unix)]
@@ -5483,6 +5639,26 @@ fn shutdown_signals() -> mpsc::Receiver<()> {
                 // Even a forced exit gives the whole terminal back, not just raw mode.
                 restore_terminal();
                 std::process::exit(0);
+            });
+        }
+    }
+    rx
+}
+
+/// SIGCONT, one message per continue — see the main loop's `resumed` arm. Off unix it never fires.
+fn resumed_signal() -> mpsc::Receiver<()> {
+    let (tx, rx) = mpsc::channel(1);
+    #[cfg(not(unix))]
+    drop(tx);
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        if let Ok(mut sig) = signal(SignalKind::from_raw(libc::SIGCONT)) {
+            tokio::spawn(async move {
+                while sig.recv().await.is_some() {
+                    // A continue already waiting says the same thing; one is enough.
+                    let _ = tx.try_send(());
+                }
             });
         }
     }
@@ -7633,6 +7809,16 @@ mod tests {
         let all = b"\x1b]11;rgb:ffff/ffff/ffff\x1b\\\x1b[?1u\x1b[?62c";
         assert_eq!(kitty_verdict(all), Supported);
         assert_eq!(private_replies(all), b"uc");
+    }
+
+    /// **What was typed during the startup exchange comes back**, and nothing the terminal said.
+    #[cfg(unix)]
+    #[test]
+    fn typing_among_the_replies_is_kept_and_the_replies_are_not() {
+        let resp = b"he\x1b]11;rgb:0000/0000/0000\x1b\\l\x1b[?1ul\x1b[Ao\x1bb\r\x1b[?62;22c";
+        assert_eq!(typed_ahead(resp), "hello\n");
+        assert_eq!(typed_ahead("안\x1b[?62c녕".as_bytes()), "안녕");
+        assert_eq!(typed_ahead(b"\x1b[?1u\x1b[?62c"), "");
     }
 
     /// **A paste arrives as the fields can show it.** CRLF and a bare CR are one line break, a tab
