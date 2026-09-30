@@ -12,7 +12,15 @@
 
 /// The default budget for one answer, stdout and stderr together.
 pub const BUDGET: usize = 8_000;
-/// How many error-looking lines from the omitted middle are carried over.
+/// An answer is cut only when that saves at least this much. **Cutting a file read for a few
+/// hundred bytes costs more than it saves**: the agent loses the file's middle, and a measured
+/// session cut `cat budget.rs` to save 712 bytes.
+const MIN_SAVING: usize = 2_000;
+/// Room held back from the head and tail for the marker and the hints, so the answer stays within
+/// the budget.
+const MARKER_ROOM: usize = 300;
+/// How many error-looking lines from the omitted middle are carried over, at most. They share an
+/// eighth of the room, so they are paid for out of the budget rather than on top of it.
 const ERROR_LINES: usize = 20;
 /// Each carried line is clipped to this many characters.
 const ERROR_LINE_CHARS: usize = 200;
@@ -24,9 +32,9 @@ pub fn budget() -> usize {
     std::env::var("ZYRIS_CODE_EXEC_BUDGET").ok().and_then(|v| v.parse().ok()).unwrap_or(BUDGET)
 }
 
-/// Whether an answer has to be cut at all.
+/// Whether an answer has to be cut at all: over the budget by at least [`MIN_SAVING`].
 pub fn over(stdout: &str, stderr: &str, budget: usize) -> bool {
-    budget > 0 && stdout.len() + stderr.len() > budget
+    budget > 0 && stdout.len() + stderr.len() > budget + MIN_SAVING
 }
 
 /// Both streams as one buffer, the way `wait.logs` pages it.
@@ -63,7 +71,8 @@ fn fit(text: &str, room: usize, base: u64, job: &str, hints: &str) -> String {
     if text.len() <= room {
         return text.to_string();
     }
-    let half = room / 2;
+    let error_room = room / 8;
+    let half = room.saturating_sub(error_room + MARKER_ROOM) / 2;
     let head_end = line_end_before(text, half);
     let tail_start = line_start_after(text, text.len() - half).max(head_end);
     let middle = &text[head_end..tail_start];
@@ -77,11 +86,16 @@ fn fit(text: &str, room: usize, base: u64, job: &str, hints: &str) -> String {
         middle.lines().count(),
         base + head_end as u64,
     );
+    let mut spent = 0;
     let errors: Vec<String> = middle
         .lines()
         .filter(|l| looks_like_an_error(l))
         .take(ERROR_LINES)
-        .map(|l| l.chars().take(ERROR_LINE_CHARS).collect())
+        .map(|l| l.chars().take(ERROR_LINE_CHARS).collect::<String>())
+        .take_while(|l| {
+            spent += l.len() + 1;
+            spent <= error_room
+        })
         .collect();
     if !errors.is_empty() {
         marker.push_str("Error lines from the omitted part:\n");
@@ -145,8 +159,8 @@ mod tests {
     /// **Under budget, nothing changes** — and a budget of 0 means no budget at all.
     #[test]
     fn an_answer_within_the_budget_is_left_alone() {
-        assert!(!over("abc", "de", 5));
-        assert!(over("abc", "def", 5));
+        assert!(!over(&"x".repeat(9_999), "", 8_000), "saving under MIN_SAVING");
+        assert!(over(&"x".repeat(9_000), &"y".repeat(1_001), 8_000));
         assert!(!over(&"x".repeat(100_000), "", 0));
         assert_eq!(fit("short\n", 100, 0, "b1", ""), "short\n");
     }
@@ -156,15 +170,16 @@ mod tests {
     #[test]
     fn a_long_answer_keeps_its_head_and_tail_and_says_where_the_rest_is() {
         let text = lines(1000, 9); // 10 bytes a line
-        let out = fit(&text, 1000, 0, "b7", "");
+                                   // (2000 - 2000/8 - MARKER_ROOM) / 2 = 725, which the line boundary brings to 720.
+        let out = fit(&text, 2000, 0, "b7", "");
         let (head, rest) = out.split_once('…').unwrap();
-        assert_eq!(head, &text[..500]);
-        assert!(out.ends_with(&text[text.len() - 500..]));
+        assert_eq!(head, &text[..720]);
+        assert!(out.ends_with(&text[text.len() - 720..]));
         assert!(
-            rest.starts_with(" 9000 bytes (900 lines) omitted. wait.logs job=\"b7\" offset=500 ")
+            rest.starts_with(" 8560 bytes (856 lines) omitted. wait.logs job=\"b7\" offset=720 ")
         );
         // The offset is where the omitted part starts in the recorded output.
-        assert!(text[500..].starts_with("000000050\n"));
+        assert!(text[720..].starts_with("000000072\n"));
     }
 
     /// An error in the middle is carried after the marker; a clean middle adds nothing.
@@ -179,12 +194,25 @@ mod tests {
         assert!(!fit(&lines(500, 9), 1000, 0, "b1", "").contains("Error lines"));
     }
 
+    /// **The answer stays within the budget**, carried error lines and hints included — a measured
+    /// `git show` came back at 8,957 bytes on a budget of 8,000.
+    #[test]
+    fn carried_errors_and_hints_are_paid_for_out_of_the_budget() {
+        let text: String =
+            (0..2000).map(|i| format!("error[E{i:04}]: something went wrong here\n")).collect();
+        for room in [1_000, 8_000] {
+            let out = fit(&text, room, 0, "b12", &hints("git diff; grep x; cat y"));
+            assert!(out.len() <= room, "{} bytes on a budget of {room}", out.len());
+            assert!(out.contains("Error lines from the omitted part:"));
+        }
+    }
+
     /// Each stream gets its share, and stderr's offset counts stdout and the separator before it.
     #[test]
     fn both_streams_share_the_budget_and_stderr_points_past_stdout() {
         let stdout = lines(300, 9);
         let stderr = lines(100, 9);
-        let (out, err) = shape(&stdout, &stderr, 800, "b2", "cargo build");
+        let (out, err) = shape(&stdout, &stderr, 2_000, "b2", "cargo build");
         assert!(out.len() < stdout.len() && err.len() < stderr.len());
         let base = stdout.len() + STDERR_SEPARATOR.len();
         let full = full_output(&stdout, &stderr);
