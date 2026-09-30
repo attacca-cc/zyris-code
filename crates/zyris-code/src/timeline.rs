@@ -291,6 +291,17 @@ impl Timeline {
         self.push_said(Voice::Echo, text.into());
     }
 
+    /// Takes back the **newest** echo carrying these words — a send that failed.
+    ///
+    /// Newest, because the failed one is the one just echoed; an older echo of the same words is
+    /// a message that did go out and is still waiting on its server copy.
+    pub fn take_back(&mut self, text: &str) {
+        if let Some(at) = self.said.iter().rposition(|s| s.voice == Voice::Echo && s.text == text) {
+            self.said.remove(at);
+            self.dirty = true;
+        }
+    }
+
     /// The one place a locally-made item is born. **Both voices go through it** — the anchor rule
     /// and the seq allocation must not exist in two copies.
     fn push_said(&mut self, voice: Voice, text: String) {

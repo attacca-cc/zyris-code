@@ -749,6 +749,7 @@ fn the_device_code_reaches_the_github_screen_as_a_frame() {
         &Action::Frame(AppFrame::Github(GithubNews::Code {
             code: "WXQR-7KBD".into(),
             uri: "https://github.com/login/device".into(),
+            role: zyris_code::github::auth::Role::User,
         })),
     );
     let screen = dump(&mut s, 80, 24);
@@ -1405,6 +1406,8 @@ fn choosing_then_submitting_fills_the_answer_and_marks_it_for_sending() {
     use zyris_code::question::{Act, RowKind};
 
     let mut s = State::new();
+    // Attached: with nowhere to send it, an answer is held rather than handed over.
+    s.connected = true;
     apply(&mut s, &Action::Frame(question_event(1, serde_json::Value::Null)));
 
     let press = |s: &mut State, code| {
@@ -1439,13 +1442,10 @@ fn choosing_then_submitting_fills_the_answer_and_marks_it_for_sending() {
     press(&mut s, KeyCode::Enter);
 
     assert!(s.asking.is_none(), "submitting closes the question");
-    assert!(s.submit_now, "the send-now flag must be set");
-    assert!(
-        s.input.text.contains("어느 쪽으로 갈까요?"),
-        "the question must be carried: {}",
-        s.input.text
-    );
-    assert!(s.input.text.contains("B안"), "{}", s.input.text);
+    let answer = s.outbox.clone().expect("the answer must be handed over to send");
+    assert!(answer.contains("어느 쪽으로 갈까요?"), "the question must be carried: {answer}");
+    assert!(answer.contains("B안"), "{answer}");
+    assert!(s.input.text.is_empty(), "the answer went through the draft: {}", s.input.text);
 }
 
 /// The submit row is always at the bottom, and the question UI is drawn in the input box's place.
@@ -2301,6 +2301,10 @@ fn the_enroll_window_shows_the_code_and_the_address() {
         "주소가 안 보인다:\n{screen}"
     );
     assert!(screen.contains("Connect to Attacca"), "no title:\n{screen}");
+    // Nothing attached yet: the window is the whole app, and Esc quits it (C28).
+    assert!(screen.contains("Esc quit"), "no hint for the closing key:\n{screen}");
+    s.connected = true;
+    let screen = dump(&mut s, 80, 24);
     assert!(screen.contains("Esc close"), "no hint for the closing key:\n{screen}");
 }
 
@@ -2801,4 +2805,15 @@ fn a_screen_with_no_room_is_drawn_without_panicking() {
         // The point is that it returns at all; what it drew in nought cells is not a question.
         let _ = dump(&mut state, w, h);
     }
+}
+
+/// **What has the keys is what is on top.** A panel was drawn last, over the enrolment window —
+/// which has the keys first — so Esc dismissed a code nobody had seen (C7).
+#[test]
+fn the_enroll_window_is_drawn_over_an_open_panel() {
+    let mut s = State::new();
+    s.panel = Some(zyris_code::panel::mode(s.lang, s.mode, None));
+    apply(&mut s, &Action::Frame(AppFrame::Enroll(enroll_view())));
+    let screen = dump(&mut s, 80, 30);
+    assert!(screen.contains("WXQR-7KBD"), "the code is under the panel:\n{screen}");
 }

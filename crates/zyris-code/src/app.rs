@@ -138,8 +138,15 @@ pub enum Frame {
         id: String,
         status: crate::picker::ThreadStatus,
     },
-    /// A list could not be fetched. The list closes and the reason is said once.
-    PickerFailed(String),
+    /// A list could not be fetched — `for_list` names which one, `None` for a thread's history.
+    ///
+    /// **Named, because it lands whenever it lands.** It used to close whatever list was up and
+    /// say so in red, so a refresh failing a second after the person moved on shut the history
+    /// search or the file list they had moved on to.
+    PickerFailed {
+        why: String,
+        for_list: Option<crate::picker::Level>,
+    },
     /// News from the GitHub sign-in, which runs **off the loop**.
     ///
     /// Device flow is a wait: ask for a code, then poll until somebody approves it in a browser,
@@ -176,6 +183,12 @@ pub enum Frame {
     /// not come up, authentication dropping and re-enrollment starting, and the like).
     /// Fades on its own after `STATUS_WINDOW`.
     Notice(String),
+    /// Something went wrong that nobody's keystroke caused — an MCP server that did not start.
+    /// **Painted as an error**, where `Notice` would read like "connected".
+    Problem(String),
+    /// The stop Esc asked for did not reach the server, and why. **The turn is still running**, so
+    /// the line stops saying it is stopping.
+    StopFailed(String),
     /// An enrollment code was issued. **From this moment the screen owns showing the code** —
     /// the upstream stdout box goes quiet (`enroll::ScreenEnroll`).
     Enroll(EnrollView),
@@ -424,7 +437,7 @@ pub struct State {
     pub quit_armed_at: Option<Instant>,
     /// Set by `/quit`. The I/O side sees it and breaks out of the loop.
     ///
-    /// `apply` is pure, so it cannot quit here — same trick as `submit_now`/`flush_queue`.
+    /// `apply` is pure, so it cannot quit here — same trick as `outbox`/`flush_queue`.
     pub quitting: bool,
     /// The newest release, once the check has answered. `/update` uses it rather than asking
     /// again — the answer does not change between one keystroke and the next.
@@ -548,6 +561,9 @@ pub struct State {
     /// A question lands here on its own when it arrives — the turn is blocked waiting for
     /// the answer, so the user should not have to open it separately.
     pub asking: Option<(i64, crate::question::Answering)>,
+    /// The question last put away with Esc, so its own frame coming round again does not put it
+    /// back up. An answer can just as well be a plain message.
+    pub dismissed_question: Option<i64>,
     /// The plan waiting to be approved, if one is. **Not in `asking`** — a question replaces the
     /// input because answering it *is* the message, while a plan is decided by an ordinary message
     /// and the draft has to stay reachable to say what to change.
@@ -563,9 +579,15 @@ pub struct State {
     /// Which screen row the activity line was drawn on. Clicking it opens the todo list, and
     /// `apply` is pure — so the drawing side writes it down here, the way `view_total` is.
     pub activity_row: Option<u16>,
-    /// Should the answer filled in by submitting the question be sent right away? The I/O
-    /// side sees it and clears it.
-    pub submit_now: bool,
+    /// A message `apply` has decided goes out now. The I/O side takes it right after `apply` and
+    /// sends it.
+    ///
+    /// **Every way a message leaves ends here** — Enter in the input, a question card's answer, a
+    /// plugin command's prompt. The I/O side used to decide for itself whether a `Submit` went out,
+    /// by rules of its own, and when `apply` stopped holding messages typed mid-turn the loop kept
+    /// skipping them: the line was echoed as sent and never reached the server. One field that
+    /// `apply` fills is one decision, made once.
+    pub outbox: Option<String>,
     /// The slash commands the plugins add (`plugin::commands`). **Read once at startup** — they
     /// are files on disk, and re-reading them per keystroke would put disk access in the draw loop.
     pub plugin_commands: Vec<crate::plugin::PluginCommand>,
@@ -658,7 +680,7 @@ pub struct State {
     pub session_id: Option<String>,
     pub jobs: Vec<JobRow>,
     /// A slash command the user typed. `run()` picks it up and runs it — same trick as
-    /// `submit_now`.
+    /// `outbox`.
     pub command_out: Option<String>,
     /// The enrollment code window. **It lands here on its own when re-enrollment starts.**
     ///
@@ -711,6 +733,12 @@ pub struct State {
     /// Without it the deliberate reconnect reports itself in red as "the connection was lost" —
     /// true, but it reads as something having gone wrong when it is the thing that was asked for.
     pub reconnecting: bool,
+    /// Why the connection last dropped, while it is still down.
+    ///
+    /// **"Connecting…" with no reason, for minutes, is the whole of what a person used to see.**
+    /// The reason went by once as a six-second notice and then lived only in the log; kept here,
+    /// the activity line goes on saying it until the connection is back.
+    pub dropped_because: Option<String>,
     /// Raised when the settings changed and the disk and the gate have yet to hear about it.
     ///
     /// **`apply` is pure, so it cannot save.** The I/O loop takes this down the same way it
@@ -803,11 +831,12 @@ impl Default for State {
             click_flipped: None,
             screen: Vec::new(),
             asking: None,
+            dismissed_question: None,
             plan: None,
             plan_decided: false,
             ask_area: None,
             activity_row: None,
-            submit_now: false,
+            outbox: None,
             plugin_commands: Vec::new(),
             picker: None,
             thread_status: std::collections::HashMap::new(),
@@ -844,6 +873,7 @@ impl Default for State {
             lang: crate::lang::current(),
             config: crate::config::Config::default(),
             reconnecting: false,
+            dropped_because: None,
             config_out: false,
             files: Vec::new(),
             files_wanted: false,
@@ -1006,6 +1036,43 @@ impl State {
     pub fn remember_sent(&mut self, text: &str) {
         if self.sent.last().map(String::as_str) != Some(text) {
             self.sent.push(text.to_string());
+        }
+    }
+
+    /// Sends `text`: on screen now and into `outbox` for the I/O side — or, with nowhere to send
+    /// it, held in `queued` until there is.
+    ///
+    /// **Held too while a thread's history is on its way.** The session has already moved, but
+    /// the screen and `last_cursor` are still the old thread's: sent now, the echo is wiped when
+    /// the history lands and the stream opens at the wrong place. It goes out as the history
+    /// lands (`Frame::History`).
+    fn post(&mut self, text: String) {
+        if !self.connected || self.loading_history {
+            self.queued.push(text);
+            return;
+        }
+        self.timeline.echo(text.as_str());
+        self.outbox = Some(text);
+    }
+
+    /// A message that did not go out. **It comes back into the draft and its echo comes off the
+    /// conversation**, so nothing on screen reads as delivered and nothing has to be retyped.
+    ///
+    /// The draft may have been started again while the send was out; it is kept, after the text
+    /// that came back, rather than overwritten.
+    pub fn unsend(&mut self, text: &str, why: String) {
+        self.timeline.take_back(text);
+        self.give_back(text);
+        self.set_error(why);
+    }
+
+    /// Puts text that did not go out back at the front of the draft, keeping what is already there.
+    fn give_back(&mut self, text: &str) {
+        let draft = self.input.take();
+        self.input.insert_str(text);
+        if !draft.is_empty() {
+            self.input.insert_str("\n");
+            self.input.insert_str(&draft);
         }
     }
 
@@ -1275,7 +1342,10 @@ impl State {
 pub enum GithubNews {
     /// A code to approve, and where. **Shown the moment it arrives** — it is the only thing the
     /// person can act on, and it is worthless after it expires.
-    Code { code: String, uri: String },
+    ///
+    /// **Which account it is for travels with it**, because the reviewer's code comes with a
+    /// warning the person's does not: approve it in a logged-out window.
+    Code { code: String, uri: String, role: crate::github::auth::Role },
     /// It finished, one way or the other. The screen says so and re-reads who is connected.
     Settled { note: String, worked: bool },
     /// Where a long set-up has got to. **Not `Settled`** — the screen must stay busy, because the
@@ -1636,39 +1706,48 @@ pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
                 _ => vec![],
             };
         }
-        return match key.code {
-            KeyCode::Up => vec![Action::PickUp],
-            KeyCode::Down => vec![Action::PickDown],
-            KeyCode::Char('k') if !typing => vec![Action::PickUp],
-            KeyCode::Char('j') if !typing => vec![Action::PickDown],
-            // **Del asks; it does not delete.** In the lists that are typed into it stays a plain
-            // editing key, so the draft keeps it.
-            KeyCode::Delete if !typing => vec![Action::PickDelete],
-            // **A fully typed command must run on the first Enter.** If Enter only ever
-            // meant "pick" because the list is up, typing `/rules` to the end and pressing
-            // it would just rewrite the same text into the input and do nothing — this
-            // actually happened.
-            KeyCode::Enter if typing && typed_a_whole_command(state) => {
-                vec![Action::Submit(state.input.text.trim().to_string())]
+        // **A list that is typed into keeps only the list's keys.** ↑↓ walk it, Enter takes a row,
+        // Esc puts it away and Tab opens the note; every other key is the draft's, exactly as
+        // with no list up — it used to be that only characters, Backspace and ←→ got through, so
+        // Delete, Home, End and the Ctrl editing keys did nothing on a line that began with `/` or
+        // held an open `@`.
+        if typing {
+            let plain_enter = key.code == KeyCode::Enter && !alt && !shift;
+            match key.code {
+                KeyCode::Up => return vec![Action::PickUp],
+                KeyCode::Down => return vec![Action::PickDown],
+                // **A fully typed command must run on the first Enter.** If Enter only ever
+                // meant "pick" because the list is up, typing `/rules` to the end and pressing
+                // it would just rewrite the same text into the input and do nothing — this
+                // actually happened.
+                KeyCode::Enter if plain_enter && typed_a_whole_command(state) => {
+                    return vec![Action::Submit(state.input.text.trim().to_string())];
+                }
+                KeyCode::Enter if plain_enter => return vec![Action::PickConfirm],
+                KeyCode::Esc => return vec![Action::PickBack],
+                // **`Tab` opens the note under the list** — see the arm below.
+                KeyCode::Tab => return vec![Action::PickExpand],
+                _ => {}
             }
-            KeyCode::Enter => vec![Action::PickConfirm],
-            KeyCode::Char(c) if typing && !ctrl => vec![Action::Insert(c)],
-            KeyCode::Backspace if typing => vec![Action::Backspace],
-            // ← is back. At the project level there is nothing behind, so it closes.
-            // In the command list ← moves the cursor, so only Esc closes.
-            KeyCode::Left if !typing => vec![Action::PickBack],
-            KeyCode::Esc => vec![Action::PickBack],
-            KeyCode::Left if typing => vec![Action::Left],
-            KeyCode::Right if typing => vec![Action::Right],
-            // **`Tab` opens the note under the list.** It is held to one line, so an ordinary list
-            // does not pay — on every row — for the longest description it happens to carry; the
-            // key shows that description whole (`Action::PickExpand`). **Nothing else claims `Tab`
-            // while a list is up**: the forms and the question card are handled above this and
-            // never reach here.
-            KeyCode::Tab => vec![Action::PickExpand],
-            // → does nothing. Enter is the only way to confirm.
-            _ => vec![],
-        };
+        } else {
+            return match key.code {
+                KeyCode::Up | KeyCode::Char('k') => vec![Action::PickUp],
+                KeyCode::Down | KeyCode::Char('j') => vec![Action::PickDown],
+                // **Del asks; it does not delete.**
+                KeyCode::Delete => vec![Action::PickDelete],
+                KeyCode::Enter => vec![Action::PickConfirm],
+                // ← is back. At the project level there is nothing behind, so it closes.
+                KeyCode::Left | KeyCode::Esc => vec![Action::PickBack],
+                // **`Tab` opens the note under the list.** It is held to one line, so an ordinary
+                // list does not pay — on every row — for the longest description it happens to
+                // carry; the key shows that description whole (`Action::PickExpand`). **Nothing
+                // else claims `Tab` while a list is up**: the forms and the question card are
+                // handled above this and never reach here.
+                KeyCode::Tab => vec![Action::PickExpand],
+                // → does nothing. Enter is the only way to confirm.
+                _ => vec![],
+            };
+        }
     }
 
     match key.code {
@@ -1751,12 +1830,15 @@ pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
             vec![Action::RecallOlder]
         }
         KeyCode::Char('n') if ctrl && state.recalling() => vec![Action::RecallNewer],
-        // With a selection up, Esc clears it. This comes before cancelling a running turn —
-        // what is in front of you comes first.
-        KeyCode::Esc if state.selection.is_some() => vec![Action::ClearSelection],
         // **The one key that stops a turn.** Ctrl+C is the way out of the app (2026-09-15),
         // so there is no second key here to be pressed by mistake.
+        //
+        // **Before the highlight.** A selection outlives the mouse button, so one made while
+        // reading the answer turned the stop key into two presses, the first of them silent.
+        // Stopping drops the highlight as any other key does (`apply`).
         KeyCode::Esc if state.running => vec![Action::Cancel],
+        // With a selection up and nothing to stop, Esc clears it.
+        KeyCode::Esc if state.selection.is_some() => vec![Action::ClearSelection],
         // **Shift+Enter and Alt+Enter are newlines.** With the kitty keyboard protocol on
         // (`PushKeyboardEnhancementFlags` in `run()` below) Shift+Enter arrives separately as
         // Enter+SHIFT. Alt+Enter (ESC+\r) is the fallback for terminals without the
@@ -1772,7 +1854,9 @@ pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
         KeyCode::Enter if state.plan.is_some() && state.input.text.trim().is_empty() => {
             vec![Action::Submit(state.lang.plan_approved().to_string())]
         }
-        KeyCode::Enter if !state.input.text.is_empty() => {
+        // **Blank is empty.** A space or a stray Shift+Enter sent a message of nothing — a turn
+        // spent on it — while the arm above already read the same draft as empty.
+        KeyCode::Enter if !state.input.text.trim().is_empty() => {
             vec![Action::Submit(state.input.text.clone())]
         }
         KeyCode::Backspace => vec![Action::Backspace],
@@ -1828,12 +1912,23 @@ pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
 /// Keys for the question screen. While typing free text, characters go to the input.
 fn ask_key(a: &crate::question::Answering, key: KeyEvent, ctrl: bool) -> Vec<Action> {
     if a.typing {
+        // **The same editing keys as every other field.** Delete, Home, End and the Ctrl keys
+        // were dead here, in the one field whose text is sent the moment it is confirmed.
         return match key.code {
             KeyCode::Enter => vec![Action::AskConfirm],
             KeyCode::Esc => vec![Action::AskCancel],
             KeyCode::Backspace => vec![Action::Backspace],
+            KeyCode::Delete => vec![Action::Delete],
             KeyCode::Left => vec![Action::Left],
             KeyCode::Right => vec![Action::Right],
+            KeyCode::Home => vec![Action::Home],
+            KeyCode::End => vec![Action::End],
+            KeyCode::Char('u') if ctrl => vec![Action::KillToStart],
+            KeyCode::Char('k') if ctrl => vec![Action::KillToEnd],
+            KeyCode::Char('w') if ctrl => vec![Action::DeleteWord],
+            KeyCode::Char('y') if ctrl => vec![Action::Yank],
+            KeyCode::Char('a') if ctrl => vec![Action::Home],
+            KeyCode::Char('e') if ctrl => vec![Action::End],
             KeyCode::Char(c) if !ctrl => vec![Action::Insert(c)],
             _ => vec![],
         };
@@ -1872,6 +1967,8 @@ fn enter_becomes_newline(state: &State, key: &KeyEvent, in_burst: bool) -> bool 
     }
     state.enroll.is_none()
         && state.new_project.is_none()
+        && state.github_form.is_none()
+        && state.panel.is_none()
         && state.picker.is_none()
         && !state.input.text.is_empty()
 }
@@ -1893,6 +1990,23 @@ pub fn apply(state: &mut State, action: &Action) {
         && matches!(action, Action::Submit(_) | Action::OpenPicker | Action::OpenHistory)
     {
         return;
+    }
+
+    // **An armed quit is for the very next key.** Ctrl+C, a few keystrokes, Ctrl+C inside the
+    // window used to quit — the shell habit of Ctrl+C to drop a half-typed line, twice, is exactly
+    // that. Only a key disarms it: frames and the pointer moving are not somebody changing their
+    // mind.
+    if !matches!(
+        action,
+        Action::ArmQuit
+            | Action::Quit
+            | Action::Frame(_)
+            | Action::Wheel(_)
+            | Action::DragTo(..)
+            | Action::Release
+            | Action::Repaint
+    ) {
+        state.quit_armed_at = None;
     }
 
     // Editing a character leaves the recall right away. Otherwise one ↓ loses the edit —
@@ -1946,9 +2060,18 @@ pub fn apply(state: &mut State, action: &Action) {
         state.selection = None;
     }
 
+    // **A form applies only what was routed to it.** `on_key` gives the enrolment window and the
+    // question card the keys before any form, and every form branch below ends in `return` — so
+    // without this the card's keys and the window's Esc were swallowed by a form nobody was typing
+    // into, and a question arriving over one wedged the screen. Ctrl+C is let through everywhere
+    // (`on_key`), so its arming is too; a frame is the server's news, never a keystroke.
+    let forms_have_it = state.enroll.is_none()
+        && state.asking.is_none()
+        && !matches!(action, Action::Frame(_) | Action::ArmQuit | Action::Quit);
+
     // **With the GitHub screen open, keys belong to it.** Only the reviewer row takes text — the
     // person's row is a button, so a keystroke there is not swallowed into an invisible field.
-    if let Some(form) = state.github_form.as_mut().filter(|_| !matches!(action, Action::Frame(_))) {
+    if let Some(form) = state.github_form.as_mut().filter(|_| forms_have_it) {
         match action {
             Action::Insert(c) => {
                 if let Some(field) = form.typing() {
@@ -2030,7 +2153,7 @@ pub fn apply(state: &mut State, action: &Action) {
     // below: a form is a place for keys, not for the server's news, and swallowing frames while one
     // is open would lose timeline events.
     if state.panel.as_ref().is_some_and(|p| p.manager.as_ref().is_some_and(|m| m.form.is_some()))
-        && !matches!(action, Action::Frame(_))
+        && forms_have_it
     {
         let mut handled = true;
         match action {
@@ -2102,7 +2225,7 @@ pub fn apply(state: &mut State, action: &Action) {
         }
     }
 
-    if state.new_project.is_some() && !matches!(action, Action::Frame(_)) {
+    if state.new_project.is_some() && forms_have_it {
         match action {
             Action::Insert(c) => {
                 state.new_project.as_mut().expect("just checked it").active().insert(*c)
@@ -2139,6 +2262,27 @@ pub fn apply(state: &mut State, action: &Action) {
     match action {
         Action::Insert(c) => state.editor().insert(*c),
         Action::Paste(text) => {
+            // **A paste goes where a key would have gone.** It does not pass through `on_key`, so
+            // it used to land in the draft whatever was up — behind a history search it was meant
+            // for, invisible, and sent with the next Enter.
+            let typing_answer = state.asking.as_ref().is_some_and(|(_, a)| a.typing);
+            let level = state.picker.as_ref().map(|p| &p.level);
+            if let Some(crate::picker::Level::History { query }) = level {
+                let query = format!("{query}{}", text.replace('\n', " "));
+                state.picker = Some(crate::picker::Picker::history(&state.sent, &query));
+                return;
+            }
+            let list_of_its_own = level.is_some_and(|l| {
+                !matches!(l, crate::picker::Level::Commands | crate::picker::Level::Files { .. })
+            });
+            if !typing_answer
+                && (state.enroll.is_some()
+                    || state.asking.is_some()
+                    || state.panel.is_some()
+                    || list_of_its_own)
+            {
+                return;
+            }
             // Newlines inside go in verbatim. The slash command list does not open — a
             // paste must not change the mode. The matches! above releases the recall.
             state.editor().insert_str(text);
@@ -2188,17 +2332,21 @@ pub fn apply(state: &mut State, action: &Action) {
         Action::Right => state.editor().right(),
         Action::WordLeft => state.editor().word_left(),
         Action::WordRight => state.editor().word_right(),
-        Action::Home => state.input.home(),
-        Action::End => state.input.end(),
+        Action::Home => state.editor().home(),
+        Action::End => state.editor().end(),
         Action::Submit(text) => {
             state.input.take();
             state.recall = None;
             // Once sent, the list has done its job. Left open it keeps covering the screen.
             state.picker = None;
+            // **`//` is the way to send a line that starts with a slash word** — `//tmp is full`
+            // goes out as `/tmp is full`. Without it such a message could not be sent at all.
+            let literal = crate::command::literal(text).map(str::to_string);
+            let text = literal.as_ref().unwrap_or(text);
             // **Slash commands never reach the server.** One typo must not spend credits,
             // and there is no reason to queue them just because a turn is running —
             // changing the mode or looking at a list is not something to wait a turn for.
-            if crate::command::is_command(text) {
+            if literal.is_none() && crate::command::is_command(text) {
                 state.remember_sent(text);
                 state.command_out = Some(text.clone());
                 return;
@@ -2207,8 +2355,9 @@ pub fn apply(state: &mut State, action: &Action) {
             // running goes out at once: attacca takes it and carries it to the next turn, so
             // holding it here only meant the server never saw it, it died with the app, and it
             // never appeared in the session's history. What is left for the hold is a window with
-            // no live connection — sending then would lose the message outright.
-            if !state.connected {
+            // no live connection — sending then would lose the message outright — and a thread
+            // still loading (`State::post`).
+            if !state.connected || state.loading_history {
                 state.queued.push(text.clone());
                 return;
             }
@@ -2229,7 +2378,7 @@ pub fn apply(state: &mut State, action: &Action) {
             // **One arm covers all four modes** — the mode is consulted later, in
             // `Session::open_for`. It sits below both early returns on purpose: slash commands
             // never reach the conversation, and a held message is echoed when it really goes out.
-            state.timeline.echo(text.as_str());
+            state.post(text.clone());
             state.remember_sent(text);
         }
         Action::Wheel(notches) => {
@@ -2242,6 +2391,11 @@ pub fn apply(state: &mut State, action: &Action) {
                 } else {
                     p.scroll_down((-(*notches)) as usize);
                 }
+                return;
+            }
+            // **Nor under anything else laid over it.** The conversation moving behind a list or
+            // a window is a place lost for nothing anyone could see.
+            if covered(state) {
                 return;
             }
             let (total, height) = (state.view_total, state.view_height);
@@ -2279,8 +2433,11 @@ pub fn apply(state: &mut State, action: &Action) {
             }
         }
         Action::Press(x, y) | Action::ActivatingPress(x, y) => {
-            // Pressing on the question screen picks that row.
-            if let (Some(area), Some((_, a))) = (state.ask_area, state.asking.as_ref()) {
+            // Pressing on the question screen picks that row. **Not the press that focused the
+            // window** — nobody aimed it, and a row here can be Submit or Reject.
+            let aimed = matches!(action, Action::Press(..));
+            if let (Some(area), Some((_, a)), true) = (state.ask_area, state.asking.as_ref(), aimed)
+            {
                 if *y >= area.y && *y < area.y + area.height {
                     if let Some(i) = crate::widgets::ask_row_at(a, area, *y, state.lang) {
                         if let Some((_, a)) = &mut state.asking {
@@ -2372,7 +2529,11 @@ pub fn apply(state: &mut State, action: &Action) {
             let Some(drag) = state.drag else { return };
             // **Not every press is allowed to become a click.** The one that came with the click
             // that focused this window is a drag and nothing else (see `Action::ActivatingPress`).
-            if drag.is_click() && !state.press_cannot_click {
+            // **A click on something laid over the conversation is not a click on it.** The rows
+            // and the activity line underneath are hidden, and folding one of them is a change
+            // nobody could see being made. The drag itself still stands: everything on screen,
+            // the enrolment code included, is there to be copied.
+            if drag.is_click() && !state.press_cannot_click && !covered(state) {
                 // **A click on the activity line opens or folds the todo list.** Only when there
                 // is one to show — on every other line that row is ordinary text, and taking the
                 // click would cost the ability to select it.
@@ -2431,24 +2592,23 @@ pub fn apply(state: &mut State, action: &Action) {
                 Some(RowKind::Action(Act::Next)) | Some(RowKind::Action(Act::Skip)) => a.advance(),
                 Some(RowKind::Action(Act::Edit)) => a.to_edit(),
                 // Say we will not answer. Closing quietly leaves the other side waiting.
+                //
+                // **The answer goes out on its own; the draft is left alone.** It used to be put
+                // into the input and sent from there, which replaced whatever the person had been
+                // typing when the question arrived — and sent nothing of it.
                 Some(RowKind::Action(Act::Reject)) => {
                     state.asking = None;
-                    state.input = Input::new();
-                    state.input.insert_str(state.lang.question_refused());
-                    state.submit_now = true;
+                    state.post(state.lang.question_refused().to_string());
                 }
-                // Submitting is immediate. Put the answer in the input and the I/O side
-                // sends it as-is.
+                // Submitting is immediate.
                 Some(RowKind::Action(Act::Submit)) => {
                     if let Some((_, a)) = state.asking.take() {
-                        state.input = Input::new();
                         let text = a.answer_text(state.lang);
-                        state.input.insert_str(if text.is_empty() {
-                            state.lang.all_skipped()
+                        state.post(if text.is_empty() {
+                            state.lang.all_skipped().to_string()
                         } else {
-                            &text
+                            text
                         });
-                        state.submit_now = true;
                     }
                 }
                 None => {}
@@ -2457,14 +2617,22 @@ pub fn apply(state: &mut State, action: &Action) {
         Action::AskCancel => {
             // While typing, only stop the typing. Otherwise put the question away — an
             // answer can just be a plain message too.
+            //
+            // **Past the first question, Esc goes back one.** It used to put the card away from
+            // any step, and every answer given on the steps before went with it.
             let typing = state.asking.as_ref().is_some_and(|(_, a)| a.typing);
+            let deeper = state.asking.as_ref().is_some_and(|(_, a)| a.step > 0 || a.in_review());
             if typing {
                 if let Some((_, a)) = &mut state.asking {
                     a.typing = false;
                     a.input = Input::new();
                 }
-            } else {
-                state.asking = None;
+            } else if deeper {
+                if let Some((_, a)) = &mut state.asking {
+                    a.back();
+                }
+            } else if let Some((seq, _)) = state.asking.take() {
+                state.dismissed_question = Some(seq);
             }
         }
         Action::ClearSelection => {
@@ -2818,8 +2986,8 @@ pub fn apply(state: &mut State, action: &Action) {
                     state.input.text = text.clone();
                     state.input.end();
                 }
-                // Past the bottom the recall ends. It amounts to coming back to where the
-                // typing was.
+                // Past the bottom the recall ends and the draft is empty again — which is where
+                // the typing was, since recall only starts on an empty draft.
                 None => {
                     state.recall = None;
                     state.input.take();
@@ -2903,6 +3071,13 @@ fn apply_frame(state: &mut State, frame: &Frame) {
                     if state.plan.as_ref().is_some_and(|p| p.seq == plan.seq) {
                         state.plan = None;
                     }
+                    // **A thread whose plan was agreed is working to it.** Leaving a thread takes
+                    // the decision down with it (`leave_session`), so coming back is where it is
+                    // read again — from the thread, which is where it was made. A newer plan still
+                    // waiting outranks it, and keeps the fence up.
+                    if state.plan.is_none() {
+                        state.plan_decided = true;
+                    }
                 } else if state.plan.as_ref().is_none_or(|p| p.seq < plan.seq) {
                     // **A fresh plan is undecided again.** The agent revising and submitting anew is
                     // how a plan mode loop goes round, and the gate has to close behind it.
@@ -2945,7 +3120,13 @@ fn apply_frame(state: &mut State, frame: &Frame) {
                     if state.asking.as_ref().is_some_and(|(q, _)| *q == entry.seq) {
                         state.asking = None;
                     }
-                } else if state.asking.as_ref().is_none_or(|(q, _)| *q < entry.seq) {
+                } else if state.asking.as_ref().is_none_or(|(q, _)| *q < entry.seq)
+                    // **Put away stays away.** The server updates a question in place when its
+                    // wait runs out, and that frame reopened the card the person had just
+                    // dismissed — taking the keys aimed at the draft. Reopening the thread
+                    // brings it back (`clear_conversation`).
+                    && state.dismissed_question != Some(entry.seq)
+                {
                     state.asking =
                         Some((entry.seq, crate::question::Answering::new(steps.clone())));
                 }
@@ -2962,7 +3143,7 @@ fn apply_frame(state: &mut State, frame: &Frame) {
         Frame::Status { running } => {
             // **The end of a turn is when the queue gets flushed.** Sending is I/O and
             // cannot happen here — only raise the flag and `run` picks it up. Same trick as
-            // `submit_now`.
+            // `outbox`.
             if state.running && !*running && !state.queued.is_empty() {
                 state.flush_queue = true;
             }
@@ -3034,6 +3215,17 @@ fn apply_frame(state: &mut State, frame: &Frame) {
         }
         Frame::Files(paths) => {
             state.files = paths.clone();
+            // **A walk that found nothing closes the box it was loading into.** Empty is also how
+            // "not walked yet" reads, so passing it on put "loading" straight back up, for ever.
+            if paths.is_empty() {
+                if matches!(
+                    state.picker.as_ref().map(|p| &p.level),
+                    Some(crate::picker::Level::Files { .. })
+                ) {
+                    state.picker = None;
+                }
+                return;
+            }
             // **Only fill in the list if it is still the one waiting.** The walk takes as long as
             // it takes, and by the time it lands the person may have dismissed it with `Esc` —
             // which leaves the `@…` sitting in the draft, so the reference alone cannot say
@@ -3050,15 +3242,27 @@ fn apply_frame(state: &mut State, frame: &Frame) {
         //
         // **It is dropped if the list has moved on.** A slow project list arriving after the
         // person already went into a project would throw them back out.
+        //
+        // **The same list means the same project**, not merely a thread list: another project's
+        // slow answer landing on this one put its threads under this project's name.
         Frame::Picker { picker, thread_was_running } => {
-            let same = state.picker.as_ref().is_some_and(|cur| {
-                std::mem::discriminant(&cur.level) == std::mem::discriminant(&picker.level)
-            });
+            let same =
+                state.picker.as_ref().is_some_and(|cur| same_list(&cur.level, &picker.level));
             if same {
-                let (cursor, top) =
-                    state.picker.as_ref().map(|cur| (cur.cursor, cur.top)).unwrap_or((0, 0));
+                let (cursor, top, on) = state
+                    .picker
+                    .as_ref()
+                    .map(|cur| {
+                        (cur.cursor, cur.top, cur.rows.get(cur.cursor).and_then(|r| r.id.clone()))
+                    })
+                    .unwrap_or((0, 0, None));
                 let mut p = picker.clone();
-                p.cursor = cursor.min(p.rows.len().saturating_sub(1));
+                // **The cursor stays on the row, not on the number.** A refresh that reorders
+                // the threads moved an index-kept cursor onto a different one, and Enter then
+                // opened a thread nobody had picked. The index is the fallback for a row gone.
+                let again =
+                    on.and_then(|id| p.rows.iter().position(|r| r.id.as_ref() == Some(&id)));
+                p.cursor = again.unwrap_or(cursor).min(p.rows.len().saturating_sub(1));
                 // The scroll position too — a refresh that snapped the list back to the top
                 // would be the same yank as losing the cursor.
                 p.top = top.min(p.rows.len().saturating_sub(1));
@@ -3101,19 +3305,44 @@ fn apply_frame(state: &mut State, frame: &Frame) {
         }
         // **Say it and close.** A list left open and forever empty reads as a hang, and so
         // does an activity line stuck on "loading…".
-        Frame::PickerFailed(why) => {
-            state.picker = None;
+        //
+        // **Only about the list it was for.** A thread's history failing ends the loading; a list
+        // failing closes that list if it is the one up and still empty. One already showing rows
+        // keeps them — a refresh that failed knows less than what is on screen — and a list the
+        // person has left is nobody's news.
+        Frame::PickerFailed { why, for_list: None } => {
             state.loading_history = false;
             state.set_error(why.clone());
+        }
+        Frame::PickerFailed { why, for_list: Some(level) } => {
+            let up = state.picker.as_ref().filter(|p| same_list(&p.level, level));
+            match up.map(|p| p.loading) {
+                Some(true) => {
+                    state.picker = None;
+                    state.set_error(why.clone());
+                }
+                Some(false) => tracing::warn!(error = %why, "a list refresh failed"),
+                None => {}
+            }
         }
         // **The screen may have been closed while this was in flight.** Esc closes it and the
         // sign-in carries on in the background — so the code goes to the transcript as well, and
         // that is where it is read from if the window is gone.
         Frame::Github(news) => {
             match news {
-                GithubNews::Code { code, uri } => {
-                    if let Some(form) = state.github_form.as_mut() {
-                        form.pending = Some((code.clone(), uri.clone()));
+                GithubNews::Code { code, uri, role } => {
+                    let shown = match state.github_form.as_mut() {
+                        Some(form) => {
+                            form.pending = Some((code.clone(), uri.clone()));
+                            true
+                        }
+                        None => false,
+                    };
+                    // **The transcript holds it where the screen cannot**: the screen was closed
+                    // while the sign-in went on, or the code is the reviewer's, whose warning
+                    // (approve it in a logged-out window) the screen has no room for.
+                    if !shown || *role == crate::github::auth::Role::Reviewer {
+                        state.timeline.say(state.lang.github_code(code, uri, *role));
                     }
                 }
                 // **A step keeps the screen busy.** Making a key can take seconds; saying nothing
@@ -3147,6 +3376,10 @@ fn apply_frame(state: &mut State, frame: &Frame) {
         // rather than at the moment of the click — until this lands, the previous thread is
         // still what is on screen and still what the person can read.
         Frame::History { entries } => {
+            // **What was typed while this loaded is this thread's**, and goes out now that the
+            // screen and the cursor are this thread's too (`State::post`). `switch` already gave
+            // back what was held for the thread before.
+            let held = std::mem::take(&mut state.queued);
             clear_conversation(state);
             for past in entries {
                 let frame = Frame::Event {
@@ -3158,6 +3391,8 @@ fn apply_frame(state: &mut State, frame: &Frame) {
                 apply(state, &Action::Frame(frame));
             }
             state.loading_history = false;
+            state.flush_queue = !held.is_empty();
+            state.queued = held;
         }
         // **The screen says when it dropped.** The activity line turns to "connecting…" and
         // the reason goes by once as a notice. Reconnecting is the Runner's job, and
@@ -3177,8 +3412,19 @@ fn apply_frame(state: &mut State, frame: &Frame) {
         // The answer to a `/update` that had to ask. **Only a release closes the screen**; being
         // current is said here and the conversation carries on.
         Frame::UpdateChecked(found) => {
-            state.clear_status();
+            // Only the "looking…" this answers — anything else on the line has its own reason.
+            if state.status() == Some(state.lang.update_checking()) {
+                state.clear_status();
+            }
             match found {
+                // **Leaving is only right if nothing was started meanwhile.** The check takes
+                // seconds and hands the keys back while it runs, so the screen closed mid-sentence
+                // and the draft went with it. With something being written the release is said
+                // instead, and the next `/update` goes straight out (the tag is known now).
+                Some(tag) if !state.input.text.trim().is_empty() => {
+                    state.update_tag = Some(tag.clone());
+                    state.timeline.say(state.lang.update_available(tag));
+                }
                 Some(tag) => {
                     state.update_tag = Some(tag.clone());
                     state.update_wanted = true;
@@ -3188,12 +3434,16 @@ fn apply_frame(state: &mut State, frame: &Frame) {
         }
         Frame::Disconnected(why) => {
             state.connected = false;
+            // **A call cut off with the connection never reports its end** — its `ExecDone` comes
+            // from the serving future the drop just took away — so "working" would stay up.
+            state.running_tool = None;
             // **Losing the connection is a failure, not news** — silent failure is the worst
             // kind, and this is the one line that gets to say it. Unless we asked for it.
             if std::mem::take(&mut state.reconnecting) {
                 state.set_status(state.lang.reconnecting());
             } else {
                 state.set_error(state.lang.disconnected(why));
+                state.dropped_because = Some(why.clone());
             }
         }
         // The time is not carried in the frame but stamped where it is received — same way
@@ -3275,6 +3525,30 @@ fn apply_frame(state: &mut State, frame: &Frame) {
         // Approved, and the credential was stored. Close the window.
         Frame::EnrollDone => state.enroll = None,
         Frame::Notice(text) => state.set_status(text.clone()),
+        Frame::Problem(text) => state.set_error(text.clone()),
+        Frame::StopFailed(why) => {
+            state.stopping = false;
+            state.set_error(state.lang.stop_failed(why));
+        }
+    }
+}
+
+/// Whether something is laid over the conversation — a list, a form, a panel or the enrolment
+/// window — so the wheel and a click must not reach the rows hidden under it.
+fn covered(state: &State) -> bool {
+    state.picker.is_some()
+        || state.panel.is_some()
+        || state.new_project.is_some()
+        || state.github_form.is_some()
+        || state.enroll.is_some()
+}
+
+/// Whether two list levels are the same list — the same kind, and for threads the same project.
+fn same_list(a: &crate::picker::Level, b: &crate::picker::Level) -> bool {
+    use crate::picker::Level;
+    match (a, b) {
+        (Level::Sessions { project_id: x, .. }, Level::Sessions { project_id: y, .. }) => x == y,
+        _ => std::mem::discriminant(a) == std::mem::discriminant(b),
     }
 }
 
@@ -3345,7 +3619,10 @@ fn follow_the_at(state: &mut State) {
         state.picker = Some(crate::picker::Picker::loading_files(at));
         return;
     }
-    state.picker = Some(crate::picker::Picker::files(&state.files, &query, at));
+    // **No match, no list.** An empty box took Enter and did nothing with it, so `ping @bob`
+    // could not be sent without Esc first — the command list already closes the same way.
+    let list = crate::picker::Picker::files(&state.files, &query, at);
+    state.picker = (!list.rows.is_empty()).then_some(list);
 }
 
 /// Puts a chosen path where the `@…` was.
@@ -3509,20 +3786,27 @@ pub fn run_command(state: &mut State, text: &str) -> Option<crate::command::Comm
             // What it does is send its prompt. A command is a prompt (`plugin::PluginCommand`), so
             // running one is typing what the plugin author wrote and pressing Enter — reusing the
             // ordinary send path rather than inventing a second way for text to reach the server.
-            if let Some(found) = state.plugin_commands.iter().find(|c| c.name == *what) {
+            //
+            // **What follows the name goes with the prompt.** `/review 123` ran the prompt with the
+            // `123` dropped, and nothing said so.
+            let found = state.plugin_commands.iter().find(|c| c.name.eq_ignore_ascii_case(what));
+            if let Some(found) = found {
                 let prompt = found.prompt.clone();
                 if prompt.is_empty() {
                     state.timeline.say(state.lang.plugin_command_empty(what));
                     return Some(cmd);
                 }
-                state.input.take();
-                state.input.insert_str(&prompt);
-                state.submit_now = true;
+                let args = text.trim().split_once(char::is_whitespace).map_or("", |(_, a)| a.trim());
+                state.post(if args.is_empty() { prompt } else { format!("{prompt}\n\n{args}") });
                 return Some(cmd);
             }
             state
                 .timeline
                 .say(state.lang.unknown_command(what, &crate::command::help_text(state.lang)));
+            // **A line that was not a command is not thrown away.** It may have been a sentence
+            // (`/tmp is full`) or a typo; either way the words come back to be fixed, or sent
+            // with `//` in front.
+            state.give_back(text);
         }
         // The ones that cannot be done here. The I/O side takes them.
         Command::Mcp(_)
@@ -3665,6 +3949,16 @@ fn draws_immediately(actions: &[Action]) -> bool {
 /// frame is asked for when the breath steps instead — see `transcript::BREATH_STEPS`.
 fn tick_draws_for_the_breath(state: &State, last_step: u64) -> bool {
     state.running && crate::widgets::transcript::breath_step(state.breath_ms()) != last_step
+}
+
+/// The second the enrolment window's countdown shows, `None` with no window up.
+///
+/// **The countdown moves once a second, so it is drawn once a second.** It used to mark every tick
+/// dirty — sixty frames a second, twenty over SSH, for a number that changes once — which is
+/// bytes over the link for nothing and a screen reader fed the same window without end.
+fn enroll_second(state: &State) -> Option<u64> {
+    let view = state.enroll.as_ref()?;
+    Some(view.expires_at.saturating_duration_since(Instant::now()).as_secs())
 }
 
 /// Whether the picker's dot has moved — the only animated thing left when no turn is running.
@@ -4743,6 +5037,8 @@ async fn run_inner(
     // screen too, and dragging across the enrollment code is how that code gets copied out.
     let mut gesture_dirty = false;
     let mut dirty = true;
+    // The enrolment countdown's second as last drawn — see `enroll_second`.
+    let mut shown_second = enroll_second(&state);
 
     // **Wait for the first handle while drawing the screen.** This stretch is the first
     // enrollment — the enrollment code window comes up over "connecting…". `on_connect`
@@ -4855,9 +5151,12 @@ async fn run_inner(
                 }
             }
             _ = ticker.tick() => {
-                // With the enrollment code window up, the time left is ticking down, so
-                // keep drawing. A gesture waiting for a frame is the other reason.
-                if state.enroll.is_some() || gesture_dirty {
+                // With the enrollment code window up, the time left is ticking down — drawn
+                // when the second it shows changes (`enroll_second`). A gesture waiting for a
+                // frame is the other reason.
+                let second = enroll_second(&state);
+                if second != shown_second || gesture_dirty {
+                    shown_second = second;
                     dirty = true;
                     gesture_dirty = false;
                 }
@@ -5126,22 +5425,6 @@ async fn run_inner(
                                 state.set_status(state.lang.link_not_opened());
                             }
                         }
-                        // **While work is running we do not send here.** `apply` puts it on
-                        // the queue and `flush_queue` below sends them in order when the
-                        // turn ends. `apply` runs after this match, so the `running` seen
-                        // here is still the old value.
-                        // Slash commands never go to the server. `apply` puts them in
-                        // `command_out` and we run them below this match.
-                        Action::Submit(text) if crate::command::is_command(text) => {}
-                        Action::Submit(_) if state.running => {}
-                        Action::Submit(text) => {
-                            if agent_id.is_empty() {
-                                state.set_error(state.lang.agent_cannot_send());
-                            } else {
-                                send_and_tell(&api, &mut state, &mut session, &agent_id, text, &tx)
-                                    .await;
-                            }
-                        }
                         // **The list opens empty and fills itself.** Fetching it here would
                         // hold keys and drawing until the server answered, so the box goes up
                         // saying "loading…" and a task sends the rows in.
@@ -5163,11 +5446,21 @@ async fn run_inner(
                         Action::PickConfirm => {
                             pick(&api, &mut state, &mut session, &mut agent_id, &tx).await;
                         }
+                        // **Off the loop, and its failure said.** It was awaited here before `apply`
+                        // could mark the turn as stopping, so a slow link froze the screen for up to
+                        // the call's deadline with no sign the key had gone in — and a refusal was
+                        // thrown away, leaving "Stopping…" up over a turn that carried on.
                         Action::Cancel => {
-                            if let Some(id) = session.id() {
-                                let _ =
-                                    crate::conn::within(&api, api.cancel_turn(id.to_string(), None))
-                                        .await;
+                            if let Some(id) = session.id().map(str::to_string) {
+                                let (api, tx) = (Arc::clone(&api), tx.clone());
+                                tokio::spawn(async move {
+                                    let asked = api.cancel_turn(id.clone(), None);
+                                    if let Err(e) = crate::conn::within(&api, asked).await {
+                                        let failed = Frame::StopFailed(e.to_string());
+                                        let _ =
+                                            tx.send((Some(Origin::asked(id)), Action::Frame(failed)));
+                                    }
+                                });
                             }
                         }
                         // Only clears the screen. It is redrawn just below.
@@ -5306,19 +5599,19 @@ async fn run_inner(
                         restage(&state, &mut session);
                     }
 
-                    // Pressing submit on a question sends right away — putting the answer in
-                    // the input and making the user press Enter once more turns a submission
-                    // into a draft.
-                    if std::mem::take(&mut state.submit_now) {
-                        let text = state.input.take();
-                        if !text.is_empty() {
-                            // **The third way a message leaves.** Answering a question card never
-                            // builds an `Action::Submit`, so it misses the echo in `apply` — and
-                            // an answer that vanishes on Enter is the same complaint.
-                            state.timeline.echo(text.as_str());
-                            send_and_tell(&api, &mut state, &mut session, &agent_id, &text, &tx)
-                                .await;
-                        }
+                    // **What `apply` decided goes out, goes out here** — Enter, a question
+                    // card's answer, a plugin command's prompt (`State::outbox`). After the mode
+                    // edge above, so a message typed right after Shift+Tab opens what the new
+                    // mode asks for.
+                    //
+                    // **The screen is drawn before the wait.** The send is a round trip — up to
+                    // `CALL_TIMEOUT`, and opening a session costs more — and until it returns the
+                    // loop draws nothing, so the draft sat there uncleared and unechoed and got
+                    // Enter pressed on it a second time.
+                    if let Some(text) = state.outbox.take() {
+                        draw_frame(terminal, &mut state)?;
+                        deliver(&api, &mut state, &mut session, &mut agent_id, &text, &tx).await;
+                        dirty = true;
                     }
                     // **Draw right where the key was pressed.** One frame is 64 bytes so
                     // there is nothing to save, and waiting for a tick makes the hand feel
@@ -5388,7 +5681,7 @@ async fn run_inner(
                 }
                 // The frame ending a turn arrives here — so this is also where the queue is
                 // flushed.
-                flush_queue(&api, &mut session, &agent_id, &mut state, &tx).await;
+                flush_queue(&api, &mut session, &mut agent_id, &mut state, &tx).await;
                 dirty = true;
             }
             // Reconnect. Swap the handle in and reopen the stream for the session in view.
@@ -5396,10 +5689,17 @@ async fn run_inner(
                 if let Some(fresh) = api_of(&api_rx) {
                     api = fresh;
                     state.connected = true;
+                    state.dropped_because = None;
                     state.ever_connected = true;
                     // A drop and reattach shows on screen too — connecting → connected →
                     // idle.
                     state.set_status(state.lang.connected());
+                    // **What was held for want of a connection goes now.** The only other
+                    // trigger is a turn ending, and an idle session has none coming — so "1
+                    // queued" sat on the bar for as long as nobody else started one.
+                    if !state.queued.is_empty() {
+                        state.flush_queue = true;
+                    }
                     if let Some(id) = session.id().map(str::to_string) {
                         spawn_stream(
                             Arc::clone(&api),
@@ -5409,6 +5709,7 @@ async fn run_inner(
                             tx.clone(),
                         );
                     }
+                    flush_queue(&api, &mut session, &mut agent_id, &mut state, &tx).await;
                     dirty = true;
                 }
             }
@@ -5516,9 +5817,11 @@ async fn run_inner(
                 if state.opening() {
                     dirty = true;
                 }
-                // With the enrollment code window up, the time left is ticking down, so keep
-                // drawing.
-                if state.enroll.is_some() {
+                // With the enrollment code window up, the time left is ticking down, so it is
+                // drawn when the second it shows changes.
+                let second = enroll_second(&state);
+                if second != shown_second {
+                    shown_second = second;
                     dirty = true;
                 }
                 // While a turn runs, batch the drawing of what the turn is sending. One streaming
@@ -5587,6 +5890,13 @@ async fn run_inner(
             }
         }
 
+        // **The gate hears what the screen decided, every time round, from one place.** The plan
+        // fence moves on a key (Enter approving) and on a frame (a revised plan), and the sync used
+        // to hang off a few other events only — so an approved plan stayed refused at the gate,
+        // and every write the agent then made to carry it out came back "nothing may be written
+        // yet". Two locks and a store; there is no edge worth tracking.
+        sync_gate(&bridge, &state);
+
         // **Asking for an update is leaving.** Nothing about installing belongs on this side: the
         // installer prints as it works and the new version needs this terminal, and neither is
         // possible while ratatui holds the screen. So the screen closes, and `main` — back on the
@@ -5614,6 +5924,12 @@ async fn run_inner(
     // gone, so there is nothing left to watch it end on. What the turn then does without a node
     // is the server's business, and it says so in the thread.
     Ok(())
+}
+
+/// Carries the screen's decision material — mode, settings, whether the plan is agreed — to the
+/// gate the tools ask (`Bridge::decide`).
+fn sync_gate(bridge: &crate::tools::bridge::Bridge, state: &State) {
+    bridge.sync(state.mode, &state.config, state.plan_decided);
 }
 
 /// Gathers the shutdown signals sent from outside into one channel.
@@ -5732,7 +6048,10 @@ fn spawn_projects(
                 picker: crate::picker::Picker::projects(items, lang),
                 thread_was_running: None,
             },
-            Err(e) => Frame::PickerFailed(e.to_string()),
+            Err(e) => Frame::PickerFailed {
+                why: e.to_string(),
+                for_list: Some(crate::picker::Level::Projects),
+            },
         };
         let _ = tx.send((None, Action::Frame(frame)));
     });
@@ -5763,7 +6082,9 @@ fn spawn_sessions(
         let items = match crate::conn::sessions(&api, &project_id).await {
             Ok(v) => v,
             Err(e) => {
-                let _ = tx.send((None, Action::Frame(Frame::PickerFailed(e.to_string()))));
+                let for_list = Some(crate::picker::Level::Sessions { project_id, project_name });
+                let failed = Frame::PickerFailed { why: e.to_string(), for_list };
+                let _ = tx.send((None, Action::Frame(failed)));
                 return;
             }
         };
@@ -5832,7 +6153,10 @@ fn spawn_agents(api: &Arc<AttaccaApiClient>, tx: &mpsc::UnboundedSender<AppMsg>)
                     thread_was_running: None,
                 }
             }
-            Err(e) => Frame::PickerFailed(crate::lang::current().agent_list_error(&e.to_string())),
+            Err(e) => Frame::PickerFailed {
+                why: crate::lang::current().agent_list_error(&e.to_string()),
+                for_list: Some(crate::picker::Level::Agents),
+            },
         };
         let _ = tx.send((None, Action::Frame(frame)));
     });
@@ -5848,7 +6172,7 @@ fn spawn_history(api: &Arc<AttaccaApiClient>, tx: &mpsc::UnboundedSender<AppMsg>
     tokio::spawn(async move {
         let frame = match crate::conn::history(&api, &id).await {
             Ok(events) => Frame::History { entries: history_past(&events) },
-            Err(e) => Frame::PickerFailed(e.to_string()),
+            Err(e) => Frame::PickerFailed { why: e.to_string(), for_list: None },
         };
         let _ = tx.send((Some(Origin::asked(id)), Action::Frame(frame)));
     });
@@ -6022,11 +6346,30 @@ async fn pick(
 /// false, and frames from the stale session are dropped by `frame_is_current` so it does not
 /// come from there either. Left as it is, the queue also fires the held messages off at the
 /// end of this or the next session's turn.
+///
+/// **What was held goes back into the draft, not into the bin.** Messages held for want of a
+/// connection were typed for the conversation being left; sending them into the next one would be
+/// a surprise, and dropping them — which is what this did — lost them without a word.
+///
+/// **The plan goes too.** It belongs to the thread that submitted it: left up, Enter on an empty
+/// draft sent the approval into the *next* thread, and an approval given in one lowered the plan
+/// fence for another. History replay puts a thread's own plan back (`apply_frame`).
 fn leave_session(state: &mut State) {
     state.running = false;
     state.stopping = false;
-    state.queued.clear();
     state.flush_queue = false;
+    if !state.queued.is_empty() {
+        let held = std::mem::take(&mut state.queued).join("\n");
+        state.give_back(&held);
+    }
+    state.plan = None;
+    state.plan_decided = false;
+    // **Whatever was loading was the thread being left.** Its history frame is tagged with that
+    // thread and dropped as stale once the session moves, so nothing else would ever clear this,
+    // and "Loading..." outranks everything else the activity line has to say.
+    state.loading_history = false;
+    // A tool call's end comes from the serving future; one cut off with the session never reports.
+    state.running_tool = None;
 }
 
 /// Tears the conversation down, so what the next session draws is only its own.
@@ -6049,6 +6392,7 @@ fn clear_conversation(state: &mut State) {
     // its own.
     state.reasoning_title = None;
     state.asking = None;
+    state.dismissed_question = None;
     state.last_cursor = None;
     state.scroll = Scroll::new(); // Start from the bottom.
                                   // **A highlight belongs to the conversation it was made on.** It is anchored to screen rows
@@ -6072,6 +6416,7 @@ fn switch(
     // takes a while; blanking now would leave an empty window for all of it. `Frame::History`
     // does the clearing when it lands, so until then the previous thread stays readable.
     session.switch_to(id.clone(), project_id);
+    leave_session(state);
     state.usage.clear();
     state.picker = None;
     // **Cleared at the click, not when the history lands.** A notice outranks "loading…" on the
@@ -6317,7 +6662,7 @@ async fn finish_command(
         // happened and say so, which is the only honest way round — a node cannot open a browser
         // on somebody's behalf and should not try.
         Command::Github(action) => {
-            let said = run_github(state, action.clone()).await;
+            let said = run_github(state, action.clone(), tx);
             if !said.is_empty() {
                 state.timeline.say(said);
             }
@@ -6340,9 +6685,14 @@ async fn finish_command(
     }
 }
 
-/// `/github`. **The wait is the whole of it** — the person has to approve a code in a browser, so
-/// this polls until they have, and says what is happening while it does.
-async fn run_github(state: &mut State, action: Option<crate::command::AccountAction>) -> String {
+/// `/github`. Opens the screen, signs out, or starts a sign-in — **never waits on one.** The
+/// person has to approve a code in a browser, which takes minutes, and that wait belongs to a
+/// task off the loop (`spawn_github_login`) reporting back through `Frame::Github`.
+fn run_github(
+    state: &mut State,
+    action: Option<crate::command::AccountAction>,
+    tx: &mpsc::UnboundedSender<AppMsg>,
+) -> String {
     use crate::github::auth;
 
     match action {
@@ -6366,48 +6716,20 @@ async fn run_github(state: &mut State, action: Option<crate::command::AccountAct
                 state.lang.github_nothing_to_log_out().to_string()
             }
         }
+        // **The same screen and the same background sign-in the screen's own row uses.** This
+        // form of the command used to run device flow right here, awaited on the loop: nothing
+        // was drawn — not even the code it had just written — no key was read, and the watchdog
+        // ended the app a minute later.
         Some(crate::command::AccountAction::Login(role)) => {
-            let pending = match auth::begin().await {
-                Ok(p) => p,
-                Err(why) => return state.lang.github_login_failed(&why.to_string()),
-            };
-            // **The code goes on screen before the wait starts.** It is the only thing the person
-            // can act on, and printing it after the polling loop would be printing it too late.
-            state.timeline.say(state.lang.github_code(
-                &pending.user_code,
-                &pending.verification_uri,
-                role,
-            ));
-            let deadline =
-                std::time::Instant::now() + std::time::Duration::from_secs(pending.expires_in);
-            let mut wait = std::time::Duration::from_secs(pending.interval);
-            loop {
-                if std::time::Instant::now() >= deadline {
-                    return state.lang.github_login_failed("the code expired");
-                }
-                tokio::time::sleep(wait).await;
-                match auth::poll(&pending).await {
-                    auth::Poll::Waiting { interval } => {
-                        wait = std::time::Duration::from_secs(interval)
-                    }
-                    auth::Poll::Failed(why) => return state.lang.github_login_failed(&why),
-                    auth::Poll::Done(token) => {
-                        // **The login is asked for straight away** so `/github` can name the
-                        // account without a round trip, and a token that does not work is caught
-                        // here rather than at the first tool call.
-                        let login = match crate::github::api::Github::new(token.clone()) {
-                            Ok(client) => client.me().await.unwrap_or_default(),
-                            Err(_) => String::new(),
-                        };
-                        let mut accounts = auth::Accounts::load();
-                        accounts.set(role, Some(auth::Account { token, login: login.clone() }));
-                        if let Err(e) = accounts.save() {
-                            return state.lang.github_login_failed(&e.to_string());
-                        }
-                        return state.lang.github_logged_in(&login, role);
-                    }
-                }
-            }
+            let accounts = auth::Accounts::load();
+            let mut form = crate::githubform::Form::new(
+                accounts.exactly(auth::Role::User).map(|a| a.login.clone()),
+                accounts.exactly(auth::Role::Reviewer).map(|a| a.login.clone()),
+            );
+            form.busy = true;
+            state.github_form = Some(form);
+            spawn_github_login(role, state.lang, tx);
+            String::new()
         }
     }
 }
@@ -6569,6 +6891,7 @@ async fn ask_for_the_gpg_scope(
     say(GithubNews::Code {
         code: pending.user_code.clone(),
         uri: pending.verification_uri.clone(),
+        role: auth::Role::User,
     });
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(pending.expires_in);
     let mut wait = std::time::Duration::from_secs(pending.interval);
@@ -6627,6 +6950,7 @@ fn spawn_github_login(
         say(GithubNews::Code {
             code: pending.user_code.clone(),
             uri: pending.verification_uri.clone(),
+            role,
         });
         let deadline =
             std::time::Instant::now() + std::time::Duration::from_secs(pending.expires_in);
@@ -7323,17 +7647,24 @@ fn switch_plugin(state: &State, name: &str, on: bool) -> String {
 async fn flush_queue(
     api: &Arc<AttaccaApiClient>,
     session: &mut Session,
-    agent_id: &str,
+    agent_id: &mut String,
     state: &mut State,
     tx: &mpsc::UnboundedSender<AppMsg>,
 ) {
-    if !std::mem::take(&mut state.flush_queue) {
+    if !state.flush_queue {
         return;
     }
-    if agent_id.is_empty() {
-        state.set_error(state.lang.agent_cannot_send());
+    // **Only with somewhere to send it.** A turn stream ends when the connection drops, and that
+    // end used to spend the flush on a dead socket; left raised, the reconnect sends it instead.
+    if !state.connected {
         return;
     }
+    state.flush_queue = false;
+    if let Err(why) = ensure_agent(api, state, agent_id).await {
+        state.set_error(why);
+        return;
+    }
+    let agent_id = agent_id.as_str();
     while let Some(text) = state.queued.first().cloned() {
         match send(api, session, agent_id, &text, state.last_cursor, state.mode, tx).await {
             Ok(announced) => {
@@ -7394,26 +7725,50 @@ fn restage(state: &State, session: &mut Session) {
     session.set_route(route);
 }
 
-/// Sends, and if something new was opened, says so.
-///
-/// **There are two call sites, so it lives here as one** (Enter in the input, and submit on
-/// a question card). Fixing only one would leave two paths doing the same thing while saying
-/// different words.
-async fn send_and_tell(
+/// Sends one message `apply` put in the outbox, and says what it opened — or, when it could not
+/// go, gives it back (`State::unsend`).
+async fn deliver(
     api: &Arc<AttaccaApiClient>,
     state: &mut State,
     session: &mut Session,
-    agent_id: &str,
+    agent_id: &mut String,
     text: &str,
     tx: &mpsc::UnboundedSender<AppMsg>,
 ) {
+    if let Err(why) = ensure_agent(api, state, agent_id).await {
+        state.unsend(text, why);
+        return;
+    }
     match send(api, session, agent_id, text, state.last_cursor, state.mode, tx).await {
         Ok(announced) => {
             if let Some(said) = opened_text(state.lang, announced) {
                 state.timeline.say(said);
             }
         }
-        Err(e) => state.set_error(e.to_string()),
+        Err(e) => state.unsend(text, e.to_string()),
+    }
+}
+
+/// Makes sure there is an agent to send to, looking it up again if the one at startup failed.
+///
+/// **The startup lookup is one call on a connection that may be minutes old.** A timeout there
+/// used to leave `agent_id` empty for the rest of the run, and every Enter after it said only "No
+/// agent" — with nothing to say why, and nothing but a restart to fix it. Asked again at the send,
+/// a passing failure heals itself; a real one says its cause and the way out.
+async fn ensure_agent(
+    api: &Arc<AttaccaApiClient>,
+    state: &State,
+    agent_id: &mut String,
+) -> Result<(), String> {
+    if !agent_id.is_empty() {
+        return Ok(());
+    }
+    match Session::agent_id_named(api, &state.agent).await {
+        Ok(id) => {
+            *agent_id = id;
+            Ok(())
+        }
+        Err(e) => Err(state.lang.agent_cannot_send(&e.to_string())),
     }
 }
 
@@ -7511,7 +7866,13 @@ fn spawn_stream(
                 // finished, and the activity line would go idle in the middle of one.
                 let _ = tx.send((tag(), Action::Frame(Frame::Status { running: false })));
             }
-            Err(e) => tracing::error!(error = %e, "could not open the turn stream"),
+            // **Said, not only logged.** The line reads "connected" either way, and a stream that
+            // never opened means none of the turn's answers will ever appear.
+            Err(e) => {
+                tracing::error!(error = %e, "could not open the turn stream");
+                let said = crate::lang::current().stream_failed(&e.to_string());
+                let _ = tx.send((tag(), Action::Frame(Frame::Problem(said))));
+            }
         }
     });
     session.holds_stream(task.abort_handle());
@@ -8033,7 +8394,7 @@ mod tests {
         assert!(s.picker.is_none(), "the file list opened before there was anything to send to");
 
         apply(&mut s, &Action::Submit("hello".into()));
-        assert!(!s.submit_now, "a message went out before anything had attached");
+        assert!(s.outbox.is_none(), "a message went out before anything had attached");
 
         apply(&mut s, &Action::OpenPicker);
         assert!(s.picker.is_none(), "the project list opened with nothing to read it from");
@@ -11401,5 +11762,797 @@ mod polish {
             apply(&mut s, &Action::Left);
         }
         assert!(s.picker.is_some(), "back inside the reference, the list is wanted again");
+    }
+}
+
+/// **Interaction flows across surfaces** — what a key, a frame and the loop's hand-off do together
+/// (UI audit C).
+#[cfg(test)]
+mod interaction {
+    use super::*;
+    use crate::event::EntryKind;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    /// Attached, and attached now — the same default as the other test modules.
+    fn state() -> State {
+        let mut s = State::new();
+        s.connected = true;
+        s.ever_connected = true;
+        s
+    }
+
+    fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, mods)
+    }
+
+    /// The lines echoed locally and not yet replaced by the server's copy.
+    fn echoes(s: &mut State) -> Vec<String> {
+        s.timeline
+            .items()
+            .iter()
+            .filter_map(|item| match item {
+                crate::timeline::Item::User { seq, text } if *seq < 0 => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A one-step question with two options, as the stream delivers it.
+    fn question_frame(seq: i64) -> Action {
+        let opt = |label: &str| crate::question::Opt { label: label.into(), description: None };
+        Action::Frame(Frame::Event {
+            cursor: seq,
+            entry: Some(crate::event::Entry {
+                id: None,
+                seq,
+                kind: EntryKind::Question {
+                    steps: vec![crate::question::Step {
+                        header: None,
+                        question: "which one?".into(),
+                        multi: false,
+                        options: vec![opt("A"), opt("B")],
+                    }],
+                    answered: false,
+                },
+            }),
+            todo: None,
+            plan: None,
+        })
+    }
+
+    fn type_in(s: &mut State, text: &str) {
+        for c in text.chars() {
+            apply(s, &Action::Insert(c));
+        }
+    }
+
+    /// **A line typed mid-turn is handed to the sender, not only echoed.** `apply` stopped holding
+    /// it and the loop kept skipping every `Submit` while a turn ran, so the line showed as sent
+    /// and the agent never saw it (C1). Now the one decision is `apply`'s, and the loop sends
+    /// whatever it leaves in the outbox.
+    #[test]
+    fn a_line_typed_during_a_turn_is_handed_to_the_sender() {
+        let mut s = state();
+        s.running = true;
+        type_in(&mut s, "그거 말고 이거");
+        for action in on_key(&s, key(KeyCode::Enter, KeyModifiers::NONE)) {
+            apply(&mut s, &action);
+        }
+        assert_eq!(s.outbox.as_deref(), Some("그거 말고 이거"), "nothing was handed over to send");
+        assert!(s.queued.is_empty());
+    }
+
+    /// Held messages never reach the outbox — they go out through the queue, once there is
+    /// somewhere to send them.
+    #[test]
+    fn a_held_message_is_not_handed_to_the_sender() {
+        let mut s = state();
+        s.connected = false;
+        apply(&mut s, &Action::Submit("나중에".into()));
+        assert!(s.outbox.is_none());
+        assert_eq!(s.queued, vec!["나중에"]);
+    }
+
+    /// **A send that failed gives the words back.** The draft used to be empty and the echo stayed
+    /// in the conversation as if delivered, with a six-second notice as the only trace (C11).
+    #[test]
+    fn a_failed_send_comes_back_into_the_draft_and_off_the_conversation() {
+        let mut s = state();
+        apply(&mut s, &Action::Submit("보낼 말".into()));
+        assert_eq!(echoes(&mut s), vec!["보낼 말"]);
+        // Typing had started again while the send was out.
+        type_in(&mut s, "다음 말");
+
+        let text = s.outbox.take().expect("handed over");
+        s.unsend(&text, "timed out".into());
+        assert_eq!(s.input.text, "보낼 말\n다음 말", "the words did not come back");
+        assert!(echoes(&mut s).is_empty(), "the echo still reads as delivered");
+        assert_eq!(s.status_severity(), Severity::Error);
+    }
+
+    /// **Answering a question leaves the draft alone.** The answer used to be written into the
+    /// input and sent from there, which threw away whatever was being typed when the question came
+    /// (C12).
+    #[test]
+    fn answering_a_question_keeps_the_draft() {
+        let mut s = state();
+        type_in(&mut s, "반쯤 쓴 말");
+        apply(&mut s, &question_frame(4));
+        // Pick A, skip on to the review screen, submit.
+        apply(&mut s, &Action::AskConfirm);
+        apply(&mut s, &Action::AskDown);
+        apply(&mut s, &Action::AskDown);
+        apply(&mut s, &Action::AskDown);
+        apply(&mut s, &Action::AskConfirm);
+        assert!(s.asking.as_ref().is_some_and(|(_, a)| a.in_review()), "not on the review screen");
+        apply(&mut s, &Action::AskConfirm);
+
+        assert!(s.asking.is_none());
+        assert_eq!(s.input.text, "반쯤 쓴 말", "the draft was replaced by the answer");
+        assert!(s.outbox.as_deref().is_some_and(|a| a.contains("which one?") && a.contains('A')));
+    }
+
+    /// **Blank is empty.** Spaces and a stray newline used to go out as a message (C24).
+    #[test]
+    fn a_blank_draft_is_not_sent() {
+        let mut s = state();
+        type_in(&mut s, "  \n ");
+        assert_eq!(on_key(&s, key(KeyCode::Enter, KeyModifiers::NONE)), vec![]);
+    }
+
+    /// **While a thread loads, what is typed waits for it** and goes out once it has landed —
+    /// sent at once, it went with the old thread's cursor and its echo was wiped by the history
+    /// (C14).
+    #[test]
+    fn a_message_typed_while_a_thread_loads_goes_out_when_it_lands() {
+        let mut s = state();
+        s.loading_history = true;
+        apply(&mut s, &Action::Submit("로딩 중에 친 말".into()));
+        assert!(s.outbox.is_none(), "sent into a thread that is not on screen yet");
+        assert_eq!(s.queued, vec!["로딩 중에 친 말"]);
+
+        apply(&mut s, &Action::Frame(Frame::History { entries: vec![] }));
+        assert!(!s.loading_history);
+        assert_eq!(s.queued, vec!["로딩 중에 친 말"], "the history landing threw it away");
+        assert!(s.flush_queue, "nothing asks for it to go out");
+    }
+
+    /// **Leaving a thread gives back what was held for it**, rather than dropping it or sending it
+    /// into the next one.
+    #[test]
+    fn leaving_a_thread_puts_held_messages_back_in_the_draft() {
+        let mut s = state();
+        s.connected = false;
+        apply(&mut s, &Action::Submit("하나".into()));
+        apply(&mut s, &Action::Submit("둘".into()));
+        type_in(&mut s, "쓰는 중");
+        leave_session(&mut s);
+        assert!(s.queued.is_empty());
+        assert_eq!(s.input.text, "하나\n둘\n쓰는 중");
+    }
+
+    /// **Leaving a thread ends its loading**, so "Loading..." cannot outlive the fetch that was
+    /// abandoned (C13).
+    #[test]
+    fn leaving_a_thread_while_it_loads_ends_the_loading() {
+        let mut s = state();
+        s.loading_history = true;
+        leave_session(&mut s);
+        assert!(!s.loading_history);
+    }
+
+    fn plan_frame(seq: i64, decided: bool) -> Action {
+        let plan = crate::plan::Submitted { seq, markdown: "# Plan".into(), decided };
+        Action::Frame(Frame::Event {
+            cursor: seq,
+            entry: None,
+            todo: None,
+            plan: Some(Box::new(plan)),
+        })
+    }
+
+    /// **Approving a plan reaches the gate.** `apply` lowered the fence on screen, but the gate
+    /// reads its own copy and nothing carried the approval there — so every write the agent made
+    /// to carry the plan out was refused (C2). The loop syncs after every event now; this drives
+    /// the same seam.
+    #[test]
+    fn an_approved_plan_lowers_the_fence_at_the_gate() {
+        use crate::tools::gate::{Call, Decision};
+        let mut s = state();
+        s.mode = Mode::Plan;
+        let bridge = crate::tools::bridge::Bridge::new();
+        let write = Call::new("code_edit", "edit", "a.rs".into());
+
+        apply(&mut s, &plan_frame(5, false));
+        sync_gate(&bridge, &s);
+        assert!(matches!(bridge.decide(&write), Decision::Refuse(_)), "undecided, yet writable");
+
+        for action in on_key(&s, key(KeyCode::Enter, KeyModifiers::NONE)) {
+            apply(&mut s, &action);
+        }
+        sync_gate(&bridge, &s);
+        assert_eq!(bridge.decide(&write), Decision::Run, "the approval never reached the gate");
+
+        // And a revised plan puts it back up.
+        apply(&mut s, &plan_frame(9, false));
+        sync_gate(&bridge, &s);
+        assert!(matches!(bridge.decide(&write), Decision::Refuse(_)));
+    }
+
+    /// **A plan belongs to its thread.** Left behind, Enter on the next thread's empty draft sent
+    /// the approval there, and an approval given in one thread lowered the fence in another (C6).
+    #[test]
+    fn leaving_a_thread_leaves_its_plan_behind() {
+        let mut s = state();
+        apply(&mut s, &plan_frame(5, false));
+        s.plan_decided = true;
+        leave_session(&mut s);
+        assert!(s.plan.is_none());
+        assert!(!s.plan_decided, "the last thread's approval rode into this one");
+        assert_eq!(on_key(&s, key(KeyCode::Enter, KeyModifiers::NONE)), vec![]);
+    }
+
+    /// **Coming back to a thread whose plan was agreed reads the agreement back.** Leaving drops
+    /// it, so the thread's own history is where it has to come from.
+    #[test]
+    fn a_thread_whose_plan_was_agreed_comes_back_agreed() {
+        let mut s = state();
+        let past = |seq: i64, decided: bool| Past {
+            cursor: seq,
+            entry: None,
+            todo: None,
+            plan: Some(Box::new(crate::plan::Submitted {
+                seq,
+                markdown: "# Plan".into(),
+                decided,
+            })),
+        };
+        apply(&mut s, &Action::Frame(Frame::History { entries: vec![past(5, true)] }));
+        assert!(s.plan_decided, "an agreed plan came back undecided");
+
+        apply(
+            &mut s,
+            &Action::Frame(Frame::History { entries: vec![past(5, true), past(9, false)] }),
+        );
+        assert!(!s.plan_decided, "a newer plan still waiting must keep the fence up");
+        assert_eq!(s.plan.as_ref().map(|p| p.seq), Some(9));
+    }
+
+    /// **`/github login` returns at once, with the screen up and busy.** It used to run device
+    /// flow awaited on the loop — nothing drawn, no key read, and the watchdog ended the app a
+    /// minute in (C3). A current-thread runtime never polls the spawned sign-in here, because the
+    /// test never yields: what is checked is that the command itself does not wait.
+    #[tokio::test(flavor = "current_thread")]
+    async fn github_login_opens_the_screen_instead_of_waiting() {
+        use crate::command::AccountAction;
+        use crate::github::auth::Role;
+        let mut s = state();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let said = run_github(&mut s, Some(AccountAction::Login(Role::User)), &tx);
+        assert!(said.is_empty(), "{said}");
+        assert!(s.github_form.as_ref().is_some_and(|f| f.busy), "the sign-in has no screen");
+    }
+
+    /// **A code with nowhere to go goes into the conversation**, the way the screen's comment
+    /// always said it did — the screen can be closed while the sign-in carries on.
+    #[test]
+    fn a_github_code_with_the_screen_closed_is_still_said() {
+        let mut s = state();
+        apply(
+            &mut s,
+            &Action::Frame(Frame::Github(GithubNews::Code {
+                code: "WXQR-7KBD".into(),
+                uri: "https://github.com/login/device".into(),
+                role: crate::github::auth::Role::User,
+            })),
+        );
+        let said = s.timeline.items().iter().any(|item| {
+            matches!(item, crate::timeline::Item::System { text, .. } if text.contains("WXQR-7KBD"))
+        });
+        assert!(said, "the code was dropped");
+    }
+
+    fn press(s: &mut State, code: KeyCode, mods: KeyModifiers) {
+        for action in on_key(s, key(code, mods)) {
+            apply(s, &action);
+        }
+    }
+
+    /// Every form that can be up when a question lands, alone.
+    fn with_each_form() -> Vec<(&'static str, State)> {
+        let mut github = state();
+        github.github_form = Some(crate::githubform::Form::default());
+        let mut project = state();
+        project.new_project = Some(crate::newproject::Form::new());
+        vec![("github", github), ("new project", project)]
+    }
+
+    /// **A question over a form answers to its keys.** `on_key` routed Esc, Enter and the arrows to
+    /// the card, and the form branches of `apply` swallowed every one of them — the screen was
+    /// wedged until the process was killed (C4).
+    #[test]
+    fn a_question_over_a_form_takes_its_keys() {
+        for (name, mut s) in with_each_form() {
+            apply(&mut s, &question_frame(3));
+            press(&mut s, KeyCode::Down, KeyModifiers::NONE);
+            assert_eq!(s.asking.as_ref().map(|(_, a)| a.cursor), Some(1), "{name}: ↓ was lost");
+            press(&mut s, KeyCode::Enter, KeyModifiers::NONE);
+            assert!(s.asking.as_ref().is_some_and(|(_, a)| a.is_chosen(1)), "{name}: Enter lost");
+            press(&mut s, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(s.asking.is_none(), "{name}: Esc did not put the card away");
+            // With the card gone, the form has the keys again.
+            press(&mut s, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(s.github_form.is_none() && s.new_project.is_none(), "{name}: form stuck");
+        }
+    }
+
+    /// **Ctrl+C arms the quit from every surface.** Its arming was swallowed by the forms, so the
+    /// second press could never quit (C4).
+    #[test]
+    fn ctrl_c_arms_the_quit_from_every_form() {
+        for (name, mut s) in with_each_form() {
+            press(&mut s, KeyCode::Char('c'), KeyModifiers::CONTROL);
+            assert!(s.quit_pending(), "{name}: the first Ctrl+C was swallowed");
+            assert_eq!(
+                on_key(&s, key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+                vec![Action::Quit],
+                "{name}"
+            );
+        }
+    }
+
+    /// **The enrolment window over a form closes on Esc.** The form swallowed its close too.
+    #[test]
+    fn the_enrolment_window_over_a_form_closes() {
+        for (name, mut s) in with_each_form() {
+            s.enroll = Some(EnrollView {
+                code: "ABCD".into(),
+                uri: "https://example.com".into(),
+                expires_at: Instant::now() + Duration::from_secs(60),
+                phase: EnrollPhase::Waiting,
+            });
+            press(&mut s, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(s.enroll.is_none(), "{name}: the window stayed");
+            assert!(s.github_form.is_some() || s.new_project.is_some(), "{name}: form went too");
+        }
+    }
+
+    /// **A paste goes where a key would have.** It landed in the draft behind a history search,
+    /// out of sight, and went out with the next Enter (C8).
+    #[test]
+    fn a_paste_into_the_history_search_searches() {
+        let mut s = state();
+        s.sent = vec!["빌드 고쳐".into(), "테스트 돌려".into()];
+        apply(&mut s, &Action::OpenHistory);
+        apply(&mut s, &Action::Paste("테스트".into()));
+        assert_eq!(s.input.text, "", "the paste went into the hidden draft");
+        assert!(matches!(
+            s.picker.as_ref().map(|p| &p.level),
+            Some(crate::picker::Level::History { query }) if query == "테스트"
+        ));
+    }
+
+    /// Nothing under a panel, a card or a list of its own takes a paste.
+    #[test]
+    fn a_paste_over_a_panel_or_a_card_goes_nowhere() {
+        let mut s = state();
+        s.panel = Some(crate::panel::mode(s.lang, s.mode, None));
+        apply(&mut s, &Action::Paste("x".into()));
+        assert_eq!(s.input.text, "");
+
+        let mut s = state();
+        apply(&mut s, &question_frame(3));
+        apply(&mut s, &Action::Paste("x".into()));
+        assert_eq!(s.input.text, "", "the card is not being typed into");
+    }
+
+    /// **The wheel and a click do not reach the conversation under a list.** Both moved or folded
+    /// rows nobody could see (C8).
+    #[test]
+    fn the_wheel_and_a_click_stay_off_a_covered_conversation() {
+        let mut s = state();
+        s.view_total = 100;
+        s.view_height = 10;
+        s.scroll.on_content(100, 10);
+        s.view_cards.insert(2, 7);
+        s.picker = Some(crate::picker::Picker::loading_projects());
+        let before = (s.scroll.top, s.scroll.stick);
+        apply(&mut s, &Action::Wheel(3));
+        assert_eq!((s.scroll.top, s.scroll.stick), before, "the hidden conversation scrolled");
+
+        apply(&mut s, &Action::Press(4, 2));
+        apply(&mut s, &Action::Release);
+        assert!(!s.folds.contains_key(&7), "a card under the list was folded");
+    }
+
+    /// **A burst Enter on the GitHub screen or a panel is still their Enter**, not a newline in
+    /// the draft behind them (C8).
+    #[test]
+    fn a_burst_enter_is_not_a_newline_behind_a_form_or_panel() {
+        let enter = key(KeyCode::Enter, KeyModifiers::NONE);
+        let mut s = state();
+        s.input.insert_str("draft");
+        s.github_form = Some(crate::githubform::Form::default());
+        assert!(!enter_becomes_newline(&s, &enter, true));
+        s.github_form = None;
+        s.panel = Some(crate::panel::mode(s.lang, s.mode, None));
+        assert!(!enter_becomes_newline(&s, &enter, true));
+    }
+
+    /// **Editing keys work with the command list up.** Only characters, Backspace and ←→ got
+    /// through; Delete, Home and the Ctrl keys were dead on a line starting with `/` (C23).
+    #[test]
+    fn the_command_list_leaves_the_editing_keys_to_the_draft() {
+        let mut s = state();
+        type_in(&mut s, "/rules");
+        assert!(s.picker.is_some());
+        press(&mut s, KeyCode::Home, KeyModifiers::NONE);
+        assert_eq!(s.input.cursor, 0);
+        press(&mut s, KeyCode::Delete, KeyModifiers::NONE);
+        assert_eq!(s.input.text, "rules");
+        press(&mut s, KeyCode::Char('/'), KeyModifiers::NONE);
+        press(&mut s, KeyCode::Char('e'), KeyModifiers::CONTROL);
+        assert_eq!(s.input.cursor, s.input.len_chars());
+        press(&mut s, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        assert_eq!(s.input.text, "");
+    }
+
+    /// **An `@` that matches nothing is not a list.** The empty box ate Enter, so `ping @bob`
+    /// could not be sent (C23).
+    #[test]
+    fn a_file_reference_matching_nothing_closes_the_list() {
+        let mut s = state();
+        s.files = vec!["src/app.rs".into()];
+        type_in(&mut s, "ping @bob");
+        assert!(s.picker.is_none(), "an empty file list is up");
+        assert_eq!(
+            on_key(&s, key(KeyCode::Enter, KeyModifiers::NONE)),
+            vec![Action::Submit("ping @bob".into())]
+        );
+    }
+
+    /// **A walk that found nothing does not leave "loading" up for ever** (C23).
+    #[test]
+    fn an_empty_walk_closes_the_loading_list() {
+        let mut s = state();
+        type_in(&mut s, "@");
+        assert!(s.picker.as_ref().is_some_and(|p| p.loading));
+        apply(&mut s, &Action::Frame(Frame::Files(vec![])));
+        assert!(s.picker.is_none());
+    }
+
+    /// **A stop that did not reach the server says so, and stops saying "Stopping…".** The
+    /// failure was thrown away and the line claimed a stop over a turn that carried on (C10).
+    #[test]
+    fn a_stop_that_failed_is_said_and_released() {
+        let mut s = state();
+        s.running = true;
+        apply(&mut s, &Action::Cancel);
+        assert!(s.stopping);
+        apply(&mut s, &Action::Frame(Frame::StopFailed("scope missing".into())));
+        assert!(!s.stopping, "still claims to be stopping");
+        assert_eq!(s.status_severity(), Severity::Error);
+        assert!(s.status().is_some_and(|t| t.contains("scope missing")));
+    }
+
+    /// **Esc stops a turn on the first press, highlight or not** (C25). The highlight goes with it.
+    #[test]
+    fn esc_stops_a_turn_even_with_a_highlight_up() {
+        let mut s = state();
+        s.running = true;
+        s.selection = Some("copied".into());
+        let actions = on_key(&s, key(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(actions, vec![Action::Cancel]);
+        apply(&mut s, &Action::Cancel);
+        assert!(s.selection.is_none());
+    }
+
+    /// **Only the very next key confirms a quit.** Ctrl+C, some typing, Ctrl+C used to quit (C25).
+    #[test]
+    fn any_other_key_disarms_the_quit() {
+        let mut s = state();
+        press(&mut s, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(s.quit_pending());
+        press(&mut s, KeyCode::Char('x'), KeyModifiers::NONE);
+        assert!(!s.quit_pending(), "typing did not disarm it");
+        assert_eq!(
+            on_key(&s, key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            vec![Action::ArmQuit]
+        );
+        // The server's news is not somebody changing their mind.
+        press(&mut s, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        apply(&mut s, &Action::Frame(Frame::Status { running: false }));
+        assert!(s.quit_pending());
+    }
+
+    /// **The armed quit says what leaving takes with it** — background work that dies with the
+    /// app, and words that were never sent (C19).
+    #[test]
+    fn the_armed_quit_names_what_it_would_lose() {
+        let mut s = state();
+        s.lang = crate::lang::Lang::En;
+        s.jobs.push(JobRow {
+            id: "b1".into(),
+            label: "cargo build".into(),
+            since: Instant::now(),
+            session: None,
+        });
+        type_in(&mut s, "half a thought");
+        press(&mut s, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        let (_, text, _) = crate::widgets::activity::parts(&s);
+        assert!(text.contains("1 running job"), "{text}");
+        assert!(text.contains("1 unsent"), "{text}");
+    }
+
+    /// **"Esc stops" is not offered beside a question**, where Esc belongs to the card (C25).
+    #[test]
+    fn a_question_waiting_is_what_the_activity_line_says() {
+        let mut s = state();
+        s.running = true;
+        apply(&mut s, &question_frame(3));
+        let (_, text, hint) = crate::widgets::activity::parts(&s);
+        assert_eq!(text, s.lang.waiting_answer());
+        assert_ne!(hint, s.lang.esc_stops());
+    }
+
+    /// **`/update` does not close the screen over a message being written** (C20). The release is
+    /// said, and the next `/update` goes straight out.
+    #[test]
+    fn a_release_found_while_writing_waits_to_be_asked_again() {
+        let mut s = state();
+        run_command(&mut s, "/update");
+        type_in(&mut s, "쓰는 중인 긴 메시지");
+        apply(&mut s, &Action::Frame(Frame::UpdateChecked(Some("v9.9.9".into()))));
+        assert!(!s.update_wanted, "the screen closed mid-sentence");
+        assert_eq!(s.update_tag.as_deref(), Some("v9.9.9"));
+        run_command(&mut s, "/update");
+        assert!(s.update_wanted, "asked again, it still waits");
+    }
+
+    /// **A dropped connection takes the running call with it** — its end would never come, and
+    /// "working" would stay (C29).
+    #[test]
+    fn a_drop_ends_the_running_call() {
+        let mut s = state();
+        s.running_tool = Some((1, "exec".into(), Instant::now()));
+        apply(&mut s, &Action::Frame(Frame::Disconnected("reset".into())));
+        assert!(s.running_tool.is_none());
+    }
+
+    /// **An MCP server that did not start is an error, not news** (C26).
+    #[test]
+    fn a_problem_is_painted_as_an_error() {
+        let mut s = state();
+        apply(&mut s, &Action::Frame(Frame::Problem("MCP server 'x' did not start".into())));
+        assert_eq!(s.status_severity(), Severity::Error);
+    }
+
+    fn threads(project: &str, ids: &[&str]) -> crate::picker::Picker {
+        let items = ids
+            .iter()
+            .map(|id| {
+                (id.to_string(), format!("thread {id}"), crate::picker::ThreadStatus::Unknown)
+            })
+            .collect();
+        crate::picker::Picker::sessions(
+            project.into(),
+            project.into(),
+            items,
+            crate::lang::Lang::En,
+        )
+    }
+
+    fn listed(picker: crate::picker::Picker) -> Action {
+        Action::Frame(Frame::Picker { picker, thread_was_running: None })
+    }
+
+    /// **A refresh keeps the cursor on the row it was on**, not on its number — reordered threads
+    /// put an index-kept cursor on another one, and Enter opened it (C15).
+    #[test]
+    fn a_refresh_keeps_the_cursor_on_the_same_thread() {
+        let mut s = state();
+        s.picker = Some(threads("p", &["a", "b", "c"]));
+        apply(&mut s, &Action::PickDown);
+        apply(&mut s, &Action::PickDown); // on "b" (row 0 is "new thread")
+        apply(&mut s, &listed(threads("p", &["c", "a", "b"])));
+        let p = s.picker.as_ref().unwrap();
+        assert_eq!(p.rows[p.cursor].id.as_deref(), Some("b"), "the cursor moved to another thread");
+    }
+
+    /// **Another project's thread list does not land on this one** (C15).
+    #[test]
+    fn another_projects_threads_are_not_taken_for_this_ones() {
+        let mut s = state();
+        s.picker = Some(crate::picker::Picker::loading_sessions("y".into(), "y".into()));
+        apply(&mut s, &listed(threads("x", &["from-x"])));
+        let p = s.picker.as_ref().unwrap();
+        assert!(p.loading && p.rows.is_empty(), "X's threads landed under Y");
+    }
+
+    /// **A list failing closes only itself.** The history search the person moved on to stayed
+    /// shut under them, with a red line about a list no longer on screen (C16).
+    #[test]
+    fn a_failed_list_leaves_other_lists_alone() {
+        let mut s = state();
+        s.sent = vec!["hi".into()];
+        apply(&mut s, &Action::OpenHistory);
+        let failed = Frame::PickerFailed {
+            why: "timed out".into(),
+            for_list: Some(crate::picker::Level::Sessions {
+                project_id: "p".into(),
+                project_name: "p".into(),
+            }),
+        };
+        apply(&mut s, &Action::Frame(failed.clone()));
+        assert!(s.picker.is_some(), "the history search was closed");
+        assert!(s.status().is_none(), "news about a list nobody is looking at");
+
+        // A refresh of the list on screen that fails keeps what it shows.
+        s.picker = Some(threads("p", &["a"]));
+        apply(&mut s, &Action::Frame(failed.clone()));
+        assert_eq!(s.picker.as_ref().map(|p| p.rows.len()), Some(2), "the rows were thrown away");
+
+        // Still loading, it closes and says why.
+        s.picker = Some(crate::picker::Picker::loading_sessions("p".into(), "p".into()));
+        apply(&mut s, &Action::Frame(failed));
+        assert!(s.picker.is_none());
+        assert_eq!(s.status_severity(), Severity::Error);
+    }
+
+    /// A two-step question, for walking back through.
+    fn two_steps(seq: i64) -> Action {
+        let step = |q: &str| crate::question::Step {
+            header: None,
+            question: q.into(),
+            multi: false,
+            options: vec![crate::question::Opt { label: "yes".into(), description: None }],
+        };
+        Action::Frame(Frame::Event {
+            cursor: seq,
+            entry: Some(crate::event::Entry {
+                id: None,
+                seq,
+                kind: EntryKind::Question {
+                    steps: vec![step("one?"), step("two?")],
+                    answered: false,
+                },
+            }),
+            todo: None,
+            plan: None,
+        })
+    }
+
+    /// **Esc past the first question goes back one**, rather than dropping every answer (C12).
+    #[test]
+    fn esc_on_a_later_step_goes_back_rather_than_discarding() {
+        let mut s = state();
+        apply(&mut s, &two_steps(3));
+        apply(&mut s, &Action::AskConfirm); // pick "yes"
+        apply(&mut s, &Action::AskDown);
+        apply(&mut s, &Action::AskDown);
+        apply(&mut s, &Action::AskConfirm); // next
+        assert_eq!(s.asking.as_ref().map(|(_, a)| a.step), Some(1));
+        press(&mut s, KeyCode::Esc, KeyModifiers::NONE);
+        let (_, a) = s.asking.as_ref().expect("the card went away with its answers");
+        assert_eq!(a.step, 0);
+        assert!(a.is_chosen(0), "the first answer was lost");
+    }
+
+    /// **A question put away stays away** when its own frame comes round again (C12).
+    #[test]
+    fn a_dismissed_question_does_not_come_back_on_its_own() {
+        let mut s = state();
+        apply(&mut s, &question_frame(3));
+        press(&mut s, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(s.asking.is_none());
+        apply(&mut s, &question_frame(3));
+        assert!(s.asking.is_none(), "the dismissed card took the keys back");
+        // A newer question is a new question.
+        apply(&mut s, &question_frame(8));
+        assert!(s.asking.is_some());
+    }
+
+    /// **The free answer takes the editing keys every other field does** (C12).
+    #[test]
+    fn a_free_answer_takes_the_editing_keys() {
+        let mut s = state();
+        apply(&mut s, &question_frame(3));
+        // The free row sits after the two options.
+        apply(&mut s, &Action::AskDown);
+        apply(&mut s, &Action::AskDown);
+        apply(&mut s, &Action::AskConfirm);
+        assert!(s.asking.as_ref().is_some_and(|(_, a)| a.typing));
+        type_in(&mut s, "abc");
+        press(&mut s, KeyCode::Home, KeyModifiers::NONE);
+        press(&mut s, KeyCode::Delete, KeyModifiers::NONE);
+        let typed = &s.asking.as_ref().unwrap().1.input;
+        assert_eq!(typed.text, "bc");
+        assert_eq!(s.input.text, "", "the keys went to the draft behind the card");
+    }
+
+    /// **The press that focused the window does not act on the card** — a row there can be
+    /// Submit or Reject (C27).
+    #[test]
+    fn the_activating_click_does_not_answer_a_question() {
+        let mut s = state();
+        apply(&mut s, &question_frame(3));
+        s.ask_area = Some(ratatui::layout::Rect::new(0, 10, 80, 8));
+        let before = s.asking.as_ref().map(|(_, a)| a.cursor);
+        for y in 10..18 {
+            apply(&mut s, &Action::ActivatingPress(2, y));
+            apply(&mut s, &Action::Release);
+        }
+        assert_eq!(s.asking.as_ref().map(|(_, a)| a.cursor), before);
+        assert!(s.asking.as_ref().is_some_and(|(_, a)| !a.is_chosen(0) && !a.is_chosen(1)));
+    }
+
+    /// **A line that was not a command comes back to be fixed.** `/tmp is full` or a typo used to
+    /// vanish into "unknown command" with the draft gone (C22).
+    #[test]
+    fn a_line_that_is_no_command_comes_back() {
+        let mut s = state();
+        apply(&mut s, &Action::Submit("/tmp is full".into()));
+        let text = s.command_out.take().expect("taken as a command");
+        run_command(&mut s, &text);
+        assert_eq!(s.input.text, "/tmp is full");
+        assert!(s.outbox.is_none(), "an unknown word went to the agent");
+    }
+
+    /// **`//` sends it as written, one slash off** (C22).
+    #[test]
+    fn a_double_slash_line_is_sent() {
+        let mut s = state();
+        apply(&mut s, &Action::Submit("//tmp is full".into()));
+        assert!(s.command_out.is_none());
+        assert_eq!(s.outbox.as_deref(), Some("/tmp is full"));
+    }
+
+    /// **A plugin command's arguments ride along with its prompt** (C22).
+    #[test]
+    fn a_plugin_command_keeps_its_arguments() {
+        let mut s = state();
+        s.plugin_commands.push(crate::plugin::PluginCommand {
+            name: "review".into(),
+            description: String::new(),
+            prompt: "Review the pull request.".into(),
+            plugin: "p".into(),
+        });
+        run_command(&mut s, "/review 123");
+        assert_eq!(s.outbox.as_deref(), Some("Review the pull request.\n\n123"));
+    }
+
+    /// **The enrolment countdown asks for a frame when its second changes, not on every tick**
+    /// (C31). Two reads within one second agree, so the tick between them draws nothing.
+    #[test]
+    fn the_enrolment_countdown_moves_by_the_second() {
+        let mut s = state();
+        assert_eq!(enroll_second(&s), None);
+        s.enroll = Some(EnrollView {
+            code: "ABCD".into(),
+            uri: "https://example.com".into(),
+            expires_at: Instant::now() + Duration::from_millis(90_500),
+            phase: EnrollPhase::Waiting,
+        });
+        let first = enroll_second(&s);
+        assert_eq!(first, Some(90));
+        assert_eq!(enroll_second(&s), first, "a tick inside the same second would redraw");
+    }
+
+    /// **Why the connection dropped stays said while it is down** — it used to go by in six
+    /// seconds and leave "Connecting…" alone for as long as the outage lasted (C17).
+    #[test]
+    fn the_reason_for_a_drop_outlives_its_notice() {
+        let mut s = state();
+        s.lang = crate::lang::Lang::En;
+        apply(&mut s, &Action::Frame(Frame::Disconnected("connection refused".into())));
+        let later = Instant::now() + STATUS_WINDOW + Duration::from_secs(1);
+        let (_, text, _) = crate::widgets::activity::parts_at(&s, later);
+        assert!(text.contains("connection refused"), "{text}");
+
+        // A drop somebody asked for is not a failure, and has no reason to keep saying.
+        let mut s = state();
+        s.reconnecting = true;
+        apply(&mut s, &Action::Frame(Frame::Disconnected("reconnect requested".into())));
+        assert!(s.dropped_because.is_none());
     }
 }

@@ -128,6 +128,13 @@ pub fn draw(frame: &mut Frame, state: &mut State) {
         picker::draw(frame, full, p, state.lang, blink_ms);
     }
 
+    // **The popup panel sits over the lists and under the forms and the enrolment window** — the
+    // order `on_key` hands out the keys in, so what has them is what is on top. It used to be
+    // drawn last, over an enrolment code that Esc then dismissed unseen.
+    if let Some(p) = &mut state.panel {
+        panel::draw(frame, full, p, state.lang);
+    }
+
     // **The new-project form is laid on top of the picker.** The picker stays below, so pressing Esc
     // to close returns to the same spot.
     if let Some(form) = &state.new_project {
@@ -146,15 +153,8 @@ pub fn draw(frame: &mut Frame, state: &mut State) {
     if let Some(view) = &state.enroll {
         // **The window is drawn from a borrow of `state`**, so the link it hands back is stored
         // after that borrow ends.
-        let links = enroll::draw(frame, full, view, state.lang);
+        let links = enroll::draw(frame, full, view, state.lang, state.connected);
         state.screen_links.extend(links);
-    }
-
-    // **The popup panel is drawn on top of everything.** It only opens from a slash
-    // command, so nothing else is open underneath — it covers the conversation it
-    // would otherwise have filled with text.
-    if let Some(p) = &mut state.panel {
-        panel::draw(frame, full, p, state.lang);
     }
 
     // **By default no background is painted** — the terminal uses its own. If the app painted, only the area

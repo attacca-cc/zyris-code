@@ -199,7 +199,7 @@ pub fn start_mcp(caps: zyris::Capabilities, cwd: PathBuf, bridge: Bridge) {
             // **If it fails silently, a person waits thinking the tool exists.** The status line
             // disappears after 6 seconds, so we note it separately so `/mcp` can still show it later.
             bridge.note_mcp(slug, Err(why.clone()));
-            bridge.frame(crate::app::Frame::Notice(format!(
+            bridge.frame(crate::app::Frame::Problem(format!(
                 "MCP server '{slug}' did not start: {why}"
             )));
         }
