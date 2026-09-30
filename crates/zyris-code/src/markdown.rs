@@ -116,92 +116,133 @@ pub fn render_rich(src: &str, width: u16) -> Rendered {
     let mut out_prefix: Vec<u16> = Vec::new();
     let mut buf: Vec<Piece> = Vec::new();
     let mut style = Style::default().fg(theme::text());
+    // **What each open inline or block tag found, restored when it closes.** `End(Strong)` used to
+    // reset to plain text, so the rest of a heading lost its weight and the rest of a quote its
+    // colour after the first bold word.
+    let mut styles: Vec<Style> = Vec::new();
     let mut in_code = false;
-    let mut list_depth: usize = 0;
+    // The next number of each open list, innermost last; `None` for a bulleted one.
+    let mut lists: Vec<Option<u64>> = Vec::new();
+    // The indent of each open item, innermost last — the margin its own text hangs at.
+    let mut items: Vec<String> = Vec::new();
     // **The indent a list item's own text sits at**, so a wrapped line stays inside the item it
     // belongs to. It is set when the item opens and handed to every paragraph of that item; the
     // first paragraph's first line does not take it, because the bullet is already standing there.
     let mut item_indent = String::new();
     let mut item_first_para = true;
+    // How many block quotes are open. Each draws a `│ ` down the left of every line inside it.
+    let mut quote = 0usize;
     let mut table: Option<Table> = None;
     // The link currently being read. Its text carries this URL. `None` outside a link.
     let mut cur_link: Option<String> = None;
-    // The style to restore when the current link ends. Links cannot nest (CommonMark),
-    // so one slot is enough. Without it, a link inside a blockquote would leave the rest
-    // of the quote in plain `TEXT`.
-    let mut link_saved: Option<Style> = None;
+
+    // Ends the buffered text with the item margin `$indent` on wrapped lines — and on the first
+    // one too when `$first` — inside the bars of any quote it sits in.
+    macro_rules! flush_at {
+        ($indent:expr, $first:expr) => {{
+            let bars = "│ ".repeat(quote);
+            let indent: &str = $indent;
+            let first = if $first { format!("{bars}{indent}") } else { bars.clone() };
+            flush(
+                &mut out,
+                &mut out_links,
+                &mut out_prefix,
+                &mut buf,
+                width,
+                &format!("{bars}{indent}"),
+                &first,
+            )
+        }};
+    }
 
     let parser = Parser::new_ext(src, Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES);
     for event in parser {
         match event {
             Event::Start(Tag::Heading { .. }) => {
+                styles.push(style);
                 style = Style::default().fg(theme::text_heading()).add_modifier(Modifier::BOLD);
             }
             Event::End(TagEnd::Heading(_)) => {
-                flush(&mut out, &mut out_links, &mut out_prefix, &mut buf, width, "", false);
-                style = Style::default().fg(theme::text());
+                flush_at!("", false);
+                style = styles.pop().unwrap_or(style);
             }
-            Event::Start(Tag::Emphasis) => style = style.add_modifier(Modifier::ITALIC),
-            Event::End(TagEnd::Emphasis) => style = style.remove_modifier(Modifier::ITALIC),
+            Event::Start(Tag::Emphasis) => {
+                styles.push(style);
+                style = style.add_modifier(Modifier::ITALIC);
+            }
             Event::Start(Tag::Strong) => {
-                style = style.fg(theme::text_heading()).add_modifier(Modifier::BOLD)
+                styles.push(style);
+                style = style.fg(theme::text_heading()).add_modifier(Modifier::BOLD);
             }
-            Event::End(TagEnd::Strong) => style = Style::default().fg(theme::text()),
-            Event::Start(Tag::BlockQuote(_)) => style = Style::default().fg(theme::text_muted()),
+            // **Struck through and dimmed**: the strike alone is dropped by the Linux console and
+            // several multiplexers, and an old value would then read as the current one.
+            Event::Start(Tag::Strikethrough) => {
+                styles.push(style);
+                style = style.fg(theme::text_muted()).add_modifier(Modifier::CROSSED_OUT);
+            }
+            Event::End(TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough) => {
+                style = styles.pop().unwrap_or(style);
+            }
+            // **A quote wears a bar down its left**, not only a dimmer colour — muted text alone
+            // read as ordinary prose.
+            Event::Start(Tag::BlockQuote(_)) => {
+                flush_at!(&item_indent, false);
+                styles.push(style);
+                style = Style::default().fg(theme::text_muted());
+                quote += 1;
+            }
             Event::End(TagEnd::BlockQuote(_)) => {
-                flush(&mut out, &mut out_links, &mut out_prefix, &mut buf, width, "│ ", false);
-                style = Style::default().fg(theme::text());
+                flush_at!("", false);
+                quote = quote.saturating_sub(1);
+                style = styles.pop().unwrap_or(style);
             }
-            Event::Start(Tag::List(_)) => {
+            Event::Start(Tag::List(start)) => {
                 // **A nested list starts on its own line.** A tight list has no paragraph to end
                 // the line, so without this the inner bullet is glued onto the end of the outer
                 // item's sentence: `∙ 바깥  ∙ 안쪽`. The flush carries the outer item's margin,
                 // which is what the line it closes belongs to.
-                flush(
-                    &mut out,
-                    &mut out_links,
-                    &mut out_prefix,
-                    &mut buf,
-                    width,
-                    &item_indent,
-                    false,
-                );
-                list_depth += 1;
+                flush_at!(&item_indent, false);
+                lists.push(start);
             }
-            Event::End(TagEnd::List(_)) => list_depth = list_depth.saturating_sub(1),
+            Event::End(TagEnd::List(_)) => {
+                lists.pop();
+            }
             Event::Start(Tag::Item) => {
+                // **An ordered list keeps its numbers**: "see step 3" has to find a 3.
+                let marker = match lists.last_mut() {
+                    Some(Some(n)) => {
+                        *n += 1;
+                        format!("{}. ", *n - 1)
+                    }
+                    _ => "∙ ".to_string(),
+                };
+                let base = items.last().cloned().unwrap_or_default();
                 buf.push(Piece {
                     span: Span::styled(
-                        format!("{}∙ ", "  ".repeat(list_depth.saturating_sub(1))),
+                        format!("{base}{marker}"),
                         Style::default().fg(theme::accent()),
                     ),
                     url: None,
                 });
-                // **The bullet and its text are one margin wide**, so the item's own indent is the
-                // whole of it — `  ` per level, which is what `∙ ` fills at the first level.
-                item_indent = "  ".repeat(list_depth);
+                // **The marker and its text are one margin wide**, so the item's own indent is the
+                // whole of it: the enclosing item's, plus what the marker fills.
+                item_indent = format!("{base}{}", " ".repeat(display_width(&marker)));
+                items.push(item_indent.clone());
                 item_first_para = true;
             }
             Event::End(TagEnd::Item) => {
                 // **A tight list item ends here and nowhere else.** With no paragraph of its own
                 // (that is what "tight" means) the item's text is still in the buffer, and this is
                 // the only flush it gets — so this is where its margin has to be passed.
-                flush(
-                    &mut out,
-                    &mut out_links,
-                    &mut out_prefix,
-                    &mut buf,
-                    width,
-                    &item_indent,
-                    false,
-                );
+                flush_at!(&item_indent, false);
                 // **Back out one level, not to nothing.** An item inside an item leaves the outer
                 // item's margin behind it, which is where its own remaining text belongs.
-                item_indent = "  ".repeat(list_depth.saturating_sub(1));
+                items.pop();
+                item_indent = items.last().cloned().unwrap_or_default();
                 item_first_para = false;
             }
             Event::Start(Tag::CodeBlock(kind)) => {
-                flush(&mut out, &mut out_links, &mut out_prefix, &mut buf, width, "", false);
+                flush_at!("", false);
                 let lang = match &kind {
                     CodeBlockKind::Fenced(l) if !l.is_empty() => l.to_string(),
                     _ => String::new(),
@@ -267,7 +308,9 @@ pub fn render_rich(src: &str, width: u16) -> Rendered {
             // drawing side can wrap the cells in OSC 8 — that is what makes Ctrl+click open it.
             Event::Start(Tag::Link { dest_url, .. }) => {
                 cur_link = safe_url(&dest_url).map(str::to_string);
-                link_saved = Some(style);
+                // Restored when the link ends, so a link inside a quote leaves the rest of the
+                // quote in the quote's colour.
+                styles.push(style);
                 // A refused destination (`safe_url`) leaves plain text, not a link that does
                 // nothing when clicked.
                 if cur_link.is_some() {
@@ -276,13 +319,26 @@ pub fn render_rich(src: &str, width: u16) -> Rendered {
             }
             Event::End(TagEnd::Link) => {
                 cur_link = None;
-                style = link_saved.take().unwrap_or(Style::default().fg(theme::text()));
+                style = styles.pop().unwrap_or(style);
+            }
+            // **HTML is text to a terminal reader.** pulldown-cmark reads `<String>`, `<T>`,
+            // `<path>` — any `<word>` in prose — as inline HTML, and dropping it turned "use
+            // Vec<String> here" into "use Vec here" without a sign anything was missing.
+            Event::InlineHtml(t) => match &mut table {
+                Some(tb) => tb.cell.push_str(&t),
+                None => buf.push(Piece { span: Span::styled(t.to_string(), style), url: None }),
+            },
+            Event::Html(t) => {
+                for raw in t.lines() {
+                    buf.push(Piece { span: Span::styled(raw.to_string(), style), url: None });
+                    flush_at!(&item_indent, !item_first_para);
+                }
             }
             // --- table ---------------------------------------------------------
             // Cell text is collected, then drawn once with widths aligned when the table ends. Column
             // widths need every row, so they can't be drawn midway.
             Event::Start(Tag::Table(_)) => {
-                flush(&mut out, &mut out_links, &mut out_prefix, &mut buf, width, "", false);
+                flush_at!("", false);
                 table = Some(Table::default());
             }
             Event::End(TagEnd::Table) => {
@@ -332,15 +388,7 @@ pub fn render_rich(src: &str, width: u16) -> Rendered {
                 // second paragraph of the same item is indented from its own first line, because
                 // the bullet is not in front of it — the item's first paragraph is the one line the
                 // bullet stands on.
-                flush(
-                    &mut out,
-                    &mut out_links,
-                    &mut out_prefix,
-                    &mut buf,
-                    width,
-                    &item_indent,
-                    !item_first_para,
-                );
+                flush_at!(&item_indent, !item_first_para);
                 item_first_para = false;
             }
             Event::Rule => {
@@ -354,7 +402,7 @@ pub fn render_rich(src: &str, width: u16) -> Rendered {
             _ => {}
         }
     }
-    flush(&mut out, &mut out_links, &mut out_prefix, &mut buf, width, "", false);
+    flush_at!("", false);
     Rendered { lines: out, links: out_links, prefix: out_prefix }
 }
 
@@ -378,7 +426,9 @@ fn optimistic_table(src: &str) -> Option<String> {
     // Counts from the end how many lines start with a pipe.
     let start = lines.iter().rposition(|l| !l.trim_start().starts_with('|')).map_or(0, |i| i + 1);
     let block = &lines[start..];
-    if block.is_empty() {
+    // **Pipes inside a code fence are code**: a shell line `| sort` at the end of a streaming
+    // snippet got an invented `|---|` row under it.
+    if block.is_empty() || fenced(&lines[..start]).is_some() {
         return None;
     }
 
@@ -441,10 +491,14 @@ fn split_glued_rows(src: &str) -> Option<String> {
         return None;
     }
     let mut changed = false;
+    // The fence the line is inside, if any. `| grep x || true` in a code block is code, and it
+    // was split into two lines for good.
+    let mut fence: Option<char> = None;
     let out: Vec<String> = src
         .lines()
         .map(|line| {
-            if !line.trim_start().starts_with('|') || !line.contains("||") {
+            fence = step_fence(fence, line);
+            if fence.is_some() || !line.trim_start().starts_with('|') || !line.contains("||") {
                 return line.to_string();
             }
             changed = true;
@@ -460,6 +514,23 @@ fn split_glued_rows(src: &str) -> Option<String> {
         })
         .collect();
     changed.then(|| out.join("\n"))
+}
+
+/// The fence open after `line`, given the one open before it: a line of three backticks or
+/// tildes opens one, and a line of the same character closes it.
+fn step_fence(open: Option<char>, line: &str) -> Option<char> {
+    let t = line.trim_start();
+    let mark = ['`', '~'].into_iter().find(|c| t.starts_with(&c.to_string().repeat(3)));
+    match (open, mark) {
+        (None, Some(c)) => Some(c),
+        (Some(o), Some(c)) if o == c => None,
+        (open, _) => open,
+    }
+}
+
+/// The fence still open at the end of `lines`, if any.
+fn fenced(lines: &[&str]) -> Option<char> {
+    lines.iter().fold(None, |open, line| step_fence(open, line))
 }
 
 /// State held until one whole table is collected.
@@ -637,11 +708,11 @@ pub fn truncate_to(s: &str, limit: usize) -> String {
 /// Along with each line it records the links on it — a word that carries a URL opens a
 /// range at its column, and the range closes when the next word has a different URL (or none).
 ///
-/// **`indent` is the margin of what was wrapped.** It opens every line but the first when
-/// `indent_first` is false, and every line when it is true. A list item's first line already
-/// carries its bullet, which fills exactly that margin; a second paragraph of the same item
-/// carries nothing, so its own first line takes it too. Before this, a wrapped line started at
-/// column zero and stepped out of the list it belonged to. `width` is the whole room and the
+/// **`indent` is the margin of what was wrapped.** It opens every line but the first, which opens
+/// with `first`. A list item's first line already carries its bullet, which fills exactly that
+/// margin, so it takes only a quote's bars there; a second paragraph of the same item carries
+/// nothing, so its own first line takes the whole margin too. Before this, a wrapped line started
+/// at column zero and stepped out of the list it belonged to. `width` is the whole room and the
 /// margin is counted inside it, so nothing is drawn past the edge.
 fn flush(
     out: &mut Vec<Line<'static>>,
@@ -650,7 +721,7 @@ fn flush(
     buf: &mut Vec<Piece>,
     width: usize,
     indent: &str,
-    indent_first: bool,
+    first: &str,
 ) {
     if buf.is_empty() {
         return;
@@ -672,9 +743,7 @@ fn flush(
         open: None,
         joined: false,
     };
-    if indent_first {
-        f.margin();
-    }
+    f.open_with(first);
     // The widest word a fresh line can take whole.
     let room = limit.saturating_sub(f.indent_w).max(1);
 
@@ -746,13 +815,17 @@ impl Fill<'_> {
     /// **The margin opens a line.** Without it the wrapped part would sit against the left edge
     /// it was told to stay away from.
     fn margin(&mut self) {
-        if self.indent_w > 0 {
-            self.line.push(Span::styled(
-                self.indent.to_string(),
-                Style::default().fg(theme::border_light()),
-            ));
-            self.used = self.indent_w;
-            self.margin_w = self.indent_w;
+        self.open_with(self.indent);
+    }
+
+    /// Opens the line with `margin`, which the selection counts as layout, not text.
+    fn open_with(&mut self, margin: &str) {
+        let w = display_width(margin);
+        if w > 0 {
+            self.line
+                .push(Span::styled(margin.to_string(), Style::default().fg(theme::border_light())));
+            self.used = w;
+            self.margin_w = w;
         }
     }
 
@@ -1273,6 +1346,48 @@ mod tests {
         assert!(out.iter().all(|l| display_width(l) <= 12), "{out:?}");
         assert!(out.join(" ").contains("long"), "{out:?}");
         assert!(out[0].starts_with("∙ a: 1"), "{out:?}");
+    }
+
+    /// **Angle-bracketed words are text.** Parsed as inline HTML they were dropped: "use
+    /// Vec<String> here" read "use Vec here".
+    #[test]
+    fn html_in_prose_is_kept_as_text() {
+        let out = plain(&render("use Vec<String> here and <T>\n\n<div>block</div>", 60));
+        assert_eq!(out, ["use Vec<String> here and <T>", "<div>block</div>"]);
+    }
+
+    /// Strikethrough strikes and dims, an ordered list keeps its numbers, a quote draws its bar,
+    /// and a bold word gives the heading or quote around it back its own style.
+    #[test]
+    fn strike_numbers_quotes_and_nested_styles_render() {
+        let r = render("~~old~~ new", 40);
+        let old = &r[0].spans[0];
+        assert_eq!(old.content, "old");
+        assert!(old.style.add_modifier.contains(Modifier::CROSSED_OUT));
+        assert_eq!(old.style.fg, Some(theme::text_muted()));
+
+        let out = plain(&render("3. third\n4. fourth", 40));
+        assert_eq!(out, ["3. third", "4. fourth"]);
+
+        let out = plain(&render("> quoted words that wrap onto a second line here", 20));
+        assert!(out.len() > 1 && out.iter().all(|l| l.starts_with("│ ")), "{out:?}");
+
+        let r = render("# Title **b** rest", 40);
+        let rest = r[0].spans.iter().find(|s| s.content.contains("rest")).expect("{r:?}");
+        assert!(rest.style.add_modifier.contains(Modifier::BOLD), "{r:?}");
+        let r = render("> a **b** c", 40);
+        let c = r[0].spans.iter().find(|s| s.content == "c").expect("{r:?}");
+        assert_eq!(c.style.fg, Some(theme::text_muted()), "{r:?}");
+    }
+
+    /// **Pipes inside a code fence are code**: no table is invented under `| sort`, and
+    /// `|| true` is not split into two rows.
+    #[test]
+    fn pipes_inside_a_code_fence_are_left_alone() {
+        assert_eq!(optimistic_table("```sh\nls\n| sort"), None);
+        assert_eq!(split_glued_rows("```\n| grep x || true\n```"), None);
+        // Outside a fence both still do their job.
+        assert!(split_glued_rows("```\n```\n| a || b |").is_some());
     }
 
     #[test]
