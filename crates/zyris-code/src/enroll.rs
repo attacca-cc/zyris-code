@@ -85,8 +85,10 @@ struct DeviceGrant {
     /// The websocket URL. `zyris::enroll` derives the HTTP base from it, so this node cannot end up
     /// enrolling against one deployment while connecting to another.
     url: String,
-    /// What to ask to be enrolled as. Settled before this value is built — see [`source`].
-    request: zyris::EnrollRequest,
+    /// What to ask to be enrolled as. Settled before this value is built — see [`source`] — and
+    /// only ever narrowed after: a scope the server says it does not know is taken out
+    /// (`start_enrollment`).
+    request: std::sync::Mutex<zyris::EnrollRequest>,
     ui: ScreenEnroll,
     held: tokio::sync::Mutex<Option<zyris::Credential>>,
     /// Held for the length of one enrollment, so two dials cannot put two codes on the screen.
@@ -109,7 +111,7 @@ impl DeviceGrant {
         DeviceGrant {
             store,
             url,
-            request,
+            request: std::sync::Mutex::new(request),
             ui,
             held: tokio::sync::Mutex::new(None),
             enrolling: tokio::sync::Mutex::new(()),
@@ -164,8 +166,7 @@ impl DeviceGrant {
     /// rate-limits repeated grants from one address, so a code left unapproved long enough renews
     /// into that refusal — which arrives as `Unavailable`, and the run loop backs off on it.
     async fn enroll(&self) -> Result<zyris::Credential, CredentialsError> {
-        let mut enrollment =
-            zyris::enroll(&self.url, self.request.clone()).await.map_err(enrollment_trouble)?;
+        let mut enrollment = self.start_enrollment().await?;
         self.ui.show(enrollment.code());
         loop {
             // Hoisted out of the `match` so nothing borrows `enrollment` while the arm that has
@@ -195,6 +196,39 @@ impl DeviceGrant {
                 }
             }
         }
+    }
+
+    /// Asks for a code, **leaving out any scope the server says it does not know.**
+    ///
+    /// One unknown scope refuses the whole authorize request before a person ever sees a code, so
+    /// a build asking for a scope the deployment has not shipped (or has since dropped — 0.3.2's
+    /// `nodes:write`) could not enroll at all, and the only way out was a new build. The server
+    /// cannot demand a scope it does not know, so asking without it loses nothing; the person is
+    /// asked to approve what is left.
+    ///
+    /// The server names one scope per refusal, so this repeats until the request goes through. It
+    /// ends: every round takes a scope out, and a refusal naming one that is not in the request
+    /// is returned as it was.
+    async fn start_enrollment(&self) -> Result<zyris::Enrollment, CredentialsError> {
+        loop {
+            let request = self.request.lock().unwrap().clone();
+            match zyris::enroll(&self.url, request).await {
+                Ok(enrollment) => return Ok(enrollment),
+                Err(zyris::EnrollError::ScopeUnknown { scope }) if self.drop_scope(&scope) => {
+                    tracing::warn!(%scope, "the server does not know this scope; asking without it");
+                    crate::conn::server_does_not_know(&scope);
+                }
+                Err(e) => return Err(enrollment_trouble(e)),
+            }
+        }
+    }
+
+    /// Takes `scope` out of the request. False when it was not there to take.
+    fn drop_scope(&self, scope: &str) -> bool {
+        let mut request = self.request.lock().unwrap();
+        let before = request.scopes.len();
+        request.scopes.retain(|s| s != scope);
+        request.scopes.len() < before
     }
 
     /// Lets go of the credential held in memory. The next `bearer` goes back through
@@ -257,10 +291,9 @@ impl Credentials for DeviceGrant {
 /// folded into "back off and try again", which is the answer that never surfaces anything.
 fn enrollment_trouble(error: zyris::EnrollError) -> CredentialsError {
     match error {
-        // **The 2026-08-03 incident, and this message is the only thing that explains it.** One
-        // scope the deployment does not know refuses the *whole* authorize request with a 422, so
-        // nobody ever reaches the approval screen. Naming the scope is the difference between
-        // "enrollment is broken" and one line to delete from `conn::REQUIRED_SCOPES`.
+        // **Only reached when the named scope is not in the request** — `start_enrollment` drops
+        // the ones that are and asks again. The server then refused something this build never
+        // sent, and naming it is all that can be done.
         zyris::EnrollError::ScopeUnknown { scope } => CredentialsError::NeedsOperator(format!(
             "this server does not know the scope {scope}; it must be removed from the list this \
              build asks for before enrollment can even show a code"
@@ -546,6 +579,92 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel();
         bridge.attach(tx);
         (bridge, rx)
+    }
+
+    /// An authorize endpoint that refuses any request naming `nodes:write`, the way a deployment
+    /// that never shipped it does, and hands out a code otherwise. Returns the websocket URL.
+    fn refusing_nodes_write() -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                // Read the whole request: the body can arrive after the headers.
+                let mut seen = Vec::new();
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = stream.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    seen.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&seen);
+                    let Some(end) = text.find("\r\n\r\n") else { continue };
+                    let length = text[..end]
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                        })
+                        .unwrap_or(0);
+                    if seen.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+                let (status, body) = if String::from_utf8_lossy(&seen).contains("nodes:write") {
+                    (
+                        "422 Unprocessable Entity",
+                        r#"{"error":"unknown_scope","scope":"nodes:write"}"#,
+                    )
+                } else {
+                    (
+                        "200 OK",
+                        r#"{"device_code":"zdc_secret","user_code":"WXQR-7KBD","verification_uri":"https://attacca.example/settings/zyris/device","expires_in":600,"interval":1}"#,
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        format!("ws://{address}/zyris/v1/ws")
+    }
+
+    fn grant_asking_for(url: String, scopes: &[&str]) -> DeviceGrant {
+        DeviceGrant::new(
+            Arc::new(MemoryCredentialStore::default()),
+            url,
+            zyris::EnrollRequest {
+                program: "zyris-code".to_string(),
+                system_hint: "arch".to_string(),
+                platform: "linux".to_string(),
+                scopes: scopes.iter().map(|s| s.to_string()).collect(),
+            },
+            ScreenEnroll { bridge: Bridge::new() },
+        )
+    }
+
+    /// **A scope the server does not know is dropped, and the person is asked for the rest.** It
+    /// used to end enrollment before any code was shown, and only a new build got past it.
+    #[tokio::test]
+    async fn a_scope_the_server_does_not_know_is_left_out_and_a_code_is_shown() {
+        let grant = grant_asking_for(refusing_nodes_write(), &["agents:read", "nodes:write"]);
+        let enrollment = grant.start_enrollment().await.expect("it must get a code");
+        assert_eq!(enrollment.code().user_code, "WXQR-7KBD");
+        assert_eq!(grant.request.lock().unwrap().scopes, vec!["agents:read".to_string()]);
+    }
+
+    /// A refusal naming a scope this build never sent cannot be fixed by dropping it. It comes back
+    /// as it did, rather than asking again for ever.
+    #[test]
+    fn a_refused_scope_that_was_never_asked_for_is_not_dropped() {
+        let grant = grant_asking_for("ws://127.0.0.1:1/zyris/v1/ws".to_string(), &["agents:read"]);
+        assert!(!grant.drop_scope("nodes:write"));
+        assert!(grant.drop_scope("agents:read"));
+        assert!(grant.request.lock().unwrap().scopes.is_empty());
     }
 
     /// **With the screen up, the code goes to the screen.** It doesn't leak to stdout.
