@@ -170,7 +170,9 @@ pub fn clip_schema(value: &mut Value) {
 /// touches that description, so this is where it gets attached.
 pub const LONG_HINT: &str =
     " A long run is fine; this node waits for it. Use wait.start to leave one running in the \
-      background while you do something else.";
+      background while you do something else. Output over 8 KB comes back as its head and tail, \
+      the rest readable with wait.logs; read files with file_io.read and search code with \
+      search.grep, which page.";
 
 /// What this node adds to `file_io.read`'s description. **It sits outside the budget** — it is added
 /// after trimming, exactly like `LONG_HINT` above.
