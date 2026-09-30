@@ -287,13 +287,40 @@ pub fn draw(frame: &mut Frame, state: &mut State) {
         // the same answer `selection::extract` reads, so the colour and the clipboard agree.
         let body: Vec<u16> = state.screen_body();
         let cells = frame.buffer_mut().content.as_mut_slice();
+        // **Where a background cannot be told apart, the wash is reversed as well** — with
+        // `NO_COLOR` there is no background at all, and with sixteen colours the wash lands on the
+        // same slot as the terminal's own, so the drag would highlight nothing.
+        let reverse = state.caps.colours.reduced();
         for (y, from, to) in selection::row_spans(&drag, area.width, band, moved) {
             let from = from.max(body.get(y as usize).copied().unwrap_or(0));
             for x in from..to {
                 let idx = y as usize * width + x as usize;
                 if let Some(cell) = cells.get_mut(idx) {
                     cell.bg = bg;
+                    if reverse {
+                        cell.modifier.insert(ratatui::style::Modifier::REVERSED);
+                    }
                 }
+            }
+        }
+    }
+
+    // **The palette goes out in the depth this terminal reads** (`term::Colours`). Last, so every
+    // colour laid on above — the wash included — is mapped, and a 24-bit terminal pays nothing.
+    let colours = state.caps.colours;
+    if colours != crate::term::Colours::True {
+        for cell in frame.buffer_mut().content.iter_mut() {
+            cell.fg = colours.fit(cell.fg);
+            cell.bg = colours.fit(cell.bg);
+        }
+    }
+
+    // **On a terminal that draws Ambiguous characters wide, they are swapped for narrow ones** —
+    // after the snapshot above, so a drag still copies the real text (`term::narrow_stand_in`).
+    if state.caps.ambiguous_wide {
+        for cell in frame.buffer_mut().content.iter_mut() {
+            if let Some(narrow) = crate::term::narrow_stand_in(cell.symbol()) {
+                cell.set_symbol(narrow);
             }
         }
     }

@@ -213,15 +213,19 @@ pub fn body_start(row: &str) -> usize {
 
 /// The characters in screen columns `[from, to)`. Full-width glyphs count as 2 cells.
 fn slice_cols(row: &str, from: usize, to: usize) -> String {
+    use unicode_segmentation::UnicodeSegmentation;
+
     let mut out = String::new();
     let mut col = 0usize;
-    for ch in row.chars() {
-        let w = display_width(&ch.to_string()).max(1);
+    // A cluster at a time, as the row was drawn: counting by `char`, with at least a column each,
+    // put a combining mark or an emoji's joiner in a column of its own and slid the copy sideways.
+    for g in row.graphemes(true) {
+        let w = display_width(g);
         if col >= to {
             break;
         }
         if col >= from {
-            out.push(ch);
+            out.push_str(g);
         }
         col += w;
     }

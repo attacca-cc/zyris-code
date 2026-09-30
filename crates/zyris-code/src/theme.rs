@@ -71,14 +71,57 @@ pub fn set(theme: Theme) {
     PICKED.store(if theme == Theme::Light { 1 } else { 0 }, Ordering::Relaxed);
 }
 
+/// What the terminal said its background is, when it was asked at startup: 0 not answered,
+/// 1 dark, 2 light. See [`answered`].
+static ANSWERED: AtomicU8 = AtomicU8::new(0);
+
+/// Records the terminal's own answer about its background, for [`detect`] to prefer.
+pub fn answered(theme: Option<Theme>) {
+    let v = match theme {
+        None => 0,
+        Some(Theme::Dark) => 1,
+        Some(Theme::Light) => 2,
+    };
+    ANSWERED.store(v, Ordering::Relaxed);
+}
+
+/// Reads the background out of an OSC 11 reply, `ESC ] 11 ; rgb:RRRR/GGGG/BBBB` ended by BEL or
+/// `ESC \`, wherever it sits among other bytes. Each channel has one to four hex digits.
+///
+/// Light is a background whose relative luminance is past the middle — the same line the two
+/// palettes are drawn to either side of.
+pub fn background_from_reply(resp: &[u8]) -> Option<Theme> {
+    const HEAD: &[u8] = b"\x1b]11;rgb:";
+    let at = resp.windows(HEAD.len()).position(|w| w == HEAD)? + HEAD.len();
+    let rest = &resp[at..];
+    let end = rest.iter().position(|b| *b == 0x07 || *b == 0x1b)?;
+    let body = std::str::from_utf8(&rest[..end]).ok()?;
+    let mut channels = body.split('/').map(|hex| {
+        let n = u32::from_str_radix(hex, 16).ok()?;
+        (1..=4).contains(&hex.len()).then(|| n as f64 / ((1u32 << (4 * hex.len())) - 1) as f64)
+    });
+    let (r, g, b) = (channels.next()??, channels.next()??, channels.next()??);
+    let luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    Some(if luminance > 0.5 { Theme::Light } else { Theme::Dark })
+}
+
 /// Which theme to start in when the setting says "work it out".
 ///
-/// **`COLORFGBG` is the only thing we can ask without asking the terminal.** Querying the real
-/// background is OSC 11, and this app does not put questions on the wire and wait for an answer —
-/// `Terminal::clear()`'s DSR did exactly that and hung the app on terminals that never replied.
-/// So this reads the hint some terminals export (`fg;bg`, where the background is the last field)
-/// and settles for dark when there is none. Getting it wrong costs one `/config theme`.
+/// **The terminal's own answer comes first.** At startup the app asks for the background colour
+/// (OSC 11) inside the same bounded, device-attributes-fenced question it asks about the keyboard
+/// (`app::probe_kitty_keyboard`), so a terminal that does not answer costs nothing and cannot hang it —
+/// the way `Terminal::clear()`'s DSR once did. Most terminals answer, and most of them export
+/// nothing else: Terminal.app, Windows Terminal, VS Code, Ghostty, kitty and Alacritty all leave
+/// `COLORFGBG` unset, which put the dark palette — 1.19:1 text — on every white background.
+///
+/// **`COLORFGBG` is the fallback**, the hint some terminals export (`fg;bg`, where the background
+/// is the last field), and dark when there is neither. Getting it wrong costs one `/config theme`.
 pub fn detect() -> Theme {
+    match ANSWERED.load(Ordering::Relaxed) {
+        1 => return Theme::Dark,
+        2 => return Theme::Light,
+        _ => {}
+    }
     let Ok(value) = std::env::var("COLORFGBG") else { return Theme::Dark };
     let Some(bg) = value.rsplit(';').next() else { return Theme::Dark };
     // 0-6 and 8 are the dark half of the 16-colour palette; 7 and 9-15 are the light half.
@@ -509,6 +552,23 @@ pub fn diff_del() -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **What the terminal said about its background is read, whatever the digits.** Terminals
+    /// answer in four hex digits a channel (xterm, VTE), two (some others), and end with BEL or ST.
+    #[test]
+    fn the_background_is_read_from_the_terminals_answer() {
+        let light = b"\x1b]11;rgb:ffff/ffff/ffff\x1b\\";
+        assert_eq!(background_from_reply(light), Some(Theme::Light));
+        assert_eq!(background_from_reply(b"\x1b]11;rgb:1e1e/1e1e/1e1e\x07"), Some(Theme::Dark));
+        assert_eq!(background_from_reply(b"\x1b]11;rgb:fa/f7/f2\x07"), Some(Theme::Light));
+        // Typed keys and the other replies around it do not matter.
+        let mixed = b"ab\x1b[?1u\x1b]11;rgb:0000/0000/0000\x07\x1b[?62;22c";
+        assert_eq!(background_from_reply(mixed), Some(Theme::Dark));
+        // Silence, a half-arrived reply, or rubbish is no answer at all.
+        assert_eq!(background_from_reply(b"\x1b[?62;22c"), None);
+        assert_eq!(background_from_reply(b"\x1b]11;rgb:ffff/ff"), None);
+        assert_eq!(background_from_reply(b"\x1b]11;rgb:zz/zz/zz\x07"), None);
+    }
 
     fn palettes() -> [(Theme, Palette); 2] {
         [

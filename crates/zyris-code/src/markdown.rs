@@ -8,15 +8,58 @@
 //! treats the rest as code, so an "open code block" just comes out naturally.
 
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
+use ratatui::buffer::CellWidth;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use unicode_width::UnicodeWidthStr;
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::theme;
 
 /// The number of columns it occupies on screen. Fullwidth is 2 columns.
+///
+/// **Measured the way ratatui draws it**: by grapheme cluster, with ratatui's own cell width. It
+/// used to be counted by `char`, and wrapping, the cursor and selection each forced every `char` to
+/// at least one column — while the buffer puts a whole cluster in one cell. NFD Hangul (`ᄒ ᅡ ᆫ`,
+/// how macOS spells file names) counted four columns and drew two, and an emoji with a
+/// skin tone or a joiner counted twice what it drew, so lines wrapped early and the cursor stood
+/// off to the right of what was typed. A cluster holding a control character counts nothing,
+/// because the buffer drops it.
 pub fn display_width(s: &str) -> usize {
-    UnicodeWidthStr::width(s)
+    // Printable ASCII is one column a byte, and it is most of what is measured.
+    if s.bytes().all(|b| (0x20..0x7f).contains(&b)) {
+        return s.len();
+    }
+    s.graphemes(true).map(cluster_width).sum()
+}
+
+/// One cluster's columns — see [`display_width`].
+fn cluster_width(cluster: &str) -> usize {
+    if cluster.contains(char::is_control) {
+        0
+    } else {
+        cluster.cell_width() as usize
+    }
+}
+
+/// `url` if it is safe to hand to the terminal (OSC 8) and to the OS opener, else `None`.
+///
+/// **A link's destination is text we did not write** — the agent's answer, and through it any web
+/// page or file it read. Two things are refused:
+///
+/// - **Any control character.** The URL goes inside an OSC 8 sequence, and an `ESC \` in it ends
+///   the hyperlink early and hands the rest to the terminal as commands: a clipboard write, a
+///   title, anything. CommonMark's `<...>` form lets such bytes through.
+/// - **Any scheme but `http`, `https` and `mailto`.** Ctrl+click hands the URL to `open`,
+///   `xdg-open` or the Windows shell, and `file:`, `javascript:`, `ms-msdt:` and a bare relative
+///   path all mean something to those.
+///
+/// A refused link keeps its text; it is only no longer a link.
+pub fn safe_url(url: &str) -> Option<&str> {
+    if url.chars().any(char::is_control) {
+        return None;
+    }
+    let scheme = url.split_once(':')?.0.to_ascii_lowercase();
+    matches!(scheme.as_str(), "http" | "https" | "mailto").then_some(url)
 }
 
 /// A link on one output line, in that line's display columns.
@@ -204,9 +247,13 @@ pub fn render_rich(src: &str, width: u16) -> Rendered {
             // A link. Its text renders styled (underlined) and **its URL rides along** so the
             // drawing side can wrap the cells in OSC 8 — that is what makes Ctrl+click open it.
             Event::Start(Tag::Link { dest_url, .. }) => {
-                cur_link = Some(dest_url.to_string());
+                cur_link = safe_url(&dest_url).map(str::to_string);
                 link_saved = Some(style);
-                style = Style::default().fg(theme::link()).add_modifier(Modifier::UNDERLINED);
+                // A refused destination (`safe_url`) leaves plain text, not a link that does
+                // nothing when clicked.
+                if cur_link.is_some() {
+                    style = Style::default().fg(theme::link()).add_modifier(Modifier::UNDERLINED);
+                }
             }
             Event::End(TagEnd::Link) => {
                 cur_link = None;
@@ -511,12 +558,12 @@ pub fn truncate_to(s: &str, limit: usize) -> String {
         return s.to_string();
     }
     let mut out = String::new();
-    for ch in s.chars() {
+    for g in s.graphemes(true) {
         // Leave one column for the `…`.
-        if display_width(&out) + display_width(&ch.to_string()) > limit.saturating_sub(1) {
+        if display_width(&out) + display_width(g) > limit.saturating_sub(1) {
             break;
         }
-        out.push(ch);
+        out.push_str(g);
     }
     out.push('…');
     out
@@ -635,16 +682,17 @@ fn flush(
 fn split_keeping_spaces(s: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
-    for ch in s.chars() {
-        if ch == ' ' {
+    // By cluster, so a cut never falls between a letter and its mark or inside an emoji sequence.
+    for g in s.graphemes(true) {
+        if g == " " {
             if !cur.is_empty() {
                 out.push(std::mem::take(&mut cur));
             }
             out.push(" ".to_string());
         } else {
-            cur.push(ch);
+            cur.push_str(g);
             // Fullwidth has no word boundaries — it must be cut per character to stay within width.
-            if ch.len_utf8() > 1 && display_width(&cur) >= 2 {
+            if g.len() > 1 && display_width(&cur) >= 2 {
                 out.push(std::mem::take(&mut cur));
             }
         }
@@ -664,6 +712,25 @@ mod tests {
     }
 
     /// A link's URL rides along so the drawing side can wrap the cells in OSC 8.
+    /// **Columns are counted the way the buffer fills cells**: a cluster at a time. Counted by
+    /// `char` these came out wider than they draw, and everything measured with them drifted.
+    #[test]
+    fn width_is_counted_per_cluster_as_ratatui_draws_it() {
+        // NFD Hangul: three scalars, one syllable, two columns.
+        assert_eq!(display_width("\u{1112}\u{1161}\u{11ab}"), 2);
+        // A letter and its combining accent share one cell.
+        assert_eq!(display_width("e\u{301}"), 1);
+        // Emoji with a joiner, a skin tone, a variation selector.
+        assert_eq!(display_width("\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}"), 2);
+        assert_eq!(display_width("\u{1f44d}\u{1f3fd}"), 2);
+        // Control characters are dropped by the buffer, so they take nothing.
+        assert_eq!(display_width("a\tb\r"), 2);
+        // And the same total as ratatui's own count of a drawn line.
+        for s in ["한글 abc", "e\u{301}x", "\u{1f44d}\u{1f3fd}!"] {
+            assert_eq!(display_width(s), ratatui::text::Line::raw(s).width(), "{s:?}");
+        }
+    }
+
     #[test]
     fn a_link_records_its_range_and_url() {
         let r = render_rich("[문서](https://example.com/x) 끝", 40);
@@ -684,6 +751,29 @@ mod tests {
             col += w;
         }
         assert_eq!(covered, "문서", "the range must cover the link text");
+    }
+
+    /// **Only a web or mail link is a link.** A control character would end the OSC 8 sequence it
+    /// rides in and hand the rest to the terminal; any other scheme is handed to the OS opener.
+    #[test]
+    fn only_safe_destinations_become_links() {
+        assert_eq!(safe_url("https://example.com/?a=1&b"), Some("https://example.com/?a=1&b"));
+        assert_eq!(safe_url("HTTP://x"), Some("HTTP://x"));
+        assert_eq!(safe_url("mailto:a@b.c"), Some("mailto:a@b.c"));
+        for bad in [
+            "https://x/\x1b\\\x1b]52;c;aGk=\x07",
+            "https://x/\u{9c}",
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "ms-msdt:/id",
+            "notes.md",
+        ] {
+            assert_eq!(safe_url(bad), None, "{bad:?} was let through");
+        }
+        let r = render_rich("[bad](<https://x/\u{1b}]52;c;aGk=\u{7}>) [ok](https://ok)", 40);
+        let urls: Vec<&str> = r.links.iter().flatten().map(|l| l.url.as_str()).collect();
+        assert_eq!(urls, ["https://ok"]);
+        assert!(plain(&r.lines).join("").contains("bad"), "the text of a refused link stays");
     }
 
     /// Two links on one line are separate ranges with their own URLs.

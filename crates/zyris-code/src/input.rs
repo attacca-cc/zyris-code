@@ -3,6 +3,8 @@
 //! **The cursor is a character (char) index.** Handled as a byte index, it would leave character
 //! boundaries in Korean and panic.
 
+use unicode_segmentation::UnicodeSegmentation;
+
 use crate::markdown::display_width;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -30,14 +32,40 @@ impl Input {
         self.cursor += 1;
     }
 
+    /// Removes the cluster before the cursor.
+    ///
+    /// **A cluster, not a `char`**, like every movement here: one `char` left half an emoji
+    /// sequence or an orphaned accent in the draft.
     pub fn backspace(&mut self) {
         if self.cursor == 0 {
             return;
         }
-        let from = self.byte_at(self.cursor - 1);
+        let start = self.cluster_before(self.cursor);
+        let from = self.byte_at(start);
         let to = self.byte_at(self.cursor);
         self.text.replace_range(from..to, "");
-        self.cursor -= 1;
+        self.cursor = start;
+    }
+
+    /// Where clusters begin and end, in characters: `0`, every boundary after it, and the end.
+    fn boundaries(&self) -> Vec<usize> {
+        let mut at = 0;
+        let mut out = vec![0];
+        for g in self.text.graphemes(true) {
+            at += g.chars().count();
+            out.push(at);
+        }
+        out
+    }
+
+    /// The start of the cluster that ends at or spans `at`.
+    fn cluster_before(&self, at: usize) -> usize {
+        self.boundaries().into_iter().rev().find(|b| *b < at).unwrap_or(0)
+    }
+
+    /// The end of the cluster that starts at or spans `at`.
+    fn cluster_after(&self, at: usize) -> usize {
+        self.boundaries().into_iter().find(|b| *b > at).unwrap_or(self.len_chars())
     }
 
     pub fn take(&mut self) -> String {
@@ -51,11 +79,11 @@ impl Input {
     }
 
     pub fn left(&mut self) {
-        self.cursor = self.cursor.saturating_sub(1);
+        self.cursor = self.cluster_before(self.cursor);
     }
 
     pub fn right(&mut self) {
-        self.cursor = (self.cursor + 1).min(self.len_chars());
+        self.cursor = self.cluster_after(self.cursor);
     }
 
     pub fn home(&mut self) {
@@ -123,7 +151,7 @@ impl Input {
             return;
         }
         let from = self.byte_at(self.cursor);
-        let to = self.byte_at(self.cursor + 1);
+        let to = self.byte_at(self.cluster_after(self.cursor));
         self.text.replace_range(from..to, "");
     }
 
@@ -276,10 +304,16 @@ impl Input {
         let (mut row, mut col) = (0u16, 0usize);
         let mut at = (0u16, 0u16);
 
-        for (i, ch) in self.text.chars().enumerate() {
+        // **A cluster at a time, measured as it is drawn** (`display_width`). The cursor is a
+        // `char` index; one that falls inside a cluster is shown at the cluster's start.
+        let mut i = 0usize;
+        for g in self.text.graphemes(true) {
+            let here = i;
+            i += g.chars().count();
+            let holds_cursor = (here..i).contains(&self.cursor);
             // Pasting can bring in newlines. Break the line right there.
-            if ch == '\n' {
-                if i == self.cursor {
+            if g.ends_with('\n') {
+                if holds_cursor {
                     at = (row, col as u16);
                 }
                 lines.push(String::new());
@@ -287,16 +321,16 @@ impl Input {
                 col = 0;
                 continue;
             }
-            let w = display_width(&ch.to_string()).max(1);
+            let w = display_width(g);
             if col + w > limit {
                 lines.push(String::new());
                 row += 1;
                 col = 0;
             }
-            if i == self.cursor {
+            if holds_cursor {
                 at = (row, col as u16);
             }
-            lines.last_mut().expect("there is always at least one line").push(ch);
+            lines.last_mut().expect("there is always at least one line").push_str(g);
             col += w;
         }
         // If the cursor is at the very end, it's the end of the last line.
@@ -314,6 +348,35 @@ impl Input {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The draft is edited a cluster at a time and measured as it is drawn.** NFD Hangul is three
+    /// scalars in two columns; an emoji with a skin tone is two scalars in two columns. Counted by
+    /// `char` each wrapped early, put the cursor to the right of the glyph, and a Backspace left
+    /// half of it behind.
+    #[test]
+    fn clusters_are_moved_over_deleted_and_measured_whole() {
+        let nfd = "\u{1112}\u{1161}\u{11ab}";
+        let mut i = Input::new();
+        i.insert_str(&format!("a{nfd}"));
+        assert_eq!(i.wrapped(40).1, (0, 3), "the cursor sits after two columns of syllable");
+        i.left();
+        assert_eq!(i.cursor, 1, "one step left crosses the whole syllable");
+        i.right();
+        assert_eq!(i.cursor, 4);
+        i.backspace();
+        assert_eq!(i.text, "a", "Backspace took the syllable whole");
+
+        let mut i = Input::new();
+        i.insert_str("x\u{1f44d}\u{1f3fd}y");
+        i.home();
+        i.right();
+        i.delete();
+        assert_eq!(i.text, "xy", "Delete took the emoji and its skin tone together");
+
+        let mut i = Input::new();
+        i.insert_str(&nfd.repeat(3));
+        assert_eq!(i.height(6), 1, "three syllables are six columns, one line");
+    }
 
     /// The cursor is in characters (char). Counted in byte indices, it panics on Korean.
     #[test]

@@ -227,8 +227,8 @@ impl Lang {
     /// works everywhere) is the way to insert a newline.
     pub fn kitty_shift_enter_hint(self) -> &'static str {
         self.pick(
-            "연결됨 ‒ 이 터미널은 Shift+Enter를 구별하지 못합니다. 줄바꿈은 Alt+Enter를 쓰세요.",
-            "Connected ‒ this terminal can't tell Shift+Enter apart from Enter. Use Alt+Enter for a newline.",
+            "연결됨 ‒ 이 터미널은 Shift+Enter를 구별하지 못합니다. 줄바꿈은 Ctrl+J나 Alt+Enter를 쓰세요.",
+            "Connected ‒ this terminal can't tell Shift+Enter apart from Enter. Use Ctrl+J or Alt+Enter for a newline.",
         )
     }
     /// A span of seconds, in at most two units.
@@ -656,6 +656,33 @@ impl Lang {
     }
     /// The screen never came up — the shell notice is all the person gets. `main` says this and
     /// exits instead of sitting on the waiting line with a frozen cursor (the 2026-08-07 report).
+    /// The screen was asked for where there is no terminal to draw it on (`term::no_screen`).
+    pub fn no_screen(self, program: &str, why: crate::term::NoScreen) -> String {
+        use crate::term::NoScreen;
+        match (self, why) {
+            (Lang::Ko, NoScreen::NotATerminal) => format!(
+                "{program}: 화면은 터미널에서만 뜹니다 ‒ 입력이나 출력이 터미널이 아닙니다. \
+                 스크립트에서는 `{program} -p <요청>`을 쓰세요 (ssh라면 `ssh -t`)."
+            ),
+            (Lang::En, NoScreen::NotATerminal) => format!(
+                "{program}: the screen needs a terminal, and stdin or stdout is not one. \
+                 From a script use `{program} -p <prompt>` (over ssh, `ssh -t`)."
+            ),
+            (Lang::Ko, NoScreen::Dumb) => format!(
+                "{program}: TERM=dumb인 곳에서는 화면을 그릴 수 없습니다. `{program} -p <요청>`을 쓰세요."
+            ),
+            (Lang::En, NoScreen::Dumb) => format!(
+                "{program}: cannot draw the screen where TERM=dumb. Use `{program} -p <prompt>`."
+            ),
+        }
+    }
+    /// Ctrl+click on a link that nothing on this machine would open (`app::open_url`).
+    pub fn link_not_opened(self) -> &'static str {
+        self.pick(
+            "링크를 열지 못했습니다 ‒ 이 컴퓨터에 브라우저를 여는 프로그램이 없습니다.",
+            "Could not open the link ‒ nothing on this machine would open a browser.",
+        )
+    }
     pub fn screen_failed(self, why: &str) -> String {
         match self {
             Lang::Ko => format!("화면을 띄우지 못했습니다: {why}"),
@@ -1731,17 +1758,20 @@ impl Lang {
         }
     }
     /// Said while `/reconnect` is reattaching.
-    /// Said **once** when a selection could not reach the system clipboard, because this terminal
-    /// was not found to read OSC 52. Copying looks like it worked otherwise — the text is held in
-    /// the app and pastes back into it — so without a word the paste into another window is where
-    /// it is discovered, and by then the reason is nowhere in sight.
-    pub fn copy_stayed_here(self) -> &'static str {
+    /// Said **once** when a selection could not reach the system clipboard: this terminal was not
+    /// found to read OSC 52 and no clipboard tool was found either. The highlight looks like a copy
+    /// that worked, so without a word the paste into another window is where it is discovered.
+    ///
+    /// **It does not say the copy stayed in the app.** It used to, and nothing in the app could
+    /// paste it back — the text was simply gone.
+    pub fn copy_not_sent(self) -> &'static str {
         self.pick(
-            "복사한 글이 이 앱 안에만 있습니다 ‒ 이 터미널이 시스템 클립보드 쓰기를 안 받습니다. \
-             ZYRIS_CODE_OSC52=1로 켜 보거나, ZYRIS_CODE_MOUSE=0으로 터미널이 직접 긁게 하세요.",
-            "The copy stayed inside this app ‒ this terminal was not found to accept clipboard \
-             writes. Try ZYRIS_CODE_OSC52=1, or ZYRIS_CODE_MOUSE=0 to let the terminal select \
-             text itself.",
+            "시스템 클립보드에 복사하지 못했습니다 ‒ 이 터미널이 클립보드 쓰기를 받는지 알 수 없고 \
+             wl-copy, xclip, pbcopy도 없습니다. ZYRIS_CODE_OSC52=1로 켜 보거나, \
+             ZYRIS_CODE_MOUSE=0으로 터미널이 직접 긁게 하세요.",
+            "Could not copy to the system clipboard ‒ this terminal was not found to accept \
+             clipboard writes, and no wl-copy, xclip or pbcopy was found. Try ZYRIS_CODE_OSC52=1, \
+             or ZYRIS_CODE_MOUSE=0 to let the terminal select text itself.",
         )
     }
     pub fn reconnecting(self) -> &'static str {
@@ -2895,7 +2925,7 @@ mod tests {
             (ko.enroll_title(), en.enroll_title()),
             (ko.enroll_steps(), en.enroll_steps()),
             (ko.enroll_warning(), en.enroll_warning()),
-            (ko.copy_stayed_here(), en.copy_stayed_here()),
+            (ko.copy_not_sent(), en.copy_not_sent()),
             (ko.enroll_lapsed(), en.enroll_lapsed()),
             (ko.enroll_denied(), en.enroll_denied()),
             (ko.enroll_keys(), en.enroll_keys()),
@@ -2958,7 +2988,7 @@ mod tests {
             en.enroll_title(),
             en.enroll_steps(),
             en.enroll_warning(),
-            en.copy_stayed_here(),
+            en.copy_not_sent(),
             en.enroll_lapsed(),
             en.enroll_denied(),
             en.enroll_keys(),

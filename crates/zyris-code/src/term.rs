@@ -21,6 +21,8 @@
 //! So an unknown terminal is told no, and `$ZYRIS_CODE_HYPERLINKS` / `$ZYRIS_CODE_OSC52` override
 //! the guess in either direction for whoever knows better than we do.
 
+use ratatui::style::Color;
+
 /// Terminals known to render OSC 8 hyperlinks.
 ///
 /// Matched against `TERM_PROGRAM` and `LC_TERMINAL`. **`LC_TERMINAL` matters inside tmux**, which
@@ -46,6 +48,198 @@ fn override_of(value: Option<&str>) -> Option<bool> {
     }
 }
 
+/// How many colours the terminal can draw.
+///
+/// **The palette is written in 24-bit and sent in whatever the terminal reads.** Every theme colour
+/// is `Color::Rgb`, and a terminal that has no 24-bit colour does not ignore `38;2;r;g;b` — macOS
+/// Terminal.app misreads its parameters and paints unrelated colours, and the Linux console folds
+/// it into eight slots where the text and the dimmed text land on the same one. So the frame is
+/// mapped to the nearest colour the terminal does have (`widgets::draw`, through [`Colours::fit`])
+/// rather than every call site learning about depth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Colours {
+    /// `38;2;r;g;b` as written.
+    #[default]
+    True,
+    /// The xterm 256-colour palette. The sixteen base slots are left out of the match: the person's
+    /// theme redefines those, so what they look like is anybody's guess.
+    Indexed,
+    /// The sixteen base colours only.
+    Sixteen,
+    /// `NO_COLOR`: none at all. crossterm already drops every colour sequence when it is set, so
+    /// the frame is left as it is and only the cues that live in colour alone get a stand-in.
+    Mono,
+}
+
+impl Colours {
+    /// Which depth the environment says, over the same lookup as the rest of [`Caps`].
+    ///
+    /// **`COLORTERM` is the one real answer**, and the terminals that support 24-bit colour set
+    /// it — but it is not forwarded over SSH by default, so the terminals already known by name
+    /// count as well. After that `TERM` decides: `-256color` gets the palette and anything else the
+    /// sixteen, which is what `linux`, `screen` and a bare `xterm` really have. No `TERM` at all is
+    /// the Windows console, which has drawn 24-bit colour since Windows 10.
+    fn from_env(var: &dyn Fn(&str) -> Option<String>, named: bool) -> Colours {
+        if var("NO_COLOR").is_some_and(|v| !v.is_empty()) {
+            return Colours::Mono;
+        }
+        let colorterm = var("COLORTERM").unwrap_or_default().to_ascii_lowercase();
+        if colorterm == "truecolor" || colorterm == "24bit" || named {
+            return Colours::True;
+        }
+        match var("TERM") {
+            None => Colours::True,
+            Some(t) if t.ends_with("-direct") || t.contains("truecolor") => Colours::True,
+            Some(t) if t.contains("256color") => Colours::Indexed,
+            Some(_) => Colours::Sixteen,
+        }
+    }
+
+    /// Whether a cue carried by a background alone would vanish here — the drag's wash, above all.
+    pub fn reduced(self) -> bool {
+        matches!(self, Colours::Sixteen | Colours::Mono)
+    }
+
+    /// `colour` as this terminal can draw it. Anything that is not 24-bit passes through.
+    pub fn fit(self, colour: Color) -> Color {
+        let Color::Rgb(r, g, b) = colour else { return colour };
+        match self {
+            Colours::True | Colours::Mono => colour,
+            Colours::Indexed => Color::Indexed(nearest_indexed(r, g, b)),
+            Colours::Sixteen => Color::Indexed(nearest(&BASE16, (r, g, b)) as u8),
+        }
+    }
+}
+
+/// xterm's defaults for the sixteen base colours. Only a guess at what the person's theme has, but
+/// the nearest slot by these is still the nearest by kind — a red stays a red.
+const BASE16: [(u8, u8, u8); 16] = [
+    (0, 0, 0),
+    (205, 0, 0),
+    (0, 205, 0),
+    (205, 205, 0),
+    (0, 0, 238),
+    (205, 0, 205),
+    (0, 205, 205),
+    (229, 229, 229),
+    (127, 127, 127),
+    (255, 0, 0),
+    (0, 255, 0),
+    (255, 255, 0),
+    (92, 92, 255),
+    (255, 0, 255),
+    (0, 255, 255),
+    (255, 255, 255),
+];
+
+/// Index of the entry closest to `to`, by squared distance.
+fn nearest(of: &[(u8, u8, u8)], to: (u8, u8, u8)) -> usize {
+    let d = |(r, g, b): (u8, u8, u8)| {
+        let (dr, dg, db) = (r as i32 - to.0 as i32, g as i32 - to.1 as i32, b as i32 - to.2 as i32);
+        dr * dr + dg * dg + db * db
+    };
+    (0..of.len()).min_by_key(|&i| d(of[i])).unwrap_or(0)
+}
+
+/// The closest of the 6x6x6 cube (16-231) and the grey ramp (232-255).
+fn nearest_indexed(r: u8, g: u8, b: u8) -> u8 {
+    const LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
+    let level = |c: u8| nearest(&LEVELS.map(|l| (l, l, l)), (c, c, c));
+    let (ri, gi, bi) = (level(r), level(g), level(b));
+    let cube = (LEVELS[ri], LEVELS[gi], LEVELS[bi]);
+    let grey_i = ((r as usize + g as usize + b as usize) / 3).saturating_sub(3) / 10;
+    let grey_i = grey_i.min(23);
+    let grey = 8 + 10 * grey_i as u8;
+    if nearest(&[cube, (grey, grey, grey)], (r, g, b)) == 0 {
+        16 + 36 * ri as u8 + 6 * gi as u8 + bi as u8
+    } else {
+        232 + grey_i as u8
+    }
+}
+
+/// A one-column stand-in for a cell a CJK-configured terminal would draw two columns wide, or
+/// `None` when the cell is drawn the same either way.
+///
+/// **The screen is laid out in ratatui's widths, and ratatui counts an Ambiguous character as one
+/// column.** A terminal set to draw them wide — PuTTY's "ambiguous as wide", iTerm2's and
+/// Terminal.app's double-width setting, common among Korean users — draws `—`, `…`, `“`, `·`, `×` or
+/// a box-drawing line in two, and the rest of the row slides right by one for each; the diff
+/// thinks those cells are right, so the damage stays until a full repaint. The app's own glyphs
+/// are policed by `tests/width.rs`; the agent's text cannot be. Swapping the cell for an ASCII
+/// look-alike keeps the row where it was measured. Letters (Greek, Cyrillic) are left alone: a row
+/// that slides is still readable, a word of question marks is not.
+///
+/// **Only the screen changes.** The swap happens on the finished frame, after the text a drag
+/// copies was taken from it, so a copy still carries the real characters.
+///
+/// **Opt-in, not guessed from the locale.** Most Korean terminals — Windows Terminal, iTerm2,
+/// GNOME Terminal — draw these narrow by default, and swapping them there would only coarsen text
+/// that was already right.
+pub fn narrow_stand_in(cell: &str) -> Option<&'static str> {
+    use unicode_width::UnicodeWidthStr;
+    if cell.width_cjk() <= cell.width() {
+        return None;
+    }
+    let mut chars = cell.chars();
+    let first = chars.next()?;
+    if first.is_alphabetic() {
+        return None;
+    }
+    // Written as escapes: these are what the agent's text may hold, never what the app draws, and
+    // `tests/width.rs` reads the app's literals for what it draws.
+    Some(match first {
+        // Dashes, and the horizontal and vertical lines of box drawing.
+        '\u{2010}'..='\u{2015}' => "-",
+        '\u{2500}' | '\u{2501}' | '\u{2504}' | '\u{2505}' | '\u{2508}' | '\u{2509}'
+        | '\u{254C}' | '\u{254D}' | '\u{2550}' => "-",
+        '\u{2502}' | '\u{2503}' | '\u{2506}' | '\u{2507}' | '\u{250A}' | '\u{250B}'
+        | '\u{254E}' | '\u{254F}' | '\u{2551}' => "|",
+        '\u{2500}'..='\u{257F}' => "+",
+        // Half and part blocks standing at an edge read as a bar; the rest as a fill.
+        '\u{258C}'..='\u{2590}' => "|",
+        '\u{2580}'..='\u{259F}' => "#",
+        // Quotes, primes, ellipsis and middle dots.
+        '\u{201C}' | '\u{201D}' | '\u{2033}' => "\"",
+        '\u{2018}' | '\u{2019}' | '\u{2032}' => "'",
+        '\u{2026}' | '\u{00B7}' | '\u{2027}' => ".",
+        // Arrows and pointing triangles keep their direction; other shapes are a bullet.
+        '\u{2192}' | '\u{21D2}' | '\u{25B6}' | '\u{25BA}' => ">",
+        '\u{2190}' | '\u{21D0}' | '\u{25C0}' | '\u{25C4}' => "<",
+        '\u{2191}' | '\u{25B2}' => "^",
+        '\u{2193}' | '\u{25BC}' => "v",
+        '\u{2022}' | '\u{203B}' | '\u{2605}' | '\u{2606}' | '\u{25A0}'..='\u{25FF}' => "*",
+        '\u{00D7}' => "x",
+        '\u{00F7}' => "/",
+        '\u{00B1}' => "+",
+        '\u{00B0}' | '\u{00BA}' => "o",
+        _ => "?",
+    })
+}
+
+/// Why the screen cannot be drawn here, if it cannot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoScreen {
+    /// stdin or stdout is not a terminal: `ssh host zyris-code` without `-t`, cron, CI, a pipe.
+    NotATerminal,
+    /// `TERM=dumb`: Emacs `M-x shell`, CI logs. A full-screen app there is escape soup.
+    Dumb,
+}
+
+/// Whether the screen can be drawn, before anything tries to.
+///
+/// **Asked in `main`, not found out by `ratatui::init`.** Without a terminal that call panicked,
+/// and the person saw a Rust panic and "task N panicked" instead of a sentence pointing at `-p`;
+/// with only stdout redirected the screen ran and every frame went into the pipe.
+pub fn no_screen(stdin_tty: bool, stdout_tty: bool, term: Option<&str>) -> Option<NoScreen> {
+    if !(stdin_tty && stdout_tty) {
+        Some(NoScreen::NotATerminal)
+    } else if term == Some("dumb") {
+        Some(NoScreen::Dumb)
+    } else {
+        None
+    }
+}
+
 /// What the app asks about a terminal. Taken from the environment once at startup — reading it per
 /// frame would put a `std::env` lookup inside the draw loop for an answer that cannot change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -56,6 +250,11 @@ pub struct Caps {
     pub osc52: bool,
     /// Whether to take the mouse at all. Off hands selection and copy back to the terminal.
     pub mouse: bool,
+    /// How the palette has to be sent.
+    pub colours: Colours,
+    /// Whether this terminal draws East Asian Ambiguous characters two columns wide — see
+    /// [`narrow_stand_in`]. Only ever set by `$ZYRIS_CODE_AMBIGUOUS_WIDE`.
+    pub ambiguous_wide: bool,
 }
 
 impl Caps {
@@ -88,16 +287,26 @@ impl Caps {
             override_of(var("ZYRIS_CODE_HYPERLINKS").as_deref()).unwrap_or(named && !dumb);
         // **OSC 52 is the same guess but a weaker one.** Several terminals that draw hyperlinks
         // keep clipboard writes switched off by default (xterm, and Alacritty until told
-        // otherwise), so a true here means "worth trying", not "will work". Trying costs nothing:
-        // the in-app clipboard is filled either way, and a terminal that ignores the sequence
-        // ignores it silently.
-        let osc52 = override_of(var("ZYRIS_CODE_OSC52").as_deref()).unwrap_or(named && !dumb);
+        // otherwise), so a true here means "worth trying", not "will work". A terminal that
+        // ignores the sequence ignores it silently.
+        //
+        // **Over SSH it is tried whatever the name.** `TERM_PROGRAM` and friends are not forwarded
+        // by default, so a known terminal looks unknown there — and OSC 52 is the only route to
+        // the clipboard of the machine at the keyboard (`clipboard::export`).
+        let ssh = var("SSH_CONNECTION").is_some() || var("SSH_TTY").is_some();
+        let osc52 =
+            override_of(var("ZYRIS_CODE_OSC52").as_deref()).unwrap_or((named || ssh) && !dumb);
         // **Taking the mouse takes the terminal's own selection with it.** Anyone who would rather
         // keep copy-on-select can say so, and then the drag, the click-to-fold and the Ctrl+click
         // all go back to the terminal.
         let mouse = override_of(var("ZYRIS_CODE_MOUSE").as_deref()).unwrap_or(!dumb);
 
-        Caps { hyperlinks, osc52, mouse }
+        let colours = Colours::from_env(&var, named);
+
+        let ambiguous_wide =
+            override_of(var("ZYRIS_CODE_AMBIGUOUS_WIDE").as_deref()).unwrap_or(false);
+
+        Caps { hyperlinks, osc52, mouse, colours, ambiguous_wide }
     }
 }
 
@@ -160,6 +369,14 @@ mod tests {
         assert!(c.hyperlinks, "the terminal underneath tmux was not seen");
     }
 
+    /// **Over SSH the terminal's name rarely arrives**, and OSC 52 is the one way to its clipboard.
+    #[test]
+    fn a_remote_session_tries_the_clipboard_sequence() {
+        assert!(caps(&[("TERM", "xterm-256color"), ("SSH_CONNECTION", "1 2 3 4")]).osc52);
+        assert!(caps(&[("TERM", "xterm-256color"), ("SSH_TTY", "/dev/pts/3")]).osc52);
+        assert!(!caps(&[("TERM", "xterm-256color"), ("SSH_TTY", "/dev/pts/3")]).hyperlinks);
+    }
+
     /// `TERM=dumb` is the one answer that is certain, and it rules out the mouse as well.
     #[test]
     fn a_dumb_terminal_is_given_nothing_at_all() {
@@ -179,6 +396,86 @@ mod tests {
 
         assert!(!caps(&[("TERM_PROGRAM", "ghostty"), ("ZYRIS_CODE_OSC52", "no")]).osc52);
         assert!(!caps(&[("ZYRIS_CODE_MOUSE", "0")]).mouse, "the mouse could not be handed back");
+    }
+
+    /// **24-bit colour only where the terminal says so.** Terminal.app, the Linux console and a
+    /// `screen` without `RGB` are the ones that got `38;2` and painted it wrong.
+    #[test]
+    fn the_colour_depth_follows_what_the_terminal_says() {
+        assert_eq!(
+            caps(&[("COLORTERM", "truecolor"), ("TERM", "xterm-256color")]).colours,
+            Colours::True
+        );
+        assert_eq!(caps(&[("COLORTERM", "24bit"), ("TERM", "screen")]).colours, Colours::True);
+        assert_eq!(caps(&[("TERM", "xterm-256color")]).colours, Colours::Indexed);
+        assert_eq!(
+            caps(&[("TERM_PROGRAM", "Apple_Terminal"), ("TERM", "xterm-256color")]).colours,
+            Colours::Indexed
+        );
+        assert_eq!(caps(&[("TERM", "linux")]).colours, Colours::Sixteen);
+        assert_eq!(caps(&[("TERM", "screen")]).colours, Colours::Sixteen);
+        assert_eq!(caps(&[("TERM", "xterm-direct")]).colours, Colours::True);
+        // Known by name, as over SSH where COLORTERM does not travel.
+        assert_eq!(caps(&[("TERM", "xterm-kitty")]).colours, Colours::True);
+        assert_eq!(
+            caps(&[("LC_TERMINAL", "iTerm2"), ("TERM", "xterm-256color")]).colours,
+            Colours::True
+        );
+        // The Windows console sets no TERM.
+        assert_eq!(caps(&[]).colours, Colours::True);
+        // NO_COLOR wins over everything; empty means unset, as the convention says.
+        assert_eq!(caps(&[("NO_COLOR", "1"), ("COLORTERM", "truecolor")]).colours, Colours::Mono);
+        assert_eq!(caps(&[("NO_COLOR", ""), ("COLORTERM", "truecolor")]).colours, Colours::True);
+    }
+
+    #[test]
+    fn a_colour_is_mapped_to_the_nearest_the_terminal_has() {
+        let rgb = Color::Rgb(0xe8, 0xe2, 0xdc);
+        assert_eq!(Colours::True.fit(rgb), rgb);
+        assert_eq!(Colours::Mono.fit(rgb), rgb);
+        // Exact cube and grey entries come back as themselves.
+        assert_eq!(Colours::Indexed.fit(Color::Rgb(255, 0, 0)), Color::Indexed(196));
+        assert_eq!(Colours::Indexed.fit(Color::Rgb(0, 0, 0)), Color::Indexed(16));
+        assert_eq!(Colours::Indexed.fit(Color::Rgb(128, 128, 128)), Color::Indexed(244));
+        assert_eq!(Colours::Sixteen.fit(Color::Rgb(250, 10, 10)), Color::Indexed(9));
+        assert_eq!(Colours::Sixteen.fit(Color::Rgb(0x0f, 0x0d, 0x0a)), Color::Indexed(0));
+        // Not ours to touch.
+        assert_eq!(Colours::Sixteen.fit(Color::Reset), Color::Reset);
+        assert_eq!(Colours::Indexed.fit(Color::Indexed(3)), Color::Indexed(3));
+        // Every value lands inside the range its depth may use.
+        for v in (0..=255u8).step_by(5) {
+            for c in [Color::Rgb(v, 255 - v, v / 2), Color::Rgb(v, v, v)] {
+                assert!(matches!(Colours::Indexed.fit(c), Color::Indexed(16..=255)), "{c:?}");
+                assert!(matches!(Colours::Sixteen.fit(c), Color::Indexed(0..=15)), "{c:?}");
+            }
+        }
+    }
+
+    /// **Only the cells a wide-ambiguous terminal would draw in two columns are swapped**, and only
+    /// for something one column wide. Hangul, ASCII and the app's own narrow glyphs are untouched.
+    #[test]
+    fn an_ambiguous_cell_gets_a_one_column_stand_in() {
+        assert_eq!(narrow_stand_in("—"), Some("-"));
+        assert_eq!(narrow_stand_in("…"), Some("."));
+        assert_eq!(narrow_stand_in("│"), Some("|"));
+        assert_eq!(narrow_stand_in("●"), Some("*"));
+        assert_eq!(narrow_stand_in("→"), Some(">"));
+        assert_eq!(narrow_stand_in("\u{2460}"), Some("?"), "① has no look-alike");
+        assert_eq!(narrow_stand_in("▌"), Some("|"));
+        for same in ["a", "한", " ", "-", "Ж", "α"] {
+            assert_eq!(narrow_stand_in(same), None, "{same:?} was swapped");
+        }
+        assert!(!caps(&[]).ambiguous_wide, "off unless asked for");
+        assert!(caps(&[("ZYRIS_CODE_AMBIGUOUS_WIDE", "1")]).ambiguous_wide);
+    }
+
+    #[test]
+    fn the_screen_is_not_drawn_without_a_terminal_to_draw_on() {
+        assert_eq!(no_screen(true, true, Some("xterm-256color")), None);
+        assert_eq!(no_screen(true, true, None), None, "the Windows console sets no TERM");
+        assert_eq!(no_screen(false, true, None), Some(NoScreen::NotATerminal));
+        assert_eq!(no_screen(true, false, Some("xterm")), Some(NoScreen::NotATerminal));
+        assert_eq!(no_screen(true, true, Some("dumb")), Some(NoScreen::Dumb));
     }
 
     /// A value that means nothing falls back to the guess rather than to `false` — `MOUSE=maybe`

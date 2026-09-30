@@ -169,6 +169,18 @@ async fn run_app() -> ExitCode {
     // Order: `$ZYRIS_CODE_LANG` → last choice → locale.
     zyris_code::lang::set(zyris_code::lang::startup());
 
+    // **No screen without a terminal to draw it on** (`term::no_screen`). Said before anything
+    // else starts, in a sentence that points at print mode.
+    if printing.is_none() {
+        use std::io::IsTerminal;
+        let term = std::env::var("TERM").ok();
+        let tty = (std::io::stdin().is_terminal(), std::io::stdout().is_terminal());
+        if let Some(why) = zyris_code::term::no_screen(tty.0, tty.1, term.as_deref()) {
+            zyris_code::cli::warn(&lang::current().no_screen(&program, why));
+            return ExitCode::FAILURE;
+        }
+    }
+
     // **Updating happens here, on the terminal, before anything else is built.**
     //
     // It used to happen from inside the screen: the app asked for an update, wrote a script out,
@@ -294,7 +306,7 @@ async fn run_app() -> ExitCode {
     };
     if let Some(ended) = died_before_screen {
         // The app may have died mid-raw-mode; restore the terminal so the reason is readable.
-        ratatui::restore();
+        app::restore_terminal();
         let why = match ended {
             Ok(Ok(())) => "the screen ended before it attached".to_string(),
             Ok(Err(e)) => e.to_string(),
@@ -453,8 +465,14 @@ async fn run_app() -> ExitCode {
         app_result = &mut app_task => RunnerEnded::App(app_result),
     };
     match outcome {
-        // The runner ended cleanly (SIGINT).
-        RunnerEnded::Runner(Ok(())) => ExitCode::SUCCESS,
+        // The runner ended cleanly (SIGINT). **The screen is closed before leaving**, exactly as on
+        // the error arm below: returning straight away dropped the app mid-raw-mode, with the
+        // alternate screen, mouse tracking and line-wrap-off all left on, and exit 0 hid it.
+        RunnerEnded::Runner(Ok(())) => {
+            let _ = die_tx.send(true);
+            let _ = tokio::time::timeout(Duration::from_secs(3), app_task).await;
+            ExitCode::SUCCESS
+        }
         RunnerEnded::Runner(Err(e)) => {
             // Close the screen first if it's alive — the reason is visible only after the terminal
             // is restored. If it can't be closed (app already dead), just say it.
