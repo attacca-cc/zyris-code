@@ -246,7 +246,11 @@ impl Form {
 }
 
 /// Walks `at` by `by` around a ring of `len`. Negative steps go backwards.
-fn step(at: usize, by: i32, len: usize) -> usize {
+///
+/// **The one ring walk.** Every list that wraps — the picker, the question card, this form, the
+/// `/mode` list — moves its cursor through here, so an empty list is `0` everywhere rather than a
+/// division by zero in whichever copy forgot to check.
+pub(crate) fn step(at: usize, by: i32, len: usize) -> usize {
     if len == 0 {
         return 0;
     }

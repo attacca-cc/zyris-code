@@ -48,13 +48,9 @@ impl Form {
         self.error = None;
     }
 
-    /// Move to the previous field.
+    /// Move to the previous field. With two fields that is the other one, the same as `next`.
     pub fn prev(&mut self) {
-        self.field = match self.field {
-            Field::Name => Field::Description,
-            Field::Description => Field::Name,
-        };
-        self.error = None;
+        self.next();
     }
 
     /// Submit. **An empty name never calls the server** — we would not know what to create, and

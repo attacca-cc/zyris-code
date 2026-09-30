@@ -7571,9 +7571,8 @@ async fn flush_queue(
 /// `Mode::next` would tie the panel's cursor to whatever order the cycle happens to use.
 fn step_mode(from: crate::mode::Mode, dir: i32) -> crate::mode::Mode {
     let all = crate::mode::Mode::ALL;
-    let at = all.iter().position(|m| *m == from).unwrap_or(0) as i32;
-    let n = all.len() as i32;
-    all[(((at + dir) % n + n) % n) as usize]
+    let at = all.iter().position(|m| *m == from).unwrap_or(0);
+    all[crate::panel::step(at, dir, all.len())]
 }
 
 /// Sets the session staging so the next message goes where the mode decided. **It only runs

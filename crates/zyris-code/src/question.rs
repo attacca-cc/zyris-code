@@ -227,15 +227,14 @@ impl Answering {
         if self.typing {
             return;
         }
-        let n = self.rows().len();
-        self.cursor = (self.cursor + n - 1) % n;
+        self.cursor = crate::panel::step(self.cursor, -1, self.rows().len());
     }
 
     pub fn down(&mut self) {
         if self.typing {
             return;
         }
-        self.cursor = (self.cursor + 1) % self.rows().len();
+        self.cursor = crate::panel::step(self.cursor, 1, self.rows().len());
     }
 
     /// What was typed directly into this step. The screen shows it.
