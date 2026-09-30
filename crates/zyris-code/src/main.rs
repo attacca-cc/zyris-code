@@ -95,7 +95,7 @@ async fn main() -> ExitCode {
     // dies the user sees nothing but a frozen cursor — the `notice` layer collects the reason.
     //
     // **The default is the platform's temp directory, not `/tmp`.** Windows has no `\tmp` on the
-    // current drive, so `File::create` failed there and the `Err` arm below silently dropped the
+    // current drive, so opening the file failed there and the `Err` arm below silently dropped the
     // file layer — leaving no logs at all on the one platform where nothing can be reproduced
     // locally. `std::env::temp_dir` reads `%TEMP%` there and `/tmp` here.
     let log = zyris_code::notice::log_path();
@@ -103,7 +103,7 @@ async fn main() -> ExitCode {
         // **It's `zyris=info`.** If only disconnects (`warn`) were kept, the reconnecting would vanish
         // from the log and "keeps disconnecting" couldn't be traced later.
         .unwrap_or_else(|_| "zyris_code=info,zyris=info".into());
-    match std::fs::File::create(&log) {
+    match zyris_code::notice::LogFile::open(&log) {
         Ok(file) => {
             tracing_subscriber::registry()
                 .with(tracing_subscriber::fmt::layer().with_writer(file).with_ansi(false))

@@ -144,7 +144,7 @@ fn print_mode_never_updates() {
             ("ZYRIS_SERVER_URL", "ws://127.0.0.1:1".into()),
             ("ZYRIS_CONFIG_DIR", dir.display().to_string()),
             // **Not the default log.** That one belongs to whatever zyris-code session is running
-            // this suite, and the app empties it on start.
+            // this suite, and this test's lines would be mixed into it.
             ("ZYRIS_CODE_LOG", dir.join("log").display().to_string()),
         ],
         Duration::from_secs(8),

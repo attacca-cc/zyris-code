@@ -80,7 +80,7 @@ impl Notice {
                 plain(&lang.previous_error(before));
             }
         }
-        plain(&lang.log_location(&log_path().to_string_lossy()));
+        plain(&lang.log_location(&log_path().to_string_lossy(), std::process::id()));
     }
 
     /// A spot that ends things but is **not an error**. Red is used sparingly — if everything is red, the real error
@@ -162,6 +162,65 @@ pub fn log_path() -> std::path::PathBuf {
     std::env::var("ZYRIS_CODE_LOG")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::env::temp_dir().join("zyris-code.log"))
+}
+
+/// Past this size the log is emptied when the app starts, rather than grown for ever.
+const LOG_KEEP_BYTES: u64 = 10 * 1024 * 1024;
+
+/// The log file, opened for appending, **with every line marked by the process that wrote it.**
+///
+/// **Several windows share one log.** It used to be emptied on every start, so opening a second
+/// window wiped the first one's record, and the two then wrote into the same file with nothing to
+/// tell their lines apart. Appending keeps both; the `[pid]` prefix says whose each line is.
+///
+/// ponytail: the size check runs only at start, so a second window starting while the log is over
+/// the limit empties it under the first; rotate by date if that ever loses something that matters.
+pub struct LogFile {
+    file: std::fs::File,
+    prefix: String,
+}
+
+impl LogFile {
+    pub fn open(path: &std::path::Path) -> std::io::Result<LogFile> {
+        Self::open_keeping(path, LOG_KEEP_BYTES)
+    }
+
+    fn open_keeping(path: &std::path::Path, keep: u64) -> std::io::Result<LogFile> {
+        if std::fs::metadata(path).is_ok_and(|m| m.len() > keep) {
+            std::fs::File::create(path)?;
+        }
+        let file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+        Ok(LogFile { file, prefix: format!("[{}] ", std::process::id()) })
+    }
+}
+
+/// One formatted event, written as one append.
+///
+/// `tracing-subscriber`'s formatter hands each event over in a single `write_all`, so prefixing
+/// every `write` marks every line; building the whole line first keeps two processes' lines from
+/// interleaving inside one another.
+pub struct LogLine<'a>(&'a LogFile);
+
+impl Write for LogLine<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut line = Vec::with_capacity(self.0.prefix.len() + buf.len());
+        line.extend_from_slice(self.0.prefix.as_bytes());
+        line.extend_from_slice(buf);
+        (&self.0.file).write_all(&line)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        (&self.0.file).flush()
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogFile {
+    type Writer = LogLine<'a>;
+
+    fn make_writer(&'a self) -> LogLine<'a> {
+        LogLine(self)
+    }
 }
 
 /// A single red line. **No color unless it's a terminal** — for something receiving through a pipe,
@@ -343,5 +402,43 @@ mod tests {
         );
         assert!(!colours_with(Some(OsStr::new("1")), true), "NO_COLOR was not respected");
         assert!(colours_with(None, true), "a terminal with no NO_COLOR should get colour");
+    }
+
+    /// **A second window adds to the log instead of emptying it**, and each line says whose it is.
+    #[test]
+    fn opening_the_log_again_keeps_what_is_there_and_marks_each_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        std::fs::write(&path, "an earlier window\n").unwrap();
+        let log = LogFile::open(&path).unwrap();
+        LogLine(&log).write_all(b"this window\n").unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text, format!("an earlier window\n[{}] this window\n", std::process::id()));
+    }
+
+    /// Past the limit it is emptied at start, so it does not grow for ever.
+    #[test]
+    fn a_log_past_the_limit_is_emptied_at_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        std::fs::write(&path, "x".repeat(100)).unwrap();
+        LogFile::open_keeping(&path, 50).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+        std::fs::write(&path, "x".repeat(10)).unwrap();
+        LogFile::open_keeping(&path, 50).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap().len(), 10);
+    }
+
+    /// **The way to read the log names this run.** Pasted to an agent, the whole shared log would
+    /// cost it every other window's lines; the command it is handed filters to this process.
+    #[test]
+    fn the_log_line_says_how_to_read_only_this_run() {
+        let line = crate::lang::Lang::En.log_location("/tmp/zyris-code.log", 4242);
+        assert!(line.contains("[4242] "), "{line}");
+        assert!(line.contains("/tmp/zyris-code.log"), "{line}");
+        // The prefix the filter looks for is the one `LogFile` writes.
+        let dir = tempfile::tempdir().unwrap();
+        let log = LogFile::open(&dir.path().join("log")).unwrap();
+        assert_eq!(log.prefix, format!("[{}] ", std::process::id()));
     }
 }

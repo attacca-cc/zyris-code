@@ -355,7 +355,7 @@ Messages typed while a turn is running are queued and sent in order when it ends
 | `ZYRIS_CONFIG_DIR` | `<config>/zyris-code` | Directory the credential lives in. Set it and it wins outright |
 | `ZYRIS_CODE_BG` | — | Paint a page background (`zyris`, or `#rrggbb`). Off by default so the terminal's own background shows; turn it on if wide characters leave smears over SSH |
 | `ZYRIS_CREDENTIAL` / `ZYRIS_CREDENTIAL_FILE` | — | Dial with a `zc_` credential issued in Attacca (or a file holding one) instead of enrolling |
-| `ZYRIS_CODE_LOG` | `/tmp/zyris-code.log` | Log file. Logs never go to the terminal — they would land in the middle of the UI |
+| `ZYRIS_CODE_LOG` | `/tmp/zyris-code.log` | Log file. Logs never go to the terminal — they would land in the middle of the UI. Every window appends to it, each line starting with `[pid]`, so read one window with `grep -F '[<pid>] '` rather than the whole file; it is emptied at start once past 10 MB |
 | `ZYRIS_CODE_EXEC_MAX_SECS` | `1800` | Longest a `terminal.exec` command may run before this node kills it — and, because the two must agree, the wait it asks callers for. `0` lifts the ceiling, and then only the agent's own `timeout_ms` bounds a command |
 | `ZYRIS_CODE_EXEC_BUDGET` | `8000` | Bytes of a `terminal.exec` answer the agent receives, stdout and stderr together. A longer answer keeps its head and tail, and the whole of it is kept as a finished job that `wait.logs` pages; it is cut only when that saves at least 2 KB. `0` sends every answer whole |
 | `ZYRIS_CODE_WIRE_DEADLINE_SECS` | `55` | Answer the wire before the server gives up on a call, for the tools that declare no limit of their own (`wait.until`); `0` disables it |
