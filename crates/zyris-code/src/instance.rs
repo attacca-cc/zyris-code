@@ -246,6 +246,13 @@ impl FileLock {
             }
         }
     }
+
+    /// `take`, for async code. **The wait runs on the blocking pool**: `take` sleeps the thread it
+    /// is on for up to `wait`, and on a runtime worker that stalls every other task scheduled
+    /// there — the UI's included — for as long as another window holds the file.
+    pub async fn take_async(path: PathBuf, wait: Duration) -> Option<FileLock> {
+        tokio::task::spawn_blocking(move || FileLock::take(&path, wait)).await.ok().flatten()
+    }
 }
 
 #[cfg(test)]
@@ -327,6 +334,31 @@ mod tests {
         let me = Instance::register(root.path(), "app", here.path()).unwrap();
         assert!(!row.exists() && !lock_path(&row).exists(), "a stale row was left behind");
         drop(me);
+    }
+
+    /// **Waiting for a held lock does not stall the runtime.** On a single-threaded runtime a
+    /// thread-sleeping wait would keep the ticker below from running at all until it gave up.
+    #[tokio::test(flavor = "current_thread")]
+    async fn waiting_for_a_lock_leaves_the_runtime_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let at = dir.path().join("x.lock");
+        let held = FileLock::take(&at, Duration::ZERO).expect("a free lock");
+
+        let ticks = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counter = ticks.clone();
+        let ticker = tokio::spawn(async move {
+            loop {
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+        let got = FileLock::take_async(at.clone(), Duration::from_millis(300)).await;
+        assert!(got.is_none(), "a held lock was taken");
+        assert!(ticks.load(std::sync::atomic::Ordering::Relaxed) > 5, "the runtime was blocked");
+        ticker.abort();
+
+        drop(held);
+        assert!(FileLock::take_async(at, Duration::ZERO).await.is_some());
     }
 
     /// Two different directories register side by side; the registry is keyed by pid, not by path,

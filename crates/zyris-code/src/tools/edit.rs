@@ -195,7 +195,7 @@ impl LocalEdit {
         // did before this existed, which is the right failure for a safety net (the same call as
         // the undo snapshot's).
         let lock = self.lock_for(&full);
-        let _held = crate::instance::FileLock::take(&lock, LOCK_WAIT);
+        let _held = crate::instance::FileLock::take_async(lock, LOCK_WAIT).await;
         // Read **after** the lock, so what this side computes from is what whoever held it left.
         let existed = tokio::fs::try_exists(&full).await.unwrap_or(false);
         let old = tokio::fs::read_to_string(&full).await.unwrap_or_default();
@@ -258,7 +258,11 @@ impl LocalEdit {
         // **Snapshot right before writing.** All three tools meet here, so there's a single spot.
         // A failure doesn't block the edit — if a missing safety net stopped work,
         // you'd end up with files that can't be fixed (see `undo::snapshot`'s comment).
-        self.undo.snapshot(&full);
+        //
+        // On the blocking pool: the snapshot waits on the undo log's cross-window lock the same
+        // way, and must not stall a runtime worker while it does.
+        let (undo, at) = (self.undo.clone(), full.clone());
+        let _ = tokio::task::spawn_blocking(move || undo.snapshot(&at)).await;
         atomic_write(&full, new.as_bytes())
             .await
             .map_err(|e| WireError::internal(format!("couldn't write: {e}")))?;
