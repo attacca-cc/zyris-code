@@ -84,10 +84,19 @@ impl Allowed {
             tracing::warn!(error = %e, "could not read which MCP servers are allowed");
             Allowed::default()
         });
-        if allowed.version != VERSION {
+        if allowed.version > VERSION {
+            // **A newer build owns this file.** Clearing its approvals and stamping this build's
+            // version on it would throw away answers a release this one knows nothing about asked
+            // the person for — and the fields carrying them are exactly the ones `serde` dropped
+            // on the floor a moment ago. Left alone; `save` refuses to write over it too.
             tracing::warn!(
                 version = allowed.version,
-                "ignoring project approvals from an unknown format"
+                "which servers are allowed was written by a newer build; leaving it alone"
+            );
+        } else if allowed.version != VERSION {
+            tracing::warn!(
+                version = allowed.version,
+                "ignoring project approvals from an older format"
             );
             allowed.approvals.clear();
             allowed.version = VERSION;
@@ -96,27 +105,39 @@ impl Allowed {
     }
 
     /// **The app keeps running if this fails** — the answer is already in effect for this run.
+    ///
+    /// **A file a newer build wrote is not touched.** This build's copy of `Allowed` knows nothing
+    /// about whatever fields that release added, so writing it back would delete them — and
+    /// stamping this build's `version` on the file would make the newer window clear its own
+    /// approvals the next time it loads it.
     pub fn save(&self) {
         let Some(at) = store() else { return };
-        if let Some(dir) = at.parent() {
-            let _ = std::fs::create_dir_all(dir);
+        if Self::file_is_newer(&at) {
+            tracing::warn!(
+                "mcp-enabled.json was written by a newer build; not writing this build's copy over it"
+            );
+            return;
         }
         let Ok(text) = serde_json::to_string(self) else { return };
-        let temp = at.with_extension(format!("{}.tmp", std::process::id()));
-        let written = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)
-            .and_then(|mut file| {
-                use std::io::Write;
-                file.write_all(text.as_bytes())?;
-                file.sync_all()
-            })
-            .and_then(|()| std::fs::rename(&temp, &at));
-        if let Err(e) = written {
-            let _ = std::fs::remove_file(&temp);
+        // **Atomic, and the temp name is no longer this process's business.** Two windows writing
+        // at once used to fight over one pid-named temp file and could rename each other's
+        // half-written content into place.
+        if let Err(e) = crate::atomic::write_atomic(&at, text.as_bytes(), None) {
             tracing::warn!(error = %e, "could not save which MCP servers are allowed");
         }
+    }
+
+    /// Whether the file on disk carries a `version` this build does not know.
+    ///
+    /// Read from the raw JSON rather than through `Allowed`: `serde` drops the fields a newer
+    /// release added, and "is this mine to overwrite" is a question about the file, not about the
+    /// part of it this build can parse.
+    fn file_is_newer(at: &Path) -> bool {
+        std::fs::read_to_string(at)
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .and_then(|value| value.get("version").and_then(Value::as_u64))
+            .is_some_and(|version| version > VERSION as u64)
     }
 
     pub fn allows(&self, slug: &str) -> bool {

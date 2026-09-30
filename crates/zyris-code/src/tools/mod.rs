@@ -44,6 +44,37 @@ pub fn working_dir() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
+/// Takes this app's identity variables out of a child's environment.
+///
+/// **Nothing started from here should inherit who this window is.** `main` exports
+/// `ZYRIS_NODE_NAME`, `ZYRIS_SCOPES`, `ZYRIS_CONFIG_DIR`, `ZYRIS_PROFILE` and the credential
+/// variables into its own environment so the modules can read them, and a child inherits all of it
+/// unless told otherwise. A `zyris-code` an agent starts from a shell — or a test that spawns the
+/// binary — would then ask Attacca for *this* window's node name while working in another
+/// directory, reuse this window's scope list after the required one grew, and read a credential
+/// that was handed to this window specifically. Removed per child rather than from the process, so
+/// this app's own reads are untouched.
+///
+/// **`ZYRIS_CODE_*` settings are left alone.** The log path, the language and the trace switch are
+/// things a person set for the app, and a child that reports to the same log is a feature rather
+/// than a leak.
+pub fn scrub_identity(command: &mut tokio::process::Command) {
+    for key in IDENTITY_VARS {
+        command.env_remove(key);
+    }
+}
+
+/// The variables that say *which* node a process is. See [`scrub_identity`].
+const IDENTITY_VARS: [&str; 7] = [
+    "ZYRIS_NODE_NAME",
+    "ZYRIS_SCOPES",
+    "ZYRIS_CONFIG_DIR",
+    "ZYRIS_PROFILE",
+    "ZYRIS_CREDENTIAL",
+    "ZYRIS_CREDENTIAL_FILE",
+    "ZYRIS_CODE_UPDATED",
+];
+
 /// Attaches everything this node hands out to the node being built.
 ///
 /// **It takes the builder, not the runner.** `Runner` used to collect capabilities itself; the

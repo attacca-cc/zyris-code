@@ -75,7 +75,9 @@ impl Signing {
         if let Some(dir) = at.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        std::fs::write(&at, serde_json::to_string(self)?)?;
+        // **Atomic.** A window that read this mid-write saw invalid JSON, `Signing::load` answered
+        // `None`, and a commit made in that window went out unsigned with nothing said about it.
+        crate::atomic::write_atomic(&at, serde_json::to_string(self)?.as_bytes(), None)?;
         Ok(())
     }
 

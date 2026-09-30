@@ -77,6 +77,8 @@ impl Git {
 
     async fn git(&self, args: &[String], token: Option<String>) -> zyris::Result<Ran> {
         let mut command = tokio::process::Command::new("git");
+        // **git has no business knowing which node started it.** See `tools::scrub_identity`.
+        crate::tools::scrub_identity(&mut command);
         command.current_dir(&self.cwd).args(args);
         if let Some(token) = token {
             command.env(TOKEN_VAR, token);
@@ -96,6 +98,21 @@ impl Git {
             out: String::from_utf8_lossy(&out.stdout).to_string(),
             err: String::from_utf8_lossy(&out.stderr).to_string(),
         })
+    }
+
+    /// Whether a merge, cherry-pick, revert or rebase is stopped and waiting for a commit.
+    ///
+    /// Asked of `rev-parse --git-path`, not by joining `.git/`: in a linked worktree or a
+    /// submodule `.git` is a file, and the state lives wherever it points.
+    async fn concluding(&self) -> bool {
+        const MARKERS: [&str; 5] =
+            ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply"];
+        let mut args = vec!["rev-parse"];
+        for marker in MARKERS {
+            args.extend(["--git-path", marker]);
+        }
+        let Ok(out) = self.read(&args).await else { return false };
+        out.lines().any(|line| self.cwd.join(line.trim()).exists())
     }
 
     /// A read. Answers the text or a failure carrying git's own words.
@@ -174,6 +191,50 @@ pub fn split_status(text: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
         }
     }
     (staged, unstaged, untracked)
+}
+
+/// The sha git reports for the commit it just made, out of git's own first line.
+///
+/// `[main 1a2b3c4] subject`, or `[main (root-commit) 1a2b3c4] subject` where the branch has no
+/// history yet. **Not a later `rev-parse`**: another window can land a commit in between, and the
+/// sha this side reported would be that one's. Anything that is not a plausible short sha (the
+/// branch name in `[main]`, a bracketed subject) answers `None`, so the caller falls back rather
+/// than reporting a subject as a sha.
+pub fn sha_from_commit(out: &str) -> Option<String> {
+    let line = out.lines().find(|line| line.trim_start().starts_with('['))?;
+    let (_, rest) = line.split_once('[')?;
+    let (inside, _) = rest.split_once(']')?;
+    let sha = inside.split_whitespace().last()?;
+    (sha.len() >= 7 && sha.chars().all(|c| c.is_ascii_hexdigit())).then(|| sha.to_string())
+}
+
+/// The other half of each staged rename that one of `paths` belongs to, read from
+/// `git diff --cached -M --name-status -z`.
+///
+/// A named path covers itself and, as a pathspec does, everything under it. **Only renames**:
+/// a copy leaves its source untouched, so there is nothing of it to commit.
+pub fn rename_partners(name_status: &str, paths: &[String]) -> Vec<String> {
+    let named: Vec<String> = paths
+        .iter()
+        .map(|p| p.replace('\\', "/").trim_start_matches("./").trim_end_matches('/').to_string())
+        .collect();
+    let covered =
+        |n: &str| named.iter().any(|p| p == "." || n == p || n.starts_with(&format!("{p}/")));
+    let mut out = Vec::new();
+    let mut fields = name_status.split('\0').filter(|f| !f.is_empty());
+    while let Some(status) = fields.next() {
+        let two = status.starts_with('R') || status.starts_with('C');
+        let Some(old) = fields.next() else { break };
+        let new = if two { fields.next() } else { None };
+        if let (true, Some(new)) = (status.starts_with('R'), new) {
+            match (covered(old), covered(new)) {
+                (false, true) => out.push(old.to_string()),
+                (true, false) => out.push(new.to_string()),
+                _ => {}
+            }
+        }
+    }
+    out
 }
 
 /// One line of `git log --format=…`, as the agent sees it.
@@ -268,6 +329,22 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0]["sha"], "abc123");
         assert_eq!(got[0]["subject"], "feat(git): add a: thing\x1f and more");
+    }
+
+    /// **The sha is read out of the commit's own line.** `rev-parse HEAD` a moment after committing
+    /// answers with whatever HEAD holds *then*, and another window can land a commit in between —
+    /// so the sha this reported would be that window's commit, under this one's message.
+    #[test]
+    fn the_sha_is_read_from_the_commits_own_line() {
+        assert_eq!(sha_from_commit("[main 1a2b3c4] feat: a thing\n").as_deref(), Some("1a2b3c4"));
+        assert_eq!(
+            sha_from_commit("[main (root-commit) deadbee] first\n").as_deref(),
+            Some("deadbee"),
+        );
+        // Not a sha: the branch name in `[main]`, or a line with no bracket at all. The caller
+        // falls back to `rev-parse` rather than reporting a subject as a sha.
+        assert_eq!(sha_from_commit("[main] a subject\n"), None);
+        assert_eq!(sha_from_commit("nothing here\n"), None);
     }
 }
 
@@ -606,6 +683,28 @@ impl GitCap for Git {
         }
         args.push("-m".into());
         args.push(message.clone());
+        // **The commit takes exactly the paths this call names.** Without a pathspec `git commit`
+        // writes whatever the index happens to hold, and the index is shared with every other
+        // window and with whatever the person did at a shell — so one window's commit swept in
+        // another's staged file under its own message, and the other's commit then found nothing
+        // to do. `-- <paths>` takes the named files and leaves the rest of the index alone.
+        //
+        // **Except while a merge, cherry-pick, revert or rebase is stopped.** git refuses a partial
+        // commit then ("cannot do a partial commit during a merge"), and the commit that concludes
+        // one has to take the whole index anyway — that index *is* the resolution. The named paths
+        // were added above, so they are in it.
+        if !paths.is_empty() && !self.concluding().await {
+            args.push("--".into());
+            args.extend(paths.iter().cloned());
+            // **A rename is two paths.** After `git mv a b`, naming only `b` committed the new
+            // file and left the deletion of `a` staged behind it. The other half of every staged
+            // rename a named path belongs to goes into the commit too.
+            let staged = self
+                .read(&["diff", "--cached", "--relative", "-M", "--name-status", "-z"])
+                .await
+                .unwrap_or_default();
+            args.extend(rename_partners(&staged, &paths));
+        }
         let ran = self.git(&args, None).await?;
         if !ran.ok {
             return Err(zyris::WireError::internal(ran.why()));
@@ -613,7 +712,14 @@ impl GitCap for Git {
         // **Asked, not assumed.** A key can be on the ring and still fail to sign — expired, or
         // gpg missing on this machine — and a commit reported as signed when it is not is worse
         // than one reported plainly.
-        let sha = self.read(&["rev-parse", "--short", "HEAD"]).await.unwrap_or_default();
+        //
+        // **The sha comes out of the commit's own answer**, not from a `rev-parse` a moment later:
+        // another window can land a commit in between, and the sha this reports would be that
+        // one's. `rev-parse` is kept only for a git that printed nothing to read.
+        let sha = match sha_from_commit(&ran.out) {
+            Some(sha) => sha,
+            None => self.read(&["rev-parse", "--short", "HEAD"]).await.unwrap_or_default(),
+        };
         let signed = self
             .read(&["log", "-1", "--format=%G?"])
             .await
@@ -952,6 +1058,68 @@ mod against_a_real_repository {
         assert!(why.to_string().to_lowercase().contains("nothing"), "{why}");
         // And a commit with no message never reaches git at all.
         assert!(git.commit("  ".into(), vec![], false).await.is_err());
+    }
+
+    /// Runs git in `dir` and answers its stdout, for a test setting up a repository by hand.
+    fn sh(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .expect("git has to be installed to run these");
+        String::from_utf8_lossy(&out.stdout).to_string()
+    }
+
+    /// **Naming the resolved file concludes a merge.** git refuses a partial commit while a merge
+    /// is stopped, so `commit -- <paths>` failed on exactly the commit a conflict resolution needs.
+    #[tokio::test]
+    async fn a_commit_naming_a_resolved_file_concludes_a_merge() {
+        let (dir, git) = repo().await;
+        let at = dir.path();
+        sh(at, &["switch", "-q", "-c", "side"]);
+        std::fs::write(at.join("first.txt"), "side\n").unwrap();
+        sh(at, &["commit", "-qam", "side"]);
+        sh(at, &["switch", "-q", "main"]);
+        std::fs::write(at.join("first.txt"), "main\n").unwrap();
+        sh(at, &["commit", "-qam", "main"]);
+        sh(at, &["merge", "side"]);
+        assert!(at.join(".git/MERGE_HEAD").exists(), "the merge was meant to stop on a conflict");
+
+        std::fs::write(at.join("first.txt"), "both\n").unwrap();
+        git.commit("merge side".into(), vec!["first.txt".into()], false)
+            .await
+            .expect("the merge commit");
+        assert_eq!(sh(at, &["rev-list", "--parents", "-n1", "HEAD"]).split_whitespace().count(), 3);
+        assert_eq!(git.status().await.expect("status")["clean"], true);
+    }
+
+    /// **A rename is committed whole.** Naming only the new path used to commit the addition and
+    /// leave the deletion of the old one staged behind it.
+    #[tokio::test]
+    async fn a_commit_naming_a_renamed_file_takes_the_old_name_too() {
+        let (dir, git) = repo().await;
+        let at = dir.path();
+        std::fs::write(at.join("other.txt"), "other\n").unwrap();
+        sh(at, &["add", "other.txt"]);
+        sh(at, &["mv", "first.txt", "moved.txt"]);
+
+        git.commit("move".into(), vec!["moved.txt".into()], false).await.expect("commit");
+        let staged = sh(at, &["diff", "--cached", "--name-only"]);
+        assert_eq!(staged.trim(), "other.txt", "the rename was left half-committed");
+    }
+
+    #[test]
+    fn a_rename_partner_is_found_from_either_side() {
+        let staged = "R100\0a.txt\0b.txt\0M\0c.txt\0C090\0d.txt\0e.txt\0R100\0src/x\0lib/x\0";
+        let names = |paths: &[&str]| {
+            let paths: Vec<String> = paths.iter().map(|p| p.to_string()).collect();
+            rename_partners(staged, &paths)
+        };
+        assert_eq!(names(&["b.txt"]), vec!["a.txt"]);
+        assert_eq!(names(&["./a.txt"]), vec!["b.txt"]);
+        assert_eq!(names(&["a.txt", "b.txt"]), Vec::<String>::new());
+        assert_eq!(names(&["e.txt", "c.txt"]), Vec::<String>::new(), "a copy has no partner");
+        assert_eq!(names(&["lib/"]), vec!["src/x"]);
     }
 
     /// Making a branch, and being on it afterwards. **`branches` has to agree** — the two answers

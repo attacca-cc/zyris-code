@@ -136,7 +136,9 @@ pub fn save(lang: Lang) {
     if let Some(dir) = at.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    if let Err(e) = std::fs::write(&at, lang.code()) {
+    // **Atomic.** A window reading this while another writes it saw an empty file, `load` answered
+    // `None`, and the choice appeared not to stick.
+    if let Err(e) = crate::atomic::write_atomic(&at, lang.code().as_bytes(), None) {
         tracing::warn!(error = %e, "couldn't save the chosen language");
     }
 }
@@ -903,6 +905,16 @@ impl Lang {
         match self {
             Lang::Ko => format!("되돌리지 못했습니다: {e}"),
             Lang::En => format!("Couldn't revert: {e}"),
+        }
+    }
+    pub fn undo_after_other_window(self, path: &str) -> String {
+        match self {
+            Lang::Ko => format!(
+                "되돌리지 않았습니다: 다른 창이 그 뒤에 {path}을(를) 편집했습니다. 되돌리면 그 편집이 지워집니다."
+            ),
+            Lang::En => format!(
+                "Not reverted: another window has edited {path} since. Reverting would erase its edit."
+            ),
         }
     }
     pub fn changes_text(self, changed: &[Changed], cwd: &Path) -> String {
@@ -3010,6 +3022,7 @@ mod tests {
             en.agent_staged("Main Agent"),
             en.reverted("src/x.rs"),
             en.undo_failed("x"),
+            en.undo_after_other_window("src/x.rs"),
             en.server_timeout(15),
             en.missing_scopes("a, b"),
             en.scopes_asked_again("a"),

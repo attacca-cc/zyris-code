@@ -150,12 +150,12 @@ impl Accounts {
         if let Some(dir) = at.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        std::fs::write(&at, serde_json::to_string(self)?)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&at, std::fs::Permissions::from_mode(0o600));
-        }
+        // **The mode is set before the token is.** Writing first and `chmod`-ing after left the
+        // token readable by anybody under a permissive umask for as long as the two calls were
+        // apart — and this file holds a token for every repository the account can reach. The write
+        // is atomic too, so a window that reads it mid-write does not see an empty file and decide
+        // nobody is signed in.
+        crate::atomic::write_atomic(&at, serde_json::to_string(self)?.as_bytes(), Some(0o600))?;
         Ok(())
     }
 
