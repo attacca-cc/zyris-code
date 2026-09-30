@@ -138,8 +138,15 @@ pub enum Frame {
         id: String,
         status: crate::picker::ThreadStatus,
     },
-    /// A list could not be fetched. The list closes and the reason is said once.
-    PickerFailed(String),
+    /// A list could not be fetched — `for_list` names which one, `None` for a thread's history.
+    ///
+    /// **Named, because it lands whenever it lands.** It used to close whatever list was up and
+    /// say so in red, so a refresh failing a second after the person moved on shut the history
+    /// search or the file list they had moved on to.
+    PickerFailed {
+        why: String,
+        for_list: Option<crate::picker::Level>,
+    },
     /// News from the GitHub sign-in, which runs **off the loop**.
     ///
     /// Device flow is a wait: ask for a code, then poll until somebody approves it in a browser,
@@ -554,6 +561,9 @@ pub struct State {
     /// A question lands here on its own when it arrives — the turn is blocked waiting for
     /// the answer, so the user should not have to open it separately.
     pub asking: Option<(i64, crate::question::Answering)>,
+    /// The question last put away with Esc, so its own frame coming round again does not put it
+    /// back up. An answer can just as well be a plain message.
+    pub dismissed_question: Option<i64>,
     /// The plan waiting to be approved, if one is. **Not in `asking`** — a question replaces the
     /// input because answering it *is* the message, while a plan is decided by an ordinary message
     /// and the draft has to stay reachable to say what to change.
@@ -815,6 +825,7 @@ impl Default for State {
             click_flipped: None,
             screen: Vec::new(),
             asking: None,
+            dismissed_question: None,
             plan: None,
             plan_decided: false,
             ask_area: None,
@@ -1894,12 +1905,23 @@ pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
 /// Keys for the question screen. While typing free text, characters go to the input.
 fn ask_key(a: &crate::question::Answering, key: KeyEvent, ctrl: bool) -> Vec<Action> {
     if a.typing {
+        // **The same editing keys as every other field.** Delete, Home, End and the Ctrl keys
+        // were dead here, in the one field whose text is sent the moment it is confirmed.
         return match key.code {
             KeyCode::Enter => vec![Action::AskConfirm],
             KeyCode::Esc => vec![Action::AskCancel],
             KeyCode::Backspace => vec![Action::Backspace],
+            KeyCode::Delete => vec![Action::Delete],
             KeyCode::Left => vec![Action::Left],
             KeyCode::Right => vec![Action::Right],
+            KeyCode::Home => vec![Action::Home],
+            KeyCode::End => vec![Action::End],
+            KeyCode::Char('u') if ctrl => vec![Action::KillToStart],
+            KeyCode::Char('k') if ctrl => vec![Action::KillToEnd],
+            KeyCode::Char('w') if ctrl => vec![Action::DeleteWord],
+            KeyCode::Char('y') if ctrl => vec![Action::Yank],
+            KeyCode::Char('a') if ctrl => vec![Action::Home],
+            KeyCode::Char('e') if ctrl => vec![Action::End],
             KeyCode::Char(c) if !ctrl => vec![Action::Insert(c)],
             _ => vec![],
         };
@@ -2400,8 +2422,11 @@ pub fn apply(state: &mut State, action: &Action) {
             }
         }
         Action::Press(x, y) | Action::ActivatingPress(x, y) => {
-            // Pressing on the question screen picks that row.
-            if let (Some(area), Some((_, a))) = (state.ask_area, state.asking.as_ref()) {
+            // Pressing on the question screen picks that row. **Not the press that focused the
+            // window** — nobody aimed it, and a row here can be Submit or Reject.
+            let aimed = matches!(action, Action::Press(..));
+            if let (Some(area), Some((_, a)), true) = (state.ask_area, state.asking.as_ref(), aimed)
+            {
                 if *y >= area.y && *y < area.y + area.height {
                     if let Some(i) = crate::widgets::ask_row_at(a, area, *y, state.lang) {
                         if let Some((_, a)) = &mut state.asking {
@@ -2581,14 +2606,22 @@ pub fn apply(state: &mut State, action: &Action) {
         Action::AskCancel => {
             // While typing, only stop the typing. Otherwise put the question away — an
             // answer can just be a plain message too.
+            //
+            // **Past the first question, Esc goes back one.** It used to put the card away from
+            // any step, and every answer given on the steps before went with it.
             let typing = state.asking.as_ref().is_some_and(|(_, a)| a.typing);
+            let deeper = state.asking.as_ref().is_some_and(|(_, a)| a.step > 0 || a.in_review());
             if typing {
                 if let Some((_, a)) = &mut state.asking {
                     a.typing = false;
                     a.input = Input::new();
                 }
-            } else {
-                state.asking = None;
+            } else if deeper {
+                if let Some((_, a)) = &mut state.asking {
+                    a.back();
+                }
+            } else if let Some((seq, _)) = state.asking.take() {
+                state.dismissed_question = Some(seq);
             }
         }
         Action::ClearSelection => {
@@ -2942,8 +2975,8 @@ pub fn apply(state: &mut State, action: &Action) {
                     state.input.text = text.clone();
                     state.input.end();
                 }
-                // Past the bottom the recall ends. It amounts to coming back to where the
-                // typing was.
+                // Past the bottom the recall ends and the draft is empty again — which is where
+                // the typing was, since recall only starts on an empty draft.
                 None => {
                     state.recall = None;
                     state.input.take();
@@ -3076,7 +3109,13 @@ fn apply_frame(state: &mut State, frame: &Frame) {
                     if state.asking.as_ref().is_some_and(|(q, _)| *q == entry.seq) {
                         state.asking = None;
                     }
-                } else if state.asking.as_ref().is_none_or(|(q, _)| *q < entry.seq) {
+                } else if state.asking.as_ref().is_none_or(|(q, _)| *q < entry.seq)
+                    // **Put away stays away.** The server updates a question in place when its
+                    // wait runs out, and that frame reopened the card the person had just
+                    // dismissed — taking the keys aimed at the draft. Reopening the thread
+                    // brings it back (`clear_conversation`).
+                    && state.dismissed_question != Some(entry.seq)
+                {
                     state.asking =
                         Some((entry.seq, crate::question::Answering::new(steps.clone())));
                 }
@@ -3192,15 +3231,27 @@ fn apply_frame(state: &mut State, frame: &Frame) {
         //
         // **It is dropped if the list has moved on.** A slow project list arriving after the
         // person already went into a project would throw them back out.
+        //
+        // **The same list means the same project**, not merely a thread list: another project's
+        // slow answer landing on this one put its threads under this project's name.
         Frame::Picker { picker, thread_was_running } => {
-            let same = state.picker.as_ref().is_some_and(|cur| {
-                std::mem::discriminant(&cur.level) == std::mem::discriminant(&picker.level)
-            });
+            let same =
+                state.picker.as_ref().is_some_and(|cur| same_list(&cur.level, &picker.level));
             if same {
-                let (cursor, top) =
-                    state.picker.as_ref().map(|cur| (cur.cursor, cur.top)).unwrap_or((0, 0));
+                let (cursor, top, on) = state
+                    .picker
+                    .as_ref()
+                    .map(|cur| {
+                        (cur.cursor, cur.top, cur.rows.get(cur.cursor).and_then(|r| r.id.clone()))
+                    })
+                    .unwrap_or((0, 0, None));
                 let mut p = picker.clone();
-                p.cursor = cursor.min(p.rows.len().saturating_sub(1));
+                // **The cursor stays on the row, not on the number.** A refresh that reorders
+                // the threads moved an index-kept cursor onto a different one, and Enter then
+                // opened a thread nobody had picked. The index is the fallback for a row gone.
+                let again =
+                    on.and_then(|id| p.rows.iter().position(|r| r.id.as_ref() == Some(&id)));
+                p.cursor = again.unwrap_or(cursor).min(p.rows.len().saturating_sub(1));
                 // The scroll position too — a refresh that snapped the list back to the top
                 // would be the same yank as losing the cursor.
                 p.top = top.min(p.rows.len().saturating_sub(1));
@@ -3243,10 +3294,25 @@ fn apply_frame(state: &mut State, frame: &Frame) {
         }
         // **Say it and close.** A list left open and forever empty reads as a hang, and so
         // does an activity line stuck on "loading…".
-        Frame::PickerFailed(why) => {
-            state.picker = None;
+        //
+        // **Only about the list it was for.** A thread's history failing ends the loading; a list
+        // failing closes that list if it is the one up and still empty. One already showing rows
+        // keeps them — a refresh that failed knows less than what is on screen — and a list the
+        // person has left is nobody's news.
+        Frame::PickerFailed { why, for_list: None } => {
             state.loading_history = false;
             state.set_error(why.clone());
+        }
+        Frame::PickerFailed { why, for_list: Some(level) } => {
+            let up = state.picker.as_ref().filter(|p| same_list(&p.level, level));
+            match up.map(|p| p.loading) {
+                Some(true) => {
+                    state.picker = None;
+                    state.set_error(why.clone());
+                }
+                Some(false) => tracing::warn!(error = %why, "a list refresh failed"),
+                None => {}
+            }
         }
         // **The screen may have been closed while this was in flight.** Esc closes it and the
         // sign-in carries on in the background — so the code goes to the transcript as well, and
@@ -3463,6 +3529,15 @@ fn covered(state: &State) -> bool {
         || state.new_project.is_some()
         || state.github_form.is_some()
         || state.enroll.is_some()
+}
+
+/// Whether two list levels are the same list — the same kind, and for threads the same project.
+fn same_list(a: &crate::picker::Level, b: &crate::picker::Level) -> bool {
+    use crate::picker::Level;
+    match (a, b) {
+        (Level::Sessions { project_id: x, .. }, Level::Sessions { project_id: y, .. }) => x == y,
+        _ => std::mem::discriminant(a) == std::mem::discriminant(b),
+    }
 }
 
 /// Is what was typed already a whole command name? If so there is no reason to pick from
@@ -5934,7 +6009,10 @@ fn spawn_projects(
                 picker: crate::picker::Picker::projects(items, lang),
                 thread_was_running: None,
             },
-            Err(e) => Frame::PickerFailed(e.to_string()),
+            Err(e) => Frame::PickerFailed {
+                why: e.to_string(),
+                for_list: Some(crate::picker::Level::Projects),
+            },
         };
         let _ = tx.send((None, Action::Frame(frame)));
     });
@@ -5965,7 +6043,9 @@ fn spawn_sessions(
         let items = match crate::conn::sessions(&api, &project_id).await {
             Ok(v) => v,
             Err(e) => {
-                let _ = tx.send((None, Action::Frame(Frame::PickerFailed(e.to_string()))));
+                let for_list = Some(crate::picker::Level::Sessions { project_id, project_name });
+                let failed = Frame::PickerFailed { why: e.to_string(), for_list };
+                let _ = tx.send((None, Action::Frame(failed)));
                 return;
             }
         };
@@ -6034,7 +6114,10 @@ fn spawn_agents(api: &Arc<AttaccaApiClient>, tx: &mpsc::UnboundedSender<AppMsg>)
                     thread_was_running: None,
                 }
             }
-            Err(e) => Frame::PickerFailed(crate::lang::current().agent_list_error(&e.to_string())),
+            Err(e) => Frame::PickerFailed {
+                why: crate::lang::current().agent_list_error(&e.to_string()),
+                for_list: Some(crate::picker::Level::Agents),
+            },
         };
         let _ = tx.send((None, Action::Frame(frame)));
     });
@@ -6050,7 +6133,7 @@ fn spawn_history(api: &Arc<AttaccaApiClient>, tx: &mpsc::UnboundedSender<AppMsg>
     tokio::spawn(async move {
         let frame = match crate::conn::history(&api, &id).await {
             Ok(events) => Frame::History { entries: history_past(&events) },
-            Err(e) => Frame::PickerFailed(e.to_string()),
+            Err(e) => Frame::PickerFailed { why: e.to_string(), for_list: None },
         };
         let _ = tx.send((Some(Origin::asked(id)), Action::Frame(frame)));
     });
@@ -6270,6 +6353,7 @@ fn clear_conversation(state: &mut State) {
     // its own.
     state.reasoning_title = None;
     state.asking = None;
+    state.dismissed_question = None;
     state.last_cursor = None;
     state.scroll = Scroll::new(); // Start from the bottom.
                                   // **A highlight belongs to the conversation it was made on.** It is anchored to screen rows
@@ -12196,5 +12280,164 @@ mod interaction {
         let mut s = state();
         apply(&mut s, &Action::Frame(Frame::Problem("MCP server 'x' did not start".into())));
         assert_eq!(s.status_severity(), Severity::Error);
+    }
+
+    fn threads(project: &str, ids: &[&str]) -> crate::picker::Picker {
+        let items = ids
+            .iter()
+            .map(|id| {
+                (id.to_string(), format!("thread {id}"), crate::picker::ThreadStatus::Unknown)
+            })
+            .collect();
+        crate::picker::Picker::sessions(
+            project.into(),
+            project.into(),
+            items,
+            crate::lang::Lang::En,
+        )
+    }
+
+    fn listed(picker: crate::picker::Picker) -> Action {
+        Action::Frame(Frame::Picker { picker, thread_was_running: None })
+    }
+
+    /// **A refresh keeps the cursor on the row it was on**, not on its number — reordered threads
+    /// put an index-kept cursor on another one, and Enter opened it (C15).
+    #[test]
+    fn a_refresh_keeps_the_cursor_on_the_same_thread() {
+        let mut s = state();
+        s.picker = Some(threads("p", &["a", "b", "c"]));
+        apply(&mut s, &Action::PickDown);
+        apply(&mut s, &Action::PickDown); // on "b" (row 0 is "new thread")
+        apply(&mut s, &listed(threads("p", &["c", "a", "b"])));
+        let p = s.picker.as_ref().unwrap();
+        assert_eq!(p.rows[p.cursor].id.as_deref(), Some("b"), "the cursor moved to another thread");
+    }
+
+    /// **Another project's thread list does not land on this one** (C15).
+    #[test]
+    fn another_projects_threads_are_not_taken_for_this_ones() {
+        let mut s = state();
+        s.picker = Some(crate::picker::Picker::loading_sessions("y".into(), "y".into()));
+        apply(&mut s, &listed(threads("x", &["from-x"])));
+        let p = s.picker.as_ref().unwrap();
+        assert!(p.loading && p.rows.is_empty(), "X's threads landed under Y");
+    }
+
+    /// **A list failing closes only itself.** The history search the person moved on to stayed
+    /// shut under them, with a red line about a list no longer on screen (C16).
+    #[test]
+    fn a_failed_list_leaves_other_lists_alone() {
+        let mut s = state();
+        s.sent = vec!["hi".into()];
+        apply(&mut s, &Action::OpenHistory);
+        let failed = Frame::PickerFailed {
+            why: "timed out".into(),
+            for_list: Some(crate::picker::Level::Sessions {
+                project_id: "p".into(),
+                project_name: "p".into(),
+            }),
+        };
+        apply(&mut s, &Action::Frame(failed.clone()));
+        assert!(s.picker.is_some(), "the history search was closed");
+        assert!(s.status().is_none(), "news about a list nobody is looking at");
+
+        // A refresh of the list on screen that fails keeps what it shows.
+        s.picker = Some(threads("p", &["a"]));
+        apply(&mut s, &Action::Frame(failed.clone()));
+        assert_eq!(s.picker.as_ref().map(|p| p.rows.len()), Some(2), "the rows were thrown away");
+
+        // Still loading, it closes and says why.
+        s.picker = Some(crate::picker::Picker::loading_sessions("p".into(), "p".into()));
+        apply(&mut s, &Action::Frame(failed));
+        assert!(s.picker.is_none());
+        assert_eq!(s.status_severity(), Severity::Error);
+    }
+
+    /// A two-step question, for walking back through.
+    fn two_steps(seq: i64) -> Action {
+        let step = |q: &str| crate::question::Step {
+            header: None,
+            question: q.into(),
+            multi: false,
+            options: vec![crate::question::Opt { label: "yes".into(), description: None }],
+        };
+        Action::Frame(Frame::Event {
+            cursor: seq,
+            entry: Some(crate::event::Entry {
+                id: None,
+                seq,
+                kind: EntryKind::Question {
+                    steps: vec![step("one?"), step("two?")],
+                    answered: false,
+                },
+            }),
+            todo: None,
+            plan: None,
+        })
+    }
+
+    /// **Esc past the first question goes back one**, rather than dropping every answer (C12).
+    #[test]
+    fn esc_on_a_later_step_goes_back_rather_than_discarding() {
+        let mut s = state();
+        apply(&mut s, &two_steps(3));
+        apply(&mut s, &Action::AskConfirm); // pick "yes"
+        apply(&mut s, &Action::AskDown);
+        apply(&mut s, &Action::AskDown);
+        apply(&mut s, &Action::AskConfirm); // next
+        assert_eq!(s.asking.as_ref().map(|(_, a)| a.step), Some(1));
+        press(&mut s, KeyCode::Esc, KeyModifiers::NONE);
+        let (_, a) = s.asking.as_ref().expect("the card went away with its answers");
+        assert_eq!(a.step, 0);
+        assert!(a.is_chosen(0), "the first answer was lost");
+    }
+
+    /// **A question put away stays away** when its own frame comes round again (C12).
+    #[test]
+    fn a_dismissed_question_does_not_come_back_on_its_own() {
+        let mut s = state();
+        apply(&mut s, &question_frame(3));
+        press(&mut s, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(s.asking.is_none());
+        apply(&mut s, &question_frame(3));
+        assert!(s.asking.is_none(), "the dismissed card took the keys back");
+        // A newer question is a new question.
+        apply(&mut s, &question_frame(8));
+        assert!(s.asking.is_some());
+    }
+
+    /// **The free answer takes the editing keys every other field does** (C12).
+    #[test]
+    fn a_free_answer_takes_the_editing_keys() {
+        let mut s = state();
+        apply(&mut s, &question_frame(3));
+        // The free row sits after the two options.
+        apply(&mut s, &Action::AskDown);
+        apply(&mut s, &Action::AskDown);
+        apply(&mut s, &Action::AskConfirm);
+        assert!(s.asking.as_ref().is_some_and(|(_, a)| a.typing));
+        type_in(&mut s, "abc");
+        press(&mut s, KeyCode::Home, KeyModifiers::NONE);
+        press(&mut s, KeyCode::Delete, KeyModifiers::NONE);
+        let typed = &s.asking.as_ref().unwrap().1.input;
+        assert_eq!(typed.text, "bc");
+        assert_eq!(s.input.text, "", "the keys went to the draft behind the card");
+    }
+
+    /// **The press that focused the window does not act on the card** — a row there can be
+    /// Submit or Reject (C27).
+    #[test]
+    fn the_activating_click_does_not_answer_a_question() {
+        let mut s = state();
+        apply(&mut s, &question_frame(3));
+        s.ask_area = Some(ratatui::layout::Rect::new(0, 10, 80, 8));
+        let before = s.asking.as_ref().map(|(_, a)| a.cursor);
+        for y in 10..18 {
+            apply(&mut s, &Action::ActivatingPress(2, y));
+            apply(&mut s, &Action::Release);
+        }
+        assert_eq!(s.asking.as_ref().map(|(_, a)| a.cursor), before);
+        assert!(s.asking.as_ref().is_some_and(|(_, a)| !a.is_chosen(0) && !a.is_chosen(1)));
     }
 }
