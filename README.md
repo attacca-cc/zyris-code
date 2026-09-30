@@ -357,6 +357,7 @@ Messages typed while a turn is running are queued and sent in order when it ends
 | `ZYRIS_CREDENTIAL` / `ZYRIS_CREDENTIAL_FILE` | — | Dial with a `zc_` credential issued in Attacca (or a file holding one) instead of enrolling |
 | `ZYRIS_CODE_LOG` | `/tmp/zyris-code.log` | Log file. Logs never go to the terminal — they would land in the middle of the UI |
 | `ZYRIS_CODE_EXEC_MAX_SECS` | `1800` | Longest a `terminal.exec` command may run before this node kills it — and, because the two must agree, the wait it asks callers for. `0` lifts the ceiling, and then only the agent's own `timeout_ms` bounds a command |
+| `ZYRIS_CODE_EXEC_BUDGET` | `8000` | Bytes of a `terminal.exec` answer the agent receives, stdout and stderr together. A longer answer keeps its head and tail, and the whole of it is kept as a finished job that `wait.logs` pages; it is cut only when that saves at least 2 KB. `0` sends every answer whole |
 | `ZYRIS_CODE_WIRE_DEADLINE_SECS` | `55` | Answer the wire before the server gives up on a call, for the tools that declare no limit of their own (`wait.until`); `0` disables it |
 | `ZYRIS_CODE_MOUSE` | on | `0` hands the mouse back to the terminal, so copy-on-select and the scrollback drag work as they do everywhere else. Click-to-fold, drag-to-copy and Ctrl+click go with it |
 | `ZYRIS_CODE_HYPERLINKS` | detected | Force OSC 8 link markup on or off. Only terminals known to read it are sent any, because one that does not prints the escape bytes across the screen. Links stay Ctrl+clickable either way — the app opens them itself |
