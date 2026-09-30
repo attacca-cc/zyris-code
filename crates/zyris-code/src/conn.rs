@@ -1,6 +1,7 @@
 //! Conversations with Attacca. A session is created at **the first message**.
 
 use anyhow::{anyhow, Result};
+use sha2::{Digest, Sha256};
 // `AttaccaApi` is a trait. To call its methods, the client type alone is not enough — the trait
 // has to be in scope, or you get stuck with "method not found".
 use zyris_attacca::{
@@ -278,10 +279,52 @@ pub fn node_name() -> String {
     }
 }
 
-/// The working directory's name. Windows in different directories are told apart by this, and two
-/// windows in one directory by the server (`myrepo`, `myrepo-2`).
+/// The working directory's name, **with a short hash of the path when another live window in a
+/// different directory would answer to the same one.**
+///
+/// The basename alone is not unique: `~/work/app` and `~/oss/app` are both `app`, and which of the
+/// two Attacca calls `app` and which `app-2` is decided by start order and reconnect timing — so
+/// `.../app` can come to mean the other repository between one turn and the next, and a session
+/// resumed from the thread list edits the wrong tree. Where one window wants the name nothing
+/// changes; where two do, the one that would have collided gets a suffix of its own path, which is
+/// stable for as long as the directory is.
 pub fn default_node_name() -> String {
-    dir_name(&std::env::current_dir().unwrap_or_default())
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let base = dir_name(&cwd);
+    let collides = others_with_basename(&base, &cwd);
+    disambiguated(&base, &cwd, collides)
+}
+
+/// The name, given whether another live window already answers to the plain one.
+///
+/// Pure, so the rule can be checked without a registry — the same split this file already makes
+/// between deciding a name and finding out who else is here.
+fn disambiguated(base: &str, cwd: &std::path::Path, collides: bool) -> String {
+    if !collides {
+        return base.to_string();
+    }
+    let mut hash = Sha256::new();
+    hash.update(cwd.to_string_lossy().as_bytes());
+    let digest = format!("{:x}", hash.finalize());
+    // Six hex digits: short enough to leave room in the server's 32-character slug, long enough
+    // that two paths colliding on it is not something that happens.
+    format!("{base}-{}", &digest[..6])
+}
+
+/// Whether a live window other than this one wants `base` for a directory that is not this one.
+///
+/// A second window in the **same** directory is left to the server: there the two names really are
+/// interchangeable and `-2` costs nothing. What this catches is two different repositories whose
+/// last path component happens to match.
+fn others_with_basename(base: &str, cwd: &std::path::Path) -> bool {
+    let mine = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    crate::instance::live(&crate::instance::cache_root()).into_iter().any(|row| {
+        if row.pid == std::process::id() || row.node_name != base {
+            return false;
+        }
+        let theirs = std::fs::canonicalize(&row.cwd).unwrap_or(row.cwd);
+        theirs != mine
+    })
 }
 
 /// The last component of `dir`, or this app's name for `/` and anything else without one.
@@ -328,7 +371,11 @@ pub fn node_preamble(cwd: &std::path::Path, address: Option<&zyris::NodeAddress>
          Every zyris tool takes a `node_path` argument that says which computer it runs on. \
          Pass the node_path above to read and edit files, run a shell and do everything else \
          here. Another node_path touches a different computer: do not use it unless that \
-         computer is what the conversation is about.",
+         computer is what the conversation is about.\n\n\
+         **For a write or a command, use this node and no other.** Plan mode and the \
+         directory-access setting that judge a call belong to the window that receives it, so \
+         routing a write through a different window goes around the limits the person set for \
+         this conversation (issue 09).",
         cwd = cwd.display(),
         platform = std::env::consts::OS,
     )
@@ -539,6 +586,9 @@ impl Session {
         )
         .await
         .map_err(|e| anyhow!(crate::lang::current().thread_create_error(&e.to_string())))?;
+        // **Recorded as this window's.** Startup adoption filters by this record, so a session a
+        // window is still serving is not picked up by the next one that opens (issue 06).
+        remember_session(&session.id);
         self.id = Some(session.id.clone());
         Ok(session.id)
     }
@@ -614,6 +664,7 @@ impl Session {
             .session_id
             .clone()
             .ok_or_else(|| anyhow!(crate::lang::current().job_no_session(&job.id)))?;
+        remember_session(&id);
         self.id = Some(id.clone());
         let route = match plan_mode {
             true => Route::Plan,
@@ -643,6 +694,7 @@ impl Session {
         .map_err(|e| anyhow!(crate::lang::current().work_create_error(&e.to_string())))?;
 
         let id = planner_session(api, &work).await?;
+        remember_session(&id);
         self.id = Some(id.clone());
         Ok(Opened { id, sent: true, announced: Some((Route::Work, work.id)) })
     }
@@ -817,7 +869,14 @@ pub async fn session_awaiting_answer(api: &AttaccaApiClient) -> Option<String> {
         within(api, api.list_sessions(ZSessionFilter { project_id: None, limit: Some(50) }))
             .await
             .ok()?;
-    for s in sessions.into_iter().filter(|s| s.running).take(5) {
+    // **Only sessions this machine opened, and whose window is gone.** "Running, and waiting on a
+    // question" is a property of the whole account: a new window used to find the pending question
+    // of a session another window was serving, switch into it and answer it from a different
+    // directory — and then cancel that session's turn when the new window closed. A session left
+    // behind by a window that has since ended is exactly what this is for, and that is the case the
+    // ownership record keeps (`owned_sessions`).
+    let owned = owned_sessions();
+    for s in sessions.into_iter().filter(|s| s.running && owned.contains(&s.id)).take(5) {
         let events = history(api, &s.id).await.ok()?;
         // If there's at least one question awaiting an answer, that's the session.
         let pending = events.iter().rev().take(50).any(|e| {
@@ -831,6 +890,60 @@ pub async fn session_awaiting_answer(api: &AttaccaApiClient) -> Option<String> {
         }
     }
     None
+}
+
+/// Where this working directory's sessions are recorded. One file per directory, so two windows in
+/// different repositories do not read each other's list.
+fn session_file() -> Option<std::path::PathBuf> {
+    let cwd = std::env::current_dir().ok()?;
+    let mut hash = Sha256::new();
+    hash.update(cwd.to_string_lossy().as_bytes());
+    let digest = format!("{:x}", hash.finalize());
+    Some(crate::instance::cache_root().join("sessions").join(format!("{}.json", &digest[..16])))
+}
+
+/// Records that **this window** opened `session_id`.
+///
+/// Attacca's session list carries no owner, so the only place this can be kept is here. It is kept
+/// across runs on purpose: a session whose window ended is the thing startup-adoption is for.
+/// Written atomically — a window reading this mid-write would find no sessions at all, which is
+/// indistinguishable from a machine that has never run this app.
+pub fn remember_session(session_id: &str) {
+    let Some(at) = session_file() else { return };
+    let mut known = read_sessions(Some(&at));
+    let id = session_id.to_string();
+    known.retain(|(known_id, _)| *known_id != id);
+    known.push((id, std::process::id()));
+    let Ok(text) = serde_json::to_vec(&known) else { return };
+    if let Err(e) = crate::atomic::write_atomic(&at, &text, None) {
+        tracing::debug!(error = %e, "could not record which session this window opened");
+    }
+}
+
+/// The sessions this machine may still adopt: its own, and those whose window has ended. **A
+/// session another window is currently serving is not in this list** — that is the whole point.
+fn owned_sessions() -> Vec<String> {
+    let live: Vec<u32> = crate::instance::live(&crate::instance::cache_root())
+        .into_iter()
+        .map(|row| row.pid)
+        .collect();
+    adoptable(read_sessions(session_file().as_deref()), &live, std::process::id())
+}
+
+/// Which of `known` may be adopted, given which pids are live. Pure, so the rule can be tested
+/// without a registry or a working directory.
+fn adoptable(known: Vec<(String, u32)>, live: &[u32], me: u32) -> Vec<String> {
+    known
+        .into_iter()
+        .filter(|(_, pid)| *pid == me || !live.contains(pid))
+        .map(|(id, _)| id)
+        .collect()
+}
+
+fn read_sessions(at: Option<&std::path::Path>) -> Vec<(String, u32)> {
+    let Some(at) = at else { return Vec::new() };
+    let Ok(text) = std::fs::read_to_string(at) else { return Vec::new() };
+    serde_json::from_str(&text).unwrap_or_default()
 }
 
 /// Session usage. If the deployment doesn't meter, `capability_not_announced` comes back ‒
@@ -888,6 +1001,34 @@ mod tests {
     fn a_node_is_named_after_its_directory() {
         assert_eq!(dir_name(std::path::Path::new("/home/ruma/myrepo")), "myrepo");
         assert_eq!(dir_name(std::path::Path::new("/")), "zyris-code");
+    }
+
+    /// **A name is only suffixed when another window wants it.** Where nothing collides the plain
+    /// directory name is kept — hanging a hash on every node would change every existing path, and
+    /// a session's preamble names this path.
+    #[test]
+    fn a_colliding_directory_name_is_told_apart_by_its_path() {
+        let here = std::path::Path::new("/home/ruma/work/app");
+        assert_eq!(disambiguated("app", here, false), "app");
+        let made = disambiguated("app", here, true);
+        assert!(made.starts_with("app-"), "{made}");
+        assert_eq!(made, disambiguated("app", here, true), "it must be stable for one directory");
+        assert_ne!(made, disambiguated("app", std::path::Path::new("/home/ruma/oss/app"), true));
+        // A slug the server accepts: lowercase letters, digits and dashes, inside 32 characters.
+        assert!(made.len() <= 32, "{made}");
+        assert!(made.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'));
+    }
+
+    /// **A session another window is serving is not adopted at startup.** A new window used to
+    /// switch into whatever pending question it found on the account — answer it from a different
+    /// directory, and cancel its turn when the new window closed. A session whose window has ended
+    /// is the case this exists for.
+    #[test]
+    fn only_sessions_nobody_is_serving_may_be_adopted() {
+        let me = std::process::id();
+        let known =
+            vec![("mine".to_string(), me), ("theirs".to_string(), 4242), ("gone".to_string(), 7)];
+        assert_eq!(adoptable(known, &[me, 4242], me), vec!["mine".to_string(), "gone".to_string()]);
     }
 
     use super::*;

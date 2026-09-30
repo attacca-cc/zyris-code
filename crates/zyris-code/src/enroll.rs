@@ -120,22 +120,50 @@ impl DeviceGrant {
 
     /// The credential to present: the one held, the one on disk, or a fresh enrollment.
     async fn credential(&self) -> Result<zyris::Credential, CredentialsError> {
-        if let Some(credential) = self.held.lock().await.clone() {
-            return Ok(credential);
+        let in_hand = { self.held.lock().await.clone() };
+        if let Some(credential) = in_hand {
+            // **Logging out in another window signs this one out too.** All windows share one
+            // credential file, and `/account logout` in one of them clears it — but this process
+            // keeps its own copy in memory, and would otherwise go on dialling with a credential
+            // the machine has been signed out of while the person believes they are signed out. The
+            // file having gone is the signal; a file that merely *changed* is another window's
+            // fresh enrollment, which `forget_refused` adopts and this leaves alone.
+            if !self.released_elsewhere().await {
+                return Ok(credential);
+            }
+            tracing::info!("the credential was cleared by another window; dropping this copy");
+            *self.held.lock().await = None;
         }
         // One enrollment at a time, so a second dial arriving mid-grant cannot put a second code on
         // the screen. **`held` is deliberately not what is locked here** — see the field.
         let _enrolling = self.enrolling.lock().await;
         // Whoever was ahead of us may have finished while we waited for that.
-        if let Some(credential) = self.held.lock().await.clone() {
+        let in_hand = { self.held.lock().await.clone() };
+        if let Some(credential) = in_hand {
             return Ok(credential);
         }
-        let credential = match self.stored().await? {
+        // **The file is locked for the read, and no longer.** Whoever holds the lock is mid-
+        // enrollment and puts the new credential down before letting go, so this sees either the
+        // finished file or nothing — without waiting out a browser trip the way it used to.
+        let found = {
+            let _transaction = self.store.lock().await.map_err(store_trouble)?;
+            self.stored().await?
+        };
+        let credential = match found {
             Some(credential) => credential,
             None => self.enroll().await?,
         };
         *self.held.lock().await = Some(credential.clone());
         Ok(credential)
+    }
+
+    /// Whether the credential carried in memory has since been cleared from the store — which is
+    /// what logging out in another window looks like from here.
+    ///
+    /// Split out so the check can be made without going on to enroll: the answer is a fact about
+    /// the file, not about the network.
+    async fn released_elsewhere(&self) -> bool {
+        self.held.lock().await.is_some() && matches!(self.store.load().await, Ok(None))
     }
 
     /// A corrupt or unreadable credential — including an account credential an earlier release
@@ -179,7 +207,25 @@ impl DeviceGrant {
                     // Stored **before** it is used, and before the window is told. A credential
                     // this process began dialling on but never wrote down would enroll again on
                     // the next start and leave an unused credential behind in the account.
-                    self.store.save(&credential).await.map_err(store_trouble)?;
+                    //
+                    // **Under the lock, and only when nobody has replaced it.** Enrolling takes as
+                    // long as a person takes to reach a browser; another window can approve and
+                    // store its own credential in the meantime, and this one's write would then be
+                    // a second credential on the account with the person's first approval thrown
+                    // away — exactly what `forget_refused`'s comment says must not happen.
+                    let _transaction = self.store.lock().await.map_err(store_trouble)?;
+                    let credential = match self.store.load().await {
+                        Ok(Some(existing)) if existing.secret != credential.secret => {
+                            tracing::info!(
+                                "another window enrolled while this one waited; adopting its credential"
+                            );
+                            existing
+                        }
+                        _ => {
+                            self.store.save(&credential).await.map_err(store_trouble)?;
+                            credential
+                        }
+                    };
                     self.ui.authorized();
                     return Ok(credential);
                 }
@@ -243,8 +289,16 @@ impl DeviceGrant {
         self.held.lock().await.is_some()
     }
 
-    #[cfg(test)]
-    pub(crate) async fn hold(&self, credential: zyris::Credential) {
+    /// The credential in hand, if any. **What `Reauth::discard_scope` compares the file against**:
+    /// "the file is not what I was carrying" means another window has done the work already, and
+    /// deleting it would throw that window's approval away.
+    async fn held(&self) -> Option<zyris::Credential> {
+        self.held.lock().await.clone()
+    }
+
+    /// Puts a credential in hand — another window's, adopted rather than re-enrolled.
+    #[allow(dead_code)]
+    async fn hold(&self, credential: zyris::Credential) {
         *self.held.lock().await = Some(credential);
     }
 }
@@ -252,9 +306,14 @@ impl DeviceGrant {
 #[async_trait::async_trait]
 impl Credentials for DeviceGrant {
     async fn bearer(&self) -> Result<String, CredentialsError> {
-        // Held through the re-read and any enrollment, so a second window starting at the same
-        // moment waits for this one's approval instead of asking for a second credential.
-        let _transaction = self.store.lock().await.map_err(store_trouble)?;
+        // **No file lock is held here, and that is the fix.** It used to be taken before every dial
+        // and kept for the whole call — and a call can be an enrollment that waits for a person in
+        // a browser, for as long as they take to walk over to one. Any other window that dialled
+        // meanwhile waited the lock's ten seconds and then gave up with exit code 2, so starting a
+        // second window during a first run killed it instead of letting it wait. What actually
+        // needs serialising is the credential **file**, and that is locked inside `credential`,
+        // `enroll` and `forget_refused` — each for a read-check-write and no longer. One enrollment
+        // per *window* is still enforced by the in-process `enrolling` mutex.
         Ok(self.credential().await?.secret().to_string())
     }
 
@@ -308,14 +367,23 @@ fn enrollment_trouble(error: zyris::EnrollError) -> CredentialsError {
     }
 }
 
-/// A store failure that reached the caller needs a person.
+/// A store failure that reached the caller, in the terms the run loop acts on.
 ///
 /// [`DeviceGrant::stored`] already swallows the discardable ones on the read path, so what is left
-/// is either a refusal — an exposed secret, a machine with nowhere to keep one — or a *write* that
-/// could not be kept. Retrying the second would mean a fresh code on every restart and an unused
-/// credential in the account behind each one, so neither is a reason to loop.
+/// is a refusal — an exposed secret, a machine with nowhere to keep one — a *write* that could not
+/// be kept, or **a lock another window is holding**. Retrying the first two would mean a fresh code
+/// on every restart and an unused credential in the account behind each one, so neither is a
+/// reason to loop; the lock is the opposite, and becomes `Unavailable` so the loop backs off and
+/// asks again.
 fn store_trouble(error: CredentialStoreError) -> CredentialsError {
-    CredentialsError::NeedsOperator(error.to_string())
+    match error {
+        // **Waiting is the whole answer.** A second window that dials while the first is enrolling
+        // used to be told this needed a person, and the run loop exits with code 2 on that — one
+        // window's login killed the other. As `Unavailable` it backs off and tries again, and the
+        // enrollment finishes in the meantime.
+        CredentialStoreError::Busy(message) => CredentialsError::Unavailable(message),
+        other => CredentialsError::NeedsOperator(other.to_string()),
+    }
 }
 
 /// What moves the enrollment code to the screen. The polling loop above calls these.
@@ -434,11 +502,53 @@ impl Reauth {
     }
 
     /// Discards the credential **at most once per process.** True if something was discarded.
+    ///
+    /// **The automatic path, and it adopts rather than clears when the file changed under us** —
+    /// see [`discard_scope`](Self::discard_scope).
     pub async fn discard_once(&self) -> bool {
         if self.spent.swap(true, Ordering::SeqCst) {
             return false;
         }
-        self.discard().await
+        self.discard_scope().await
+    }
+
+    /// The discard used when the credential on disk is missing scopes this build needs.
+    ///
+    /// **Two windows on a scope upgrade approve once.** Both see the missing scope; the first
+    /// discards the file, enrolls and writes a fresh credential; the second, arriving a moment
+    /// later, used to delete that file unconditionally — so the person had to approve a second time
+    /// and the first approval was thrown away. If the secret on disk is not the one this process
+    /// was carrying, another window has already done the work: adopt it and leave it alone.
+    ///
+    /// An explicit `/account logout` goes through [`discard`](Self::discard) instead, which always
+    /// clears — there the person means it, and this machine is what they meant it about.
+    async fn discard_scope(&self) -> bool {
+        let _transaction = match self.store.lock().await {
+            Ok(lock) => lock,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not lock the credentials for discard");
+                return false;
+            }
+        };
+        // **Only when this window is carrying something else.** A window that is carrying nothing
+        // has nothing to compare against and nothing to adopt from — the file it finds is the file
+        // it should clear, which is the case the automatic scope check exists for.
+        let carrying = self.grant.held().await;
+        if let (Some(carrying), Ok(Some(stored))) = (&carrying, self.store.load().await) {
+            if carrying.secret != stored.secret {
+                tracing::info!("another window enrolled while this one was deciding; adopting it");
+                self.grant.hold(stored).await;
+                return false;
+            }
+        }
+        self.grant.forget().await;
+        match self.store.clear().await {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not discard the credentials");
+                false
+            }
+        }
     }
 
     /// Discards the credential, however many times it is asked. What `/account logout` calls.
@@ -554,6 +664,52 @@ mod tests_discard {
         store.save(&a_credential("zc_stored")).await.unwrap();
         assert!(reauth.discard().await, "logging out was refused");
         assert!(store.load().await.unwrap().is_none(), "the credential is still there");
+    }
+
+    /// **A scope upgrade in two windows approves once.** The second window finds the credential the
+    /// first one just wrote, and must adopt it rather than delete it.
+    #[tokio::test]
+    async fn a_scope_discard_adopts_a_credential_another_window_just_wrote() {
+        let store = Arc::new(MemoryCredentialStore::default());
+        store.save(&a_credential("zc_narrow")).await.unwrap();
+        let reauth = Reauth::for_test(store.clone());
+        reauth.grant.hold(a_credential("zc_narrow")).await;
+
+        // Another window approved a wider credential while this one was looking at the old scopes.
+        store.save(&a_credential("zc_wide")).await.unwrap();
+
+        assert!(!reauth.discard_once().await, "it deleted another window's approval");
+        assert_eq!(store.load().await.unwrap().unwrap().secret, "zc_wide");
+        assert_eq!(reauth.grant.bearer().await.unwrap(), "zc_wide");
+    }
+
+    /// **An explicit logout always clears**, even when the file holds another window's credential —
+    /// the person said sign out, and this is the machine they said it about.
+    #[tokio::test]
+    async fn logging_out_clears_even_a_credential_another_window_wrote() {
+        let store = Arc::new(MemoryCredentialStore::default());
+        store.save(&a_credential("zc_old")).await.unwrap();
+        let reauth = Reauth::for_test(store.clone());
+        reauth.grant.hold(a_credential("zc_old")).await;
+        store.save(&a_credential("zc_new")).await.unwrap();
+
+        assert!(reauth.discard().await);
+        assert!(store.load().await.unwrap().is_none(), "logout left a credential behind");
+    }
+
+    /// **A credential cleared by another window is not dialled again.** `discard` in one window
+    /// clears the shared file; a second window that kept its copy in memory would go on attaching
+    /// as a machine that has been signed out.
+    #[tokio::test]
+    async fn a_credential_cleared_by_another_window_is_noticed() {
+        let store = Arc::new(MemoryCredentialStore::default());
+        store.save(&a_credential("zc_shared")).await.unwrap();
+        let reauth = Reauth::for_test(store.clone());
+        reauth.grant.hold(a_credential("zc_shared")).await;
+        assert!(!reauth.grant.released_elsewhere().await, "nothing was cleared yet");
+
+        store.clear().await.unwrap();
+        assert!(reauth.grant.released_elsewhere().await, "the cleared file was not noticed");
     }
 }
 

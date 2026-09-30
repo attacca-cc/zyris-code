@@ -26,6 +26,13 @@ use zyris_caps::resolve_under;
 
 use crate::tools::diff::diff;
 
+/// How long an edit waits for another window's edit of the same file.
+///
+/// **Short.** This is spent inside a tool call, and an edit that stalled for want of a lock would
+/// be worse than one that went through without it — the version check below still refuses a write
+/// computed from content that has since changed.
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct EditSpec {
     pub old_string: String,
@@ -113,6 +120,9 @@ pub struct LocalEdit {
     root: PathBuf,
     /// Where the pre-change content is kept. **Lives outside the user's repo** (`~/.cache`).
     undo: crate::undo::Undo,
+    /// Where the per-file advisory locks live. **Also outside the repo** — a sidecar beside the file
+    /// would show up in `git status` and could end up committed.
+    locks: PathBuf,
 }
 
 /// Which of the three tools is running. **The two differ in exactly two rules, and both are about
@@ -133,19 +143,31 @@ struct Changed {
 impl LocalEdit {
     pub fn new(root: PathBuf) -> LocalEdit {
         let undo = crate::undo::Undo::for_dir(&root);
-        LocalEdit { root, undo }
+        let locks = crate::instance::cache_root().join("locks");
+        LocalEdit { root, undo, locks }
     }
 
     /// The same, with the undo history's cache root given. **Tests use this** so they do not have
     /// to move `XDG_CACHE_HOME`, which is process-global and raced between tests.
     pub fn under(root: PathBuf, cache_root: &std::path::Path) -> LocalEdit {
         let undo = crate::undo::Undo::under(cache_root, &root);
-        LocalEdit { root, undo }
+        let locks = cache_root.join("locks");
+        LocalEdit { root, undo, locks }
     }
 
     /// The undo log. `/undo` uses it.
     pub fn undo(&self) -> crate::undo::Undo {
         self.undo.clone()
+    }
+
+    /// Where the advisory lock for one file lives. **Keyed by the full path**, so two working
+    /// directories' `src/lib.rs` are two different locks — the same reason the undo cache is keyed
+    /// by directory.
+    fn lock_for(&self, full: &Path) -> PathBuf {
+        let mut hash = Sha256::new();
+        hash.update(full.to_string_lossy().as_bytes());
+        let digest = format!("{:x}", hash.finalize());
+        self.locks.join(format!("{}.lock", &digest[..16]))
     }
 
     /// Read, change, write, and return a diff. All three tools meet here — so no matter which path,
@@ -164,6 +186,17 @@ impl LocalEdit {
         F: FnOnce(&str) -> Result<Changed, WireError>,
     {
         let full = resolve_under(&self.root, path);
+        // **One writer at a time per file, across processes.** The read, the version check and the
+        // rename below are three steps with nothing between them: two windows editing one file both
+        // read the same content, both compute from it, and the second rename silently drops the
+        // first window's edit. The lock is taken from the cache, not from the repo — see the field.
+        //
+        // A lock that could not be taken in time is not fatal: the edit goes through exactly as it
+        // did before this existed, which is the right failure for a safety net (the same call as
+        // the undo snapshot's).
+        let lock = self.lock_for(&full);
+        let _held = crate::instance::FileLock::take(&lock, LOCK_WAIT);
+        // Read **after** the lock, so what this side computes from is what whoever held it left.
         let existed = tokio::fs::try_exists(&full).await.unwrap_or(false);
         let old = tokio::fs::read_to_string(&full).await.unwrap_or_default();
 

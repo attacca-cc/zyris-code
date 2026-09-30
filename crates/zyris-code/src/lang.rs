@@ -136,7 +136,9 @@ pub fn save(lang: Lang) {
     if let Some(dir) = at.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    if let Err(e) = std::fs::write(&at, lang.code()) {
+    // **Atomic.** A window reading this while another writes it saw an empty file, `load` answered
+    // `None`, and the choice appeared not to stick.
+    if let Err(e) = crate::atomic::write_atomic(&at, lang.code().as_bytes(), None) {
         tracing::warn!(error = %e, "couldn't save the chosen language");
     }
 }

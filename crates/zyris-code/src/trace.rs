@@ -98,12 +98,17 @@ impl Trace {
         if !self.wants(what) {
             return;
         }
-        eprintln!("zyris-code[{}] {line}", what.name());
+        // **Every line says which window wrote it.** The trace file is one path for the whole
+        // machine, and two windows running side by side would otherwise leave one interleaved
+        // record — the answer to "is this the terminal or the app?" is only worth having if the
+        // lines can be told apart afterwards.
+        let pid = std::process::id();
+        eprintln!("zyris-code[{pid}][{}] {line}", what.name());
         let Some(path) = &self.path else {
             return;
         };
         if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-            let _ = writeln!(file, "[{}] {line}", what.name());
+            let _ = writeln!(file, "[{pid}] [{}] {line}", what.name());
         }
     }
 }
@@ -159,6 +164,20 @@ mod tests {
     fn the_file_lands_where_the_docs_say() {
         let t = trace("mouse");
         assert_eq!(t.path.as_deref(), Some(std::path::Path::new("/tmp/zyris-code-trace.log")));
+    }
+
+    /// **Two windows' lines can be told apart.** The trace path is one per machine, so the process
+    /// that wrote each line is what keeps the file readable when two are running — the same problem
+    /// the app log's `[pid]` prefix answers.
+    #[test]
+    fn every_line_says_which_process_wrote_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = Trace::from(Some("keys"), dir.path().to_path_buf());
+        t.note(What::Keys, "a key");
+        let text = std::fs::read_to_string(t.path.as_ref().expect("it was asked for")).unwrap();
+        assert!(text.contains(&format!("[{}]", std::process::id())), "{text}");
+        assert!(text.contains("a key"), "{text}");
+        assert!(text.contains("keys"), "the part that was asked for: {text}");
     }
 
     /// **A part that was not asked for writes nothing.** This is what makes the guard on the

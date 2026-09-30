@@ -39,8 +39,51 @@ fn connect_wait() -> Duration {
         .unwrap_or(CONNECT_WAIT)
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+/// Starts the app: writes this node's identity variables, then hands the rest to the async runtime.
+///
+/// **The identity variables are written before the runtime is built.** They used to be set from
+/// inside the multi-threaded tokio runtime, where the worker threads are already running — and a
+/// `set_var` on one thread while another calls `getenv` is a data race on glibc. Every child
+/// process this app starts reads that environment, so the window is not theoretical. Nothing in the
+/// block needs to be async: its inputs are the environment, the working directory and a constant.
+fn main() -> ExitCode {
+    set_identity_env();
+    match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+        Ok(runtime) => runtime.block_on(run_app()),
+        Err(e) => {
+            zyris_code::cli::warn(&format!("could not start the async runtime: {e}"));
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// The variables that say **which node this is** — each written only when the person has not given
+/// one, because a value from outside always wins.
+///
+/// | variable | why |
+/// |---|---|
+/// | `ZYRIS_CONFIG_DIR` | credentials go in this app's own directory, not the shared `~/.config/zyris` |
+/// | `ZYRIS_PROFILE` | the profile splits again inside that directory |
+/// | `ZYRIS_SCOPES` | **must be settled before the credential source is built** — the device grant copies the list when it is built, so a scope set afterwards never reaches the approval screen |
+/// | `ZYRIS_NODE_NAME` | the directory's name, or a hashed one where another window would collide |
+fn set_identity_env() {
+    if std::env::var_os("ZYRIS_CONFIG_DIR").is_none_or(|v| v.is_empty()) {
+        if let Some(dir) = zyris_code::conn::credential_dir() {
+            std::env::set_var("ZYRIS_CONFIG_DIR", &dir);
+        }
+    }
+    if std::env::var_os("ZYRIS_PROFILE").is_none() {
+        std::env::set_var("ZYRIS_PROFILE", zyris_code::conn::APP);
+    }
+    if std::env::var_os("ZYRIS_SCOPES").is_none() {
+        std::env::set_var("ZYRIS_SCOPES", zyris_code::conn::REQUIRED_SCOPES.join(","));
+    }
+    if std::env::var_os("ZYRIS_NODE_NAME").is_none() {
+        std::env::set_var("ZYRIS_NODE_NAME", zyris_code::conn::default_node_name());
+    }
+}
+
+async fn run_app() -> ExitCode {
     // **Answered before anything else is built.** Help and version must work with no account, no
     // credential and no terminal, and a misread flag must not reach the point of spending credit.
     let program = std::env::args()
@@ -159,17 +202,9 @@ async fn main() -> ExitCode {
     // (The variable, rather than an argument, because the old `RunConfig::app` never existed
     // upstream either and the store keeps reading the environment the same way it always did, so
     // an old credential file is still found where it was left.)
-    if std::env::var_os("ZYRIS_CONFIG_DIR").is_none_or(|v| v.is_empty()) {
-        if let Some(dir) = zyris_code::conn::credential_dir() {
-            std::env::set_var("ZYRIS_CONFIG_DIR", &dir);
-        }
-    }
-
-    // The profile splits again inside that directory. Unset just leaves it `default`, and now
-    // that `default` is ours.
-    if std::env::var_os("ZYRIS_PROFILE").is_none() {
-        std::env::set_var("ZYRIS_PROFILE", zyris_code::conn::APP);
-    }
+    // **Already written, in `set_identity_env`, before the runtime was built.** Nothing is set from
+    // in here — a `set_var` with the worker threads already running is the data race that split
+    // exists to avoid. The profile, the scopes and the node name are set in the same place.
 
     // **The scopes to request must be decided before credentials are made.** The device grant
     // copies `config.scopes` when it is built, and it is built by `enroll::source` from the
@@ -200,16 +235,14 @@ async fn main() -> ExitCode {
     //
     // **The list lives in one place** (`conn::REQUIRED_SCOPES`). If what's requested and what's
     // checked after attaching diverge, you'd either deny something you never asked for or stay silent about something missing.
-    if std::env::var_os("ZYRIS_SCOPES").is_none() {
-        std::env::set_var("ZYRIS_SCOPES", zyris_code::conn::REQUIRED_SCOPES.join(","));
-    }
+    // Set in `set_identity_env`, before the runtime — see the table there for why it must be
+    // settled before anything reads it.
 
     // Same for the node name: the working directory's name unless the person set one. The machine
     // and the program are already in the node's path (`laptop/zyris-code/…`), so the directory is
     // the part that tells windows apart; two in one directory get `-2` from the server.
-    if std::env::var_os("ZYRIS_NODE_NAME").is_none() {
-        std::env::set_var("ZYRIS_NODE_NAME", zyris_code::conn::default_node_name());
-    }
+    // Set in `set_identity_env`, before the runtime: the working directory's name, or one with a
+    // short hash of the path where another live window would answer to the same name (issue 05).
 
     // **The app is raised before the runner.** That way the enrollment code window is on screen from
     // the first enrollment (before connecting) — no more stdout box leaking into the terminal like
@@ -288,6 +321,17 @@ async fn main() -> ExitCode {
     // (`DeviceGrant` → `ScreenEnroll`). Only when there's no screen (the extreme where the app
     // couldn't start) does it fall to a stdout box.
     let config = zyris_code::runtime::RunConfig::from_env();
+
+    // **Say that this window is here, for as long as the process lives** (`instance.rs`). What asks:
+    // node-name disambiguation (issue 05), startup session adoption (06), another window's `/undo`
+    // (04), and the per-file edit locks (07). Dropped when the process ends, which is what makes
+    // "is that window still running?" a question with an answer.
+    let _instance = zyris_code::instance::Instance::register(
+        &zyris_code::instance::cache_root(),
+        &config.node_name,
+        &cwd,
+    );
+
     let creds: Arc<dyn zyris_code::runtime::Credentials> =
         match zyris_code::enroll::source(&config, &bridge) {
             Ok((creds, reauth)) => {

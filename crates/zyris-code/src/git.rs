@@ -77,6 +77,8 @@ impl Git {
 
     async fn git(&self, args: &[String], token: Option<String>) -> zyris::Result<Ran> {
         let mut command = tokio::process::Command::new("git");
+        // **git has no business knowing which node started it.** See `tools::scrub_identity`.
+        crate::tools::scrub_identity(&mut command);
         command.current_dir(&self.cwd).args(args);
         if let Some(token) = token {
             command.env(TOKEN_VAR, token);
@@ -176,6 +178,21 @@ pub fn split_status(text: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
     (staged, unstaged, untracked)
 }
 
+/// The sha git reports for the commit it just made, out of git's own first line.
+///
+/// `[main 1a2b3c4] subject`, or `[main (root-commit) 1a2b3c4] subject` where the branch has no
+/// history yet. **Not a later `rev-parse`**: another window can land a commit in between, and the
+/// sha this side reported would be that one's. Anything that is not a plausible short sha (the
+/// branch name in `[main]`, a bracketed subject) answers `None`, so the caller falls back rather
+/// than reporting a subject as a sha.
+pub fn sha_from_commit(out: &str) -> Option<String> {
+    let line = out.lines().find(|line| line.trim_start().starts_with('['))?;
+    let (_, rest) = line.split_once('[')?;
+    let (inside, _) = rest.split_once(']')?;
+    let sha = inside.split_whitespace().last()?;
+    (sha.len() >= 7 && sha.chars().all(|c| c.is_ascii_hexdigit())).then(|| sha.to_string())
+}
+
 /// One line of `git log --format=…`, as the agent sees it.
 pub fn parse_log(text: &str) -> Vec<Value> {
     text.lines()
@@ -268,6 +285,22 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0]["sha"], "abc123");
         assert_eq!(got[0]["subject"], "feat(git): add a: thing\x1f and more");
+    }
+
+    /// **The sha is read out of the commit's own line.** `rev-parse HEAD` a moment after committing
+    /// answers with whatever HEAD holds *then*, and another window can land a commit in between —
+    /// so the sha this reported would be that window's commit, under this one's message.
+    #[test]
+    fn the_sha_is_read_from_the_commits_own_line() {
+        assert_eq!(sha_from_commit("[main 1a2b3c4] feat: a thing\n").as_deref(), Some("1a2b3c4"));
+        assert_eq!(
+            sha_from_commit("[main (root-commit) deadbee] first\n").as_deref(),
+            Some("deadbee"),
+        );
+        // Not a sha: the branch name in `[main]`, or a line with no bracket at all. The caller
+        // falls back to `rev-parse` rather than reporting a subject as a sha.
+        assert_eq!(sha_from_commit("[main] a subject\n"), None);
+        assert_eq!(sha_from_commit("nothing here\n"), None);
     }
 }
 
@@ -606,6 +639,15 @@ impl GitCap for Git {
         }
         args.push("-m".into());
         args.push(message.clone());
+        // **The commit takes exactly the paths this call names.** Without a pathspec `git commit`
+        // writes whatever the index happens to hold, and the index is shared with every other
+        // window and with whatever the person did at a shell — so one window's commit swept in
+        // another's staged file under its own message, and the other's commit then found nothing
+        // to do. `-- <paths>` takes the named files and leaves the rest of the index alone.
+        if !paths.is_empty() {
+            args.push("--".into());
+            args.extend(paths.iter().cloned());
+        }
         let ran = self.git(&args, None).await?;
         if !ran.ok {
             return Err(zyris::WireError::internal(ran.why()));
@@ -613,7 +655,14 @@ impl GitCap for Git {
         // **Asked, not assumed.** A key can be on the ring and still fail to sign — expired, or
         // gpg missing on this machine — and a commit reported as signed when it is not is worse
         // than one reported plainly.
-        let sha = self.read(&["rev-parse", "--short", "HEAD"]).await.unwrap_or_default();
+        //
+        // **The sha comes out of the commit's own answer**, not from a `rev-parse` a moment later:
+        // another window can land a commit in between, and the sha this reports would be that
+        // one's. `rev-parse` is kept only for a git that printed nothing to read.
+        let sha = match sha_from_commit(&ran.out) {
+            Some(sha) => sha,
+            None => self.read(&["rev-parse", "--short", "HEAD"]).await.unwrap_or_default(),
+        };
         let signed = self
             .read(&["log", "-1", "--format=%G?"])
             .await

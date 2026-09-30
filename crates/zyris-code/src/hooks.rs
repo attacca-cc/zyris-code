@@ -236,6 +236,10 @@ async fn one(hook: &Hook, tool: &str, input: &Value) -> Verdict {
         c.arg("-c").arg(&hook.command);
         c
     };
+    // **A hook does not need to know which node ran it.** A plugin's script that starts a
+    // `zyris-code` of its own would otherwise inherit this window's identity — see
+    // `tools::scrub_identity`.
+    crate::tools::scrub_identity(&mut command);
     // The variable every manifest in the wild uses to find its own scripts.
     command.env("CLAUDE_PLUGIN_ROOT", &hook.root);
     command.env("ZYRIS_PLUGIN_ROOT", &hook.root);

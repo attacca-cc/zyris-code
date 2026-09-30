@@ -56,6 +56,11 @@ pub enum CredentialStoreError {
     /// The credential may exist, but using it would be wrong and someone needs to know — a
     /// world-readable key file, a config directory that cannot be located. Never discarded silently.
     Refused(String),
+    /// **Someone else holds the lock right now.** Not a refusal: nothing is wrong with the
+    /// credential and nobody has to be told; the caller should wait and ask again. Kept apart from
+    /// [`Refused`](Self::Refused) because the run loop's answer to the two is opposite — one backs
+    /// off, the other exits.
+    Busy(String),
     /// Unreadable, corrupt, or written by a version this build does not understand. Safe to throw
     /// away and enroll again.
     Unusable(String),
@@ -67,9 +72,9 @@ pub enum CredentialStoreError {
 impl std::fmt::Display for CredentialStoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CredentialStoreError::Refused(message) | CredentialStoreError::Unusable(message) => {
-                f.write_str(message)
-            }
+            CredentialStoreError::Refused(message)
+            | CredentialStoreError::Busy(message)
+            | CredentialStoreError::Unusable(message) => f.write_str(message),
             CredentialStoreError::Other(error) => write!(f, "{error}"),
         }
     }
@@ -79,7 +84,9 @@ impl std::error::Error for CredentialStoreError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             CredentialStoreError::Other(error) => Some(error.as_ref()),
-            CredentialStoreError::Refused(_) | CredentialStoreError::Unusable(_) => None,
+            CredentialStoreError::Refused(_)
+            | CredentialStoreError::Busy(_)
+            | CredentialStoreError::Unusable(_) => None,
         }
     }
 }
@@ -306,8 +313,12 @@ impl CredentialStore for FileCredentialStore {
                 Ok(()) => return Ok(CredentialLock { file: Some(file) }),
                 Err(fs::TryLockError::WouldBlock) => {
                     if started.elapsed() >= LOCK_WAIT {
-                        return Err(CredentialStoreError::Refused(format!(
-                            "timed out waiting for credential lock {}; try again",
+                        // **`Busy`, not `Refused`.** The holder is an enrollment waiting on a
+                        // person in a browser; the answer here is to wait and try again, and the
+                        // run loop only backs off on `Unavailable`. Reported as a refusal it ended
+                        // the process with exit code 2 — one window's login killed the others.
+                        return Err(CredentialStoreError::Busy(format!(
+                            "another window is holding the credential lock {}",
                             lock_path.display()
                         )));
                     }
@@ -524,6 +535,9 @@ mod tests {
     fn only_unusable_may_be_thrown_away() {
         assert!(CredentialStoreError::Unusable("corrupt".into()).is_discardable());
         assert!(!CredentialStoreError::Refused("mode 0644".into()).is_discardable());
+        // **A held lock is not a reason to drop the credential.** Treated as discardable it would
+        // have every window that arrived while another was enrolling erase the file.
+        assert!(!CredentialStoreError::Busy("someone else has it".into()).is_discardable());
         assert!(
             !CredentialStoreError::other(std::io::Error::other("keychain locked")).is_discardable()
         );
