@@ -216,6 +216,36 @@ pub fn narrow_stand_in(cell: &str) -> Option<&'static str> {
     })
 }
 
+/// The ASCII a cell holding one of the app's own marks is drawn as, when the font cannot be
+/// trusted with them ([`Caps::ascii`]); `None` for everything else.
+///
+/// **Only marks, never letters.** Hangul, kana and accented Latin are what the text says, and a
+/// console that cannot draw them is not helped by a `?`. Applied to the finished frame after the
+/// text a drag copies was taken, so a copy keeps the real characters. The box drawing, arrows and
+/// dots that are also ambiguous in width take [`narrow_stand_in`]'s look-alikes.
+pub fn ascii_stand_in(cell: &str) -> Option<&'static str> {
+    let first = cell.chars().next()?;
+    if first.is_ascii() || first.is_alphanumeric() {
+        return None;
+    }
+    // Written as escapes, like `narrow_stand_in`'s table: `tests/width.rs` reads literals as
+    // what the app draws.
+    Some(match first {
+        '\u{273B}' | '\u{25C6}' | '\u{25C8}' | '\u{25CF}' => "*",
+        '\u{25CB}' => "o",
+        '\u{23BF}' => "`",
+        '\u{276F}' | '\u{25B8}' => ">",
+        '\u{25BE}' | '\u{2713}' => "v",
+        '\u{270E}' => "~",
+        '\u{2715}' => "x",
+        '\u{250A}' => ":",
+        '\u{2219}' => ".",
+        '\u{2012}' | '\u{2212}' => "-",
+        '\u{258C}' => "|",
+        _ => return narrow_stand_in(cell).filter(|s| *s != "?"),
+    })
+}
+
 /// Why the screen cannot be drawn here, if it cannot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoScreen {
@@ -255,6 +285,9 @@ pub struct Caps {
     /// Whether this terminal draws East Asian Ambiguous characters two columns wide — see
     /// [`narrow_stand_in`]. Only ever set by `$ZYRIS_CODE_AMBIGUOUS_WIDE`.
     pub ambiguous_wide: bool,
+    /// Whether the app's own marks are drawn in ASCII — see [`ascii_stand_in`]. On for the Linux
+    /// console, and set either way by `$ZYRIS_CODE_ASCII`.
+    pub ascii: bool,
 }
 
 impl Caps {
@@ -306,7 +339,12 @@ impl Caps {
         let ambiguous_wide =
             override_of(var("ZYRIS_CODE_AMBIGUOUS_WIDE").as_deref()).unwrap_or(false);
 
-        Caps { hyperlinks, osc52, mouse, colours, ambiguous_wide }
+        // **The Linux console's font has none of the marks** (`✻ ⎿ ❯ ▸ ✓` …) and draws each as a
+        // box or a character of another width. `TERM=linux` is that console and nothing else.
+        let ascii = override_of(var("ZYRIS_CODE_ASCII").as_deref())
+            .unwrap_or(term.as_deref() == Some("linux"));
+
+        Caps { hyperlinks, osc52, mouse, colours, ambiguous_wide, ascii }
     }
 }
 
@@ -467,6 +505,24 @@ mod tests {
         }
         assert!(!caps(&[]).ambiguous_wide, "off unless asked for");
         assert!(caps(&[("ZYRIS_CODE_AMBIGUOUS_WIDE", "1")]).ambiguous_wide);
+    }
+
+    /// **On the Linux console the app's marks are drawn in ASCII**, since its font has none of
+    /// them; letters and the text's own symbols are left as they are.
+    #[test]
+    fn the_linux_console_gets_ascii_marks() {
+        assert!(caps(&[("TERM", "linux")]).ascii);
+        assert!(!caps(&[("TERM", "xterm-256color")]).ascii);
+        assert!(caps(&[("TERM", "xterm"), ("ZYRIS_CODE_ASCII", "1")]).ascii);
+        assert!(!caps(&[("TERM", "linux"), ("ZYRIS_CODE_ASCII", "0")]).ascii);
+        for (mark, ascii) in
+            [("✻", "*"), ("⎿", "`"), ("❯", ">"), ("▸", ">"), ("✓", "v"), ("┌", "+")]
+        {
+            assert_eq!(ascii_stand_in(mark), Some(ascii), "{mark}");
+        }
+        for same in ["a", "한", "Ж", "①", "1"] {
+            assert_eq!(ascii_stand_in(same), None, "{same:?} was swapped");
+        }
     }
 
     #[test]

@@ -320,6 +320,15 @@ pub fn draw(frame: &mut Frame, state: &mut State) {
             }
         }
     }
+    // **And where the font has none of the app's marks, they are drawn in ASCII** — the same
+    // swap, after the same snapshot (`term::ascii_stand_in`).
+    if state.caps.ascii {
+        for cell in frame.buffer_mut().content.iter_mut() {
+            if let Some(plain) = crate::term::ascii_stand_in(cell.symbol()) {
+                cell.set_symbol(plain);
+            }
+        }
+    }
 
     // **Make links Ctrl+clickable.** The terminal opens an OSC 8 hyperlink on Ctrl+click, so
     // the cells under a link get the hyperlink escape sequence. Runs after the `screen`
