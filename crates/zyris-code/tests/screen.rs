@@ -236,6 +236,33 @@ fn a_scrolled_view_keeps_its_place_when_the_width_changes() {
     assert_eq!(before, after, "the top of the viewport moved to a different message:\n{narrow}");
 }
 
+/// **Reading back up a streaming answer keeps its place as it grows.** The live answer is given a
+/// fresh seq on every build, so the anchor on it was never found again and the view kept the old
+/// absolute line; it now falls back to the item before it, which keeps its seq.
+#[test]
+fn a_view_scrolled_into_a_streaming_answer_stays_on_its_words() {
+    let mut s = State::new();
+    // Long enough to wrap differently at the two widths below, so the lines above the answer
+    // change in number and an absolute line index points somewhere else.
+    said(&mut s, 1, EntryKind::User("질문 ".repeat(60)));
+    let delta = |s: &mut State, text: String| {
+        let kind = zyris_attacca::ZDeltaKind::Assistant;
+        apply(s, &Action::Frame(AppFrame::Delta { kind, text }));
+    };
+    let lines: String = (0..40).map(|i| format!("line {i:02} of the answer\n\n")).collect();
+    delta(&mut s, lines);
+    dump(&mut s, 60, 12);
+    apply(&mut s, &Action::Wheel(10));
+    let before = dump(&mut s, 60, 12);
+    let top = before.lines().next().unwrap().trim_end().to_string();
+    assert!(top.contains("line"), "not scrolled into the answer:\n{before}");
+
+    // More of the answer arrives (a new seq for it) in the same frame as a resize.
+    delta(&mut s, "more text arriving\n\n".repeat(5));
+    let after = dump(&mut s, 46, 12);
+    assert_eq!(after.lines().next().unwrap().trim_end(), top, "the view moved:\n{after}");
+}
+
 /// Sticking to the bottom is unaffected — the bottom is its own anchor.
 #[test]
 fn a_view_stuck_to_the_bottom_stays_there_when_the_width_changes() {

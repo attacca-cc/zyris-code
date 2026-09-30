@@ -190,6 +190,12 @@ impl Item {
     }
 }
 
+/// Where a streaming snippet's seq is counted down from (`flush_live`).
+const LIVE_SEQ: i64 = i64::MIN / 2;
+
+/// Builds handed out by every timeline so far — see [`Timeline::version`].
+static BUILDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 #[derive(Debug, Default)]
 pub struct Timeline {
     entries: BTreeMap<i64, Entry>,
@@ -206,6 +212,8 @@ pub struct Timeline {
     dirty: bool,
     /// How many times it actually rebuilt. Tests use this to confirm the cache really works.
     rebuilds: u64,
+    /// See [`Timeline::version`]. Zero until the first build.
+    version: u64,
     /// What the app said. It stands mixed with server events in time order.
     said: Vec<Said>,
     /// The seq for the next app item. **It's negative** — see the explanation below.
@@ -389,6 +397,14 @@ impl Timeline {
         self.rebuilds
     }
 
+    /// Which build `items` last handed out, **unique across every timeline in the process** — a
+    /// conversation swapped for a new `Timeline` starts its own `rebuilds` over at zero, and a
+    /// cache keyed on that would take the new one's first build for the old one's.
+    /// `rows::Cache::layout_keyed` skips a frame whose version it has already laid out.
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
     /// The items to draw, in seq order. If nothing changed, the previously built ones are returned as-is.
     ///
     /// The work card's boundaries follow what the server defined — thinking/tool/todo events after the
@@ -411,6 +427,7 @@ impl Timeline {
             }
             self.dirty = false;
             self.rebuilds += 1;
+            self.version = BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         }
         &self.cache
     }
@@ -447,7 +464,7 @@ impl Timeline {
                 live.retain(|s| s.after >= seq);
             }
             // Insert the snippets that belong before this event into the currently open card.
-            flush_live(&mut out, &mut open_work, &live, seq, &mut self.next_said, &mut flushed);
+            flush_live(&mut out, &mut open_work, &live, seq, &mut flushed);
             match &entry.kind {
                 EntryKind::User(text) => {
                     open_work = None;
@@ -532,7 +549,7 @@ impl Timeline {
         }
 
         // Snippets left at the end — appended to the open card's end or as a standalone answer.
-        flush_live(&mut out, &mut open_work, &live, i64::MAX, &mut self.next_said, &mut flushed);
+        flush_live(&mut out, &mut open_work, &live, i64::MAX, &mut flushed);
         // An echo sitting past the last event closes the card too — that is the ordinary case,
         // where the message was just sent and none of its turn has come back yet.
         if echoed < echoes.len() {
@@ -782,7 +799,6 @@ fn flush_live(
     open_work: &mut Option<usize>,
     live: &[LiveText],
     up_to: i64,
-    next_seq: &mut i64,
     from: &mut usize,
 ) {
     // Snippets stack in anchor order, and `from` is how many this build has already placed.
@@ -797,9 +813,14 @@ fn flush_live(
         // the reasoning the moment the durable event landed.
         //
         // Standalone answers share the negative seq space with app sayings — they must not collide.
+        //
+        // **The same snippet keeps the same seq from build to build.** It took the next free one
+        // on every build, so a person scrolled up into a streaming answer lost their place — the
+        // view is anchored by seq — and the cache made a new copy of the answer on every delta.
+        // `after` tells snippets apart (a new one starts only where it differs), and the range
+        // sits far below anything `next_said` hands out.
         *open_work = None;
-        out.push(Item::Agent { seq: *next_seq, text: seg.text.clone() });
-        *next_seq -= 1;
+        out.push(Item::Agent { seq: LIVE_SEQ - seg.after, text: seg.text.clone() });
         *from += 1;
     }
 }

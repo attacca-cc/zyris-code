@@ -357,7 +357,14 @@ pub struct Cache {
     open: HashMap<i64, bool>,
     /// How many items were actually redrawn. Tests use this to confirm the cache really works.
     renders: u64,
+    /// Everything the last [`Cache::layout_keyed`] was laid out from, so a frame where none of it
+    /// moved can skip the walk entirely.
+    last: Option<Key>,
 }
+
+/// What a layout is a function of: the timeline's build (`Timeline::rebuilds`), the width, the
+/// folds, the question left out, whether the turn runs, and the palette and language.
+type Key = (u64, u16, Folds, Option<i64>, bool, (theme::Theme, crate::lang::Lang));
 
 impl Cache {
     pub fn new() -> Self {
@@ -416,6 +423,27 @@ impl Cache {
         Some((slot.seq, line.saturating_sub(slot.first_line())))
     }
 
+    /// The stand-in anchor for `line`: `(the seq of the item before the one holding it, how far
+    /// past that item's first line it is)`. `None` for the first item.
+    ///
+    /// **For when the item itself does not survive a relayout.** A streaming answer is given a
+    /// fresh seq on every build, and an older saying is folded into the card before it, so the
+    /// anchor's own seq can vanish — and the view then stayed on the old absolute line while the
+    /// text moved. The item before it keeps its seq, and the same distance from its start lands on
+    /// the same words in both cases.
+    pub fn anchor_before(&self, line: usize) -> Option<(i64, usize)> {
+        let at = self.slots.iter().position(|s| line < s.end())?;
+        let before = self.slots.get(at.checked_sub(1)?)?;
+        Some((before.seq, line.saturating_sub(before.first_line())))
+    }
+
+    /// Where [`Cache::anchor_before`]'s `(seq, offset)` sits now: the offset is taken as it is,
+    /// past the item's end if need be, and only kept inside the whole layout.
+    pub fn line_after(&self, seq: i64, offset: usize) -> Option<usize> {
+        let slot = self.slots.iter().find(|s| s.seq == seq)?;
+        Some((slot.first_line() + offset).min(self.total.saturating_sub(1)))
+    }
+
     /// Where `(seq, offset)` sits now. The inverse of `anchor_at`, after a relayout.
     ///
     /// The offset is clamped to the item's current length: rewrapping narrower makes an item
@@ -424,6 +452,42 @@ impl Cache {
     pub fn line_of(&self, seq: i64, offset: usize) -> Option<usize> {
         let slot = self.slots.iter().find(|s| s.seq == seq)?;
         Some(slot.first_line() + offset.min(slot.len.saturating_sub(1)))
+    }
+
+    /// [`Cache::layout`], **skipped when nothing it reads has changed** since the last call. Says
+    /// whether it laid anything out.
+    ///
+    /// Even with every item cached, a layout walks the whole conversation: an `Affecting` vector
+    /// and a deep `Item` comparison per item, every frame — a breath step, a keystroke, a blink.
+    /// `version` is the timeline's build count, which moves exactly when the items may have, so
+    /// the rest of the key is cheap to compare. What is laid out is a function of the key, so a
+    /// skipped frame draws exactly what the last one did.
+    #[allow(clippy::too_many_arguments)]
+    pub fn layout_keyed(
+        &mut self,
+        version: u64,
+        items: &[Item],
+        width: u16,
+        folds: &Folds,
+        skip: Option<i64>,
+        turn: Turn,
+        lang: crate::lang::Lang,
+    ) -> bool {
+        let look = (theme::current(), lang);
+        if let Some((v, w, f, s, r, l)) = &self.last {
+            if *v == version
+                && *w == width
+                && f == folds
+                && *s == skip
+                && *r == turn.running
+                && *l == look
+            {
+                return false;
+            }
+        }
+        self.layout(items, width, folds, skip, turn, lang);
+        self.last = Some((version, width, folds.clone(), skip, turn.running, look));
+        true
     }
 
     /// Decides which item lands on which line. Only redraws changed items.
@@ -439,6 +503,8 @@ impl Cache {
         turn: Turn,
         lang: crate::lang::Lang,
     ) {
+        // Laid out from outside `layout_keyed`, so its key no longer says what is here.
+        self.last = None;
         // A width change moves every wrap point, and a theme or language change repaints every
         // span. Throw it all away.
         let look = Some((theme::current(), lang));
@@ -2361,6 +2427,48 @@ mod tests {
         cache.layout(&items, 80, &folds, None, Turn { running: false }, crate::lang::Lang::Ko);
         assert_eq!(cache.renders(), before + items.len() as u64);
         assert_eq!(cache.plain(), rows(&items, 80, &folds, crate::lang::Lang::Ko).plain());
+    }
+
+    /// **A frame where nothing moved skips the walk, and draws exactly what a full layout would.**
+    /// Every frame used to walk the whole conversation, deep-comparing each item, even for a
+    /// breath step or a keystroke.
+    #[test]
+    fn an_unchanged_frame_is_not_laid_out_again_and_draws_the_same() {
+        let items = mixed();
+        let folds = Folds::new();
+        let turn = Turn { running: false };
+        let ko = crate::lang::Lang::Ko;
+        let mut cache = Cache::new();
+        assert!(cache.layout_keyed(7, &items, 40, &folds, None, turn, ko));
+        let before = (cache.plain(), cache.cards().clone(), cache.total());
+        assert!(!cache.layout_keyed(7, &items, 40, &folds, None, turn, ko), "laid out again");
+        assert_eq!((cache.plain(), cache.cards().clone(), cache.total()), before);
+        let fresh = rows(&items, 40, &folds, ko);
+        assert_eq!(cache.plain(), fresh.plain());
+
+        // Anything in the key moving lays it out again.
+        assert!(cache.layout_keyed(8, &items, 40, &folds, None, turn, ko), "a new build");
+        assert!(cache.layout_keyed(8, &items, 41, &folds, None, turn, ko), "a new width");
+        let opened = Folds::from([(2, Fold { open: true, user_touched: true })]);
+        assert!(cache.layout_keyed(8, &items, 41, &opened, None, turn, ko), "a fold");
+        assert_eq!(cache.plain(), rows(&items, 41, &opened, ko).plain());
+        assert!(cache.layout_keyed(8, &items, 41, &opened, None, turn, crate::lang::Lang::En));
+    }
+
+    /// **An anchor whose item is gone falls back to the item before it**, at the same distance
+    /// from that item's start — where a saying folded into the card before it now stands.
+    #[test]
+    fn a_vanished_anchor_falls_back_to_the_item_before_it() {
+        let items = mixed();
+        let mut cache = Cache::new();
+        let folds = Folds::new();
+        let ko = crate::lang::Lang::Ko;
+        cache.layout(&items, 40, &folds, None, Turn { running: false }, ko);
+        let line = cache.total() - 1;
+        let (seq, offset) = cache.anchor_before(line).expect("an item before the last");
+        assert_eq!(seq, items[items.len() - 2].seq());
+        assert_eq!(cache.line_after(seq, offset), Some(line));
+        assert_eq!(cache.anchor_before(0), None, "the first item has nothing before it");
     }
 
     /// **A language switch redraws what is already on screen.** The words are baked in as each item
