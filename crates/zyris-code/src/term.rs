@@ -287,10 +287,15 @@ impl Caps {
             override_of(var("ZYRIS_CODE_HYPERLINKS").as_deref()).unwrap_or(named && !dumb);
         // **OSC 52 is the same guess but a weaker one.** Several terminals that draw hyperlinks
         // keep clipboard writes switched off by default (xterm, and Alacritty until told
-        // otherwise), so a true here means "worth trying", not "will work". Trying costs nothing:
-        // the in-app clipboard is filled either way, and a terminal that ignores the sequence
-        // ignores it silently.
-        let osc52 = override_of(var("ZYRIS_CODE_OSC52").as_deref()).unwrap_or(named && !dumb);
+        // otherwise), so a true here means "worth trying", not "will work". A terminal that
+        // ignores the sequence ignores it silently.
+        //
+        // **Over SSH it is tried whatever the name.** `TERM_PROGRAM` and friends are not forwarded
+        // by default, so a known terminal looks unknown there — and OSC 52 is the only route to
+        // the clipboard of the machine at the keyboard (`clipboard::export`).
+        let ssh = var("SSH_CONNECTION").is_some() || var("SSH_TTY").is_some();
+        let osc52 =
+            override_of(var("ZYRIS_CODE_OSC52").as_deref()).unwrap_or((named || ssh) && !dumb);
         // **Taking the mouse takes the terminal's own selection with it.** Anyone who would rather
         // keep copy-on-select can say so, and then the drag, the click-to-fold and the Ctrl+click
         // all go back to the terminal.
@@ -362,6 +367,14 @@ mod tests {
             ("TERM", "screen-256color"),
         ]);
         assert!(c.hyperlinks, "the terminal underneath tmux was not seen");
+    }
+
+    /// **Over SSH the terminal's name rarely arrives**, and OSC 52 is the one way to its clipboard.
+    #[test]
+    fn a_remote_session_tries_the_clipboard_sequence() {
+        assert!(caps(&[("TERM", "xterm-256color"), ("SSH_CONNECTION", "1 2 3 4")]).osc52);
+        assert!(caps(&[("TERM", "xterm-256color"), ("SSH_TTY", "/dev/pts/3")]).osc52);
+        assert!(!caps(&[("TERM", "xterm-256color"), ("SSH_TTY", "/dev/pts/3")]).hyperlinks);
     }
 
     /// `TERM=dumb` is the one answer that is certain, and it rules out the mouse as well.

@@ -3777,6 +3777,20 @@ fn title_for_osc(title: &str) -> String {
     title.chars().filter(|c| !c.is_control()).take(120).collect()
 }
 
+/// Sends the selection to the system clipboard (`clipboard::export`), for both loops.
+///
+/// **Silence is the worst answer when nothing could take it.** The drag's highlight looks like a
+/// copy that worked, so left unsaid it is found out in another window, where the reason is nowhere
+/// near — said once a run.
+fn copy_out(state: &mut State) {
+    let Some(text) = &state.selection else { return };
+    if !crate::clipboard::export(text, state.caps.osc52)
+        && !std::mem::replace(&mut state.said_clipboard_note, true)
+    {
+        state.set_status(state.lang.copy_not_sent());
+    }
+}
+
 /// Opens a URL in the OS's default browser, spawned so it never blocks the draw loop.
 ///
 /// This is the emulator-independent half of link opening: the transcript also wraps link
@@ -4784,14 +4798,14 @@ async fn run_inner(
                         if deferred {
                             gesture_dirty = true;
                         }
+                        let released = actions.iter().any(|a| matches!(a, Action::Release));
                         for action in actions {
                             apply(&mut state, &action);
                         }
-                        // Releasing exports what was selected, the same as in the main loop.
-                        if let Some(text) = state.selection.clone() {
-                            if state.caps.osc52 {
-                                crate::clipboard::export(&text);
-                            }
+                        // Releasing exports what was selected, the same as in the main loop —
+                        // on the release only, not on every motion sample of the drag.
+                        if released {
+                            copy_out(&mut state);
                         }
                     }
                     // Coming back to the window, redraw without clearing — the same trick the
@@ -5179,16 +5193,7 @@ async fn run_inner(
                     // terminal old enough to print the bytes instead would spray them over the
                     // transcript. The in-app clipboard is filled either way.
                     if matches!(action, Action::Release) {
-                        if let Some(text) = &state.selection {
-                            if state.caps.osc52 {
-                                crate::clipboard::export(text);
-                            } else if !std::mem::replace(&mut state.said_clipboard_note, true) {
-                                // **Silence here is the worst answer.** The copy looks to have
-                                // worked — it pastes back into this app — so left unsaid it is
-                                // found out in another window, where the reason is nowhere near.
-                                state.set_status(state.lang.copy_stayed_here());
-                            }
-                        }
+                        copy_out(&mut state);
                     }
 
                     // Slash commands. `run_command` finishes the pure part, and only what
