@@ -3947,6 +3947,18 @@ pub fn heal_mode() -> Heal {
     }
 }
 
+/// What the settings form's Enter does once `apply` has set `config_out`: the settings reach the
+/// disk, and the language and palette the app runs with. Both event loops drain it through here, so
+/// a setting cannot be saved by one loop and only shown by the other. The palette applies to the
+/// very next frame — the same promise the directory policy makes to the gate, which each loop
+/// tells itself (`bridge.sync`).
+fn save_config(state: &State) {
+    state.config.save();
+    crate::lang::set(state.lang);
+    crate::lang::save(state.lang);
+    crate::theme::set(state.config.theme.resolve());
+}
+
 /// The sequence that changes the terminal window title.
 fn set_terminal_title(title: &str) {
     use std::io::Write;
@@ -5017,10 +5029,7 @@ async fn run_inner(
                 // The main loop's full block also stages work/job sessions; there is nothing to
                 // stage yet, so carrying the decision material is the whole job here.
                 if std::mem::take(&mut state.config_out) {
-                    state.config.save();
-                    crate::lang::set(state.lang);
-                    crate::lang::save(state.lang);
-                    crate::theme::set(state.config.theme.resolve());
+                    save_config(&state);
                 }
                 bridge.sync(state.mode, &state.config, state.plan_decided);
                 // A gesture is drawn by the tick it is waiting for; everything else draws here,
@@ -5403,12 +5412,7 @@ async fn run_inner(
                     // stopping short of any of them is how a setting changes on screen and
                     // nowhere else.
                     if std::mem::take(&mut state.config_out) {
-                        state.config.save();
-                        crate::lang::set(state.lang);
-                        crate::lang::save(state.lang);
-                        // The palette applies to the very next frame — the same promise the
-                        // directory policy makes to the gate.
-                        crate::theme::set(state.config.theme.resolve());
+                        save_config(&state);
                         bridge.sync(state.mode, &state.config, state.plan_decided);
                     }
 
