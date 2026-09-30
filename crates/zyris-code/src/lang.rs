@@ -2048,18 +2048,19 @@ impl Lang {
         use crate::panel::ManagerKind;
         match (self, kind) {
             (Lang::Ko, ManagerKind::Mcp) => {
-                "↑↓ 고르기 ‒ Enter 켜기/끄기 ‒ a 추가 ‒ d 지우기 ‒ r 다시 읽기 ‒ Esc 닫기"
+                "↑↓ 고르기 ∙ Enter 켜기/끄기 ∙ a 추가 ∙ d 지우기 ∙ r 다시 읽기 ∙ Esc 닫기"
                     .to_string()
             }
             (Lang::En, ManagerKind::Mcp) => {
-                "↑↓ pick ‒ Enter on/off ‒ a add ‒ d remove ‒ r re-read ‒ Esc close".to_string()
+                "↑↓ pick ∙ Enter on/off ∙ a add ∙ d remove ∙ r re-read ∙ Esc close".to_string()
             }
             (Lang::Ko, ManagerKind::Plugins) => {
-                "↑↓ 고르기 ‒ Enter 켜기/끄기 ‒ a 받기 ‒ u 갱신 ‒ d 지우기 ‒ r 다시 읽기 ‒ Esc 닫기"
+                "↑↓ 고르기 ∙ Enter 켜기/끄기 ∙ a 받기 ∙ u 갱신 ∙ d 지우기 ∙ r 다시 읽기 ∙ Esc 닫기"
                     .to_string()
             }
             (Lang::En, ManagerKind::Plugins) => {
-                "↑↓ pick ‒ Enter on/off ‒ u update ‒ d remove ‒ r re-read ‒ Esc close".to_string()
+                "↑↓ pick ∙ Enter on/off ∙ a fetch ∙ u update ∙ d remove ∙ r re-read ∙ Esc close"
+                    .to_string()
             }
         }
     }
@@ -3185,5 +3186,21 @@ mod tests {
         }
         assert!(Lang::En.quit_armed(2, 1).contains("2 running job"));
         assert_eq!(Lang::En.quit_armed(0, 0), "Press Ctrl+C again to quit");
+    }
+
+    /// **Both languages name the same keys.** The English plugin line left out `a`, which `on_key`
+    /// maps for both managers, so the two hints said different things (D12).
+    #[test]
+    fn the_manager_hints_name_the_same_keys_in_both_languages() {
+        use crate::panel::ManagerKind;
+        let keys = |hint: String| {
+            hint.split(" ∙ ")
+                .map(|part| part.split(' ').next().unwrap_or_default().to_string())
+                .collect::<Vec<_>>()
+        };
+        for kind in [ManagerKind::Mcp, ManagerKind::Plugins] {
+            assert_eq!(keys(Lang::Ko.manager_keys(kind)), keys(Lang::En.manager_keys(kind)));
+        }
+        assert!(keys(Lang::En.manager_keys(ManagerKind::Plugins)).contains(&"a".to_string()));
     }
 }
