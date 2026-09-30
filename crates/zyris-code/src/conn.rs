@@ -202,9 +202,37 @@ fn platform_config_base() -> Option<std::path::PathBuf> {
         .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
 }
 
-/// What's **missing** from the granted permissions. The requested list and the verified list are always the single `REQUIRED_SCOPES`.
+/// Scopes the server refused to enroll with because it does not know them (`enroll.rs`).
+///
+/// ponytail: process-wide, because the enrollment and the scope check after attaching share
+/// nothing else; move it onto a shared connection state if one appears.
+static UNKNOWN_TO_SERVER: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Records that the server does not know `scope`, so it is no longer counted as missing.
+///
+/// **Otherwise the enrollment that left it out is undone right after.** The check after attaching
+/// would find it missing, drop the new credential and send the person back to the browser for a
+/// scope the server can never grant.
+pub fn server_does_not_know(scope: &str) {
+    let mut unknown = UNKNOWN_TO_SERVER.lock().unwrap();
+    if !unknown.iter().any(|s| s == scope) {
+        unknown.push(scope.to_string());
+    }
+}
+
+/// What's **missing** from the granted permissions. The requested list and the verified list are always the single `REQUIRED_SCOPES`,
+/// less any scope the server said it does not know.
 pub fn missing_scopes(granted: &[String]) -> Vec<&'static str> {
-    REQUIRED_SCOPES.iter().copied().filter(|s| !granted.iter().any(|g| g == s)).collect()
+    missing_from(granted, &UNKNOWN_TO_SERVER.lock().unwrap())
+}
+
+fn missing_from(granted: &[String], unknown: &[String]) -> Vec<&'static str> {
+    REQUIRED_SCOPES
+        .iter()
+        .copied()
+        .filter(|s| !granted.iter().any(|g| g == s))
+        .filter(|s| !unknown.iter().any(|u| u == s))
+        .collect()
 }
 
 /// Whether credentials must be dropped and approval requested again. **A pure predicate.**
@@ -965,6 +993,17 @@ mod tests {
         assert!(missing.contains(&"events:read"), "{missing:?}");
         assert!(!missing.contains(&"agents:read"), "{missing:?}");
         assert!(missing_scopes_message(&missing).contains("events:read"));
+    }
+
+    /// **A scope the server does not know is not missing.** Counted as missing, the enrollment that
+    /// left it out would be thrown away on attach and the person sent back to the browser for a
+    /// scope that can never be granted.
+    #[test]
+    fn a_scope_the_server_does_not_know_is_not_counted_missing() {
+        let all_but: Vec<String> =
+            REQUIRED_SCOPES.iter().filter(|s| **s != "jobs:write").map(|s| s.to_string()).collect();
+        assert_eq!(missing_from(&all_but, &[]), vec!["jobs:write"]);
+        assert!(missing_from(&all_but, &["jobs:write".to_string()]).is_empty());
     }
 
     /// Changing the agent **opens a new session at the next message.** A session's agent is fixed at
