@@ -2544,6 +2544,23 @@ fn link_cells(hyperlinks: bool) -> Vec<String> {
     link_buffer(hyperlinks).content.iter().map(|c| c.symbol().to_string()).collect()
 }
 
+/// **A very long URL is not written into every cell of its link.** Each cell carries the whole
+/// URL, so a 2 KB one cost 2 KB a cell on every repaint; it stays an underlined link that
+/// Ctrl+click opens through the app.
+#[test]
+fn a_very_long_url_is_not_sent_as_osc8() {
+    let mut s = State::new();
+    s.caps.hyperlinks = true;
+    let url = format!("https://example.com/{}", "a".repeat(2000));
+    said(&mut s, 1, EntryKind::Agent(format!("[문서]({url})")));
+    let mut term = Terminal::new(TestBackend::new(60, 12)).unwrap();
+    term.draw(|f| widgets::draw(f, &mut s)).unwrap();
+    let buf = term.backend().buffer().clone();
+    assert!(buf.content.iter().all(|c| !c.symbol().contains("\u{1b}]8;;")));
+    let cell = buf.content.iter().find(|c| c.symbol() == "문").expect("the link text is gone");
+    assert!(cell.modifier.contains(ratatui::style::Modifier::UNDERLINED));
+}
+
 /// A bare URL in plain text is not wrapped — the terminal detects those itself.
 #[test]
 fn a_bare_url_in_an_answer_is_not_wrapped() {

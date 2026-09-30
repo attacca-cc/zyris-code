@@ -334,6 +334,9 @@ pub fn draw(frame: &mut Frame, state: &mut State) {
     state.screen_links.extend(transcript_links);
 }
 
+/// The longest URL written into OSC 8, in bytes. See [`inject_links`].
+const OSC8_URL_MAX: usize = 512;
+
 /// Wraps the cells under each visible link in an OSC 8 hyperlink sequence, so the terminal
 /// opens the URL on Ctrl+click.
 ///
@@ -358,7 +361,12 @@ fn inject_links(frame: &mut Frame, state: &State) -> Vec<crate::app::ScreenLink>
     for (i, links) in state.view_links.iter().enumerate() {
         let y = oy + i as u16;
         for link in links {
-            let open = state.caps.hyperlinks.then(|| format!("\x1b]8;;{}\x1b\\", link.url));
+            // **Every cell carries the whole URL**, since the diff writes cells one at a time and
+            // each has to open its own link — so a very long one is not sent at all. A 2 KB signed
+            // URL on a 40-cell link was 80 KB on every full repaint; left as underlined text, it
+            // still opens on Ctrl+click through `open_url`.
+            let open = (state.caps.hyperlinks && link.url.len() <= OSC8_URL_MAX)
+                .then(|| format!("\x1b]8;;{}\x1b\\", link.url));
             let mut col = link.start;
             let mut run_start = None;
             let mut run_end = 0;

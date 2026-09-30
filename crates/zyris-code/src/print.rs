@@ -153,8 +153,15 @@ pub async fn run(
                         // Straight to stderr, and flushed with it: stdout is being written to at
                         // the same time and belongs to the answer alone.
                         crate::cli::warn(lang.question_unattended_notice());
+                        // The question is the model's text too, and stderr is usually the
+                        // terminal even when stdout is piped — so it loses its controls there.
+                        let console = {
+                            use std::io::IsTerminal;
+                            std::io::stderr().is_terminal()
+                        };
                         for step in &steps {
-                            crate::cli::warn(&format!("  {}", describe(step)));
+                            let line = format!("  {}", describe(step));
+                            crate::cli::warn(&for_stdout(&line, console, false));
                         }
                         // The reply is an ordinary message — the server's question waiter takes
                         // the next one as the answer. There is no separate response API.
