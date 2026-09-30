@@ -196,13 +196,6 @@ impl Lang {
     pub fn todo_count(self, done: usize, total: usize) -> String {
         format!(" ({done}/{total})")
     }
-    /// The line that stands in for the tasks that did not fit.
-    pub fn todo_more(self, n: usize) -> String {
-        match self {
-            Lang::Ko => format!("↓ {n}개 더"),
-            Lang::En => format!("↓ {n} more"),
-        }
-    }
     pub fn queued(self, n: usize) -> String {
         match self {
             Lang::Ko => format!("대기 {n}개"),
@@ -2634,6 +2627,8 @@ impl Lang {
     }
 
     // ── Lists (picker)
+    /// `  ↑ 3 more`: how many rows a list holds back above or below. The todo list says the same
+    /// thing on a line of its own, without the two leading spaces.
     pub fn pick_more(self, up: bool, n: usize) -> String {
         let arrow = if up { "↑" } else { "↓" };
         match self {

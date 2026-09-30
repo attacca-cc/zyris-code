@@ -69,7 +69,10 @@ pub fn lines(items: &[Todo], lang: Lang, width: usize, rows: usize) -> Vec<Line<
         let muted = Style::default().fg(theme::text_muted());
         out.push(Line::from(vec![
             Span::raw(PAD),
-            Span::styled(lang.todo_more(items.len() - shown), muted),
+            Span::styled(
+                lang.pick_more(false, items.len() - shown).trim_start().to_string(),
+                muted,
+            ),
         ]));
     }
     out
