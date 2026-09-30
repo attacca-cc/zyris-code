@@ -91,6 +91,27 @@ struct Settings {
     /// whatever happens to be written on the machine — which is also what would make a test's answer
     /// depend on the person running it.
     synced: bool,
+    /// The screen's copy as it was last pushed in, so the next push can tell what it changed.
+    pushed: Config,
+}
+
+/// Takes in the screen's copy of the settings.
+///
+/// **Only what the screen changed is taken.** The screen's copy is read once and then only edited,
+/// so it goes stale the moment another window writes the file — and `sync` runs on every mode
+/// change, not only on a settings change. Copying it over whole, stamped with the file's current
+/// mtime, put a `/config dir deny` from another window back to `allow` at this window's next
+/// Shift+Tab, and marked the file as read so nothing ever corrected it. A push that changes nothing
+/// now leaves the gate's copy — and its mtime, so a newer file still wins — alone.
+fn push_settings(settings: &mut Settings, screen: &Config) {
+    if !settings.synced {
+        *settings = Settings { config: *screen, at: config_mtime(), synced: true, pushed: *screen };
+    } else if *screen != settings.pushed {
+        // `at` is left as it was: the save that goes with this change moved the mtime, so the
+        // next decision re-reads the file, which by then holds this change and every other.
+        settings.config = settings.config.overlay(&settings.pushed, screen);
+        settings.pushed = *screen;
+    }
 }
 
 /// The `config.json` mtime right now, if the file is there.
@@ -153,9 +174,14 @@ impl Bridge {
     /// I/O site touches state.
     pub fn sync(&self, mode: Mode, config: &Config, plan_decided: bool) {
         *self.0.mode.lock().unwrap() = mode;
-        *self.0.settings.lock().unwrap() =
-            Settings { config: *config, at: config_mtime(), synced: true };
+        push_settings(&mut self.0.settings.lock().unwrap(), config);
         self.0.plan_decided.store(plan_decided, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The settings as the screen last pushed them — the copy its next change is made from, and
+    /// so the `before` its `Config::save_changes` compares against.
+    pub fn screen_config(&self) -> Config {
+        self.0.settings.lock().unwrap().pushed
     }
 
     /// Records what the plugins want run around a tool call. `tools::announce` calls it once,
@@ -411,7 +437,12 @@ mod tests {
         let at = dir.path().join("config.json");
         // `synced: true` is what a window that has pushed its copy in looks like; before that there
         // is nothing to re-read for (see the field).
-        let mut settings = Settings { config: Config::default(), at: None, synced: true };
+        let mut settings = Settings {
+            config: Config::default(),
+            at: None,
+            synced: true,
+            pushed: Config::default(),
+        };
 
         // Nothing on disk: the cached copy stands, which is where a fresh window starts.
         assert_eq!(settings_at(None, &mut settings).dir_access, crate::config::DirAccess::Deny);
@@ -437,5 +468,28 @@ mod tests {
             settings_at(Some(&at), &mut settings).dir_access,
             crate::config::DirAccess::Deny
         );
+    }
+
+    /// **A mode change does not put the screen's stale settings back.** Window B's screen still
+    /// says `allow` after the gate re-read window A's `deny`; B's next Shift+Tab pushes that stale
+    /// copy, and the gate used to take it whole — and stamp the file as read.
+    #[test]
+    fn a_push_that_changes_no_setting_keeps_what_the_gate_reread() {
+        use crate::config::{DirAccess, ThemeChoice};
+        let stale = Config { dir_access: DirAccess::Allow, ..Config::default() };
+        let mut settings = Settings::default();
+        push_settings(&mut settings, &stale);
+        let read_at = settings.at;
+        // What `settings_at` does when the file changed: the gate now holds A's `deny`.
+        settings.config.dir_access = DirAccess::Deny;
+
+        push_settings(&mut settings, &stale);
+        assert_eq!(settings.config.dir_access, DirAccess::Deny, "a mode change undid `deny`");
+        assert_eq!(settings.at, read_at, "the push marked the file as read");
+
+        // A setting B did change is taken — and only that one.
+        push_settings(&mut settings, &Config { theme: ThemeChoice::Dark, ..stale });
+        assert_eq!(settings.config.dir_access, DirAccess::Deny);
+        assert_eq!(settings.config.theme, ThemeChoice::Dark);
     }
 }

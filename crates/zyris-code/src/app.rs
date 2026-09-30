@@ -4488,7 +4488,7 @@ async fn run_inner(
                 // The main loop's full block also stages work/job sessions; there is nothing to
                 // stage yet, so carrying the decision material is the whole job here.
                 if std::mem::take(&mut state.config_out) {
-                    state.config.save();
+                    state.config.save_changes(&bridge.screen_config());
                     crate::lang::set(state.lang);
                     crate::lang::save(state.lang);
                     crate::theme::set(state.config.theme.resolve());
@@ -4884,7 +4884,7 @@ async fn run_inner(
                     // stopping short of any of them is how a setting changes on screen and
                     // nowhere else.
                     if std::mem::take(&mut state.config_out) {
-                        state.config.save();
+                        state.config.save_changes(&bridge.screen_config());
                         crate::lang::set(state.lang);
                         crate::lang::save(state.lang);
                         // The palette applies to the very next frame — the same promise the
@@ -5806,7 +5806,7 @@ async fn finish_command(
             None => state.set_error(state.lang.reconnect_not_attached()),
         },
         Command::Config(Some(action)) => {
-            state.config.save();
+            state.config.save_changes(&bridge.screen_config());
             // The palette applies to the very next frame — the same promise the directory
             // policy makes to the gate. Missing it is how a setting changes on screen and
             // nowhere else.

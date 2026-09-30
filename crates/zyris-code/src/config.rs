@@ -138,16 +138,67 @@ impl Config {
     /// knew. The file is read as the JSON it is, only the keys this build owns are replaced, and
     /// the rest is written back as it was found. The write is atomic (`atomic::write_atomic`) so a
     /// window starting up cannot read it half-written and fall back to the defaults.
-    pub fn save(&self) {
+    ///
+    /// **Only the keys that differ from `before` are written.** This window's copy of the other
+    /// settings may be older than the file — another window may have changed them since — and
+    /// writing the whole struct put this window's stale values back over that change: `/config dir
+    /// deny` in one window was undone by the next `/config theme` in another. `before` is the copy
+    /// this change was made from; the file is read now, and only what this change touched moves.
+    pub fn save_changes(&self, before: &Config) {
         let Some(at) = store() else { return };
-        let Ok(mine) = serde_json::to_value(self) else { return };
         let existing = std::fs::read_to_string(&at)
             .ok()
             .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
-        let Ok(text) = serde_json::to_vec(&merge(existing, mine)) else { return };
+        let Some(next) = saved_over(existing, before, self) else { return };
+        let Ok(text) = serde_json::to_vec(&next) else { return };
         if let Err(e) = crate::atomic::write_atomic(&at, &text, None) {
             tracing::warn!(error = %e, "couldn't save the settings");
         }
+    }
+
+    /// This copy, with the keys that changed between `before` and `after` taken from `after`.
+    ///
+    /// What the gate does with a change the screen pushes: its own copy may be newer than the
+    /// screen's (re-read from the file another window wrote), so only what the screen actually
+    /// changed is carried over.
+    pub fn overlay(&self, before: &Config, after: &Config) -> Config {
+        let (Ok(serde_json::Value::Object(mut mine)), Some(changes)) =
+            (serde_json::to_value(self), changed(before, after))
+        else {
+            return *self;
+        };
+        mine.extend(changes);
+        serde_json::from_value(serde_json::Value::Object(mine)).unwrap_or(*self)
+    }
+}
+
+/// The keys whose value differs between `before` and `after`, with `after`'s value.
+fn changed(before: &Config, after: &Config) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let (Ok(serde_json::Value::Object(old)), Ok(serde_json::Value::Object(new))) =
+        (serde_json::to_value(before), serde_json::to_value(after))
+    else {
+        return None;
+    };
+    Some(new.into_iter().filter(|(key, value)| old.get(key) != Some(value)).collect())
+}
+
+/// What the file should hold after a change from `before` to `after`. `None` when nothing
+/// changed, so nothing is written.
+///
+/// Pure, so the rule can be checked without a filesystem. A file that is missing or not an object
+/// has nothing worth keeping, and gets the whole of `after`.
+fn saved_over(
+    existing: Option<serde_json::Value>,
+    before: &Config,
+    after: &Config,
+) -> Option<serde_json::Value> {
+    let changes = changed(before, after)?;
+    match existing {
+        Some(existing @ serde_json::Value::Object(_)) if !changes.is_empty() => {
+            Some(merge(Some(existing), serde_json::Value::Object(changes)))
+        }
+        Some(serde_json::Value::Object(_)) => None,
+        _ => serde_json::to_value(after).ok(),
     }
 }
 
@@ -196,6 +247,39 @@ mod tests {
         assert_eq!(merge(None, mine.clone()), mine);
         let merged = merge(Some(serde_json::json!("not an object")), mine.clone());
         assert_eq!(merged, mine);
+    }
+
+    /// **A save moves only the key it changed.** Window B's copy still says `allow` after window A
+    /// wrote `deny`; B changing its theme must not write its stale `allow` back.
+    #[test]
+    fn a_save_writes_only_the_key_it_changed() {
+        let stale = Config { dir_access: DirAccess::Allow, ..Config::default() };
+        let on_disk =
+            serde_json::to_value(Config { dir_access: DirAccess::Deny, ..stale }).unwrap();
+        let after = Config { theme: ThemeChoice::Dark, ..stale };
+
+        let next = saved_over(Some(on_disk.clone()), &stale, &after).expect("a change to write");
+        let read: Config = serde_json::from_value(next).unwrap();
+        assert_eq!(read.dir_access, DirAccess::Deny, "the stale value was written back");
+        assert_eq!(read.theme, ThemeChoice::Dark);
+
+        // Nothing changed: nothing is written.
+        assert_eq!(saved_over(Some(on_disk), &stale, &stale), None);
+        // Nothing on disk: the whole copy, as before.
+        let fresh = saved_over(None, &stale, &after).unwrap();
+        assert_eq!(serde_json::from_value::<Config>(fresh).unwrap(), after);
+    }
+
+    /// The gate's copy takes what the screen changed and keeps what it re-read itself.
+    #[test]
+    fn an_overlay_takes_only_what_changed() {
+        let gate = Config { dir_access: DirAccess::Deny, ..Config::default() };
+        let before = Config { dir_access: DirAccess::Allow, ..Config::default() };
+        let after = Config { theme: ThemeChoice::Light, ..before };
+        let now = gate.overlay(&before, &after);
+        assert_eq!(now.dir_access, DirAccess::Deny);
+        assert_eq!(now.theme, ThemeChoice::Light);
+        assert_eq!(gate.overlay(&before, &before), gate);
     }
 
     #[test]
