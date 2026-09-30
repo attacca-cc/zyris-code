@@ -542,7 +542,7 @@ async fn probe_once(
 
     match tokio::time::timeout(limit, cmd.output()).await {
         Ok(Ok(out)) => {
-            let mut strip = crate::tools::jobs::Stripper::default();
+            let mut strip = crate::tools::clean::Stripper::default();
             let mut text = strip.push(&out.stdout);
             text.push_str(&strip.push(&out.stderr));
             text.push_str(&strip.flush());

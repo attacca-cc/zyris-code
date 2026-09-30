@@ -5,12 +5,13 @@
 //! the tests that measure the deadline would have to spawn a real process.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use regex::Regex;
 use tokio::io::AsyncReadExt;
 use tokio::sync::watch;
+
+use crate::tools::clean::Stripper;
 
 /// Output cap for one job. On overflow the front is lost and `dropped` grows to match.
 const RING_CAP: usize = 1024 * 1024;
@@ -21,107 +22,6 @@ const GRACE: Duration = Duration::from_secs(2);
 /// Grace when quitting the app. **It has to be short here** — hold the way out for two
 /// seconds and it reads as a keypress that did not land.
 const QUIT_GRACE: Duration = Duration::from_millis(300);
-
-/// ANSI escapes. CSI (`ESC [ … final byte`), OSC (`ESC ] … BEL|ST`), and the other
-/// two-character ones.
-///
-/// `\x1b[` is **deliberately left out** of the two-character branch (`[` = 0x5B is not in
-/// `[@-Z\\-_]`) — otherwise the head of an unfinished CSI gets eaten as two characters.
-static ESCAPES: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]")
-        .expect("static regex")
-});
-
-/// Turns terminal output into **text an agent can read**.
-///
-/// The comment in zyris-caps records why: *"a tool result carrying a raw `U+001B` is
-/// rejected outright by at least one agent runtime."* cargo output comes coloured, and
-/// upstream's `strip_controls` is `pub(crate)`, so it cannot be used from here.
-///
-/// It does three things: strips escapes, folds the lines a carriage return rewrites, and
-/// removes C0 other than `\n` and `\t`. **Anything cut at a chunk boundary is held until
-/// the next chunk** — characters, escapes, and a trailing `\r` alike.
-#[derive(Debug, Default)]
-pub struct Stripper {
-    /// Bytes not yet readable as characters, or an unfinished escape.
-    carry: Vec<u8>,
-    /// The line that has not met a `\n` yet. A carriage return throws this away.
-    line: String,
-    /// The previous chunk ended with `\r`. **If the next character is `\n` it is CRLF, so
-    /// the line must not be thrown away.**
-    pending_cr: bool,
-}
-
-impl Stripper {
-    /// Feeds in new bytes and gives back the text settled so far. Text settles per line.
-    pub fn push(&mut self, bytes: &[u8]) -> String {
-        self.carry.extend_from_slice(bytes);
-        // A tail that is not readable as characters is held until the next chunk.
-        let valid = match std::str::from_utf8(&self.carry) {
-            Ok(_) => self.carry.len(),
-            Err(e) if e.error_len().is_none() => e.valid_up_to(),
-            // Truly broken bytes go. Holding them only means they are never read.
-            Err(e) => e.valid_up_to() + e.error_len().unwrap_or(1),
-        };
-        let text = String::from_utf8_lossy(&self.carry[..valid]).into_owned();
-        self.carry.drain(..valid);
-
-        // An unfinished escape goes back — it is stripped only once joined to the next chunk.
-        let (ready, held) = split_incomplete_escape(&text);
-        if !held.is_empty() {
-            let mut back = held.as_bytes().to_vec();
-            back.extend_from_slice(&self.carry);
-            self.carry = back;
-        }
-
-        let stripped = ESCAPES.replace_all(ready, "");
-        self.feed(&stripped)
-    }
-
-    /// Emits whatever is left once the process has finished.
-    ///
-    /// **A trailing `\r` does not erase the line.** In a terminal the last progress line
-    /// stays on screen too, and that is what the reader last saw.
-    pub fn flush(&mut self) -> String {
-        let rest = String::from_utf8_lossy(&std::mem::take(&mut self.carry)).into_owned();
-        self.pending_cr = false;
-        let stripped = ESCAPES.replace_all(&rest, "").into_owned();
-        let mut out = self.feed(&stripped);
-        self.pending_cr = false;
-        out.push_str(&std::mem::take(&mut self.line));
-        out
-    }
-
-    /// Settles text line by line. **`\r` rewrites that line**, so what came before is gone.
-    fn feed(&mut self, text: &str) -> String {
-        let mut out = String::new();
-        let mut chars = text.chars().peekable();
-        // The previous chunk ended with `\r`. If this chunk starts with `\n` it is CRLF, so
-        // the line lives.
-        if std::mem::take(&mut self.pending_cr) && chars.peek() != Some(&'\n') {
-            self.line.clear();
-        }
-        while let Some(ch) = chars.next() {
-            match ch {
-                '\n' => {
-                    out.push_str(&std::mem::take(&mut self.line));
-                    out.push('\n');
-                }
-                // CRLF is just a newline. Throwing the line away here loses Windows output
-                // entirely.
-                '\r' => match chars.peek() {
-                    Some('\n') => {}
-                    Some(_) => self.line.clear(),
-                    None => self.pending_cr = true,
-                },
-                '\t' => self.line.push('\t'),
-                c if (c as u32) < 0x20 || c as u32 == 0x7f => {}
-                c => self.line.push(c),
-            }
-        }
-        out
-    }
-}
 
 /// What to put in the background.
 #[derive(Debug, Clone, Default)]
@@ -565,16 +465,6 @@ fn evict(inner: &mut Inner) {
     }
 }
 
-/// If the tail is an unfinished escape, settles only up to it and gives the rest back.
-fn split_incomplete_escape(text: &str) -> (&str, &str) {
-    let Some(at) = text.rfind('\x1b') else { return (text, "") };
-    // A finished escape is eaten by the regex right there — nothing to hold on to.
-    if ESCAPES.find_at(text, at).is_some_and(|m| m.start() == at) {
-        return (text, "");
-    }
-    text.split_at(at)
-}
-
 #[cfg(test)]
 mod jobs_tests {
     use super::*;
@@ -706,6 +596,17 @@ mod jobs_tests {
         wait_for(&j, &id).await;
         assert_eq!(j.read(&id, 0).unwrap().text.trim(), "1-xterm");
     }
+
+    /// **A job's output is cleaned on the way into the ring.** One agent runtime rejects a tool
+    /// result that carries a raw `U+001B`, and the stripper is what keeps one from arriving.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_jobs_output_arrives_without_escapes() {
+        let j = jobs();
+        let id = j.start(shell("printf '\\033[32mgreen\\033[0m\\n'")).unwrap();
+        wait_for(&j, &id).await;
+        assert_eq!(j.read(&id, 0).unwrap().text, "green\n");
+    }
 }
 
 #[cfg(test)]
@@ -766,71 +667,5 @@ mod ring_tests {
         let mut r = Ring::new(1024);
         r.push("하나\n둘\n");
         assert_eq!(r.tail(1024), "하나\n둘\n");
-    }
-}
-
-#[cfg(test)]
-mod strip_tests {
-    use super::*;
-
-    /// Colour codes must not reach the agent — one runtime rejects the whole result.
-    #[test]
-    fn control_sequences_never_reach_the_agent() {
-        let mut s = Stripper::default();
-        let out = s.push(b"\x1b[32m   Compiling\x1b[0m zyris-code\n");
-        assert_eq!(out, "   Compiling zyris-code\n");
-        assert!(!out.contains('\x1b'));
-    }
-
-    /// An escape cut at a chunk boundary has to be joined to the next chunk.
-    #[test]
-    fn an_escape_split_across_chunks_is_still_stripped() {
-        let mut s = Stripper::default();
-        let a = s.push(b"ok\x1b[3");
-        let b = s.push(b"2mgreen\n");
-        assert_eq!(format!("{a}{b}"), "okgreen\n");
-    }
-
-    /// A multi-byte character cut at a chunk boundary survives intact.
-    #[test]
-    fn a_character_split_across_chunks_survives() {
-        let mut s = Stripper::default();
-        let bytes = "한글".as_bytes();
-        let a = s.push(&bytes[..4]);
-        let b = s.push(&bytes[4..]);
-        let c = s.flush();
-        assert_eq!(format!("{a}{b}{c}"), "한글");
-    }
-
-    /// A carriage return rewrites that line. A progress bar must not become thousands of
-    /// lines.
-    #[test]
-    fn a_progress_line_is_rewritten_not_appended() {
-        let mut s = Stripper::default();
-        let mut out = String::new();
-        out.push_str(&s.push(b"Building [=>   ] 10%\r"));
-        out.push_str(&s.push(b"Building [====>] 99%\r"));
-        out.push_str(&s.push(b"Building [=====] 100%\n"));
-        assert_eq!(out, "Building [=====] 100%\n");
-    }
-
-    /// **CRLF is just a newline.** Read `\r` as erase only and Windows output disappears.
-    #[test]
-    fn a_crlf_is_a_newline_not_an_erase() {
-        let mut s = Stripper::default();
-        assert_eq!(s.push(b"first\r\nsecond\r\n"), "first\nsecond\n");
-        // Same result when the chunk splits in between.
-        let mut s = Stripper::default();
-        let a = s.push(b"first\r");
-        let b = s.push(b"\nsecond\n");
-        assert_eq!(format!("{a}{b}"), "first\nsecond\n");
-    }
-
-    /// Tabs and newlines survive. The rest of C0 is removed.
-    #[test]
-    fn tabs_and_newlines_survive_but_other_controls_do_not() {
-        let mut s = Stripper::default();
-        assert_eq!(s.push(b"a\tb\nc\x07d"), "a\tb\n");
-        assert_eq!(s.flush(), "cd");
     }
 }
