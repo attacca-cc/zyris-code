@@ -16,6 +16,7 @@ use zyris::{
 
 use crate::app::Frame;
 use crate::tools::bridge::Bridge;
+use crate::tools::budget;
 use crate::tools::clean;
 use crate::tools::gate::{dangling_write, escaping_path, resolved_args, target_of, Call, Decision};
 
@@ -126,12 +127,19 @@ impl<C: ServeCapability> ServeCapability for Gate<C> {
         // the result.** Appended first, the sentence the cut writes would go through the cleaning
         // as well.
         let out = match (gated.capability.as_str(), gated.tool.as_str()) {
-            ("terminal", "exec") => clean_the_output(out),
+            ("terminal", "exec") => {
+                let jobs = self.bridge.jobs();
+                fit_the_output(clean_the_output(out), &args, jobs.as_ref(), budget::budget())
+            }
             _ => out,
         };
         let out = match cut {
             Some(deadline) => note_the_cut(out, deadline),
             None => out,
+        };
+        let out = match (gated.capability.as_str(), gated.tool.as_str()) {
+            ("terminal", "exec") => drop_the_defaults(out),
+            _ => out,
         };
         // **How big an `exec` answer is, as the agent receives it.** `exec` is the costliest tool
         // in tokens, and which commands make it so cannot be read from anywhere else. This is what
@@ -171,15 +179,7 @@ impl ExecSize {
         }
         let body = response_json(out)?;
         let len = |k: &str| body.get(k).and_then(Value::as_str).map_or(0, str::len);
-        let command = match args.get("command").and_then(Value::as_str) {
-            Some(c) => c.to_string(),
-            None => args
-                .get("argv")
-                .and_then(Value::as_array)
-                .map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" "))
-                .unwrap_or_default(),
-        };
-        let command = command.split_whitespace().collect::<Vec<_>>().join(" ");
+        let command = command_line(args);
         Some(ExecSize {
             bytes: serde_json::to_string(&body).map_or(0, |s| s.len()),
             stdout: len("stdout"),
@@ -188,6 +188,71 @@ impl ExecSize {
             command: command.chars().take(Self::COMMAND_LIMIT).collect(),
         })
     }
+}
+
+/// What an `exec` call ran, on one line: its `command`, or its `argv` joined with spaces.
+fn command_line(args: &Value) -> String {
+    let command = match args.get("command").and_then(Value::as_str) {
+        Some(c) => c.to_string(),
+        None => args
+            .get("argv")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" "))
+            .unwrap_or_default(),
+    };
+    command.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The result held to `budget` bytes (`tools::budget`), **with the whole of it kept as a finished
+/// job** so `wait.logs` can page what was left out. Its id goes in `full_output`.
+///
+/// **No registry, no cut.** Cutting without somewhere to keep the rest would lose output for good,
+/// and a smaller answer is not worth that. The registry exists from announce on, so this only
+/// matters before it.
+fn fit_the_output(
+    out: Outgoing,
+    args: &Value,
+    jobs: Option<&crate::tools::jobs::Jobs>,
+    budget: usize,
+) -> Outgoing {
+    let Some(jobs) = jobs else { return out };
+    let Outgoing::Response(payload) = out else { return out };
+    let Ok(mut v) = payload.to_json() else { return Outgoing::Response(payload) };
+    let Some(obj) = v.as_object_mut() else { return Outgoing::Response(payload) };
+    let text = |k: &str| obj.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
+    let (stdout, stderr) = (text("stdout"), text("stderr"));
+    if !budget::over(&stdout, &stderr, budget) {
+        return Outgoing::Response(payload);
+    }
+    let command = command_line(args);
+    let exit_code = obj.get("exit_code").and_then(Value::as_i64).unwrap_or(-1) as i32;
+    let full = budget::full_output(&stdout, &stderr);
+    let label = format!("exec: {}", command.chars().take(80).collect::<String>());
+    let job = jobs.record(label, exit_code, &full);
+    tracing::info!(%job, full = full.len(), "exec output cut");
+    let (stdout, stderr) = budget::shape(&stdout, &stderr, budget, &job, &command);
+    obj.insert("stdout".into(), Value::from(stdout));
+    obj.insert("stderr".into(), Value::from(stderr));
+    obj.insert("full_output".into(), Value::from(job));
+    Outgoing::Response(Payload::from_json(v))
+}
+
+/// The flags that say nothing happened, taken out: `timed_out`, `stdout_truncated` and
+/// `stderr_truncated` when false. Sent on every call, they are bytes spent saying no.
+///
+/// **`stdout` and `stderr` stay even when empty.** `ExecOutput` declares neither with a default,
+/// so a reader that deserializes the answer into it would fail without them — and the transcript
+/// (`tool_view::exec_of`) shows nothing for an answer with no `stdout`.
+fn drop_the_defaults(out: Outgoing) -> Outgoing {
+    let Outgoing::Response(payload) = out else { return out };
+    let Ok(mut v) = payload.to_json() else { return Outgoing::Response(payload) };
+    let Some(obj) = v.as_object_mut() else { return Outgoing::Response(payload) };
+    for key in ["timed_out", "stdout_truncated", "stderr_truncated"] {
+        if obj.get(key) == Some(&Value::Bool(false)) {
+            obj.remove(key);
+        }
+    }
+    Outgoing::Response(Payload::from_json(v))
 }
 
 /// The result with both streams cleaned.
@@ -871,5 +936,58 @@ mod tests {
         assert_eq!(quiet_env("terminal", "open", open.clone()), open);
         let read = json!({"path": "a"});
         assert_eq!(quiet_env("file_io", "read", read.clone()), read);
+    }
+
+    /// **An answer over budget is cut, and what was cut is one `wait.logs` away.** The id in the
+    /// answer names a job whose output is the whole of both streams.
+    #[tokio::test]
+    async fn an_answer_over_budget_is_cut_and_the_whole_is_kept_as_a_job() {
+        let jobs = crate::tools::jobs::Jobs::new(std::env::temp_dir());
+        let stdout: String = (0..400).map(|i| format!("line {i:04}\n")).collect();
+        let out = Outgoing::Response(Payload::from_json(
+            json!({"exit_code": 0, "stdout": stdout, "stderr": "", "timed_out": false}),
+        ));
+        let args = json!({"command": "git diff"});
+        let Outgoing::Response(p) = fit_the_output(out, &args, Some(&jobs), 1000) else {
+            panic!("a unary response")
+        };
+        let v = p.to_json().unwrap();
+        let shown = v["stdout"].as_str().unwrap();
+        assert!(shown.len() < 1500, "{} bytes", shown.len());
+        assert!(shown.contains("git diff --stat"));
+        let job = v["full_output"].as_str().expect("the job it was kept in");
+        assert!(shown.contains(&format!("job=\"{job}\"")));
+        assert_eq!(jobs.read(job, 0).unwrap().text, stdout);
+    }
+
+    /// Within budget, or with nowhere to keep the rest, the answer is not touched.
+    #[tokio::test]
+    async fn an_answer_is_not_cut_within_budget_or_without_a_registry() {
+        let jobs = crate::tools::jobs::Jobs::new(std::env::temp_dir());
+        let answer = json!({"exit_code": 0, "stdout": "x".repeat(5000), "stderr": ""});
+        let args = json!({"command": "cat big"});
+        for (registry, budget) in [(Some(&jobs), 8000), (None, 1000), (Some(&jobs), 0)] {
+            let out = Outgoing::Response(Payload::from_json(answer.clone()));
+            let Outgoing::Response(p) = fit_the_output(out, &args, registry, budget) else {
+                panic!("a unary response")
+            };
+            assert_eq!(p.to_json().unwrap(), answer);
+        }
+        assert!(jobs.list().is_empty(), "nothing cut, nothing kept");
+    }
+
+    /// The flags that say nothing happened go; one that says something stays, and so do the
+    /// streams even when empty.
+    #[test]
+    fn false_flags_are_dropped_and_the_streams_are_kept() {
+        let out = Outgoing::Response(Payload::from_json(json!({
+            "exit_code": 0, "stdout": "", "stderr": "",
+            "timed_out": false, "stdout_truncated": true, "stderr_truncated": false,
+        })));
+        let Outgoing::Response(p) = drop_the_defaults(out) else { panic!("a unary response") };
+        assert_eq!(
+            p.to_json().unwrap(),
+            json!({"exit_code": 0, "stdout": "", "stderr": "", "stdout_truncated": true})
+        );
     }
 }

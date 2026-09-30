@@ -216,11 +216,7 @@ impl Jobs {
                     ended,
                 },
             ));
-            // **Finished ones go first.** Dropping a running one loses the handle to kill it.
-            while inner.jobs.len() > KEEP {
-                let Some(at) = inner.jobs.iter().position(|(_, j)| !j.running) else { break };
-                inner.jobs.remove(at);
-            }
+            evict(&mut inner);
             id
         };
 
@@ -246,6 +242,34 @@ impl Jobs {
             }
         });
         Ok(id)
+    }
+
+    /// Registers output that already exists as a finished job, so `wait.logs` pages it.
+    ///
+    /// **This is where a cut `terminal.exec` answer keeps the rest** (`tools::budget`). One
+    /// registry and one reader rather than a second store: the agent already knows how to page a
+    /// job, and eviction, the ring and `/jobs` come with it.
+    pub fn record(&self, label: String, exit_code: i32, out: &str) -> String {
+        let (ended, _) = watch::channel(true);
+        let mut ring = Ring::new(RING_CAP);
+        ring.push(out);
+        let mut inner = self.inner.lock().unwrap();
+        inner.next += 1;
+        let id = format!("b{}", inner.next);
+        inner.jobs.push((
+            id.clone(),
+            Job {
+                label,
+                started: Instant::now(),
+                pid: None,
+                exit_code: Some(exit_code),
+                running: false,
+                out: ring,
+                ended,
+            },
+        ));
+        evict(&mut inner);
+        id
     }
 
     pub fn snapshot(&self, id: &str) -> Option<Snapshot> {
@@ -529,6 +553,15 @@ impl Ring {
             slice.iter().position(|b| *b == b'\n').map(|i| i + 1).unwrap_or(0)
         };
         String::from_utf8_lossy(&slice[start..]).into_owned()
+    }
+}
+
+/// Holds the registry to `KEEP`. **Finished ones go first.** Dropping a running one loses the
+/// handle to kill it.
+fn evict(inner: &mut Inner) {
+    while inner.jobs.len() > KEEP {
+        let Some(at) = inner.jobs.iter().position(|(_, j)| !j.running) else { break };
+        inner.jobs.remove(at);
     }
 }
 
