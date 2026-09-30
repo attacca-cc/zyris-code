@@ -1185,7 +1185,8 @@ fn detail_lines(
         lines
     };
     let plain = |text: &str, colour: ratatui::style::Color| {
-        wrap_plain(text, inner)
+        // By column only: tool detail is JSON or raw text, never markdown.
+        crate::wrap::columns(text, inner as usize)
             .into_iter()
             .map(|l| vec![Span::styled(l, Style::default().fg(colour))])
             .collect::<Vec<_>>()
@@ -1351,7 +1352,7 @@ fn detail_lines(
                     )],
                 ));
                 let base = if failed { theme::danger() } else { theme::text_muted() };
-                for line in wrap_plain(body, inner) {
+                for line in crate::wrap::columns(body, inner as usize) {
                     out.extend(row("  ", json_line(&line, base)));
                 }
             }
@@ -1403,13 +1404,6 @@ pub(crate) fn diff_line(
         Span::styled(DETAIL_PAD, Style::default().fg(theme::border_light())),
         Span::styled(markdown::truncate_to(&text, width.max(1)), Style::default().fg(colour)),
     ])
-}
-
-/// Wraps to fit the width. **Cuts only by column count** — tool detail is JSON or raw text, so it
-/// must not be parsed as markdown.
-fn wrap_plain(text: &str, width: u16) -> Vec<String> {
-    // The one implementation lives in `crate::wrap`.
-    crate::wrap::columns(text, width as usize)
 }
 
 /// Colours one pretty-printed JSON line: a `"key"` in front of a colon stands out in `tool_arg`,
