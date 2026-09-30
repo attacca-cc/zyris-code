@@ -761,7 +761,9 @@ impl Default for State {
             running: false,
             connected: false,
             ever_connected: false,
-            caps: crate::term::Caps::detect(),
+            // **Not the environment's.** A test's frame must not change colour with the terminal
+            // the tests happen to run in; `run_inner` reads the real one.
+            caps: crate::term::Caps { mouse: true, ..Default::default() },
             said_clipboard_note: false,
             status: None,
             mode: Mode::default(),
@@ -3719,20 +3721,30 @@ enum KittyVerdict {
 /// either question, so it is skipped rather than trusted.
 #[cfg(unix)]
 fn kitty_verdict(resp: &[u8]) -> KittyVerdict {
+    // Some other final byte is not an answer to either question, so it is looked past.
+    match private_replies(resp).into_iter().find(|f| *f == b'u' || *f == b'c') {
+        Some(b'u') => KittyVerdict::Supported,
+        Some(_) => KittyVerdict::Unsupported,
+        None => KittyVerdict::Waiting,
+    }
+}
+
+/// The final byte of every complete `CSI ? … <final>` reply in `resp`, in the order they came.
+/// One still mid-sequence ends the list — its final byte has not arrived yet.
+#[cfg(unix)]
+fn private_replies(resp: &[u8]) -> Vec<u8> {
+    let mut finals = Vec::new();
     let mut rest = resp;
     while let Some(i) = rest.windows(3).position(|w| w == b"\x1b[?") {
         let tail = &rest[i + 3..];
-        let end = tail.iter().position(|b| !(b.is_ascii_digit() || *b == b';' || *b == b':'));
-        match end.map(|e| tail[e]) {
-            Some(b'u') => return KittyVerdict::Supported,
-            Some(b'c') => return KittyVerdict::Unsupported,
-            // Some other final byte: not an answer to either question. Look past it.
-            Some(_) => rest = &tail[end.unwrap() + 1..],
-            // Still mid-sequence — the final byte has not arrived yet.
-            None => return KittyVerdict::Waiting,
-        }
+        let Some(end) = tail.iter().position(|b| !(b.is_ascii_digit() || *b == b';' || *b == b':'))
+        else {
+            break;
+        };
+        finals.push(tail[end]);
+        rest = &tail[end + 1..];
     }
-    KittyVerdict::Waiting
+    finals
 }
 
 /// Asks **at startup** whether the terminal supports the kitty keyboard protocol.
@@ -3742,6 +3754,13 @@ fn kitty_verdict(resp: &[u8]) -> KittyVerdict {
 /// there is no telling them apart from the bytes the app receives.
 ///
 /// **Device attributes ride along so silence never has to be the answer** — see `kitty_verdict`.
+///
+/// **The background colour is asked in the same breath** (OSC 11, first, so its answer is in
+/// before the device attributes that close the exchange), and what comes back goes to
+/// `theme::answered`. Most terminals export nothing that says whether they are light, so this is
+/// the one way `ThemeChoice::Auto` gets it right on a white background. Reading carries on until
+/// the device-attributes reply rather than stopping at the kitty one, which also leaves no reply
+/// behind for crossterm to trip over.
 ///
 /// **crossterm has `supports_keyboard_enhancement()` and it is not used here.** Its comment
 /// describes this very technique, but it polls for the keyboard-flags event alone, so the
@@ -3759,7 +3778,7 @@ pub fn probe_kitty_keyboard() -> bool {
         use std::os::fd::AsRawFd;
 
         let mut out = io::stdout();
-        if write!(out, "\x1b[?u\x1b[c").is_err() || out.flush().is_err() {
+        if write!(out, "\x1b]11;?\x1b\\\x1b[?u\x1b[c").is_err() || out.flush().is_err() {
             return false;
         }
 
@@ -3767,7 +3786,7 @@ pub fn probe_kitty_keyboard() -> bool {
         let deadline = Instant::now() + KITTY_PROBE_TIMEOUT;
         let mut resp = Vec::with_capacity(32);
         let mut byte = [0u8; 1];
-        while Instant::now() < deadline && resp.len() < 64 {
+        while Instant::now() < deadline && resp.len() < 128 {
             let left = deadline.saturating_duration_since(Instant::now());
             let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
             // 0 = timed out, <0 = error. Either way, nothing more is coming.
@@ -3778,17 +3797,16 @@ pub fn probe_kitty_keyboard() -> bool {
                 Ok(0) | Err(_) => break,
                 Ok(_) => {
                     resp.push(byte[0]);
-                    match kitty_verdict(&resp) {
-                        KittyVerdict::Supported => return true,
-                        KittyVerdict::Unsupported => return false,
-                        KittyVerdict::Waiting => {}
+                    // The device attributes are always answered, and answered last.
+                    if byte[0] == b'c' && private_replies(&resp).contains(&b'c') {
+                        break;
                     }
                 }
             }
         }
-        // Neither answer came. A terminal with the protocol would have replied to the first
-        // question, so the honest reading of silence is "no".
-        false
+        crate::theme::answered(crate::theme::background_from_reply(&resp));
+        // Silence reads as "no": a terminal with the protocol would have replied to the question.
+        kitty_verdict(&resp) == KittyVerdict::Supported
     }
     #[cfg(not(unix))]
     {
@@ -4357,6 +4375,7 @@ async fn run_inner(
     kitty: bool,
 ) -> anyhow::Result<()> {
     let mut state = State::new();
+    state.caps = crate::term::Caps::detect();
     // Read once, from the environment: what to trace, if anything. See `crate::trace`.
     let trace = crate::trace::Trace::detect();
     // **The saved settings come in here.** `State::default` keeps the built-in defaults so
@@ -7484,6 +7503,10 @@ mod tests {
         // A `CSI ?` sequence that is neither reply is stepped over, not trusted.
         assert_eq!(kitty_verdict(b"\x1b[?25h"), Waiting, "cursor visibility, not an answer");
         assert_eq!(kitty_verdict(b"\x1b[?25h\x1b[?1u"), Supported, "and the real reply after it");
+        // The background's answer rides in front, and is not a `CSI ?` reply at all.
+        let all = b"\x1b]11;rgb:ffff/ffff/ffff\x1b\\\x1b[?1u\x1b[?62c";
+        assert_eq!(kitty_verdict(all), Supported);
+        assert_eq!(private_replies(all), b"uc");
     }
 
     /// A paste keeps its newlines — splitting on Enter would fire off the first line of a

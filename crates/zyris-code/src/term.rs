@@ -21,6 +21,8 @@
 //! So an unknown terminal is told no, and `$ZYRIS_CODE_HYPERLINKS` / `$ZYRIS_CODE_OSC52` override
 //! the guess in either direction for whoever knows better than we do.
 
+use ratatui::style::Color;
+
 /// Terminals known to render OSC 8 hyperlinks.
 ///
 /// Matched against `TERM_PROGRAM` and `LC_TERMINAL`. **`LC_TERMINAL` matters inside tmux**, which
@@ -46,6 +48,115 @@ fn override_of(value: Option<&str>) -> Option<bool> {
     }
 }
 
+/// How many colours the terminal can draw.
+///
+/// **The palette is written in 24-bit and sent in whatever the terminal reads.** Every theme colour
+/// is `Color::Rgb`, and a terminal that has no 24-bit colour does not ignore `38;2;r;g;b` — macOS
+/// Terminal.app misreads its parameters and paints unrelated colours, and the Linux console folds
+/// it into eight slots where the text and the dimmed text land on the same one. So the frame is
+/// mapped to the nearest colour the terminal does have (`widgets::draw`, through [`Colours::fit`])
+/// rather than every call site learning about depth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Colours {
+    /// `38;2;r;g;b` as written.
+    #[default]
+    True,
+    /// The xterm 256-colour palette. The sixteen base slots are left out of the match: the person's
+    /// theme redefines those, so what they look like is anybody's guess.
+    Indexed,
+    /// The sixteen base colours only.
+    Sixteen,
+    /// `NO_COLOR`: none at all. crossterm already drops every colour sequence when it is set, so
+    /// the frame is left as it is and only the cues that live in colour alone get a stand-in.
+    Mono,
+}
+
+impl Colours {
+    /// Which depth the environment says, over the same lookup as the rest of [`Caps`].
+    ///
+    /// **`COLORTERM` is the one real answer**, and the terminals that support 24-bit colour set
+    /// it — but it is not forwarded over SSH by default, so the terminals already known by name
+    /// count as well. After that `TERM` decides: `-256color` gets the palette and anything else the
+    /// sixteen, which is what `linux`, `screen` and a bare `xterm` really have. No `TERM` at all is
+    /// the Windows console, which has drawn 24-bit colour since Windows 10.
+    fn from_env(var: &dyn Fn(&str) -> Option<String>, named: bool) -> Colours {
+        if var("NO_COLOR").is_some_and(|v| !v.is_empty()) {
+            return Colours::Mono;
+        }
+        let colorterm = var("COLORTERM").unwrap_or_default().to_ascii_lowercase();
+        if colorterm == "truecolor" || colorterm == "24bit" || named {
+            return Colours::True;
+        }
+        match var("TERM") {
+            None => Colours::True,
+            Some(t) if t.ends_with("-direct") || t.contains("truecolor") => Colours::True,
+            Some(t) if t.contains("256color") => Colours::Indexed,
+            Some(_) => Colours::Sixteen,
+        }
+    }
+
+    /// Whether a cue carried by a background alone would vanish here — the drag's wash, above all.
+    pub fn reduced(self) -> bool {
+        matches!(self, Colours::Sixteen | Colours::Mono)
+    }
+
+    /// `colour` as this terminal can draw it. Anything that is not 24-bit passes through.
+    pub fn fit(self, colour: Color) -> Color {
+        let Color::Rgb(r, g, b) = colour else { return colour };
+        match self {
+            Colours::True | Colours::Mono => colour,
+            Colours::Indexed => Color::Indexed(nearest_indexed(r, g, b)),
+            Colours::Sixteen => Color::Indexed(nearest(&BASE16, (r, g, b)) as u8),
+        }
+    }
+}
+
+/// xterm's defaults for the sixteen base colours. Only a guess at what the person's theme has, but
+/// the nearest slot by these is still the nearest by kind — a red stays a red.
+const BASE16: [(u8, u8, u8); 16] = [
+    (0, 0, 0),
+    (205, 0, 0),
+    (0, 205, 0),
+    (205, 205, 0),
+    (0, 0, 238),
+    (205, 0, 205),
+    (0, 205, 205),
+    (229, 229, 229),
+    (127, 127, 127),
+    (255, 0, 0),
+    (0, 255, 0),
+    (255, 255, 0),
+    (92, 92, 255),
+    (255, 0, 255),
+    (0, 255, 255),
+    (255, 255, 255),
+];
+
+/// Index of the entry closest to `to`, by squared distance.
+fn nearest(of: &[(u8, u8, u8)], to: (u8, u8, u8)) -> usize {
+    let d = |(r, g, b): (u8, u8, u8)| {
+        let (dr, dg, db) = (r as i32 - to.0 as i32, g as i32 - to.1 as i32, b as i32 - to.2 as i32);
+        dr * dr + dg * dg + db * db
+    };
+    (0..of.len()).min_by_key(|&i| d(of[i])).unwrap_or(0)
+}
+
+/// The closest of the 6x6x6 cube (16-231) and the grey ramp (232-255).
+fn nearest_indexed(r: u8, g: u8, b: u8) -> u8 {
+    const LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
+    let level = |c: u8| nearest(&LEVELS.map(|l| (l, l, l)), (c, c, c));
+    let (ri, gi, bi) = (level(r), level(g), level(b));
+    let cube = (LEVELS[ri], LEVELS[gi], LEVELS[bi]);
+    let grey_i = ((r as usize + g as usize + b as usize) / 3).saturating_sub(3) / 10;
+    let grey_i = grey_i.min(23);
+    let grey = 8 + 10 * grey_i as u8;
+    if nearest(&[cube, (grey, grey, grey)], (r, g, b)) == 0 {
+        16 + 36 * ri as u8 + 6 * gi as u8 + bi as u8
+    } else {
+        232 + grey_i as u8
+    }
+}
+
 /// What the app asks about a terminal. Taken from the environment once at startup — reading it per
 /// frame would put a `std::env` lookup inside the draw loop for an answer that cannot change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -56,6 +167,8 @@ pub struct Caps {
     pub osc52: bool,
     /// Whether to take the mouse at all. Off hands selection and copy back to the terminal.
     pub mouse: bool,
+    /// How the palette has to be sent.
+    pub colours: Colours,
 }
 
 impl Caps {
@@ -97,7 +210,9 @@ impl Caps {
         // all go back to the terminal.
         let mouse = override_of(var("ZYRIS_CODE_MOUSE").as_deref()).unwrap_or(!dumb);
 
-        Caps { hyperlinks, osc52, mouse }
+        let colours = Colours::from_env(&var, named);
+
+        Caps { hyperlinks, osc52, mouse, colours }
     }
 }
 
@@ -179,6 +294,59 @@ mod tests {
 
         assert!(!caps(&[("TERM_PROGRAM", "ghostty"), ("ZYRIS_CODE_OSC52", "no")]).osc52);
         assert!(!caps(&[("ZYRIS_CODE_MOUSE", "0")]).mouse, "the mouse could not be handed back");
+    }
+
+    /// **24-bit colour only where the terminal says so.** Terminal.app, the Linux console and a
+    /// `screen` without `RGB` are the ones that got `38;2` and painted it wrong.
+    #[test]
+    fn the_colour_depth_follows_what_the_terminal_says() {
+        assert_eq!(
+            caps(&[("COLORTERM", "truecolor"), ("TERM", "xterm-256color")]).colours,
+            Colours::True
+        );
+        assert_eq!(caps(&[("COLORTERM", "24bit"), ("TERM", "screen")]).colours, Colours::True);
+        assert_eq!(caps(&[("TERM", "xterm-256color")]).colours, Colours::Indexed);
+        assert_eq!(
+            caps(&[("TERM_PROGRAM", "Apple_Terminal"), ("TERM", "xterm-256color")]).colours,
+            Colours::Indexed
+        );
+        assert_eq!(caps(&[("TERM", "linux")]).colours, Colours::Sixteen);
+        assert_eq!(caps(&[("TERM", "screen")]).colours, Colours::Sixteen);
+        assert_eq!(caps(&[("TERM", "xterm-direct")]).colours, Colours::True);
+        // Known by name, as over SSH where COLORTERM does not travel.
+        assert_eq!(caps(&[("TERM", "xterm-kitty")]).colours, Colours::True);
+        assert_eq!(
+            caps(&[("LC_TERMINAL", "iTerm2"), ("TERM", "xterm-256color")]).colours,
+            Colours::True
+        );
+        // The Windows console sets no TERM.
+        assert_eq!(caps(&[]).colours, Colours::True);
+        // NO_COLOR wins over everything; empty means unset, as the convention says.
+        assert_eq!(caps(&[("NO_COLOR", "1"), ("COLORTERM", "truecolor")]).colours, Colours::Mono);
+        assert_eq!(caps(&[("NO_COLOR", ""), ("COLORTERM", "truecolor")]).colours, Colours::True);
+    }
+
+    #[test]
+    fn a_colour_is_mapped_to_the_nearest_the_terminal_has() {
+        let rgb = Color::Rgb(0xe8, 0xe2, 0xdc);
+        assert_eq!(Colours::True.fit(rgb), rgb);
+        assert_eq!(Colours::Mono.fit(rgb), rgb);
+        // Exact cube and grey entries come back as themselves.
+        assert_eq!(Colours::Indexed.fit(Color::Rgb(255, 0, 0)), Color::Indexed(196));
+        assert_eq!(Colours::Indexed.fit(Color::Rgb(0, 0, 0)), Color::Indexed(16));
+        assert_eq!(Colours::Indexed.fit(Color::Rgb(128, 128, 128)), Color::Indexed(244));
+        assert_eq!(Colours::Sixteen.fit(Color::Rgb(250, 10, 10)), Color::Indexed(9));
+        assert_eq!(Colours::Sixteen.fit(Color::Rgb(0x0f, 0x0d, 0x0a)), Color::Indexed(0));
+        // Not ours to touch.
+        assert_eq!(Colours::Sixteen.fit(Color::Reset), Color::Reset);
+        assert_eq!(Colours::Indexed.fit(Color::Indexed(3)), Color::Indexed(3));
+        // Every value lands inside the range its depth may use.
+        for v in (0..=255u8).step_by(5) {
+            for c in [Color::Rgb(v, 255 - v, v / 2), Color::Rgb(v, v, v)] {
+                assert!(matches!(Colours::Indexed.fit(c), Color::Indexed(16..=255)), "{c:?}");
+                assert!(matches!(Colours::Sixteen.fit(c), Color::Indexed(0..=15)), "{c:?}");
+            }
+        }
     }
 
     /// A value that means nothing falls back to the guess rather than to `false` — `MOUSE=maybe`

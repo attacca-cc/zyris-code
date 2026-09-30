@@ -1224,6 +1224,35 @@ fn the_highlight_covers_only_the_selected_columns() {
     assert_eq!(bg(ox + 8), Some(Color::Reset), "an unselected cell must not be washed");
 }
 
+/// **A terminal without 24-bit colour is sent none**, and the drag stays visible without it.
+/// Terminal.app and the Linux console misread `38;2`; with sixteen colours or `NO_COLOR` the wash
+/// alone would highlight nothing, so it is reversed as well.
+#[test]
+fn a_terminal_with_fewer_colours_gets_only_those_and_still_sees_the_drag() {
+    use zyris_code::term::Colours;
+    for colours in [Colours::Indexed, Colours::Sixteen, Colours::Mono] {
+        let mut s = State::new();
+        s.caps.colours = colours;
+        said(&mut s, 1, EntryKind::User("안녕".into()));
+        said(&mut s, 2, EntryKind::Agent("abcdefghij".into()));
+        let _ = dump(&mut s, 60, 12);
+        let (ox, _) = s.view_origin;
+        // The agent's line is the last one drawn; find it rather than assume the layout.
+        let row = s.screen.iter().position(|r| r.contains("abcdefghij")).unwrap() as u16;
+        apply(&mut s, &Action::Press(ox, row));
+        apply(&mut s, &Action::DragTo(ox + 6, row));
+
+        let mut term = ratatui::Terminal::new(TestBackend::new(60, 12)).unwrap();
+        term.draw(|f| widgets::draw(f, &mut s)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let rgb = |c: Color| matches!(c, Color::Rgb(..));
+        let sent_rgb = buf.content.iter().any(|c| rgb(c.fg) || rgb(c.bg));
+        assert_eq!(sent_rgb, colours == Colours::Mono, "{colours:?}: 24-bit colour went out");
+        let reversed = buf[(ox + 3, row)].modifier.contains(ratatui::style::Modifier::REVERSED);
+        assert_eq!(reversed, colours.reduced(), "{colours:?}: the drag's stand-in cue");
+    }
+}
+
 /// Any other input drops the selection — it is anchored to the screen, so once the person
 /// types or moves, it points at stale text.
 #[test]
