@@ -25,7 +25,7 @@ pub fn draw(
     // name with an `…` on a screen three times that wide. The rows carry names only — every
     // description lives under the list (`detail_of`), so a long one no longer stretches the box.
     let widest = picker.rows.iter().map(row_need).max().unwrap_or(0);
-    let w = ((widest as u16 + 4).max(64)).min(area.width.saturating_sub(4)).max(20);
+    let w = ((widest as u16 + 4).max(64)).min(area.width.saturating_sub(4)).max(20.min(area.width));
     let inner_w = w.saturating_sub(2) as usize;
     // **The note area keeps room for every row's note, not only this one's.** Counted over all
     // rows, so the box is one height whichever row the cursor is on — a list whose box jumps up

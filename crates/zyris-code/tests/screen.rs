@@ -1948,6 +1948,14 @@ fn the_bottom_bar_says_how_many_messages_are_waiting() {
     let bottom = screen.lines().last().unwrap();
     assert!(bottom.contains("대기 1개"), "the queued marker is missing: {bottom:?}");
 
+    // **A long agent name and a project do not push it off a narrow line.** It was the last thing
+    // on the line, and the end of the line is what a narrow terminal cuts.
+    s.agent = "An Agent With A Really Very Long Name Indeed".into();
+    s.project_name = Some("some-project".into());
+    let screen = dump(&mut s, 40, 12);
+    let bottom = screen.lines().last().unwrap();
+    assert!(bottom.contains("대기 1개"), "the queued marker was cut: {bottom:?}");
+
     // When the queue empties, the indicator disappears too.
     s.queued.clear();
     let screen = dump(&mut s, 60, 12);

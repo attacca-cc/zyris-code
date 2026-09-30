@@ -144,6 +144,13 @@ fn plan_count(state: &State) -> String {
 
 pub fn draw(frame: &mut Frame, area: Rect, state: &State) {
     let (colour, label, hint) = parts(state);
+    // **One row, cut with a mark.** A line break in an error is drawn as nothing and fused the
+    // words either side, and a long one ran off the edge in silence. A long error is also said in
+    // the conversation (`State::set_error`), where it wraps and stays.
+    let label = crate::markdown::truncate_to(
+        &crate::tool_view::one_line(&label),
+        (area.width as usize).saturating_sub(2),
+    );
 
     // The dot blinks only while working. A still dot does not say "it is running".
     let lit = !state.running || blink_on(state.blink_ms());

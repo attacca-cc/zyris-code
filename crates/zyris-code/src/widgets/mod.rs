@@ -137,10 +137,8 @@ pub fn draw(frame: &mut Frame, state: &mut State) {
     // **The GitHub screen sits at the same level as the new-project form** — both are opened from
     // one place, and neither can be open while the other is.
     if let Some(form) = &state.github_form {
-        let link = githubform::draw(frame, full, form, state.lang);
-        if let Some(link) = link {
-            state.screen_links.push(link);
-        }
+        let links = githubform::draw(frame, full, form, state.lang);
+        state.screen_links.extend(links);
     }
 
     // **The enrollment code window overlaps on top of that.** Nothing else may be done while viewing
@@ -148,10 +146,8 @@ pub fn draw(frame: &mut Frame, state: &mut State) {
     if let Some(view) = &state.enroll {
         // **The window is drawn from a borrow of `state`**, so the link it hands back is stored
         // after that borrow ends.
-        let link = enroll::draw(frame, full, view, state.lang);
-        if let Some(link) = link {
-            state.screen_links.push(link);
-        }
+        let links = enroll::draw(frame, full, view, state.lang);
+        state.screen_links.extend(links);
     }
 
     // **The popup panel is drawn on top of everything.** It only opens from a slash

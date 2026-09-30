@@ -188,11 +188,15 @@ enum Level {
     NoChecks,
     NoDiverged,
     NoPullSize,
+    /// The counts go, **except a conflict** — the one thing on the row that must not be missed.
     NoCounts,
+    /// The pull request goes too and the branch is cut from the front with `…`. Without this a
+    /// long branch name dropped straight to `NoGit`, taking the branch and the conflict with it.
+    ShortBranch,
     NoGit,
 }
 
-const LEVELS: [Level; 8] = [
+const LEVELS: [Level; 9] = [
     Level::Full,
     Level::NoUntracked,
     Level::NoAhead,
@@ -200,6 +204,7 @@ const LEVELS: [Level; 8] = [
     Level::NoDiverged,
     Level::NoPullSize,
     Level::NoCounts,
+    Level::ShortBranch,
     Level::NoGit,
 ];
 
@@ -230,15 +235,14 @@ pub fn spans(
     let budget = width - overhead;
     let path = path_text(cwd, home);
     for level in LEVELS {
-        if let Some(out) = assemble(width, &pieces(&path, repo, pull, level), budget) {
+        if let Some(out) = assemble(width, &pieces(&path, repo, pull, level, budget), budget) {
             return out;
         }
     }
     // Even the path alone did not fit — take it from the head, never the tail.
     match shorten(&path, budget) {
-        Some(short) => {
-            assemble(width, &pieces(&short, None, None, Level::NoGit), budget).unwrap_or_else(bare)
-        }
+        Some(short) => assemble(width, &pieces(&short, None, None, Level::NoGit, budget), budget)
+            .unwrap_or_else(bare),
         None => bare(),
     }
 }
@@ -250,18 +254,34 @@ fn pieces(
     repo: Option<&Repo>,
     pull: Option<&Pull>,
     level: Level,
+    budget: usize,
 ) -> Vec<Vec<Span<'static>>> {
     let muted = Style::default().fg(theme::text_muted());
     let mut git: Vec<Span<'static>> = Vec::new();
     if let (Some(r), false) = (repo, level == Level::NoGit) {
+        let conflicts = if r.conflicts > 0 { format!(" !{}", r.conflicts) } else { String::new() };
+        let branch = match level {
+            // What is left beside the path, the separator, `* ` and the conflict mark.
+            Level::ShortBranch => {
+                let room = budget.saturating_sub(
+                    display_width(path) + display_width(SEP) + 2 + display_width(&conflicts),
+                );
+                tail_to(&r.branch, room)
+            }
+            _ => r.branch.clone(),
+        };
         // **`*`, and it has to stay something like it.** The branch used to be marked `⎇`
         // (U+2387), which `unicode-width` calls one column — and which almost no terminal font
         // has a glyph for, so the terminal falls back to a font that draws it two columns wide.
         // Everything after it then sits one column right of where the layout put it, and the
         // next positioned write eats a character: `main` came out as `mai`. `*` is what
         // `git branch` marks the current branch with, it is ASCII, and no font can widen it.
-        git.push(Span::styled(format!("* {}", r.branch), muted));
-        if level != Level::NoCounts {
+        git.push(Span::styled(format!("* {branch}"), muted));
+        if matches!(level, Level::NoCounts | Level::ShortBranch) {
+            if !conflicts.is_empty() {
+                git.push(Span::styled(conflicts, Style::default().fg(theme::danger())));
+            }
+        } else {
             let mut count = |n: usize, mark: char, style: Style| {
                 if n > 0 {
                     git.push(Span::styled(format!(" {mark}{n}"), style));
@@ -308,7 +328,7 @@ fn pieces(
     // branch's counts are: `#53` is an identity, `+118 -30` are GitHub's numbers for the whole
     // request, and neither belongs among marks that describe the working tree.
     let mut pr: Vec<Span<'static>> = Vec::new();
-    if let (Some(p), false) = (pull, level == Level::NoGit) {
+    if let (Some(p), false) = (pull, matches!(level, Level::ShortBranch | Level::NoGit)) {
         // **Yellow while it is somebody else's turn, purple once it has landed.** The number
         // carries the colour because the number is the thing being talked about.
         let state = match p.merged {
@@ -357,6 +377,26 @@ fn assemble(
     let rule = width - display_width(LEAD) - body - joins - 1;
     out.push(Span::styled(format!(" {}", "─".repeat(rule)), border));
     Some(out)
+}
+
+/// The end of `s` in `limit` columns, `…` in front when anything was cut. **The tail of a branch
+/// name is what tells it apart** — `feat/login-form` and `feat/login-api` share their head.
+fn tail_to(s: &str, limit: usize) -> String {
+    use unicode_segmentation::UnicodeSegmentation;
+    if display_width(s) <= limit {
+        return s.to_string();
+    }
+    let mut kept: Vec<&str> = Vec::new();
+    let mut used = 1;
+    for g in s.graphemes(true).rev() {
+        if used + display_width(g) > limit {
+            break;
+        }
+        used += display_width(g);
+        kept.push(g);
+    }
+    kept.reverse();
+    format!("…{}", kept.concat())
 }
 
 /// `/home/ruma/zyris-code` under `/home/ruma` becomes `~/zyris-code`.
@@ -838,6 +878,20 @@ mod tests {
         let out = strip(60, "/home/ruma/zyris-code", Some("/home/ruma"), Some(&dirty()));
         assert_eq!(out.matches('∙').count(), 1, "exactly one join: {out:?}");
         assert!(out.contains("~/zyris-code ∙ * main"), "{out:?}");
+    }
+
+    /// **A long branch is cut, not dropped, and a conflict outlasts every other count.** The
+    /// branch was never shortened, so one that did not fit took the whole git piece — and its
+    /// conflict mark — with it.
+    #[test]
+    fn a_long_branch_is_cut_from_the_front_and_keeps_its_conflict() {
+        let mut r = dirty();
+        r.branch = format!("feature/{}-login-form", "very-long-branch-name".repeat(2));
+        r.conflicts = 2;
+        let out =
+            strip(80, "/home/ruma/projects/some-client/zyris-code", Some("/home/ruma"), Some(&r));
+        assert_eq!(crate::markdown::display_width(&out), 80, "{out:?}");
+        assert!(out.contains("* …") && out.contains("login-form !2"), "{out:?}");
     }
 
     #[test]

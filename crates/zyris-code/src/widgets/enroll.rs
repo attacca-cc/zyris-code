@@ -45,16 +45,17 @@ pub fn draw(
     area: Rect,
     view: &EnrollView,
     lang: crate::lang::Lang,
-) -> Option<crate::app::ScreenLink> {
+) -> Vec<crate::app::ScreenLink> {
     // A box in the center of the screen. The code must show large, so give it more room than the list window.
-    let w = 64.min(area.width.saturating_sub(4)).max(30);
+    let w = 64.min(area.width.saturating_sub(4)).max(30.min(area.width));
     // **The width is settled before a single line is built**, because wrapping needs it and the
     // height falls out of how many lines the wrapping produced.
     let text_width = w.saturating_sub(2);
 
     let mut lines: Vec<Line<'static>> = Vec::new();
-    // Which drawn line holds the URL, so its cells can be handed back as a link.
+    // Which drawn lines hold the URL, so their cells can be handed back as a link.
     let mut uri_row: Option<usize> = None;
+    let mut uri_rows: Vec<usize> = Vec::new();
 
     match view.phase {
         EnrollPhase::Waiting => {
@@ -70,10 +71,7 @@ pub fn draw(
             // decoration; this says it is the thing to open. Ctrl+click opens it, and the link is
             // registered below so that actually works over an overlay.
             uri_row = Some(lines.len());
-            lines.push(Line::from(Span::styled(
-                view.uri.clone(),
-                Style::default().fg(theme::tool()).add_modifier(Modifier::UNDERLINED),
-            )));
+            uri_rows = uri_lines(&mut lines, &view.uri, text_width);
             lines.push(Line::from(""));
             let remaining = view.expires_at.saturating_duration_since(std::time::Instant::now());
             wrapped(
@@ -126,24 +124,48 @@ pub fn draw(
     let inner = block.inner(box_area);
     frame.render_widget(block, box_area);
 
-    let link = uri_row.and_then(|row| {
-        let y = inner.y.checked_add(row as u16)?;
-        // **Only if it is actually on screen.** A short terminal cuts the box, and a link
-        // registered on a row that was never drawn would be clickable over whatever is there.
-        if y >= inner.y.saturating_add(inner.height) {
-            return None;
-        }
-        let width = display_width(&view.uri).min(inner.width as usize) as u16;
-        Some(crate::app::ScreenLink {
-            row: y,
-            start: inner.x,
-            end: inner.x.saturating_add(width),
-            url: view.uri.clone(),
-        })
-    });
-
+    let links = uri_row.map_or_else(Vec::new, |row| link_rows(inner, row, &uri_rows, &view.uri));
     frame.render_widget(Paragraph::new(lines), inner);
-    link
+    links
+}
+
+/// Appends the URL as however many rows it takes, **by column** — an address has no word to
+/// break at, and cut at the border it was the one line here that could not be read in full.
+/// Gives back each row's width.
+pub(crate) fn uri_lines(lines: &mut Vec<Line<'static>>, uri: &str, width: u16) -> Vec<usize> {
+    let style = Style::default().fg(theme::tool()).add_modifier(Modifier::UNDERLINED);
+    crate::wrap::columns(uri, width as usize)
+        .into_iter()
+        .map(|row| {
+            let w = display_width(&row);
+            lines.push(Line::from(Span::styled(row, style)));
+            w
+        })
+        .collect()
+}
+
+/// One link per drawn row of the URL starting at line `first` of `inner`. **Only rows actually on
+/// screen**: a short terminal cuts the box, and a link on a row that was never drawn would be
+/// clickable over whatever is there.
+pub(crate) fn link_rows(
+    inner: Rect,
+    first: usize,
+    widths: &[usize],
+    url: &str,
+) -> Vec<crate::app::ScreenLink> {
+    widths
+        .iter()
+        .enumerate()
+        .filter_map(|(i, w)| {
+            let y = inner.y.checked_add((first + i) as u16)?;
+            (y < inner.y.saturating_add(inner.height)).then(|| crate::app::ScreenLink {
+                row: y,
+                start: inner.x,
+                end: inner.x.saturating_add((*w).min(inner.width as usize) as u16),
+                url: url.to_string(),
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -177,6 +199,32 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// **The address wraps inside the box and every row of it opens it.** It was one line, cut
+    /// at the border of a narrow box — the one line here that must be read in full.
+    #[test]
+    fn a_long_address_wraps_and_every_row_is_a_link() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let uri = format!("https://example.com/device/{}", "x".repeat(60));
+        let view = EnrollView {
+            code: "ABCD-1234".into(),
+            uri: uri.clone(),
+            expires_at: std::time::Instant::now(),
+            phase: EnrollPhase::Waiting,
+        };
+        let mut term = Terminal::new(TestBackend::new(40, 40)).expect("terminal");
+        let mut links = Vec::new();
+        term.draw(|f| links = draw(f, f.area(), &view, Lang::En)).expect("draw");
+        assert!(links.len() > 1, "{links:?}");
+        assert!(links.iter().all(|l| l.url == uri && l.end <= 40));
+        let buf = term.backend().buffer().clone();
+        let drawn: String = links
+            .iter()
+            .map(|l| (l.start..l.end).map(|x| buf[(x, l.row)].symbol()).collect::<String>())
+            .collect();
+        assert_eq!(drawn, uri);
     }
 
     /// A run with no space in it cannot make the line grow, nor loop looking for a break.

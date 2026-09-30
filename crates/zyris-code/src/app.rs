@@ -929,6 +929,10 @@ impl PasteBurst {
 /// How long a notice stays on screen. Plenty to read one sentence.
 pub const STATUS_WINDOW: Duration = Duration::from_secs(6);
 
+/// The longest error the activity line is trusted to show whole (`State::set_error`): what is left
+/// of an 80-column line after its dot and a little room.
+const ERROR_LINE: usize = 60;
+
 /// If the app has not ended this long after a shutdown signal, restore the screen and force
 /// the exit. A safety net for the case where the loop is stuck and never sees the signal.
 ///
@@ -951,8 +955,18 @@ impl State {
     ///
     /// Every notice used to be the same colour, errors included — so a failure looked exactly
     /// like "connected", on the one line whose whole job is to say what is happening.
+    ///
+    /// **An error too long for that one line is also said in the conversation.** The activity
+    /// line is a single row that fades after `STATUS_WINDOW`: a connection error with its cause,
+    /// or a server's error body, was cut at the right edge and gone six seconds later with nothing
+    /// to scroll back to. A short one stays where it was, so the conversation is not filled with
+    /// notices the line already said whole.
     pub fn set_error(&mut self, message: impl Into<String>) {
-        self.status = Some((message.into(), Instant::now(), Severity::Error));
+        let message = message.into();
+        if message.contains('\n') || crate::markdown::display_width(&message) > ERROR_LINE {
+            self.timeline.say(message.clone());
+        }
+        self.status = Some((message, Instant::now(), Severity::Error));
     }
 
     /// Take the notice down now rather than waiting for it to fade. Used when leaving a
@@ -10402,6 +10416,25 @@ mod tests {
         assert!(s.status().is_some());
         apply(&mut s, &Action::Frame(Frame::History { entries: vec![] }));
         assert_eq!(s.status(), None, "{:?}", s.status());
+    }
+
+    /// **A long error outlives the activity line.** The line is one row that fades in six
+    /// seconds, so the cause of a failure was cut at the edge and then gone; a long one is said in
+    /// the conversation too, and a short one is left to the line alone.
+    #[test]
+    fn a_long_error_is_also_said_in_the_conversation() {
+        let mut s = state();
+        s.set_error("보내지 못했습니다");
+        assert!(s.timeline.items().is_empty(), "{:?}", s.timeline.items());
+        let long = format!("connection lost: {}", "tls handshake failed; ".repeat(4));
+        s.set_error(long.clone());
+        let said = s
+            .timeline
+            .items()
+            .iter()
+            .any(|i| matches!(i, crate::timeline::Item::System { text, .. } if *text == long));
+        assert!(said, "{:?}", s.timeline.items());
+        assert_eq!(s.status(), Some(long.as_str()));
     }
 
     /// One manager row, so these tests say what the keys do rather than repeating the shape.

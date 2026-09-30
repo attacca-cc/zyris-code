@@ -51,8 +51,15 @@ pub fn draw(frame: &mut Frame, area: Rect, panel: &mut Panel, lang: crate::lang:
         .chain(std::iter::once(display_width(&keys)))
         .max()
         .unwrap_or(0);
-    let w = (widest as u16 + 4).min(area.width.saturating_sub(4)).max(20);
+    // Never wider than the screen: a floor above it drew the box past a narrow terminal's edge.
+    let w = (widest as u16 + 4).min(area.width.saturating_sub(4)).max(20.min(area.width));
     let inner_w = w.saturating_sub(2) as usize;
+    // **The key hint wraps like everything else in the box.** It was one line cut at the border,
+    // and on a narrow terminal the half that said what `d` and `u` do was the half that went.
+    let hint = wrap::line(
+        Line::from(Span::styled(keys, Style::default().fg(theme::text_muted()))),
+        inner_w,
+    );
     // The rows the foot keeps, whichever sentence is up. **A box that resizes under the keys is
     // what all of this exists to prevent** — that is why `foot` holds every sentence, not one.
     let foot_rows =
@@ -70,7 +77,8 @@ pub fn draw(frame: &mut Frame, area: Rect, panel: &mut Panel, lang: crate::lang:
     }
     // The box grows with the content, never taller than four fifths of the screen.
     // A button adds its own row between the body and the hint.
-    let want_h = (body.len() as u16).saturating_add(3 + u16::from(has_button)).max(5);
+    let fixed = hint.len() as u16 + u16::from(has_button);
+    let want_h = (body.len() as u16).saturating_add(2 + fixed).max(5);
     let h = want_h.min(area.height.saturating_mul(4) / 5).max(3);
     let box_area = Rect {
         x: area.x + (area.width.saturating_sub(w)) / 2,
@@ -95,10 +103,19 @@ pub fn draw(frame: &mut Frame, area: Rect, panel: &mut Panel, lang: crate::lang:
     frame.render_widget(block, box_area);
 
     let width = inner.width as usize;
-    // The last row is the hint line; the button (when present) sits above it;
-    // everything above that is body.
-    let fixed = 1 + u16::from(has_button);
+    // The last rows are the hint; the button (when present) sits above it; everything above that
+    // is body.
     let body_rows = inner.height.saturating_sub(fixed) as usize;
+
+    // **The cursor stays in view.** A list with a cursor (`❯ `) — a manager, `/mode`, a form — is
+    // moved with the arrows, which never scroll, and the box is capped at four fifths of the
+    // screen: on a short terminal the cursor walked off the bottom and Enter acted on a row
+    // nobody could see.
+    let has_cursor = panel.manager.is_some() || panel.mode_pick.is_some() || panel.form.is_some();
+    let at = body.iter().position(|l| l.spans.first().is_some_and(|s| s.content == "❯ "));
+    if let (true, Some(at)) = (has_cursor, at) {
+        panel.scroll = scroll_to_show(panel.scroll, at, body_rows);
+    }
 
     // Clamp the scroll to what actually fits, then draw that window. **The count is of drawn
     // lines** — one of the panel's own lines may have wrapped into several — so it comes from
@@ -117,9 +134,21 @@ pub fn draw(frame: &mut Frame, area: Rect, panel: &mut Panel, lang: crate::lang:
     if let Some(button) = panel.button {
         lines.push(button_line(button, panel.button_focused, lang, width));
     }
-    lines.push(Line::from(Span::styled(keys, Style::default().fg(theme::text_muted()))));
+    lines.extend(hint);
 
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The scroll that keeps line `at` inside a window of `rows` lines, moving `scroll` as little as it
+/// can.
+fn scroll_to_show(scroll: usize, at: usize, rows: usize) -> usize {
+    if at < scroll {
+        at
+    } else if rows > 0 && at >= scroll + rows {
+        at + 1 - rows
+    } else {
+        scroll
+    }
 }
 
 /// The button row — `[ 로그아웃 ]` when resting, marked `▶ … ◀` and accented
@@ -226,6 +255,27 @@ mod tests {
         panel.scroll = 1000;
         let screen = render(&mut panel, 80, 24).join("\n");
         assert!(screen.contains("row 79"), "scrolling past the end lost the last row:\n{screen}");
+    }
+
+    /// **The cursor stays on screen on a short terminal.** The arrows move it without scrolling,
+    /// so it used to walk off the bottom of a capped box and Enter acted on a row out of sight.
+    #[test]
+    fn the_cursor_row_stays_in_view_on_a_short_terminal() {
+        let last = *crate::mode::Mode::ALL.last().expect("modes");
+        let mut panel =
+            crate::panel::mode(crate::lang::Lang::Ko, crate::mode::Mode::Normal, Some(last));
+        let screen = render(&mut panel, 60, 9);
+        assert!(screen.iter().any(|r| r.contains('❯')), "the cursor is off screen:\n{screen:#?}");
+    }
+
+    /// **The key hint wraps rather than being cut at the border.**
+    #[test]
+    fn the_key_hint_wraps_on_a_narrow_terminal() {
+        let mut panel = crate::panel::mode(crate::lang::Lang::En, crate::mode::Mode::Normal, None);
+        let keys = crate::lang::Lang::Ko.mode_pick_keys();
+        let screen = render(&mut panel, 30, 40).join(" ");
+        let last = keys.split_whitespace().last().expect("a hint");
+        assert!(screen.contains(last), "{last:?} was cut from the hint:\n{screen}");
     }
 
     /// The box the widget drew: its top and bottom row, and its left and right column.

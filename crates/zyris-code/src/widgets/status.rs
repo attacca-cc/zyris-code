@@ -34,11 +34,27 @@ pub fn left_spans(state: &State) -> Vec<Span<'static>> {
     let mut left = vec![
         Span::styled(state.mode.label(state.lang), Style::default().fg(state.mode.color())),
         Span::styled("∙", Style::default().fg(theme::border_light())),
+        // An agent's name is an identifier too, and an unbounded one pushed what follows it off
+        // the line.
         Span::styled(
-            if state.agent.is_empty() { "-" } else { state.agent.as_str() }.to_string(),
+            crate::markdown::truncate_to(
+                if state.agent.is_empty() { "-" } else { state.agent.as_str() },
+                PROJECT_WIDTH,
+            ),
             Style::default().fg(theme::text_muted()),
         ),
     ];
+
+    // **If there's unsent text, it must be said.** If it isn't announced, the user believes it was
+    // sent. **Before the project**, because on a narrow terminal the end of this line is what is
+    // cut, and this was the last thing on it.
+    if !state.queued.is_empty() {
+        left.push(Span::styled(" ∙ ", Style::default().fg(theme::border_light())));
+        left.push(Span::styled(
+            state.lang.queued(state.queued.len()),
+            Style::default().fg(theme::warning()),
+        ));
+    }
 
     // **Which project the next job or work lands in.** It is decided here and nowhere on
     // screen said, so a work opened after wandering through the list went somewhere the person
@@ -48,15 +64,6 @@ pub fn left_spans(state: &State) -> Vec<Span<'static>> {
         left.push(Span::styled(
             crate::markdown::truncate_to(name, PROJECT_WIDTH),
             Style::default().fg(theme::text_muted()),
-        ));
-    }
-
-    // **If there's unsent text, it must be said.** If it isn't announced, the user believes it was sent.
-    if !state.queued.is_empty() {
-        left.push(Span::styled(" ∙ ", Style::default().fg(theme::border_light())));
-        left.push(Span::styled(
-            state.lang.queued(state.queued.len()),
-            Style::default().fg(theme::warning()),
         ));
     }
     left
