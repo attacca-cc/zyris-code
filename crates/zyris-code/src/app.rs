@@ -1318,7 +1318,10 @@ impl State {
 pub enum GithubNews {
     /// A code to approve, and where. **Shown the moment it arrives** — it is the only thing the
     /// person can act on, and it is worthless after it expires.
-    Code { code: String, uri: String },
+    ///
+    /// **Which account it is for travels with it**, because the reviewer's code comes with a
+    /// warning the person's does not: approve it in a logged-out window.
+    Code { code: String, uri: String, role: crate::github::auth::Role },
     /// It finished, one way or the other. The screen says so and re-reads who is connected.
     Settled { note: String, worked: bool },
     /// Where a long set-up has got to. **Not `Settled`** — the screen must stay busy, because the
@@ -1679,39 +1682,48 @@ pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
                 _ => vec![],
             };
         }
-        return match key.code {
-            KeyCode::Up => vec![Action::PickUp],
-            KeyCode::Down => vec![Action::PickDown],
-            KeyCode::Char('k') if !typing => vec![Action::PickUp],
-            KeyCode::Char('j') if !typing => vec![Action::PickDown],
-            // **Del asks; it does not delete.** In the lists that are typed into it stays a plain
-            // editing key, so the draft keeps it.
-            KeyCode::Delete if !typing => vec![Action::PickDelete],
-            // **A fully typed command must run on the first Enter.** If Enter only ever
-            // meant "pick" because the list is up, typing `/rules` to the end and pressing
-            // it would just rewrite the same text into the input and do nothing — this
-            // actually happened.
-            KeyCode::Enter if typing && typed_a_whole_command(state) => {
-                vec![Action::Submit(state.input.text.trim().to_string())]
+        // **A list that is typed into keeps only the list's keys.** ↑↓ walk it, Enter takes a row,
+        // Esc puts it away and Tab opens the note; every other key is the draft's, exactly as
+        // with no list up — it used to be that only characters, Backspace and ←→ got through, so
+        // Delete, Home, End and the Ctrl editing keys did nothing on a line that began with `/` or
+        // held an open `@`.
+        if typing {
+            let plain_enter = key.code == KeyCode::Enter && !alt && !shift;
+            match key.code {
+                KeyCode::Up => return vec![Action::PickUp],
+                KeyCode::Down => return vec![Action::PickDown],
+                // **A fully typed command must run on the first Enter.** If Enter only ever
+                // meant "pick" because the list is up, typing `/rules` to the end and pressing
+                // it would just rewrite the same text into the input and do nothing — this
+                // actually happened.
+                KeyCode::Enter if plain_enter && typed_a_whole_command(state) => {
+                    return vec![Action::Submit(state.input.text.trim().to_string())];
+                }
+                KeyCode::Enter if plain_enter => return vec![Action::PickConfirm],
+                KeyCode::Esc => return vec![Action::PickBack],
+                // **`Tab` opens the note under the list** — see the arm below.
+                KeyCode::Tab => return vec![Action::PickExpand],
+                _ => {}
             }
-            KeyCode::Enter => vec![Action::PickConfirm],
-            KeyCode::Char(c) if typing && !ctrl => vec![Action::Insert(c)],
-            KeyCode::Backspace if typing => vec![Action::Backspace],
-            // ← is back. At the project level there is nothing behind, so it closes.
-            // In the command list ← moves the cursor, so only Esc closes.
-            KeyCode::Left if !typing => vec![Action::PickBack],
-            KeyCode::Esc => vec![Action::PickBack],
-            KeyCode::Left if typing => vec![Action::Left],
-            KeyCode::Right if typing => vec![Action::Right],
-            // **`Tab` opens the note under the list.** It is held to one line, so an ordinary list
-            // does not pay — on every row — for the longest description it happens to carry; the
-            // key shows that description whole (`Action::PickExpand`). **Nothing else claims `Tab`
-            // while a list is up**: the forms and the question card are handled above this and
-            // never reach here.
-            KeyCode::Tab => vec![Action::PickExpand],
-            // → does nothing. Enter is the only way to confirm.
-            _ => vec![],
-        };
+        } else {
+            return match key.code {
+                KeyCode::Up | KeyCode::Char('k') => vec![Action::PickUp],
+                KeyCode::Down | KeyCode::Char('j') => vec![Action::PickDown],
+                // **Del asks; it does not delete.**
+                KeyCode::Delete => vec![Action::PickDelete],
+                KeyCode::Enter => vec![Action::PickConfirm],
+                // ← is back. At the project level there is nothing behind, so it closes.
+                KeyCode::Left | KeyCode::Esc => vec![Action::PickBack],
+                // **`Tab` opens the note under the list.** It is held to one line, so an ordinary
+                // list does not pay — on every row — for the longest description it happens to
+                // carry; the key shows that description whole (`Action::PickExpand`). **Nothing
+                // else claims `Tab` while a list is up**: the forms and the question card are
+                // handled above this and never reach here.
+                KeyCode::Tab => vec![Action::PickExpand],
+                // → does nothing. Enter is the only way to confirm.
+                _ => vec![],
+            };
+        }
     }
 
     match key.code {
@@ -1917,6 +1929,8 @@ fn enter_becomes_newline(state: &State, key: &KeyEvent, in_burst: bool) -> bool 
     }
     state.enroll.is_none()
         && state.new_project.is_none()
+        && state.github_form.is_none()
+        && state.panel.is_none()
         && state.picker.is_none()
         && !state.input.text.is_empty()
 }
@@ -1991,9 +2005,18 @@ pub fn apply(state: &mut State, action: &Action) {
         state.selection = None;
     }
 
+    // **A form applies only what was routed to it.** `on_key` gives the enrolment window and the
+    // question card the keys before any form, and every form branch below ends in `return` — so
+    // without this the card's keys and the window's Esc were swallowed by a form nobody was typing
+    // into, and a question arriving over one wedged the screen. Ctrl+C is let through everywhere
+    // (`on_key`), so its arming is too; a frame is the server's news, never a keystroke.
+    let forms_have_it = state.enroll.is_none()
+        && state.asking.is_none()
+        && !matches!(action, Action::Frame(_) | Action::ArmQuit | Action::Quit);
+
     // **With the GitHub screen open, keys belong to it.** Only the reviewer row takes text — the
     // person's row is a button, so a keystroke there is not swallowed into an invisible field.
-    if let Some(form) = state.github_form.as_mut().filter(|_| !matches!(action, Action::Frame(_))) {
+    if let Some(form) = state.github_form.as_mut().filter(|_| forms_have_it) {
         match action {
             Action::Insert(c) => {
                 if let Some(field) = form.typing() {
@@ -2075,7 +2098,7 @@ pub fn apply(state: &mut State, action: &Action) {
     // below: a form is a place for keys, not for the server's news, and swallowing frames while one
     // is open would lose timeline events.
     if state.panel.as_ref().is_some_and(|p| p.manager.as_ref().is_some_and(|m| m.form.is_some()))
-        && !matches!(action, Action::Frame(_))
+        && forms_have_it
     {
         let mut handled = true;
         match action {
@@ -2147,7 +2170,7 @@ pub fn apply(state: &mut State, action: &Action) {
         }
     }
 
-    if state.new_project.is_some() && !matches!(action, Action::Frame(_)) {
+    if state.new_project.is_some() && forms_have_it {
         match action {
             Action::Insert(c) => {
                 state.new_project.as_mut().expect("just checked it").active().insert(*c)
@@ -2184,6 +2207,27 @@ pub fn apply(state: &mut State, action: &Action) {
     match action {
         Action::Insert(c) => state.editor().insert(*c),
         Action::Paste(text) => {
+            // **A paste goes where a key would have gone.** It does not pass through `on_key`, so
+            // it used to land in the draft whatever was up — behind a history search it was meant
+            // for, invisible, and sent with the next Enter.
+            let typing_answer = state.asking.as_ref().is_some_and(|(_, a)| a.typing);
+            let level = state.picker.as_ref().map(|p| &p.level);
+            if let Some(crate::picker::Level::History { query }) = level {
+                let query = format!("{query}{}", text.replace('\n', " "));
+                state.picker = Some(crate::picker::Picker::history(&state.sent, &query));
+                return;
+            }
+            let list_of_its_own = level.is_some_and(|l| {
+                !matches!(l, crate::picker::Level::Commands | crate::picker::Level::Files { .. })
+            });
+            if !typing_answer
+                && (state.enroll.is_some()
+                    || state.asking.is_some()
+                    || state.panel.is_some()
+                    || list_of_its_own)
+            {
+                return;
+            }
             // Newlines inside go in verbatim. The slash command list does not open — a
             // paste must not change the mode. The matches! above releases the recall.
             state.editor().insert_str(text);
@@ -2288,6 +2332,11 @@ pub fn apply(state: &mut State, action: &Action) {
                 } else {
                     p.scroll_down((-(*notches)) as usize);
                 }
+                return;
+            }
+            // **Nor under anything else laid over it.** The conversation moving behind a list or
+            // a window is a place lost for nothing anyone could see.
+            if covered(state) {
                 return;
             }
             let (total, height) = (state.view_total, state.view_height);
@@ -2418,7 +2467,11 @@ pub fn apply(state: &mut State, action: &Action) {
             let Some(drag) = state.drag else { return };
             // **Not every press is allowed to become a click.** The one that came with the click
             // that focused this window is a drag and nothing else (see `Action::ActivatingPress`).
-            if drag.is_click() && !state.press_cannot_click {
+            // **A click on something laid over the conversation is not a click on it.** The rows
+            // and the activity line underneath are hidden, and folding one of them is a change
+            // nobody could see being made. The drag itself still stands: everything on screen,
+            // the enrolment code included, is there to be copied.
+            if drag.is_click() && !state.press_cannot_click && !covered(state) {
                 // **A click on the activity line opens or folds the todo list.** Only when there
                 // is one to show — on every other line that row is ordinary text, and taking the
                 // click would cost the ability to select it.
@@ -3086,6 +3139,17 @@ fn apply_frame(state: &mut State, frame: &Frame) {
         }
         Frame::Files(paths) => {
             state.files = paths.clone();
+            // **A walk that found nothing closes the box it was loading into.** Empty is also how
+            // "not walked yet" reads, so passing it on put "loading" straight back up, for ever.
+            if paths.is_empty() {
+                if matches!(
+                    state.picker.as_ref().map(|p| &p.level),
+                    Some(crate::picker::Level::Files { .. })
+                ) {
+                    state.picker = None;
+                }
+                return;
+            }
             // **Only fill in the list if it is still the one waiting.** The walk takes as long as
             // it takes, and by the time it lands the person may have dismissed it with `Esc` —
             // which leaves the `@…` sitting in the draft, so the reference alone cannot say
@@ -3163,9 +3227,19 @@ fn apply_frame(state: &mut State, frame: &Frame) {
         // that is where it is read from if the window is gone.
         Frame::Github(news) => {
             match news {
-                GithubNews::Code { code, uri } => {
-                    if let Some(form) = state.github_form.as_mut() {
-                        form.pending = Some((code.clone(), uri.clone()));
+                GithubNews::Code { code, uri, role } => {
+                    let shown = match state.github_form.as_mut() {
+                        Some(form) => {
+                            form.pending = Some((code.clone(), uri.clone()));
+                            true
+                        }
+                        None => false,
+                    };
+                    // **The transcript holds it where the screen cannot**: the screen was closed
+                    // while the sign-in went on, or the code is the reviewer's, whose warning
+                    // (approve it in a logged-out window) the screen has no room for.
+                    if !shown || *role == crate::github::auth::Role::Reviewer {
+                        state.timeline.say(state.lang.github_code(code, uri, *role));
                     }
                 }
                 // **A step keeps the screen busy.** Making a key can take seconds; saying nothing
@@ -3336,6 +3410,16 @@ fn apply_frame(state: &mut State, frame: &Frame) {
     }
 }
 
+/// Whether something is laid over the conversation — a list, a form, a panel or the enrolment
+/// window — so the wheel and a click must not reach the rows hidden under it.
+fn covered(state: &State) -> bool {
+    state.picker.is_some()
+        || state.panel.is_some()
+        || state.new_project.is_some()
+        || state.github_form.is_some()
+        || state.enroll.is_some()
+}
+
 /// Is what was typed already a whole command name? If so there is no reason to pick from
 /// the list again.
 fn typed_a_whole_command(state: &State) -> bool {
@@ -3403,7 +3487,10 @@ fn follow_the_at(state: &mut State) {
         state.picker = Some(crate::picker::Picker::loading_files(at));
         return;
     }
-    state.picker = Some(crate::picker::Picker::files(&state.files, &query, at));
+    // **No match, no list.** An empty box took Enter and did nothing with it, so `ping @bob`
+    // could not be sent without Esc first — the command list already closes the same way.
+    let list = crate::picker::Picker::files(&state.files, &query, at);
+    state.picker = (!list.rows.is_empty()).then_some(list);
 }
 
 /// Puts a chosen path where the `@…` was.
@@ -6397,7 +6484,7 @@ async fn finish_command(
         // happened and say so, which is the only honest way round — a node cannot open a browser
         // on somebody's behalf and should not try.
         Command::Github(action) => {
-            let said = run_github(state, action.clone()).await;
+            let said = run_github(state, action.clone(), tx);
             if !said.is_empty() {
                 state.timeline.say(said);
             }
@@ -6420,9 +6507,14 @@ async fn finish_command(
     }
 }
 
-/// `/github`. **The wait is the whole of it** — the person has to approve a code in a browser, so
-/// this polls until they have, and says what is happening while it does.
-async fn run_github(state: &mut State, action: Option<crate::command::AccountAction>) -> String {
+/// `/github`. Opens the screen, signs out, or starts a sign-in — **never waits on one.** The
+/// person has to approve a code in a browser, which takes minutes, and that wait belongs to a
+/// task off the loop (`spawn_github_login`) reporting back through `Frame::Github`.
+fn run_github(
+    state: &mut State,
+    action: Option<crate::command::AccountAction>,
+    tx: &mpsc::UnboundedSender<AppMsg>,
+) -> String {
     use crate::github::auth;
 
     match action {
@@ -6446,48 +6538,20 @@ async fn run_github(state: &mut State, action: Option<crate::command::AccountAct
                 state.lang.github_nothing_to_log_out().to_string()
             }
         }
+        // **The same screen and the same background sign-in the screen's own row uses.** This
+        // form of the command used to run device flow right here, awaited on the loop: nothing
+        // was drawn — not even the code it had just written — no key was read, and the watchdog
+        // ended the app a minute later.
         Some(crate::command::AccountAction::Login(role)) => {
-            let pending = match auth::begin().await {
-                Ok(p) => p,
-                Err(why) => return state.lang.github_login_failed(&why.to_string()),
-            };
-            // **The code goes on screen before the wait starts.** It is the only thing the person
-            // can act on, and printing it after the polling loop would be printing it too late.
-            state.timeline.say(state.lang.github_code(
-                &pending.user_code,
-                &pending.verification_uri,
-                role,
-            ));
-            let deadline =
-                std::time::Instant::now() + std::time::Duration::from_secs(pending.expires_in);
-            let mut wait = std::time::Duration::from_secs(pending.interval);
-            loop {
-                if std::time::Instant::now() >= deadline {
-                    return state.lang.github_login_failed("the code expired");
-                }
-                tokio::time::sleep(wait).await;
-                match auth::poll(&pending).await {
-                    auth::Poll::Waiting { interval } => {
-                        wait = std::time::Duration::from_secs(interval)
-                    }
-                    auth::Poll::Failed(why) => return state.lang.github_login_failed(&why),
-                    auth::Poll::Done(token) => {
-                        // **The login is asked for straight away** so `/github` can name the
-                        // account without a round trip, and a token that does not work is caught
-                        // here rather than at the first tool call.
-                        let login = match crate::github::api::Github::new(token.clone()) {
-                            Ok(client) => client.me().await.unwrap_or_default(),
-                            Err(_) => String::new(),
-                        };
-                        let mut accounts = auth::Accounts::load();
-                        accounts.set(role, Some(auth::Account { token, login: login.clone() }));
-                        if let Err(e) = accounts.save() {
-                            return state.lang.github_login_failed(&e.to_string());
-                        }
-                        return state.lang.github_logged_in(&login, role);
-                    }
-                }
-            }
+            let accounts = auth::Accounts::load();
+            let mut form = crate::githubform::Form::new(
+                accounts.exactly(auth::Role::User).map(|a| a.login.clone()),
+                accounts.exactly(auth::Role::Reviewer).map(|a| a.login.clone()),
+            );
+            form.busy = true;
+            state.github_form = Some(form);
+            spawn_github_login(role, state.lang, tx);
+            String::new()
         }
     }
 }
@@ -6649,6 +6713,7 @@ async fn ask_for_the_gpg_scope(
     say(GithubNews::Code {
         code: pending.user_code.clone(),
         uri: pending.verification_uri.clone(),
+        role: auth::Role::User,
     });
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(pending.expires_in);
     let mut wait = std::time::Duration::from_secs(pending.interval);
@@ -6707,6 +6772,7 @@ fn spawn_github_login(
         say(GithubNews::Code {
             code: pending.user_code.clone(),
             uri: pending.verification_uri.clone(),
+            role,
         });
         let deadline =
             std::time::Instant::now() + std::time::Duration::from_secs(pending.expires_in);
@@ -11766,5 +11832,208 @@ mod interaction {
         );
         assert!(!s.plan_decided, "a newer plan still waiting must keep the fence up");
         assert_eq!(s.plan.as_ref().map(|p| p.seq), Some(9));
+    }
+
+    /// **`/github login` returns at once, with the screen up and busy.** It used to run device
+    /// flow awaited on the loop — nothing drawn, no key read, and the watchdog ended the app a
+    /// minute in (C3). A current-thread runtime never polls the spawned sign-in here, because the
+    /// test never yields: what is checked is that the command itself does not wait.
+    #[tokio::test(flavor = "current_thread")]
+    async fn github_login_opens_the_screen_instead_of_waiting() {
+        use crate::command::AccountAction;
+        use crate::github::auth::Role;
+        let mut s = state();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let said = run_github(&mut s, Some(AccountAction::Login(Role::User)), &tx);
+        assert!(said.is_empty(), "{said}");
+        assert!(s.github_form.as_ref().is_some_and(|f| f.busy), "the sign-in has no screen");
+    }
+
+    /// **A code with nowhere to go goes into the conversation**, the way the screen's comment
+    /// always said it did — the screen can be closed while the sign-in carries on.
+    #[test]
+    fn a_github_code_with_the_screen_closed_is_still_said() {
+        let mut s = state();
+        apply(
+            &mut s,
+            &Action::Frame(Frame::Github(GithubNews::Code {
+                code: "WXQR-7KBD".into(),
+                uri: "https://github.com/login/device".into(),
+                role: crate::github::auth::Role::User,
+            })),
+        );
+        let said = s.timeline.items().iter().any(|item| {
+            matches!(item, crate::timeline::Item::System { text, .. } if text.contains("WXQR-7KBD"))
+        });
+        assert!(said, "the code was dropped");
+    }
+
+    fn press(s: &mut State, code: KeyCode, mods: KeyModifiers) {
+        for action in on_key(s, key(code, mods)) {
+            apply(s, &action);
+        }
+    }
+
+    /// Every form that can be up when a question lands, alone.
+    fn with_each_form() -> Vec<(&'static str, State)> {
+        let mut github = state();
+        github.github_form = Some(crate::githubform::Form::default());
+        let mut project = state();
+        project.new_project = Some(crate::newproject::Form::new());
+        vec![("github", github), ("new project", project)]
+    }
+
+    /// **A question over a form answers to its keys.** `on_key` routed Esc, Enter and the arrows to
+    /// the card, and the form branches of `apply` swallowed every one of them — the screen was
+    /// wedged until the process was killed (C4).
+    #[test]
+    fn a_question_over_a_form_takes_its_keys() {
+        for (name, mut s) in with_each_form() {
+            apply(&mut s, &question_frame(3));
+            press(&mut s, KeyCode::Down, KeyModifiers::NONE);
+            assert_eq!(s.asking.as_ref().map(|(_, a)| a.cursor), Some(1), "{name}: ↓ was lost");
+            press(&mut s, KeyCode::Enter, KeyModifiers::NONE);
+            assert!(s.asking.as_ref().is_some_and(|(_, a)| a.is_chosen(1)), "{name}: Enter lost");
+            press(&mut s, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(s.asking.is_none(), "{name}: Esc did not put the card away");
+            // With the card gone, the form has the keys again.
+            press(&mut s, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(s.github_form.is_none() && s.new_project.is_none(), "{name}: form stuck");
+        }
+    }
+
+    /// **Ctrl+C arms the quit from every surface.** Its arming was swallowed by the forms, so the
+    /// second press could never quit (C4).
+    #[test]
+    fn ctrl_c_arms_the_quit_from_every_form() {
+        for (name, mut s) in with_each_form() {
+            press(&mut s, KeyCode::Char('c'), KeyModifiers::CONTROL);
+            assert!(s.quit_pending(), "{name}: the first Ctrl+C was swallowed");
+            assert_eq!(
+                on_key(&s, key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+                vec![Action::Quit],
+                "{name}"
+            );
+        }
+    }
+
+    /// **The enrolment window over a form closes on Esc.** The form swallowed its close too.
+    #[test]
+    fn the_enrolment_window_over_a_form_closes() {
+        for (name, mut s) in with_each_form() {
+            s.enroll = Some(EnrollView {
+                code: "ABCD".into(),
+                uri: "https://example.com".into(),
+                expires_at: Instant::now() + Duration::from_secs(60),
+                phase: EnrollPhase::Waiting,
+            });
+            press(&mut s, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(s.enroll.is_none(), "{name}: the window stayed");
+            assert!(s.github_form.is_some() || s.new_project.is_some(), "{name}: form went too");
+        }
+    }
+
+    /// **A paste goes where a key would have.** It landed in the draft behind a history search,
+    /// out of sight, and went out with the next Enter (C8).
+    #[test]
+    fn a_paste_into_the_history_search_searches() {
+        let mut s = state();
+        s.sent = vec!["빌드 고쳐".into(), "테스트 돌려".into()];
+        apply(&mut s, &Action::OpenHistory);
+        apply(&mut s, &Action::Paste("테스트".into()));
+        assert_eq!(s.input.text, "", "the paste went into the hidden draft");
+        assert!(matches!(
+            s.picker.as_ref().map(|p| &p.level),
+            Some(crate::picker::Level::History { query }) if query == "테스트"
+        ));
+    }
+
+    /// Nothing under a panel, a card or a list of its own takes a paste.
+    #[test]
+    fn a_paste_over_a_panel_or_a_card_goes_nowhere() {
+        let mut s = state();
+        s.panel = Some(crate::panel::mode(s.lang, s.mode, None));
+        apply(&mut s, &Action::Paste("x".into()));
+        assert_eq!(s.input.text, "");
+
+        let mut s = state();
+        apply(&mut s, &question_frame(3));
+        apply(&mut s, &Action::Paste("x".into()));
+        assert_eq!(s.input.text, "", "the card is not being typed into");
+    }
+
+    /// **The wheel and a click do not reach the conversation under a list.** Both moved or folded
+    /// rows nobody could see (C8).
+    #[test]
+    fn the_wheel_and_a_click_stay_off_a_covered_conversation() {
+        let mut s = state();
+        s.view_total = 100;
+        s.view_height = 10;
+        s.scroll.on_content(100, 10);
+        s.view_cards.insert(2, 7);
+        s.picker = Some(crate::picker::Picker::loading_projects());
+        let before = (s.scroll.top, s.scroll.stick);
+        apply(&mut s, &Action::Wheel(3));
+        assert_eq!((s.scroll.top, s.scroll.stick), before, "the hidden conversation scrolled");
+
+        apply(&mut s, &Action::Press(4, 2));
+        apply(&mut s, &Action::Release);
+        assert!(!s.folds.contains_key(&7), "a card under the list was folded");
+    }
+
+    /// **A burst Enter on the GitHub screen or a panel is still their Enter**, not a newline in
+    /// the draft behind them (C8).
+    #[test]
+    fn a_burst_enter_is_not_a_newline_behind_a_form_or_panel() {
+        let enter = key(KeyCode::Enter, KeyModifiers::NONE);
+        let mut s = state();
+        s.input.insert_str("draft");
+        s.github_form = Some(crate::githubform::Form::default());
+        assert!(!enter_becomes_newline(&s, &enter, true));
+        s.github_form = None;
+        s.panel = Some(crate::panel::mode(s.lang, s.mode, None));
+        assert!(!enter_becomes_newline(&s, &enter, true));
+    }
+
+    /// **Editing keys work with the command list up.** Only characters, Backspace and ←→ got
+    /// through; Delete, Home and the Ctrl keys were dead on a line starting with `/` (C23).
+    #[test]
+    fn the_command_list_leaves_the_editing_keys_to_the_draft() {
+        let mut s = state();
+        type_in(&mut s, "/rules");
+        assert!(s.picker.is_some());
+        press(&mut s, KeyCode::Home, KeyModifiers::NONE);
+        assert_eq!(s.input.cursor, 0);
+        press(&mut s, KeyCode::Delete, KeyModifiers::NONE);
+        assert_eq!(s.input.text, "rules");
+        press(&mut s, KeyCode::Char('/'), KeyModifiers::NONE);
+        press(&mut s, KeyCode::Char('e'), KeyModifiers::CONTROL);
+        assert_eq!(s.input.cursor, s.input.len_chars());
+        press(&mut s, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        assert_eq!(s.input.text, "");
+    }
+
+    /// **An `@` that matches nothing is not a list.** The empty box ate Enter, so `ping @bob`
+    /// could not be sent (C23).
+    #[test]
+    fn a_file_reference_matching_nothing_closes_the_list() {
+        let mut s = state();
+        s.files = vec!["src/app.rs".into()];
+        type_in(&mut s, "ping @bob");
+        assert!(s.picker.is_none(), "an empty file list is up");
+        assert_eq!(
+            on_key(&s, key(KeyCode::Enter, KeyModifiers::NONE)),
+            vec![Action::Submit("ping @bob".into())]
+        );
+    }
+
+    /// **A walk that found nothing does not leave "loading" up for ever** (C23).
+    #[test]
+    fn an_empty_walk_closes_the_loading_list() {
+        let mut s = state();
+        type_in(&mut s, "@");
+        assert!(s.picker.as_ref().is_some_and(|p| p.loading));
+        apply(&mut s, &Action::Frame(Frame::Files(vec![])));
+        assert!(s.picker.is_none());
     }
 }

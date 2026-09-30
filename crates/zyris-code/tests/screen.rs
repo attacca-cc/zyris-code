@@ -749,6 +749,7 @@ fn the_device_code_reaches_the_github_screen_as_a_frame() {
         &Action::Frame(AppFrame::Github(GithubNews::Code {
             code: "WXQR-7KBD".into(),
             uri: "https://github.com/login/device".into(),
+            role: zyris_code::github::auth::Role::User,
         })),
     );
     let screen = dump(&mut s, 80, 24);
@@ -2800,4 +2801,15 @@ fn a_screen_with_no_room_is_drawn_without_panicking() {
         // The point is that it returns at all; what it drew in nought cells is not a question.
         let _ = dump(&mut state, w, h);
     }
+}
+
+/// **What has the keys is what is on top.** A panel was drawn last, over the enrolment window —
+/// which has the keys first — so Esc dismissed a code nobody had seen (C7).
+#[test]
+fn the_enroll_window_is_drawn_over_an_open_panel() {
+    let mut s = State::new();
+    s.panel = Some(zyris_code::panel::mode(s.lang, s.mode, None));
+    apply(&mut s, &Action::Frame(AppFrame::Enroll(enroll_view())));
+    let screen = dump(&mut s, 80, 30);
+    assert!(screen.contains("WXQR-7KBD"), "the code is under the panel:\n{screen}");
 }
