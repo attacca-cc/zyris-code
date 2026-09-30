@@ -634,10 +634,22 @@ impl Lang {
             Lang::En => format!("Previous error: {why}"),
         }
     }
-    pub fn log_location(self, path: &str) -> String {
+    /// Where the log is, **and how to read only this run's lines of it.** Several windows share
+    /// one log, and this line is what gets pasted to an agent; read whole, the file hands it every
+    /// other window's history too.
+    pub fn log_location(self, path: &str, pid: u32) -> String {
+        let only_this_run = if cfg!(windows) {
+            format!("Select-String -SimpleMatch '[{pid}] ' '{path}' | Select-Object -Last 50")
+        } else {
+            format!("grep -F '[{pid}] ' '{path}' | tail -n 50")
+        };
         match self {
-            Lang::Ko => format!("자세한 것은 로그에 있습니다: {path}"),
-            Lang::En => format!("See the log for details: {path}"),
+            Lang::Ko => format!(
+                "자세한 것은 로그에 있습니다: {path}\n이 실행의 줄만 보려면: {only_this_run}"
+            ),
+            Lang::En => {
+                format!("See the log for details: {path}\nThis run's lines only: {only_this_run}")
+            }
         }
     }
     /// The screen never came up — the shell notice is all the person gets. `main` says this and
@@ -2992,7 +3004,7 @@ mod tests {
             en.connect_failed("x"),
             en.previous_error("x"),
             en.screen_failed("x"),
-            en.log_location("/tmp/zyris-code.log"),
+            en.log_location("/tmp/zyris-code.log", 4242),
             en.server_unreachable(5, "x"),
             en.cwd_text(std::path::Path::new("/home/ruma"), "laptop/zyris-code/ruma", "cred"),
             en.agent_staged("Main Agent"),

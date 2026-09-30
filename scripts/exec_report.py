@@ -18,6 +18,8 @@ head, the tail and a marker ever reach the context.
 Usage
 -----
     python3 scripts/exec_report.py                    # $ZYRIS_CODE_LOG, else the temp dir
+    python3 scripts/exec_report.py --pid 4242         # one window; default: the latest one
+    python3 scripts/exec_report.py --all              # every window in the log together
     python3 scripts/exec_report.py one.log two.log    # per log, then a combined total
     python3 scripts/exec_report.py --out report.md    # write it somewhere another tool can read
     python3 scripts/exec_report.py --json data.json
@@ -45,6 +47,29 @@ _STR = re.compile(r'\b(\w+)="((?:[^"\\]|\\.)*)"')
 _WORD = re.compile(r'\b(capability|tool|job)=([^\s"]+)')
 _CMD = re.compile(r"\bcommand=(.*)$")
 _TS = re.compile(r"^(\d{4}-\d{2}-\d{2}T\S+)")
+# Every line the app writes starts with the process that wrote it, since windows share one log.
+_PID = re.compile(r"^\[(\d+)\] ")
+
+
+def this_run(lines: list[str], pid: int | None, everything: bool) -> tuple[list[str], int | None]:
+    """The lines of one window, prefix taken off, and which window that was.
+
+    **Several windows append to one log**, so reading it whole would mix their sessions. The
+    default is the window that wrote last — the one just closed. Lines from a build that wrote
+    no prefix belong to no window and are kept only with `--all`.
+    """
+    if everything:
+        return [_PID.sub("", line) for line in lines], None
+    if pid is None:
+        for line in reversed(lines):
+            m = _PID.match(line)
+            if m:
+                pid = int(m.group(1))
+                break
+        if pid is None:
+            return lines, None  # a log from before the prefix: one run, as it used to be
+    prefix = f"[{pid}] "
+    return [line[len(prefix):] for line in lines if line.startswith(prefix)], pid
 
 # The app writes the cut line immediately before the result it belongs to, so a handful
 # of lines is the whole window it can be paired across.
@@ -100,13 +125,10 @@ def parse_result(line: str) -> dict:
     }
 
 
-def read_log(path: str) -> dict:
-    """Everything one app log says about exec.
-
-    The log is truncated when the app starts (`main.rs`), so one file is one run.
-    """
+def read_log(path: str, pid: int | None = None, everything: bool = False) -> dict:
+    """Everything one app log says about exec, for one window unless `everything`."""
     with open(path, "r", encoding="utf-8", errors="replace") as fh:
-        lines = fh.read().splitlines()
+        lines, pid = this_run(fh.read().splitlines(), pid, everything)
 
     results: list[dict] = []
     calls: dict = {}
@@ -146,7 +168,7 @@ def read_log(path: str) -> dict:
         (r["full"] if r.get("full") else r["stdout"] + r["stderr"]) for r in results
     )
     return {
-        "path": path,
+        "path": path if pid is None else f"{path} [{pid}]",
         "lines": len(lines),
         "first": first_ts,
         "last": last_ts,
@@ -303,6 +325,8 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--out", help="write the report here as well")
     ap.add_argument("--json", help="write the parsed numbers here")
     ap.add_argument("--top", type=int, default=10, help="how many of the largest answers")
+    ap.add_argument("--pid", type=int, help="the window to report on; default the latest")
+    ap.add_argument("--all", action="store_true", help="every window in the log together")
     args = ap.parse_args(argv)
 
     paths = args.logs or [default_log()]
@@ -311,7 +335,7 @@ def main(argv: list[str]) -> int:
         if not os.path.exists(path):
             missing.append(path)
             continue
-        logs.append(read_log(path))
+        logs.append(read_log(path, args.pid, args.all))
     for path in missing:
         print(f"no such log: {path}", file=sys.stderr)
     if not logs:
