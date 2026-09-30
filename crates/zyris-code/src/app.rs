@@ -2332,10 +2332,14 @@ pub fn apply(state: &mut State, action: &Action) {
             state.recall = None;
             // Once sent, the list has done its job. Left open it keeps covering the screen.
             state.picker = None;
+            // **`//` is the way to send a line that starts with a slash word** — `//tmp is full`
+            // goes out as `/tmp is full`. Without it such a message could not be sent at all.
+            let literal = crate::command::literal(text).map(str::to_string);
+            let text = literal.as_ref().unwrap_or(text);
             // **Slash commands never reach the server.** One typo must not spend credits,
             // and there is no reason to queue them just because a turn is running —
             // changing the mode or looking at a list is not something to wait a turn for.
-            if crate::command::is_command(text) {
+            if literal.is_none() && crate::command::is_command(text) {
                 state.remember_sent(text);
                 state.command_out = Some(text.clone());
                 return;
@@ -3774,18 +3778,27 @@ pub fn run_command(state: &mut State, text: &str) -> Option<crate::command::Comm
             // What it does is send its prompt. A command is a prompt (`plugin::PluginCommand`), so
             // running one is typing what the plugin author wrote and pressing Enter — reusing the
             // ordinary send path rather than inventing a second way for text to reach the server.
-            if let Some(found) = state.plugin_commands.iter().find(|c| c.name == *what) {
+            //
+            // **What follows the name goes with the prompt.** `/review 123` ran the prompt with the
+            // `123` dropped, and nothing said so.
+            let found = state.plugin_commands.iter().find(|c| c.name.eq_ignore_ascii_case(what));
+            if let Some(found) = found {
                 let prompt = found.prompt.clone();
                 if prompt.is_empty() {
                     state.timeline.say(state.lang.plugin_command_empty(what));
                     return Some(cmd);
                 }
-                state.post(prompt);
+                let args = text.trim().split_once(char::is_whitespace).map_or("", |(_, a)| a.trim());
+                state.post(if args.is_empty() { prompt } else { format!("{prompt}\n\n{args}") });
                 return Some(cmd);
             }
             state
                 .timeline
                 .say(state.lang.unknown_command(what, &crate::command::help_text(state.lang)));
+            // **A line that was not a command is not thrown away.** It may have been a sentence
+            // (`/tmp is full`) or a typo; either way the words come back to be fixed, or sent
+            // with `//` in front.
+            state.give_back(text);
         }
         // The ones that cannot be done here. The I/O side takes them.
         Command::Mcp(_)
@@ -12439,5 +12452,40 @@ mod interaction {
         }
         assert_eq!(s.asking.as_ref().map(|(_, a)| a.cursor), before);
         assert!(s.asking.as_ref().is_some_and(|(_, a)| !a.is_chosen(0) && !a.is_chosen(1)));
+    }
+
+    /// **A line that was not a command comes back to be fixed.** `/tmp is full` or a typo used to
+    /// vanish into "unknown command" with the draft gone (C22).
+    #[test]
+    fn a_line_that_is_no_command_comes_back() {
+        let mut s = state();
+        apply(&mut s, &Action::Submit("/tmp is full".into()));
+        let text = s.command_out.take().expect("taken as a command");
+        run_command(&mut s, &text);
+        assert_eq!(s.input.text, "/tmp is full");
+        assert!(s.outbox.is_none(), "an unknown word went to the agent");
+    }
+
+    /// **`//` sends it as written, one slash off** (C22).
+    #[test]
+    fn a_double_slash_line_is_sent() {
+        let mut s = state();
+        apply(&mut s, &Action::Submit("//tmp is full".into()));
+        assert!(s.command_out.is_none());
+        assert_eq!(s.outbox.as_deref(), Some("/tmp is full"));
+    }
+
+    /// **A plugin command's arguments ride along with its prompt** (C22).
+    #[test]
+    fn a_plugin_command_keeps_its_arguments() {
+        let mut s = state();
+        s.plugin_commands.push(crate::plugin::PluginCommand {
+            name: "review".into(),
+            description: String::new(),
+            prompt: "Review the pull request.".into(),
+            plugin: "p".into(),
+        });
+        run_command(&mut s, "/review 123");
+        assert_eq!(s.outbox.as_deref(), Some("Review the pull request.\n\n123"));
     }
 }

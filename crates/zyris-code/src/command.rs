@@ -128,7 +128,11 @@ pub fn parse(text: &str) -> Option<Command> {
     let some = |s: &str| (!s.is_empty()).then(|| s.to_string());
     // **The command word is recognized from `COMMANDS`** — the same table `/help` and the `/`-list
     // are built from, so recognition and the help can't drift apart. Only argument handling lives here.
-    let Some(spec) = COMMANDS.iter().find(|c| c.matches(name)) else {
+    //
+    // **Matched without regard to case.** A phone keyboard capitalises the first letter, and
+    // `/Help` answering "unknown command" is a keyboard's doing, not a person's typo.
+    let lower = name.to_ascii_lowercase();
+    let Some(spec) = COMMANDS.iter().find(|c| c.matches(&lower)) else {
         return Some(Command::Unknown(name.to_string()));
     };
     Some(match spec.name {
@@ -463,8 +467,24 @@ pub fn catalogue(lang: crate::lang::Lang) -> Vec<(&'static str, &'static str)> {
 ///
 /// **A plugin may not take one of these.** `/help` has to stay `/help`, whatever a plugin calls a
 /// file of its own — so a colliding plugin command is namespaced instead (`plugin::commands`).
+///
+/// **Aliases too.** `parse` answers to them first, so a plugin command named `q` or `diff` was
+/// neither reachable nor renamed out of the way — it simply never ran.
 pub fn builtin_names() -> Vec<&'static str> {
-    COMMANDS.iter().map(|c| c.name.trim_start_matches('/')).collect()
+    COMMANDS
+        .iter()
+        .flat_map(|c| {
+            std::iter::once(c.name.trim_start_matches('/')).chain(c.aliases.iter().copied())
+        })
+        .collect()
+}
+
+/// The text a line starting `//` stands for, when it does: a message that really does begin with
+/// a slash word — quoting a command, or `/tmp` at the start of a sentence — sent with one slash
+/// taken off. A path like `//server/share` is not one and is left alone.
+pub fn literal(text: &str) -> Option<&str> {
+    let rest = text.trim_start().strip_prefix('/')?;
+    is_command(rest).then_some(rest)
 }
 
 /// Keys worth knowing. **If it isn't on the screen, it doesn't exist** — a README isn't opened when you need it.
@@ -896,5 +916,29 @@ mod tests {
         assert_eq!(parse("/status"), Some(Command::Status));
         assert_eq!(parse("/info"), Some(Command::Status));
         assert_eq!(parse("/status 지금"), Some(Command::Status));
+    }
+
+    /// **A capital letter is the keyboard's, not a typo** (C22).
+    #[test]
+    fn commands_are_matched_without_regard_to_case() {
+        assert_eq!(parse("/Help"), Some(Command::Help));
+        assert_eq!(parse("/QUIT"), Some(Command::Quit));
+    }
+
+    /// **`//` sends a line that begins with a slash word**, one slash taken off; a path is not
+    /// one of those (C22).
+    #[test]
+    fn a_double_slash_is_a_literal_slash() {
+        assert_eq!(literal("//tmp is full"), Some("/tmp is full"));
+        assert_eq!(literal("//help"), Some("/help"));
+        assert_eq!(literal("//server/share"), None);
+        assert_eq!(literal("/help"), None);
+    }
+
+    /// **Aliases are names a plugin cannot take**, or its command is never reached (C22).
+    #[test]
+    fn the_builtin_names_include_the_aliases() {
+        let names = builtin_names();
+        assert!(names.contains(&"quit") && names.contains(&"q") && names.contains(&"exit"));
     }
 }
