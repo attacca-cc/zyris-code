@@ -150,6 +150,17 @@ impl<C: ServeCapability> ServeCapability for Gate<C> {
         // **How big an `exec` answer is, as the agent receives it.** `exec` is the costliest tool
         // in tokens, and which commands make it so cannot be read from anywhere else. This is what
         // an output budget for it gets sized from. `grep 'exec result'` in the log.
+        // **Every tool's answer is sized, not only `exec`'s.** Holding `exec` down moved reading to
+        // `file_io.read` (37% of one measured session's calls), and a cost that moves has to stay
+        // visible where it lands. `target` goes last: a path can hold spaces, and the report
+        // reads it to the end of the line.
+        tracing::info!(
+            capability = %gated.capability,
+            tool = %gated.tool,
+            bytes = answer_bytes(&out),
+            target = %gated.target,
+            "tool result"
+        );
         if let Some(size) = ExecSize::of(&gated, &args, &out) {
             tracing::info!(
                 bytes = size.bytes,
@@ -162,6 +173,12 @@ impl<C: ServeCapability> ServeCapability for Gate<C> {
         }
         Ok(out)
     }
+}
+
+/// The answer serialized, in bytes — what goes on the wire and into the agent's context. A
+/// streamed answer counts its head only; its items are not the agent's context.
+fn answer_bytes(out: &Outgoing) -> usize {
+    response_json(out).and_then(|v| serde_json::to_string(&v).ok()).map_or(0, |s| s.len())
 }
 
 /// The size of one `terminal.exec` answer, for the log.
@@ -187,7 +204,7 @@ impl ExecSize {
         let len = |k: &str| body.get(k).and_then(Value::as_str).map_or(0, str::len);
         let command = command_line(args);
         Some(ExecSize {
-            bytes: serde_json::to_string(&body).map_or(0, |s| s.len()),
+            bytes: answer_bytes(out),
             stdout: len("stdout"),
             stderr: len("stderr"),
             exit_code: body.get("exit_code").and_then(Value::as_i64).unwrap_or(-1),
@@ -1026,5 +1043,13 @@ mod tests {
         assert!(!full);
         let other = json!({"path": "a", "output": "full"});
         assert_eq!(take_output_choice("file_io", "read", other.clone()), (other, false));
+    }
+
+    /// **An answer's size is what the agent receives**, serialized.
+    #[test]
+    fn an_answer_is_sized_as_it_goes_on_the_wire() {
+        let body = json!({"content": "fn main() {}\n", "version": 3});
+        let out = Outgoing::Response(Payload::from_json(body.clone()));
+        assert_eq!(answer_bytes(&out), serde_json::to_string(&body).unwrap().len());
     }
 }
