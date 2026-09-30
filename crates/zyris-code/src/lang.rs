@@ -907,6 +907,16 @@ impl Lang {
             Lang::En => format!("Couldn't revert: {e}"),
         }
     }
+    pub fn undo_after_other_window(self, path: &str) -> String {
+        match self {
+            Lang::Ko => format!(
+                "되돌리지 않았습니다: 다른 창이 그 뒤에 {path}을(를) 편집했습니다. 되돌리면 그 편집이 지워집니다."
+            ),
+            Lang::En => format!(
+                "Not reverted: another window has edited {path} since. Reverting would erase its edit."
+            ),
+        }
+    }
     pub fn changes_text(self, changed: &[Changed], cwd: &Path) -> String {
         if changed.is_empty() {
             return self
@@ -3012,6 +3022,7 @@ mod tests {
             en.agent_staged("Main Agent"),
             en.reverted("src/x.rs"),
             en.undo_failed("x"),
+            en.undo_after_other_window("src/x.rs"),
             en.server_timeout(15),
             en.missing_scopes("a, b"),
             en.scopes_asked_again("a"),

@@ -174,9 +174,18 @@ impl Undo {
         // window's edit of another file, which silently took back work still in progress. An entry
         // from a window that has since ended is fair game: that is the ordinary case of undoing
         // what yesterday's run changed.
-        let Some(at) = last_revertable(&log) else {
+        let live = live_pids();
+        let Some(at) = last_revertable(&log, &live) else {
             return Err(crate::lang::current().nothing_to_undo().to_string());
         };
+        // **Nor is a file another live window has edited since.** Restoring this entry's backup
+        // puts back the content from before *both* edits, so the other window's later change to
+        // the same file would vanish without a trace. Refused, and the entry kept, until that
+        // window has ended.
+        if log[at + 1..].iter().any(|later| later.path == log[at].path && live.contains(&later.pid))
+        {
+            return Err(crate::lang::current().undo_after_other_window(&log[at].path));
+        }
         let last = log.remove(at);
         let path = PathBuf::from(&last.path);
         let backup = self.0.dir.join(&last.backup);
@@ -202,7 +211,7 @@ impl Undo {
     pub fn is_empty(&self) -> bool {
         let _guard = self.0.lock.lock().unwrap_or_else(|e| e.into_inner());
         let _file = crate::instance::FileLock::take(&self.lock_path(), LOCK_WAIT);
-        last_revertable(&self.read_log()).is_none()
+        last_revertable(&self.read_log(), &live_pids()).is_none()
     }
 
     /// Files changed in this directory. **Most recently touched comes first.**
@@ -302,12 +311,13 @@ fn next_number(log: &[Record]) -> u64 {
 /// the process that wrote it is still running. The live set is read once rather than per entry: a
 /// log holds up to `KEEP` records, and asking the registry about each would be two hundred
 /// directory scans for one `/undo`.
-fn last_revertable(log: &[Record]) -> Option<usize> {
-    let live: Vec<u32> = crate::instance::live(&crate::instance::cache_root())
-        .into_iter()
-        .map(|row| row.pid)
-        .collect();
+fn last_revertable(log: &[Record], live: &[u32]) -> Option<usize> {
     log.iter().rposition(|record| record.pid == std::process::id() || !live.contains(&record.pid))
+}
+
+/// The pids of every live window, read once per operation.
+fn live_pids() -> Vec<u32> {
+    crate::instance::live(&crate::instance::cache_root()).into_iter().map(|row| row.pid).collect()
 }
 
 /// Where the history lives. Respects `XDG_CACHE_HOME` — tests move the location with it too.
@@ -611,6 +621,42 @@ mod tests {
         // With nothing of its own left, it says so rather than reaching into theirs.
         assert!(undo.revert_last().is_err(), "it reverted another live window's edit");
 
+        drop(held);
+    }
+
+    /// **An edit another live window made on top of ours is not erased by our `/undo`.** Our
+    /// entry's backup is the file from before both edits; restoring it took the other window's
+    /// change away with ours and said nothing.
+    #[test]
+    fn a_file_another_live_window_edited_since_is_not_reverted() {
+        let (cache, work, _g) = scoped();
+        let file = work.path().join("shared.rs");
+        write(&file, "original\n");
+        let undo = Undo::for_dir(work.path());
+        undo.snapshot(&file);
+        write(&file, "ours\n");
+
+        let other: u32 = std::process::id() + 1;
+        let held = crate::instance::fake_live(&cache.path().join("zyris-code"), other, "/tmp");
+        write(&undo.0.dir.join("999999-shared.rs.bak"), "ours\n");
+        let log = undo.0.dir.join("log.jsonl");
+        let mut text = std::fs::read_to_string(&log).unwrap();
+        text.push_str(&format!(
+            "{}\n",
+            serde_json::json!({
+                "at": 0,
+                "path": file,
+                "backup": "999999-shared.rs.bak",
+                "existed": true,
+                "pid": other,
+            })
+        ));
+        std::fs::write(&log, text).unwrap();
+        write(&file, "ours and theirs\n");
+
+        let why = undo.revert_last().expect_err("it erased another live window's edit");
+        assert_eq!(why, crate::lang::current().undo_after_other_window(&file.to_string_lossy()));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "ours and theirs\n");
         drop(held);
     }
 }
