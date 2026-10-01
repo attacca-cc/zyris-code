@@ -2396,6 +2396,10 @@ impl Lang {
     pub fn detail_timed_out(self) -> &'static str {
         self.pick("시간이 다 됐습니다", "Timed out")
     }
+    /// An `exec` that ended with no exit code: killed by a signal, so it did not succeed.
+    pub fn detail_no_exit(self) -> &'static str {
+        self.pick("종료 코드 없음", "No exit code")
+    }
     pub fn detail_exit_code(self, code: i64) -> String {
         match self {
             Lang::Ko => format!("종료 코드 {code}"),

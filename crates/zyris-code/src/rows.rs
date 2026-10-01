@@ -1203,11 +1203,13 @@ fn detail_lines(
                 body.push(0);
             }
         }
-        Detail::Exec { exit, timed_out, out: stdout, err } => {
+        Detail::Exec { exit, unreported, timed_out, out: stdout, err } => {
             // The headline first: whether it finished, and how. A quiet success still says so —
             // an empty detail reads as a broken tool.
             let (label, colour) = if *timed_out {
                 (lang.detail_timed_out().to_string(), theme::danger())
+            } else if *unreported {
+                (lang.detail_no_exit().to_string(), theme::danger())
             } else {
                 match exit {
                     Some(0) | None => (lang.detail_ok().to_string(), theme::success()),
@@ -2626,6 +2628,7 @@ mod tests {
         use crate::tool_view::{Detail, ToolState};
         let d = Detail::Exec {
             exit: Some(0),
+            unreported: false,
             timed_out: false,
             out: "Up to date".into(),
             err: String::new(),
@@ -2644,6 +2647,7 @@ mod tests {
         use crate::tool_view::{Detail, ToolState};
         let d = Detail::Exec {
             exit: Some(3),
+            unreported: false,
             timed_out: false,
             out: String::new(),
             err: "error[E0308]".into(),
@@ -2665,6 +2669,7 @@ mod tests {
         use crate::tool_view::{Detail, ToolState};
         let d = Detail::Exec {
             exit: Some(0),
+            unreported: false,
             timed_out: false,
             out: String::new(),
             err: String::new(),
