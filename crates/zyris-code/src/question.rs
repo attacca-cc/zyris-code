@@ -126,6 +126,11 @@ pub struct Answering {
     pub input: Input,
     /// Whether this is the review screen after all questions are asked.
     review: bool,
+    /// Whether Reject has been asked for once and waits for a second Enter (C27).
+    pub reject_armed: bool,
+    /// While set and in the future, Space and Enter do nothing: the card appeared over a draft
+    /// being typed, and a key aimed at the draft must not answer it (C12).
+    pub guard_until: Option<std::time::Instant>,
 }
 
 impl Answering {
@@ -140,8 +145,23 @@ impl Answering {
             typing: false,
             input: Input::new(),
             review: false,
+            reject_armed: false,
+            guard_until: None,
         }
     }
+
+    /// Guards Space and Enter until `GUARD` after `now`. Called when the card opens over a draft.
+    pub fn guard_from(&mut self, now: std::time::Instant) {
+        self.guard_until = Some(now + Self::GUARD);
+    }
+
+    /// Whether Space and Enter are still being held off at `now`.
+    pub fn guarded(&self, now: std::time::Instant) -> bool {
+        self.guard_until.is_some_and(|t| now < t)
+    }
+
+    /// How long a card that opened over a non-empty draft ignores Space and Enter.
+    pub const GUARD: std::time::Duration = std::time::Duration::from_millis(700);
 
     pub fn current(&self) -> &Step {
         &self.steps[self.step]

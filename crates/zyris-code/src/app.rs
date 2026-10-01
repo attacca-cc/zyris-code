@@ -310,6 +310,8 @@ pub enum Action {
     AskToggle,
     AskConfirm,
     AskCancel,
+    /// Any key but Enter while Reject waits for its confirmation: Reject is dropped.
+    AskDisarm,
     /// Opening/operating the list.
     OpenPicker,
     PickUp,
@@ -1543,7 +1545,7 @@ pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
     // With a question open, keys go there. The turn is blocked waiting for the answer, so
     // that is the one thing to do right now. Only quitting always works.
     if let Some((_, a)) = state.asking.as_ref().filter(|_| !quits) {
-        return ask_key(a, key, ctrl);
+        return ask_key(a, key, ctrl, Instant::now());
     }
 
     // **The GitHub screen and the new-project form take the keys the same way.** The new-project
@@ -1831,8 +1833,16 @@ pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
         // **Enter on an empty draft approves the plan.** With a plan up, Enter with nothing typed
         // had no meaning at all, and approval is the one thing that must be a single key — typing
         // is how changes are asked for, so the two cannot both be "press Enter with words".
+        //
+        // **Only once it has been opened.** A plan is folded by default, so approving on the first
+        // Enter meant approving something unread (and lifting the plan-mode fence): while folded,
+        // Enter opens it instead.
         KeyCode::Enter if state.plan.is_some() && state.input.text.trim().is_empty() => {
-            vec![Action::Submit(state.lang.plan_approved().to_string())]
+            if state.plan.as_ref().is_some_and(|p| p.open) {
+                vec![Action::Submit(state.lang.plan_approved().to_string())]
+            } else {
+                vec![Action::TogglePlan]
+            }
         }
         // **Blank is empty.** A space or a stray Shift+Enter sent a message of nothing — a turn
         // spent on it — while the arm above already read the same draft as empty.
@@ -1890,7 +1900,7 @@ pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
 }
 
 /// Keys for the question screen. While typing free text, characters go to the input.
-fn ask_key(a: &crate::question::Answering, key: KeyEvent, ctrl: bool) -> Vec<Action> {
+fn ask_key(a: &crate::question::Answering, key: KeyEvent, ctrl: bool, now: Instant) -> Vec<Action> {
     if a.typing {
         // **The same editing keys as every other field.** Delete, Home, End and the Ctrl keys
         // were dead here, in the one field whose text is sent the moment it is confirmed.
@@ -1900,9 +1910,15 @@ fn ask_key(a: &crate::question::Answering, key: KeyEvent, ctrl: bool) -> Vec<Act
             _ => field_key(key, ctrl),
         };
     }
+    // **Reject needs a second Enter; every other key (Space included) takes it back.**
+    if a.reject_armed && key.code != KeyCode::Enter {
+        return vec![Action::AskDisarm];
+    }
     match key.code {
         KeyCode::Up => vec![Action::AskUp],
         KeyCode::Down => vec![Action::AskDown],
+        // Held off just after the card opened over a draft (`Answering::guarded`).
+        KeyCode::Enter | KeyCode::Char(' ') if a.guarded(now) => vec![],
         // Enter alone both chooses and acts. On an action row (back/next/submit) it does
         // that instead.
         KeyCode::Enter | KeyCode::Char(' ') => vec![Action::AskConfirm],
@@ -2371,6 +2387,8 @@ pub fn apply(state: &mut State, action: &Action) {
                 if *y >= area.y && *y < area.y + area.height {
                     if let Some(i) = crate::widgets::ask_row_at(a, area, *y, state.lang) {
                         if let Some((_, a)) = &mut state.asking {
+                            // A click elsewhere takes a pending Reject back.
+                            a.reject_armed &= a.cursor == i;
                             a.cursor = i;
                         }
                         apply(state, &Action::AskConfirm);
@@ -2526,6 +2544,7 @@ pub fn apply(state: &mut State, action: &Action) {
                 // **The answer goes out on its own; the draft is left alone.** It used to be put
                 // into the input and sent from there, which replaced whatever the person had been
                 // typing when the question arrived — and sent nothing of it.
+                Some(RowKind::Action(Act::Reject)) if !a.reject_armed => a.reject_armed = true,
                 Some(RowKind::Action(Act::Reject)) => {
                     state.asking = None;
                     state.post(state.lang.question_refused().to_string());
@@ -2542,6 +2561,11 @@ pub fn apply(state: &mut State, action: &Action) {
                     }
                 }
                 None => {}
+            }
+        }
+        Action::AskDisarm => {
+            if let Some((_, a)) = &mut state.asking {
+                a.reject_armed = false;
             }
         }
         Action::AskCancel => {
@@ -3034,8 +3058,14 @@ fn apply_frame(state: &mut State, frame: &Frame) {
                     // brings it back (`clear_conversation`).
                     && state.dismissed_question != Some(entry.seq)
                 {
-                    state.asking =
-                        Some((entry.seq, crate::question::Answering::new(steps.clone())));
+                    let mut card = crate::question::Answering::new(steps.clone());
+                    // **A card over a draft in progress holds Space and Enter off briefly.** The
+                    // person is mid-sentence, and the key that was headed for the draft would
+                    // otherwise answer the question.
+                    if !state.input.text.trim().is_empty() {
+                        card.guard_from(Instant::now());
+                    }
+                    state.asking = Some((entry.seq, card));
                 }
             }
             state.timeline.upsert(entry.clone());
@@ -8688,6 +8718,16 @@ mod tests {
         assert!(last_system(&mut s).contains("/help"), "{}", last_system(&mut s));
     }
 
+    /// A bad argument names the argument, not "not a command".
+    #[test]
+    fn a_bad_argument_is_named() {
+        let mut s = state();
+        s.lang = crate::lang::Lang::En;
+        run_command(&mut s, "/mode plan now");
+        let said = last_system(&mut s);
+        assert!(said.contains("`/mode` does not accept `plan now`"), "{said}");
+    }
+
     /// `/status` paints the whole picture — thread, project, agent, mode, usage, cwd — in
     /// both languages, and a session-less state says so honestly.
     #[test]
@@ -9833,7 +9873,12 @@ mod tests {
         assert_eq!(s.plan.as_ref().map(|p| p.seq), Some(5), "the plan never reached the screen");
         assert!(!s.plan_decided);
 
-        // Enter on an empty draft is what sends the approval.
+        // The plan starts folded: the first Enter opens it and approves nothing.
+        assert_eq!(on_key(&s, key(KeyCode::Enter, KeyModifiers::NONE)), vec![Action::TogglePlan]);
+        apply(&mut s, &Action::TogglePlan);
+        assert!(!s.plan_decided, "a folded plan was approved unread");
+
+        // Enter on an empty draft, once it is open, is what sends the approval.
         let keys = on_key(&s, key(KeyCode::Enter, KeyModifiers::NONE));
         let Some(Action::Submit(said)) = keys.first() else {
             panic!("Enter did not approve: {keys:?}")
@@ -11892,6 +11937,59 @@ mod interaction {
         assert!(s.outbox.as_deref().is_some_and(|a| a.contains("which one?") && a.contains('A')));
     }
 
+    /// **Declining a question takes a second Enter** (C27); any other key takes it back.
+    #[test]
+    fn declining_a_question_needs_a_second_enter() {
+        let mut s = state();
+        apply(&mut s, &question_frame(4));
+        apply(&mut s, &Action::AskConfirm);
+        for _ in 0..3 {
+            apply(&mut s, &Action::AskDown);
+        }
+        apply(&mut s, &Action::AskConfirm);
+        assert!(s.asking.as_ref().is_some_and(|(_, a)| a.in_review()));
+        // Up wraps from Submit to Reject.
+        press(&mut s, KeyCode::Up, KeyModifiers::NONE);
+        press(&mut s, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(s.asking.as_ref().is_some_and(|(_, a)| a.reject_armed), "first Enter did not arm");
+        assert!(s.outbox.is_none(), "declined on one Enter");
+        // Another key cancels, and the next Enter has to arm again.
+        press(&mut s, KeyCode::Down, KeyModifiers::NONE);
+        assert!(s.asking.as_ref().is_some_and(|(_, a)| !a.reject_armed));
+        assert!(s.outbox.is_none());
+        press(&mut s, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(s.asking.as_ref().is_some_and(|(_, a)| a.reject_armed));
+        press(&mut s, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(s.asking.is_none());
+        assert_eq!(s.outbox.as_deref(), Some(s.lang.question_refused()));
+    }
+
+    /// **A card over a draft ignores Space and Enter for a moment** (C12); over an empty one it
+    /// does not wait.
+    #[test]
+    fn a_card_over_a_draft_holds_space_and_enter_off_for_a_moment() {
+        let mut s = state();
+        type_in(&mut s, "half a sentence");
+        apply(&mut s, &question_frame(4));
+        let t0 = Instant::now();
+        let enter = key(KeyCode::Enter, KeyModifiers::NONE);
+        let space = key(KeyCode::Char(' '), KeyModifiers::NONE);
+        assert!(s.asking.as_ref().unwrap().1.guard_until.is_some(), "no guard over a draft");
+        // Just after opening both keys are dropped; Up still works.
+        s.asking.as_mut().unwrap().1.guard_from(t0);
+        let a = &s.asking.as_ref().unwrap().1;
+        assert!(ask_key(a, enter, false, t0).is_empty());
+        assert!(ask_key(a, space, false, t0).is_empty());
+        assert_eq!(ask_key(a, key(KeyCode::Down, KeyModifiers::NONE), false, t0).len(), 1);
+        // Past the window they act normally.
+        let later = t0 + crate::question::Answering::GUARD;
+        assert_eq!(ask_key(a, enter, false, later), vec![Action::AskConfirm]);
+
+        let mut s = state();
+        apply(&mut s, &question_frame(4));
+        assert!(s.asking.as_ref().unwrap().1.guard_until.is_none(), "an empty draft waited");
+    }
+
     /// **Blank is empty.** Spaces and a stray newline used to go out as a message (C24).
     #[test]
     fn a_blank_draft_is_not_sent() {
@@ -11967,8 +12065,11 @@ mod interaction {
         sync_gate(&bridge, &s);
         assert!(matches!(bridge.decide(&write), Decision::Refuse(_)), "undecided, yet writable");
 
-        for action in on_key(&s, key(KeyCode::Enter, KeyModifiers::NONE)) {
-            apply(&mut s, &action);
+        // The first Enter only opens the folded plan; the second approves it.
+        for _ in 0..2 {
+            for action in on_key(&s, key(KeyCode::Enter, KeyModifiers::NONE)) {
+                apply(&mut s, &action);
+            }
         }
         sync_gate(&bridge, &s);
         assert_eq!(bridge.decide(&write), Decision::Run, "the approval never reached the gate");

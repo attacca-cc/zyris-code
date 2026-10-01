@@ -596,7 +596,7 @@ fn what_is_happening_now_sits_between_the_chat_and_the_input_box() {
     let screen = dump(&mut s, 40, 12);
     let lines: Vec<&str> = screen.lines().collect();
     let at = lines.len() - ACTIVITY_FROM_BOTTOM;
-    assert!(lines[at].contains("쉬는 중"), "the status line is not in its place:\n{screen}");
+    assert!(lines[at].contains("대기 중"), "the status line is not in its place:\n{screen}");
     assert!(lines[at - 1].trim().is_empty(), "it is not separated from the transcript:\n{screen}");
     assert!(lines[at + 1].starts_with('─'), "the line right below is not a rule:\n{screen}");
 
@@ -677,7 +677,7 @@ fn the_plan_unfolds_under_the_line_that_counts_it() {
     apply(&mut s, &Action::ToggleTodos);
     let screen = dump(&mut s, 40, 14);
     let lines: Vec<&str> = screen.lines().collect();
-    let at = lines.iter().position(|l| l.contains("쉬는 중")).expect(&screen);
+    let at = lines.iter().position(|l| l.contains("대기 중")).expect(&screen);
     assert!(lines[at + 1].contains("1. 테스트 고치기"), "{screen}");
     assert!(lines[at + 2].contains("2. 빌드 돌리기"), "{screen}");
     // Everything below the plan is where it always was.

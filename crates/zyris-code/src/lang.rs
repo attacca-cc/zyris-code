@@ -183,7 +183,7 @@ impl Lang {
         self.pick("중단하는 중…", "Stopping…")
     }
     pub fn idle(self) -> &'static str {
-        self.pick("쉬는 중", "Taking a break")
+        self.pick("대기 중", "Idle")
     }
     pub fn esc_stops(self) -> &'static str {
         self.pick("Esc 중단", "Esc stops")
@@ -290,13 +290,13 @@ impl Lang {
     /// alone is not a message, and "still running" is the one of them that must not be missed
     /// (issue #32, 2026-09-18).
     pub fn subagent_running(self) -> &'static str {
-        self.pick("실행 중", "running")
+        self.pick("실행 중", "Running")
     }
     pub fn subagent_done(self) -> &'static str {
-        self.pick("완료", "done")
+        self.pick("완료", "Done")
     }
     pub fn subagent_failed(self) -> &'static str {
-        self.pick("실패", "failed")
+        self.pick("실패", "Failed")
     }
     /// The head of a report row. **A failure says so in words as well as in colour** — colour
     /// alone is not a message.
@@ -304,8 +304,8 @@ impl Lang {
         match (self, ok) {
             (Lang::Ko, true) => "작업 결과 ∙ 완료",
             (Lang::Ko, false) => "작업 결과 ∙ 실패",
-            (Lang::En, true) => "Job result ∙ done",
-            (Lang::En, false) => "Job result ∙ failed",
+            (Lang::En, true) => "Job result ∙ Done",
+            (Lang::En, false) => "Job result ∙ Failed",
         }
     }
     /// What the activity line wears while the agent is **thinking and nothing is running**: the
@@ -324,10 +324,10 @@ impl Lang {
     pub fn job_ended(self, id: &str, ok: bool, secs: u64) -> String {
         let took = self.duration(secs);
         match (self, ok) {
-            (Lang::Ko, true) => format!("배경 {id} 완료 ∙ {took}"),
-            (Lang::Ko, false) => format!("배경 {id} 실패 ∙ {took}"),
-            (Lang::En, true) => format!("background {id} done ∙ {took}"),
-            (Lang::En, false) => format!("background {id} failed ∙ {took}"),
+            (Lang::Ko, true) => format!("배경 {id} ∙ 완료 ∙ {took}"),
+            (Lang::Ko, false) => format!("배경 {id} ∙ 실패 ∙ {took}"),
+            (Lang::En, true) => format!("Background {id} ∙ Done ∙ {took}"),
+            (Lang::En, false) => format!("Background {id} ∙ Failed ∙ {took}"),
         }
     }
     // **A background job no longer takes the activity line** (user decision, 2026-09-18, issue
@@ -427,11 +427,14 @@ impl Lang {
             (Lang::En, true) => "Ctrl+P to fold",
             (Lang::En, false) => "Ctrl+P to open",
         };
-        match self {
+        // **Folded, Enter reads the plan instead of approving it.**
+        match (self, open) {
             // **`∙`, not `·`.** The middle dot is East Asian Ambiguous: one column here and two
             // on a terminal set for CJK, which shifts everything after it on the row.
-            Lang::Ko => format!("Enter 승인 ∙ 고칠 점은 그냥 적으세요 ∙ {fold}"),
-            Lang::En => format!("Enter approves ∙ type to ask for changes ∙ {fold}"),
+            (Lang::Ko, true) => format!("Enter 승인 ∙ 고칠 점은 그냥 적으세요 ∙ {fold}"),
+            (Lang::En, true) => format!("Enter approves ∙ type to ask for changes ∙ {fold}"),
+            (Lang::Ko, false) => format!("Enter 펼쳐 읽기 ∙ 고칠 점은 그냥 적으세요 ∙ {fold}"),
+            (Lang::En, false) => format!("Enter opens the plan ∙ type to ask for changes ∙ {fold}"),
         }
     }
     pub fn plan_more(self, n: usize) -> String {
@@ -552,10 +555,21 @@ impl Lang {
         self.pick("기본", "default")
     }
     pub fn running(self) -> &'static str {
-        self.pick("작업 중", "running")
+        self.pick("실행 중", "Running")
     }
 
     pub fn unknown_command(self, what: &str, help: &str) -> String {
+        // **A known command with a bad argument carries the whole line** ("mode plan now"). Name
+        // the part that was not understood instead of calling the command itself unknown.
+        if let Some((cmd, arg)) = what.split_once(' ') {
+            let arg = arg.trim();
+            return match (self, arg.is_empty()) {
+                (Lang::Ko, false) => format!("`/{cmd}`에 `{arg}`은(는) 쓸 수 없습니다.\n\n{help}"),
+                (Lang::Ko, true) => format!("`/{cmd}`에 알맞은 값을 같이 적어 주세요.\n\n{help}"),
+                (Lang::En, false) => format!("`/{cmd}` does not accept `{arg}`.\n\n{help}"),
+                (Lang::En, true) => format!("`/{cmd}` needs a valid argument.\n\n{help}"),
+            };
+        }
         match self {
             Lang::Ko => format!("`/{what}`은 모르는 명령입니다.\n\n{help}"),
             Lang::En => format!("`/{what}` is not a command.\n\n{help}"),
@@ -591,6 +605,12 @@ impl Lang {
     }
     pub fn review_keys(self) -> &'static str {
         self.pick("↑↓ 이동 ∙ Enter 실행 ∙ 클릭도 됨", "↑↓ move ∙ Enter runs ∙ click works too")
+    }
+    pub fn reject_confirm(self) -> &'static str {
+        self.pick(
+            "정말 답하지 않으시겠어요? Enter로 확정 ∙ 다른 키는 취소",
+            "Decline to answer? Enter confirms ∙ any other key cancels",
+        )
     }
     pub fn answered(self) -> &'static str {
         self.pick("답한 내용", "Your answer")
@@ -734,6 +754,14 @@ impl Lang {
         match self {
             Lang::Ko => format!("서버에 연결하지 못했습니다 ({secs}초째): {why}"),
             Lang::En => format!("Couldn't reach the server ({secs}s in): {why}"),
+        }
+    }
+
+    /// The dial has been failing for `secs` seconds; shown on the activity line next to "Connecting...".
+    pub fn still_dialing(self, secs: u64, why: &str) -> String {
+        match self {
+            Lang::Ko => format!("{secs}초째 연결하지 못했습니다: {why}"),
+            Lang::En => format!("still can't connect after {secs}s: {why}"),
         }
     }
 
@@ -2725,6 +2753,28 @@ mod tests {
             (7325, "2h 2m"),
         ] {
             assert_eq!(Lang::En.duration(secs), want, "{secs}s");
+        }
+    }
+
+    /// **One noun per state, the same on every row** (B24).
+    #[test]
+    fn one_noun_per_state_on_every_row() {
+        for (lang, running, done, failed, stopped, idle) in [
+            (Lang::En, "Running", "Done", "Failed", "Stopped", "Idle"),
+            (Lang::Ko, "실행 중", "완료", "실패", "중단됨", "대기 중"),
+        ] {
+            assert_eq!(lang.running(), running);
+            assert_eq!(lang.subagent_running(), running);
+            assert_eq!(lang.subagent_done(), done);
+            assert_eq!(lang.run_done(), done);
+            assert_eq!(lang.detail_ok(), done);
+            assert_eq!(lang.subagent_failed(), failed);
+            assert_eq!(lang.run_stopped(), stopped);
+            assert_eq!(lang.idle(), idle);
+            assert!(lang.report_head(true).ends_with(done));
+            assert!(lang.report_head(false).ends_with(failed));
+            assert!(lang.job_ended("b1", true, 3).contains(done));
+            assert!(lang.job_ended("b1", false, 3).contains(failed));
         }
     }
 
