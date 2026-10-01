@@ -958,6 +958,8 @@ impl PasteBurst {
 
 /// How long a notice stays on screen. Plenty to read one sentence.
 pub const STATUS_WINDOW: Duration = Duration::from_secs(6);
+/// How long an error keeps the notice line against a neutral notice (`State::set_status`).
+const ERROR_HOLD: Duration = Duration::from_secs(3);
 
 /// The longest error the activity line is trusted to show whole (`State::set_error`): what is left
 /// of an 80-column line after its dot and a little room.
@@ -977,7 +979,17 @@ impl State {
     }
 
     /// Set what to say. Visible only for `STATUS_WINDOW` from this moment.
+    ///
+    /// **A notice does not push an error off the line before it could be read.** "Connected" after
+    /// a blip replaced an MCP server's failure a moment after it arrived, and the person never
+    /// learned the tool was missing. The error keeps the line for `ERROR_HOLD`; what was said
+    /// meanwhile is dropped, not queued — it is news the line can do without.
     pub fn set_status(&mut self, message: impl Into<String>) {
+        if let Some((_, at, Severity::Error)) = &self.status {
+            if at.elapsed() < ERROR_HOLD {
+                return;
+            }
+        }
         self.status = Some((message.into(), Instant::now(), Severity::Notice));
     }
 
@@ -3190,6 +3202,13 @@ fn apply_frame(state: &mut State, frame: &Frame) {
         // keeps them — a refresh that failed knows less than what is on screen — and a list the
         // person has left is nobody's news.
         Frame::PickerFailed { why, for_list: None } => {
+            // **The session has already moved, so the screen moves with it.** Leaving the old
+            // thread on screen under the new thread's id sent messages into one while the other
+            // was read. What is shown is now the thread's own, empty, and the stream opened for
+            // it (`run_inner`) fills it from the start.
+            if state.loading_history {
+                clear_conversation(state);
+            }
             state.loading_history = false;
             state.set_error(why.clone());
         }
@@ -5557,7 +5576,10 @@ async fn run_inner(
                 // just past what was re-read; that cursor exists only after the replay, so opening
                 // any earlier would re-deliver the whole thread or skip what arrived while it
                 // loaded.
-                if matches!(action, Action::Frame(Frame::History { .. })) {
+                if matches!(
+                    action,
+                    Action::Frame(Frame::History { .. } | Frame::PickerFailed { for_list: None, .. })
+                ) {
                     if let Some(id) = session.id().map(str::to_string) {
                         spawn_stream(Arc::clone(&api), &mut session, id, state.last_cursor, tx.clone());
                     }
@@ -5579,6 +5601,9 @@ async fn run_inner(
                     api = fresh;
                     state.connected = true;
                     state.dropped_because = None;
+                    // The drop this was waiting for has come and gone; left set, a later genuine
+                    // drop would be reported as the quiet "Reconnecting".
+                    state.reconnecting = false;
                     state.ever_connected = true;
                     // A drop and reattach shows on screen too — connecting → connected →
                     // idle.
@@ -12301,6 +12326,20 @@ mod interaction {
         apply(&mut s, &listed(threads("x", &["from-x"])));
         let p = s.picker.as_ref().unwrap();
         assert!(p.loading && p.rows.is_empty(), "X's threads landed under Y");
+    }
+
+    /// A thread whose history could not be read leaves the screen of the thread it replaced
+    /// (C14): the session already moved, so showing the old one told the wrong story.
+    #[test]
+    fn a_failed_history_does_not_leave_the_old_thread_on_screen() {
+        let mut s = state();
+        s.timeline.say("old thread");
+        s.loading_history = true;
+        let failed = Frame::PickerFailed { why: "timed out".into(), for_list: None };
+        apply(&mut s, &Action::Frame(failed));
+        assert!(!s.loading_history);
+        assert!(s.timeline.items().is_empty(), "the old thread stayed under the new session");
+        assert!(s.status().is_some());
     }
 
     /// **A list failing closes only itself.** The history search the person moved on to stayed
