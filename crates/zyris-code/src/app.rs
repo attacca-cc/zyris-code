@@ -1517,7 +1517,7 @@ pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
     // With a question open, keys go there. The turn is blocked waiting for the answer, so
     // that is the one thing to do right now. Only quitting always works.
     if let Some((_, a)) = state.asking.as_ref().filter(|_| !quits) {
-        return ask_key(a, key, ctrl);
+        return ask_key(a, key, ctrl, Instant::now());
     }
 
     // **The GitHub screen and the new-project form take the keys the same way.** The new-project
@@ -1872,7 +1872,7 @@ pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
 }
 
 /// Keys for the question screen. While typing free text, characters go to the input.
-fn ask_key(a: &crate::question::Answering, key: KeyEvent, ctrl: bool) -> Vec<Action> {
+fn ask_key(a: &crate::question::Answering, key: KeyEvent, ctrl: bool, now: Instant) -> Vec<Action> {
     if a.typing {
         // **The same editing keys as every other field.** Delete, Home, End and the Ctrl keys
         // were dead here, in the one field whose text is sent the moment it is confirmed.
@@ -1889,6 +1889,8 @@ fn ask_key(a: &crate::question::Answering, key: KeyEvent, ctrl: bool) -> Vec<Act
     match key.code {
         KeyCode::Up => vec![Action::AskUp],
         KeyCode::Down => vec![Action::AskDown],
+        // Held off just after the card opened over a draft (`Answering::guarded`).
+        KeyCode::Enter | KeyCode::Char(' ') if a.guarded(now) => vec![],
         // Enter alone both chooses and acts. On an action row (back/next/submit) it does
         // that instead.
         KeyCode::Enter | KeyCode::Char(' ') => vec![Action::AskConfirm],
@@ -3028,8 +3030,14 @@ fn apply_frame(state: &mut State, frame: &Frame) {
                     // brings it back (`clear_conversation`).
                     && state.dismissed_question != Some(entry.seq)
                 {
-                    state.asking =
-                        Some((entry.seq, crate::question::Answering::new(steps.clone())));
+                    let mut card = crate::question::Answering::new(steps.clone());
+                    // **A card over a draft in progress holds Space and Enter off briefly.** The
+                    // person is mid-sentence, and the key that was headed for the draft would
+                    // otherwise answer the question.
+                    if !state.input.text.trim().is_empty() {
+                        card.guard_from(Instant::now());
+                    }
+                    state.asking = Some((entry.seq, card));
                 }
             }
             state.timeline.upsert(entry.clone());
@@ -11832,6 +11840,32 @@ mod interaction {
         press(&mut s, KeyCode::Enter, KeyModifiers::NONE);
         assert!(s.asking.is_none());
         assert_eq!(s.outbox.as_deref(), Some(s.lang.question_refused()));
+    }
+
+    /// **A card over a draft ignores Space and Enter for a moment** (C12); over an empty one it
+    /// does not wait.
+    #[test]
+    fn a_card_over_a_draft_holds_space_and_enter_off_for_a_moment() {
+        let mut s = state();
+        type_in(&mut s, "half a sentence");
+        apply(&mut s, &question_frame(4));
+        let t0 = Instant::now();
+        let enter = key(KeyCode::Enter, KeyModifiers::NONE);
+        let space = key(KeyCode::Char(' '), KeyModifiers::NONE);
+        assert!(s.asking.as_ref().unwrap().1.guard_until.is_some(), "no guard over a draft");
+        // Just after opening both keys are dropped; Up still works.
+        s.asking.as_mut().unwrap().1.guard_from(t0);
+        let a = &s.asking.as_ref().unwrap().1;
+        assert!(ask_key(a, enter, false, t0).is_empty());
+        assert!(ask_key(a, space, false, t0).is_empty());
+        assert_eq!(ask_key(a, key(KeyCode::Down, KeyModifiers::NONE), false, t0).len(), 1);
+        // Past the window they act normally.
+        let later = t0 + crate::question::Answering::GUARD;
+        assert_eq!(ask_key(a, enter, false, later), vec![Action::AskConfirm]);
+
+        let mut s = state();
+        apply(&mut s, &question_frame(4));
+        assert!(s.asking.as_ref().unwrap().1.guard_until.is_none(), "an empty draft waited");
     }
 
     /// **Blank is empty.** Spaces and a stray newline used to go out as a message (C24).
