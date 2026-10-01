@@ -126,6 +126,8 @@ pub struct Answering {
     pub input: Input,
     /// Whether this is the review screen after all questions are asked.
     review: bool,
+    /// Whether Reject has been asked for once and waits for a second Enter (C27).
+    pub reject_armed: bool,
 }
 
 impl Answering {
@@ -140,6 +142,7 @@ impl Answering {
             typing: false,
             input: Input::new(),
             review: false,
+            reject_armed: false,
         }
     }
 

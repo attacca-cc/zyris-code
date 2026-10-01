@@ -595,6 +595,12 @@ impl Lang {
     pub fn review_keys(self) -> &'static str {
         self.pick("↑↓ 이동 ∙ Enter 실행 ∙ 클릭도 됨", "↑↓ move ∙ Enter runs ∙ click works too")
     }
+    pub fn reject_confirm(self) -> &'static str {
+        self.pick(
+            "정말 답하지 않으시겠어요? Enter로 확정 ∙ 다른 키는 취소",
+            "Decline to answer? Enter confirms ∙ any other key cancels",
+        )
+    }
     pub fn answered(self) -> &'static str {
         self.pick("답한 내용", "Your answer")
     }

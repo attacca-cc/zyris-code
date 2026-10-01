@@ -146,7 +146,9 @@ pub fn card(a: &Answering, width: u16, room: usize, lang: crate::lang::Lang) -> 
     let above = top;
     let below = body.len() - top - shown;
 
-    let mut hint = if a.in_review() {
+    let mut hint = if a.reject_armed {
+        lang.reject_confirm().to_string()
+    } else if a.in_review() {
         // The review screen's keys are its own — the answers are already given, so "choose" and
         // "type" would both be describing a list that is no longer being answered.
         lang.review_keys().to_string()

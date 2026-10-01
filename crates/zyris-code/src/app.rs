@@ -310,6 +310,8 @@ pub enum Action {
     AskToggle,
     AskConfirm,
     AskCancel,
+    /// Any key but Enter while Reject waits for its confirmation: Reject is dropped.
+    AskDisarm,
     /// Opening/operating the list.
     OpenPicker,
     PickUp,
@@ -1880,6 +1882,10 @@ fn ask_key(a: &crate::question::Answering, key: KeyEvent, ctrl: bool) -> Vec<Act
             _ => field_key(key, ctrl),
         };
     }
+    // **Reject needs a second Enter; every other key (Space included) takes it back.**
+    if a.reject_armed && key.code != KeyCode::Enter {
+        return vec![Action::AskDisarm];
+    }
     match key.code {
         KeyCode::Up => vec![Action::AskUp],
         KeyCode::Down => vec![Action::AskDown],
@@ -2351,6 +2357,8 @@ pub fn apply(state: &mut State, action: &Action) {
                 if *y >= area.y && *y < area.y + area.height {
                     if let Some(i) = crate::widgets::ask_row_at(a, area, *y, state.lang) {
                         if let Some((_, a)) = &mut state.asking {
+                            // A click elsewhere takes a pending Reject back.
+                            a.reject_armed &= a.cursor == i;
                             a.cursor = i;
                         }
                         apply(state, &Action::AskConfirm);
@@ -2506,6 +2514,7 @@ pub fn apply(state: &mut State, action: &Action) {
                 // **The answer goes out on its own; the draft is left alone.** It used to be put
                 // into the input and sent from there, which replaced whatever the person had been
                 // typing when the question arrived — and sent nothing of it.
+                Some(RowKind::Action(Act::Reject)) if !a.reject_armed => a.reject_armed = true,
                 Some(RowKind::Action(Act::Reject)) => {
                     state.asking = None;
                     state.post(state.lang.question_refused().to_string());
@@ -2522,6 +2531,11 @@ pub fn apply(state: &mut State, action: &Action) {
                     }
                 }
                 None => {}
+            }
+        }
+        Action::AskDisarm => {
+            if let Some((_, a)) = &mut state.asking {
+                a.reject_armed = false;
             }
         }
         Action::AskCancel => {
@@ -11791,6 +11805,33 @@ mod interaction {
         assert!(s.asking.is_none());
         assert_eq!(s.input.text, "반쯤 쓴 말", "the draft was replaced by the answer");
         assert!(s.outbox.as_deref().is_some_and(|a| a.contains("which one?") && a.contains('A')));
+    }
+
+    /// **Declining a question takes a second Enter** (C27); any other key takes it back.
+    #[test]
+    fn declining_a_question_needs_a_second_enter() {
+        let mut s = state();
+        apply(&mut s, &question_frame(4));
+        apply(&mut s, &Action::AskConfirm);
+        for _ in 0..3 {
+            apply(&mut s, &Action::AskDown);
+        }
+        apply(&mut s, &Action::AskConfirm);
+        assert!(s.asking.as_ref().is_some_and(|(_, a)| a.in_review()));
+        // Up wraps from Submit to Reject.
+        press(&mut s, KeyCode::Up, KeyModifiers::NONE);
+        press(&mut s, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(s.asking.as_ref().is_some_and(|(_, a)| a.reject_armed), "first Enter did not arm");
+        assert!(s.outbox.is_none(), "declined on one Enter");
+        // Another key cancels, and the next Enter has to arm again.
+        press(&mut s, KeyCode::Down, KeyModifiers::NONE);
+        assert!(s.asking.as_ref().is_some_and(|(_, a)| !a.reject_armed));
+        assert!(s.outbox.is_none());
+        press(&mut s, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(s.asking.as_ref().is_some_and(|(_, a)| a.reject_armed));
+        press(&mut s, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(s.asking.is_none());
+        assert_eq!(s.outbox.as_deref(), Some(s.lang.question_refused()));
     }
 
     /// **Blank is empty.** Spaces and a stray newline used to go out as a message (C24).
