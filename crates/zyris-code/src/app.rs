@@ -4741,6 +4741,23 @@ fn api_of(rx: &ApiRx) -> Option<Arc<AttaccaApiClient>> {
 /// even when the frame itself failed, so a broken frame can never leave the terminal holding a
 /// picture it will not swap. That would freeze the screen until the next frame, and on the way out
 /// of the app there is no next frame.
+/// **Says "Working…" and draws it before something slow is awaited on the loop.** Until the await
+/// returns nothing is drawn and no key is read, so without this the screen shows nothing for as
+/// long as a `git clone` or a slow server takes, and Enter gets pressed again. A mark, not a
+/// spinner: the loop cannot animate while it waits (`ponytail:` moving these off the loop is the
+/// fix that makes this unnecessary).
+fn busy(terminal: &mut ratatui::DefaultTerminal, state: &mut State) -> std::io::Result<()> {
+    state.set_status(state.lang.working());
+    draw_frame(terminal, state)
+}
+
+/// Takes `busy`'s notice down again, unless whatever ran has said something of its own since.
+fn unbusy(state: &mut State) {
+    if state.status() == Some(state.lang.working()) {
+        state.clear_status();
+    }
+}
+
 fn draw_frame(terminal: &mut ratatui::DefaultTerminal, state: &mut State) -> std::io::Result<()> {
     use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
 
@@ -5378,7 +5395,19 @@ async fn run_inner(
                             }
                         }
                         Action::PickConfirm => {
+                            // The picks that wait on the network or on `git` say so first.
+                            use crate::picker::Pick as P;
+                            let slow = matches!(
+                                state.picker.as_ref().and_then(crate::picker::Picker::pick),
+                                Some(P::InstallPlugin { .. } | P::DeleteProject { .. } | P::UseAgent { .. })
+                            );
+                            if slow {
+                                busy(terminal, &mut state)?;
+                            }
                             pick(&api, &mut state, &mut session, &mut agent_id, &tx).await;
+                            if slow {
+                                unbusy(&mut state);
+                            }
                         }
                         // **Off the loop, and its failure said.** It was awaited here before `apply`
                         // could mark the turn as stopping, so a slow link froze the screen for up to
@@ -5440,10 +5469,19 @@ async fn run_inner(
                     // Slash commands. `run_command` finishes the pure part, and only what
                     // needs the server or the disk is finished here.
                     if let Some(text) = state.command_out.take() {
+                        // `/plugin` clones and updates with `git`, `/agent` asks the server.
+                        let lower = text.to_ascii_lowercase();
+                        let slow = lower.starts_with("/plugin") || lower.starts_with("/agent");
+                        if slow {
+                            busy(terminal, &mut state)?;
+                        }
                         finish_command(
                             &api, &bridge, &mut state, &mut session, &mut agent_id, &text, &tx,
                         )
                             .await;
+                        if slow {
+                            unbusy(&mut state);
+                        }
                         // `/quit`. The way out is the same as Ctrl+C — a running turn is
                         // stopped below.
                         if state.quitting {
@@ -5465,10 +5503,20 @@ async fn run_inner(
                     // fetched plugin is updated — and then the panel is rebuilt from what is now
                     // on disk, so the row shows the truth rather than what was asked for.
                     if let Some(ask) = state.manager_out.take() {
+                        let slow = matches!(
+                            ask,
+                            ManagerAsk::InstallPlugin { .. } | ManagerAsk::UpdatePlugin { .. }
+                        );
+                        if slow {
+                            busy(terminal, &mut state)?;
+                        }
                         if let Some(said) = carry_out_manager_ask(&mut state, ask).await {
                             state.timeline.say(said);
                         }
                         refresh_the_manager(&mut state, &bridge);
+                        if slow {
+                            unbusy(&mut state);
+                        }
                     }
 
                     // **The `@` list asked for a walk.** `apply` set the flag and put the
@@ -5482,7 +5530,10 @@ async fn run_inner(
                     // here — it is I/O, so `apply` cannot. On failure the reason is left on
                     // the form and the form stays — it has to be fixable and retryable.
                     if let Some((name, description)) = state.project_out.take() {
-                        match crate::conn::create_project(&api, &name, Some(&description)).await {
+                        busy(terminal, &mut state)?;
+                        let created = crate::conn::create_project(&api, &name, Some(&description)).await;
+                        unbusy(&mut state);
+                        match created {
                             Ok((id, name)) => {
                                 // **Create it and go inside.** Having to pick it again after
                                 // creating is doing the work twice, and it invites the
@@ -12359,7 +12410,11 @@ mod interaction {
         s.remember_sent("from the thread before");
         let past = Past {
             cursor: 1,
-            entry: Some(Entry { id: None, seq: 1, kind: EntryKind::User("from this thread".into()) }),
+            entry: Some(Entry {
+                id: None,
+                seq: 1,
+                kind: EntryKind::User("from this thread".into()),
+            }),
             todo: None,
             plan: None,
         };
