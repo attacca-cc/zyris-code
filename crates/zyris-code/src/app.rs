@@ -3279,7 +3279,12 @@ fn apply_frame(state: &mut State, frame: &Frame) {
             // back what was held for the thread before.
             let held = std::mem::take(&mut state.queued);
             clear_conversation(state);
+            // **Up and Ctrl+R recall this thread's own messages**, not the last thread's, and not
+            // only what was typed in this run.
             for past in entries {
+                if let Some(Entry { kind: EntryKind::User(text), .. }) = &past.entry {
+                    state.remember_sent(text);
+                }
                 let frame = Frame::Event {
                     cursor: past.cursor,
                     entry: past.entry.clone(),
@@ -6295,6 +6300,8 @@ fn leave_session(state: &mut State) {
 /// next field added was always going to be forgotten by one of them.
 fn clear_conversation(state: &mut State) {
     leave_session(state);
+    state.sent.clear();
+    state.recall = None;
     // **News about a conversation goes with it.** "could not send" from the thread just left,
     // sitting on the line that is supposed to say what is happening here, reads as this thread
     // failing.
@@ -12326,6 +12333,31 @@ mod interaction {
         apply(&mut s, &listed(threads("x", &["from-x"])));
         let p = s.picker.as_ref().unwrap();
         assert!(p.loading && p.rows.is_empty(), "X's threads landed under Y");
+    }
+
+    /// Recall belongs to the thread on screen: its own messages come back from the history, and
+    /// the last thread's do not (C30).
+    #[test]
+    fn recall_follows_the_thread_on_screen() {
+        let mut s = state();
+        s.remember_sent("from the thread before");
+        let past = Past {
+            cursor: 1,
+            entry: Some(Entry { id: None, seq: 1, kind: EntryKind::User("from this thread".into()) }),
+            todo: None,
+            plan: None,
+        };
+        apply(&mut s, &Action::Frame(Frame::History { entries: vec![past] }));
+        assert_eq!(s.sent, vec!["from this thread".to_string()]);
+    }
+
+    /// A neutral notice does not take the line from a fresh error (C26).
+    #[test]
+    fn a_notice_does_not_replace_a_fresh_error() {
+        let mut s = state();
+        s.set_error("could not send");
+        s.set_status("Connected");
+        assert_eq!(s.status(), Some("could not send"));
     }
 
     /// A thread whose history could not be read leaves the screen of the thread it replaced
