@@ -50,8 +50,9 @@ pub enum Detail {
     None,
     /// A file change. Only the diff is drawn; the same content as JSON would double the height.
     Diff(Diff),
-    /// A shell run. `exit` is absent for the PTY reads that share this shape.
-    Exec { exit: Option<i64>, timed_out: bool, out: String, err: String },
+    /// A shell run. `exit` is absent for the PTY reads that share this shape; `unreported` marks
+    /// a real `exec` that ended with no exit code (killed by a signal), which is not a success.
+    Exec { exit: Option<i64>, unreported: bool, timed_out: bool, out: String, err: String },
     /// Content matches, with the files-scanned count that tells a narrow pattern from a wide one.
     Hits { scanned: u32, hits: Vec<Hit>, truncated: bool },
     /// A list of paths — `search.glob` and `file_io.list`.
@@ -245,9 +246,12 @@ fn flatten(v: &Value) -> String {
 fn exec_of(r: &Value) -> Option<Detail> {
     let out = r.get("stdout")?.as_str()?.to_string();
     let err = r.get("stderr").and_then(Value::as_str).unwrap_or_default().to_string();
+    let exit = r.get("exit_code").and_then(Value::as_i64);
+    let timed_out = r.get("timed_out").and_then(Value::as_bool).unwrap_or(false);
     Some(Detail::Exec {
-        exit: r.get("exit_code").and_then(Value::as_i64),
-        timed_out: r.get("timed_out").and_then(Value::as_bool).unwrap_or(false),
+        exit,
+        unreported: exit.is_none() && !timed_out,
+        timed_out,
         out: clip_body(out),
         err: clip_body(err),
     })
@@ -264,6 +268,7 @@ fn screen_of(r: &Value) -> Option<Detail> {
     };
     Some(Detail::Exec {
         exit: r.get("exited").and_then(Value::as_i64),
+        unreported: false,
         timed_out: false,
         out: clip_body(text),
         err: String::new(),
@@ -419,6 +424,16 @@ mod tests {
         let args = json!({"command": "cat <<EOF\nhello\nEOF"});
         let out = action(&wire("terminal", "exec"), Some(&args), None);
         assert!(!out.contains('\n'), "a newline would split the row: {out:?}");
+    }
+
+    /// A signalled process reports no exit code; it must not be drawn as a clean finish.
+    #[test]
+    fn an_exec_without_an_exit_code_is_unreported_not_ok() {
+        let res = json!({"stdout": "", "stderr": "", "timed_out": false});
+        match detail(&wire("terminal", "exec"), None, Some(&res), None) {
+            Detail::Exec { unreported, .. } => assert!(unreported),
+            other => panic!("expected an exec detail, got {other:?}"),
+        }
     }
 
     #[test]
