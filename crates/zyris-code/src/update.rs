@@ -53,6 +53,9 @@ const CHECK_TIMEOUT: Duration = Duration::from_secs(4);
 /// How long an update asked for by name may take to find out what the newest release is.
 const ASK_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long fetching the installer script may take, body included.
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Asked for from the screen, done once the screen is down.
 ///
 /// **A flag rather than a return value.** Installing has to happen after the terminal is given
@@ -359,8 +362,15 @@ pub async fn install(tag: &str) -> anyhow::Result<()> {
         None => {
             let client =
                 client().ok_or_else(|| anyhow::anyhow!("could not build an HTTP client"))?;
-            let script =
-                client.get(install_url(tag)).send().await?.error_for_status()?.bytes().await?;
+            // A stalled download would hold the start (or the exit) for ever.
+            let script = client
+                .get(install_url(tag))
+                .timeout(DOWNLOAD_TIMEOUT)
+                .send()
+                .await?
+                .error_for_status()?
+                .bytes()
+                .await?;
             Some(stage_downloaded_installer(&script)?)
         }
     };
@@ -418,7 +428,18 @@ pub async fn at_launch(policy: Policy) -> Option<String> {
     if !should_look(policy, std::env::var_os(RELAUNCH_MARK).is_some()) {
         return None;
     }
-    let found = newest(CHECK_TIMEOUT).await;
+    // **A wait longer than a blink says what it is waiting for**: the screen is not up yet, and a
+    // terminal that does nothing for four seconds reads as a hang. Stderr, like every other
+    // thing said before the screen.
+    let check = newest(CHECK_TIMEOUT);
+    tokio::pin!(check);
+    let found = tokio::select! {
+        found = &mut check => found,
+        () = tokio::time::sleep(Duration::from_secs(1)) => {
+            crate::cli::warn(lang::current().update_checking());
+            check.await
+        }
+    };
     match step(policy, found.as_deref(), env!("CARGO_PKG_VERSION")) {
         Step::Stay => None,
         Step::Tell(tag) => Some(tag),

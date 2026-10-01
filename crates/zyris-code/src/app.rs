@@ -957,7 +957,19 @@ impl PasteBurst {
 }
 
 /// How long a notice stays on screen. Plenty to read one sentence.
+/// **`ZYRIS_CODE_REDUCE_MOTION` stops the blink and the breath.** Both are clocks read through
+/// `blink_ms` and `breath_ms`; frozen at zero the dot stays lit and the text stays at full colour,
+/// and the tick has nothing to redraw for them. Read once, like the rest of the environment.
+fn reduce_motion() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("ZYRIS_CODE_REDUCE_MOTION").is_ok_and(|v| !v.is_empty() && v != "0")
+    })
+}
+
 pub const STATUS_WINDOW: Duration = Duration::from_secs(6);
+/// How long an error keeps the notice line against a neutral notice (`State::set_status`).
+const ERROR_HOLD: Duration = Duration::from_secs(3);
 
 /// The longest error the activity line is trusted to show whole (`State::set_error`): what is left
 /// of an 80-column line after its dot and a little room.
@@ -977,7 +989,17 @@ impl State {
     }
 
     /// Set what to say. Visible only for `STATUS_WINDOW` from this moment.
+    ///
+    /// **A notice does not push an error off the line before it could be read.** "Connected" after
+    /// a blip replaced an MCP server's failure a moment after it arrived, and the person never
+    /// learned the tool was missing. The error keeps the line for `ERROR_HOLD`; what was said
+    /// meanwhile is dropped, not queued — it is news the line can do without.
     pub fn set_status(&mut self, message: impl Into<String>) {
+        if let Some((_, at, Severity::Error)) = &self.status {
+            if at.elapsed() < ERROR_HOLD {
+                return;
+            }
+        }
         self.status = Some((message.into(), Instant::now(), Severity::Notice));
     }
 
@@ -1214,6 +1236,9 @@ impl State {
     /// has been going; which frames were drawn along the way is the drawing side's business and
     /// must not change the tempo.
     pub fn breath_ms(&self) -> u64 {
+        if reduce_motion() {
+            return 0;
+        }
         self.breath_origin.elapsed().as_millis() as u64
     }
 
@@ -1222,6 +1247,9 @@ impl State {
     /// **Read at draw time, from a clock**, for the same reason as [`State::breath_ms`]: the tempo
     /// belongs to time, not to how many frames happened to be drawn along the way.
     pub fn blink_ms(&self) -> u64 {
+        if reduce_motion() {
+            return 0;
+        }
         self.blink_origin.elapsed().as_millis() as u64
     }
 
@@ -3190,6 +3218,13 @@ fn apply_frame(state: &mut State, frame: &Frame) {
         // keeps them — a refresh that failed knows less than what is on screen — and a list the
         // person has left is nobody's news.
         Frame::PickerFailed { why, for_list: None } => {
+            // **The session has already moved, so the screen moves with it.** Leaving the old
+            // thread on screen under the new thread's id sent messages into one while the other
+            // was read. What is shown is now the thread's own, empty, and the stream opened for
+            // it (`run_inner`) fills it from the start.
+            if state.loading_history {
+                clear_conversation(state);
+            }
             state.loading_history = false;
             state.set_error(why.clone());
         }
@@ -3260,7 +3295,12 @@ fn apply_frame(state: &mut State, frame: &Frame) {
             // back what was held for the thread before.
             let held = std::mem::take(&mut state.queued);
             clear_conversation(state);
+            // **Up and Ctrl+R recall this thread's own messages**, not the last thread's, and not
+            // only what was typed in this run.
             for past in entries {
+                if let Some(Entry { kind: EntryKind::User(text), .. }) = &past.entry {
+                    state.remember_sent(text);
+                }
                 let frame = Frame::Event {
                     cursor: past.cursor,
                     entry: past.entry.clone(),
@@ -4714,6 +4754,23 @@ fn api_of(rx: &ApiRx) -> Option<Arc<AttaccaApiClient>> {
 /// even when the frame itself failed, so a broken frame can never leave the terminal holding a
 /// picture it will not swap. That would freeze the screen until the next frame, and on the way out
 /// of the app there is no next frame.
+/// **Says "Working…" and draws it before something slow is awaited on the loop.** Until the await
+/// returns nothing is drawn and no key is read, so without this the screen shows nothing for as
+/// long as a `git clone` or a slow server takes, and Enter gets pressed again. A mark, not a
+/// spinner: the loop cannot animate while it waits (`ponytail:` moving these off the loop is the
+/// fix that makes this unnecessary).
+fn busy(terminal: &mut ratatui::DefaultTerminal, state: &mut State) -> std::io::Result<()> {
+    state.set_status(state.lang.working());
+    draw_frame(terminal, state)
+}
+
+/// Takes `busy`'s notice down again, unless whatever ran has said something of its own since.
+fn unbusy(state: &mut State) {
+    if state.status() == Some(state.lang.working()) {
+        state.clear_status();
+    }
+}
+
 fn draw_frame(terminal: &mut ratatui::DefaultTerminal, state: &mut State) -> std::io::Result<()> {
     use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
 
@@ -5351,7 +5408,19 @@ async fn run_inner(
                             }
                         }
                         Action::PickConfirm => {
+                            // The picks that wait on the network or on `git` say so first.
+                            use crate::picker::Pick as P;
+                            let slow = matches!(
+                                state.picker.as_ref().and_then(crate::picker::Picker::pick),
+                                Some(P::InstallPlugin { .. } | P::DeleteProject { .. } | P::UseAgent { .. })
+                            );
+                            if slow {
+                                busy(terminal, &mut state)?;
+                            }
                             pick(&api, &mut state, &mut session, &mut agent_id, &tx).await;
+                            if slow {
+                                unbusy(&mut state);
+                            }
                         }
                         // **Off the loop, and its failure said.** It was awaited here before `apply`
                         // could mark the turn as stopping, so a slow link froze the screen for up to
@@ -5413,10 +5482,19 @@ async fn run_inner(
                     // Slash commands. `run_command` finishes the pure part, and only what
                     // needs the server or the disk is finished here.
                     if let Some(text) = state.command_out.take() {
+                        // `/plugin` clones and updates with `git`, `/agent` asks the server.
+                        let lower = text.to_ascii_lowercase();
+                        let slow = lower.starts_with("/plugin") || lower.starts_with("/agent");
+                        if slow {
+                            busy(terminal, &mut state)?;
+                        }
                         finish_command(
                             &api, &bridge, &mut state, &mut session, &mut agent_id, &text, &tx,
                         )
                             .await;
+                        if slow {
+                            unbusy(&mut state);
+                        }
                         // `/quit`. The way out is the same as Ctrl+C — a running turn is
                         // stopped below.
                         if state.quitting {
@@ -5438,10 +5516,20 @@ async fn run_inner(
                     // fetched plugin is updated — and then the panel is rebuilt from what is now
                     // on disk, so the row shows the truth rather than what was asked for.
                     if let Some(ask) = state.manager_out.take() {
+                        let slow = matches!(
+                            ask,
+                            ManagerAsk::InstallPlugin { .. } | ManagerAsk::UpdatePlugin { .. }
+                        );
+                        if slow {
+                            busy(terminal, &mut state)?;
+                        }
                         if let Some(said) = carry_out_manager_ask(&mut state, ask).await {
                             state.timeline.say(said);
                         }
                         refresh_the_manager(&mut state, &bridge);
+                        if slow {
+                            unbusy(&mut state);
+                        }
                     }
 
                     // **The `@` list asked for a walk.** `apply` set the flag and put the
@@ -5455,7 +5543,10 @@ async fn run_inner(
                     // here — it is I/O, so `apply` cannot. On failure the reason is left on
                     // the form and the form stays — it has to be fixable and retryable.
                     if let Some((name, description)) = state.project_out.take() {
-                        match crate::conn::create_project(&api, &name, Some(&description)).await {
+                        busy(terminal, &mut state)?;
+                        let created = crate::conn::create_project(&api, &name, Some(&description)).await;
+                        unbusy(&mut state);
+                        match created {
                             Ok((id, name)) => {
                                 // **Create it and go inside.** Having to pick it again after
                                 // creating is doing the work twice, and it invites the
@@ -5570,7 +5661,10 @@ async fn run_inner(
                 // just past what was re-read; that cursor exists only after the replay, so opening
                 // any earlier would re-deliver the whole thread or skip what arrived while it
                 // loaded.
-                if matches!(action, Action::Frame(Frame::History { .. })) {
+                if matches!(
+                    action,
+                    Action::Frame(Frame::History { .. } | Frame::PickerFailed { for_list: None, .. })
+                ) {
                     if let Some(id) = session.id().map(str::to_string) {
                         spawn_stream(Arc::clone(&api), &mut session, id, state.last_cursor, tx.clone());
                     }
@@ -5592,6 +5686,9 @@ async fn run_inner(
                     api = fresh;
                     state.connected = true;
                     state.dropped_because = None;
+                    // The drop this was waiting for has come and gone; left set, a later genuine
+                    // drop would be reported as the quiet "Reconnecting".
+                    state.reconnecting = false;
                     state.ever_connected = true;
                     // A drop and reattach shows on screen too — connecting → connected →
                     // idle.
@@ -6283,6 +6380,8 @@ fn leave_session(state: &mut State) {
 /// next field added was always going to be forgotten by one of them.
 fn clear_conversation(state: &mut State) {
     leave_session(state);
+    state.sent.clear();
+    state.recall = None;
     // **News about a conversation goes with it.** "could not send" from the thread just left,
     // sitting on the line that is supposed to say what is happening here, reads as this thread
     // failing.
@@ -12314,6 +12413,49 @@ mod interaction {
         apply(&mut s, &listed(threads("x", &["from-x"])));
         let p = s.picker.as_ref().unwrap();
         assert!(p.loading && p.rows.is_empty(), "X's threads landed under Y");
+    }
+
+    /// Recall belongs to the thread on screen: its own messages come back from the history, and
+    /// the last thread's do not (C30).
+    #[test]
+    fn recall_follows_the_thread_on_screen() {
+        let mut s = state();
+        s.remember_sent("from the thread before");
+        let past = Past {
+            cursor: 1,
+            entry: Some(Entry {
+                id: None,
+                seq: 1,
+                kind: EntryKind::User("from this thread".into()),
+            }),
+            todo: None,
+            plan: None,
+        };
+        apply(&mut s, &Action::Frame(Frame::History { entries: vec![past] }));
+        assert_eq!(s.sent, vec!["from this thread".to_string()]);
+    }
+
+    /// A neutral notice does not take the line from a fresh error (C26).
+    #[test]
+    fn a_notice_does_not_replace_a_fresh_error() {
+        let mut s = state();
+        s.set_error("could not send");
+        s.set_status("Connected");
+        assert_eq!(s.status(), Some("could not send"));
+    }
+
+    /// A thread whose history could not be read leaves the screen of the thread it replaced
+    /// (C14): the session already moved, so showing the old one told the wrong story.
+    #[test]
+    fn a_failed_history_does_not_leave_the_old_thread_on_screen() {
+        let mut s = state();
+        s.timeline.say("old thread");
+        s.loading_history = true;
+        let failed = Frame::PickerFailed { why: "timed out".into(), for_list: None };
+        apply(&mut s, &Action::Frame(failed));
+        assert!(!s.loading_history);
+        assert!(s.timeline.items().is_empty(), "the old thread stayed under the new session");
+        assert!(s.status().is_some());
     }
 
     /// **A list failing closes only itself.** The history search the person moved on to stayed
