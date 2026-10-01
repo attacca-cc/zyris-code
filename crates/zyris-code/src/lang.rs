@@ -559,6 +559,17 @@ impl Lang {
     }
 
     pub fn unknown_command(self, what: &str, help: &str) -> String {
+        // **A known command with a bad argument carries the whole line** ("mode plan now"). Name
+        // the part that was not understood instead of calling the command itself unknown.
+        if let Some((cmd, arg)) = what.split_once(' ') {
+            let arg = arg.trim();
+            return match (self, arg.is_empty()) {
+                (Lang::Ko, false) => format!("`/{cmd}`에 `{arg}`은(는) 쓸 수 없습니다.\n\n{help}"),
+                (Lang::Ko, true) => format!("`/{cmd}`에 알맞은 값을 같이 적어 주세요.\n\n{help}"),
+                (Lang::En, false) => format!("`/{cmd}` does not accept `{arg}`.\n\n{help}"),
+                (Lang::En, true) => format!("`/{cmd}` needs a valid argument.\n\n{help}"),
+            };
+        }
         match self {
             Lang::Ko => format!("`/{what}`은 모르는 명령입니다.\n\n{help}"),
             Lang::En => format!("`/{what}` is not a command.\n\n{help}"),
@@ -743,6 +754,14 @@ impl Lang {
         match self {
             Lang::Ko => format!("서버에 연결하지 못했습니다 ({secs}초째): {why}"),
             Lang::En => format!("Couldn't reach the server ({secs}s in): {why}"),
+        }
+    }
+
+    /// The dial has been failing for `secs` seconds; shown on the activity line next to "Connecting...".
+    pub fn still_dialing(self, secs: u64, why: &str) -> String {
+        match self {
+            Lang::Ko => format!("{secs}초째 연결하지 못했습니다: {why}"),
+            Lang::En => format!("still can't connect after {secs}s: {why}"),
         }
     }
 

@@ -8606,6 +8606,16 @@ mod tests {
         assert!(last_system(&mut s).contains("/help"), "{}", last_system(&mut s));
     }
 
+    /// A bad argument names the argument, not "not a command".
+    #[test]
+    fn a_bad_argument_is_named() {
+        let mut s = state();
+        s.lang = crate::lang::Lang::En;
+        run_command(&mut s, "/mode plan now");
+        let said = last_system(&mut s);
+        assert!(said.contains("`/mode` does not accept `plan now`"), "{said}");
+    }
+
     /// `/status` paints the whole picture — thread, project, agent, mode, usage, cwd — in
     /// both languages, and a session-less state says so honestly.
     #[test]
