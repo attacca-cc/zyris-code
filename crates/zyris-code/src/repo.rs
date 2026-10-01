@@ -256,7 +256,7 @@ fn pieces(
     level: Level,
     budget: usize,
 ) -> Vec<Vec<Span<'static>>> {
-    let muted = Style::default().fg(theme::text_muted());
+    let muted = theme::muted();
     let mut git: Vec<Span<'static>> = Vec::new();
     if let (Some(r), false) = (repo, level == Level::NoGit) {
         let conflicts = if r.conflicts > 0 { format!(" !{}", r.conflicts) } else { String::new() };

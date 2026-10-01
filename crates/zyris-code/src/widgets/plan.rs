@@ -49,15 +49,12 @@ pub fn lines(plan: &Plan, lang: Lang, width: usize, rows: usize) -> Vec<Line<'st
     let hidden = plan.hidden(room);
 
     let mut out = vec![Line::from(vec![
-        Span::styled(PAD, Style::default().fg(theme::text_muted())),
+        Span::styled(PAD, theme::muted()),
         Span::styled(
             lang.plan_title(),
             Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(
-            format!("  {}", lang.plan_keys(plan.open)),
-            Style::default().fg(theme::text_muted()),
-        ),
+        Span::styled(format!("  {}", lang.plan_keys(plan.open)), theme::muted()),
     ])];
 
     let body = plan.body();
@@ -72,7 +69,7 @@ pub fn lines(plan: &Plan, lang: Lang, width: usize, rows: usize) -> Vec<Line<'st
     if hidden > 0 && out.len() < rows {
         out.push(Line::from(vec![
             Span::raw(PAD),
-            Span::styled(lang.plan_more(hidden), Style::default().fg(theme::text_muted())),
+            Span::styled(lang.plan_more(hidden), theme::muted()),
         ]));
     }
     out.truncate(rows);

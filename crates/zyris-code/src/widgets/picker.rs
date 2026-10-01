@@ -74,10 +74,7 @@ pub fn draw(
 
     let mut lines: Vec<Line<'static>> = Vec::new();
     if picker.loading {
-        lines.push(Line::from(Span::styled(
-            lang.loading(),
-            Style::default().fg(theme::text_muted()),
-        )));
+        lines.push(Line::from(Span::styled(lang.loading(), theme::muted())));
     }
 
     // **The pure side decides** where each row goes (`picker::slots`). Here we just draw.
@@ -98,10 +95,9 @@ pub fn draw(
             Slot::Rule => {
                 Line::from(Span::styled("─".repeat(width), Style::default().fg(theme::border())))
             }
-            Slot::More { count, up } => Line::from(Span::styled(
-                lang.pick_more(up, count),
-                Style::default().fg(theme::text_muted()),
-            )),
+            Slot::More { count, up } => {
+                Line::from(Span::styled(lang.pick_more(up, count), theme::muted()))
+            }
         });
     }
 
@@ -113,10 +109,7 @@ pub fn draw(
     // a list whose descriptions sat beside short rows and under long ones changed shape as the
     // eye walked it, and where a description is belongs to the window, not to its length.
     for row in &detail {
-        lines.push(Line::from(Span::styled(
-            format!("  {row}"),
-            Style::default().fg(theme::text_muted()),
-        )));
+        lines.push(Line::from(Span::styled(format!("  {row}"), theme::muted())));
     }
     // **The rows left over stay empty, and that is the point.** A row whose note is one line and
     // a row whose note is two must not give the list two different heights.
@@ -148,7 +141,7 @@ pub fn draw(
             // draws no note area, and a key that does nothing reads as broken — the same reason a
             // list that was not cut shows no overflow mark.
             lang.picker_keys(back, shows_note),
-            Style::default().fg(theme::text_muted()),
+            theme::muted(),
         ))),
     }
 
@@ -198,7 +191,7 @@ fn row_line(
     // the first thing the eye lands on, before reading its title.
     if let Some(dot) = status_span {
         spans.push(dot);
-        spans.push(Span::styled(" ", Style::default().fg(theme::text_muted())));
+        spans.push(Span::styled(" ", theme::muted()));
     }
     // **The name, and nothing else.** The note is under the list (`cursor_detail`), so the row
     // ends where the name does whatever the length of that name's sentence.

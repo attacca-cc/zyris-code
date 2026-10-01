@@ -303,6 +303,22 @@ fn only_the_mouse_modes_this_app_reads_are_switched_on() {
     assert!(buttons < drag, "`?1002h` (drag) must be asked for after `?1000h` (buttons)");
 }
 
+/// **Without the mouse, the wheel is not turned into arrow keys** (alternate scroll, `?1007`), and
+/// the setting is handed back on the way out.
+#[cfg(unix)]
+#[test]
+fn a_screen_without_the_mouse_stops_the_wheel_becoming_arrows() {
+    let _turn = one_at_a_time();
+    let mut app = Session::start_with(&[("ZYRIS_CODE_MOUSE", "0".to_string())]);
+    app.wait_until_ready();
+    assert!(app.wait_for("\x1b[?1007l"), "alternate scroll was left on:\n{}", app.text());
+    assert!(!app.text().contains("\x1b[?1000h"), "the mouse was taken anyway");
+    app.send(b"\x03");
+    std::thread::sleep(Duration::from_millis(300));
+    app.send(b"\x03");
+    assert!(app.wait_for("\x1b[?1007h"), "alternate scroll was not given back:\n{}", app.text());
+}
+
 /// Drops ANSI escape sequences, leaving what a person would see.
 ///
 /// CSI (`ESC [ … final`), OSC (`ESC ] … BEL` or `ST`), and the two-character escapes. Enough for

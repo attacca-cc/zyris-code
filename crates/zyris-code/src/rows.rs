@@ -793,10 +793,8 @@ fn make(item: &Item, width: u16, folds: &Folds, turn: Turn, lang: crate::lang::L
             let rendered = markdown::render_rich(text, body_width(width));
             let md = rendered.prefix.clone();
             for (i, line) in rendered.lines.into_iter().enumerate() {
-                let mut spans = vec![Span::styled(
-                    if i == 0 { "◈ " } else { "  " },
-                    Style::default().fg(theme::text_muted()),
-                )];
+                let mut spans =
+                    vec![Span::styled(if i == 0 { "◈ " } else { "  " }, theme::muted())];
                 let prefix_w =
                     spans.iter().map(|s| markdown::display_width(&s.content)).sum::<usize>();
                 spans.extend(line.spans);
@@ -908,10 +906,7 @@ fn make(item: &Item, width: u16, folds: &Folds, turn: Turn, lang: crate::lang::L
             // theirs.
             let mut tail: Vec<Span<'static>> = Vec::new();
             if total > 0 {
-                tail.push(Span::styled(
-                    format!("  ∙  {}", lang.tool_count(total)),
-                    Style::default().fg(theme::text_muted()),
-                ));
+                tail.push(Span::styled(format!("  ∙  {}", lang.tool_count(total)), theme::muted()));
             }
             if add + rem > 0 {
                 tail.extend(counts(add, rem));
@@ -941,10 +936,7 @@ fn make(item: &Item, width: u16, folds: &Folds, turn: Turn, lang: crate::lang::L
                 card.push(Span::styled(head, Style::default().fg(theme::text_heading())));
                 breathing.push((out.len(), card.len() - 1));
             } else {
-                card.push(Span::styled(
-                    head,
-                    Style::default().fg(theme::text_heading()).add_modifier(Modifier::BOLD),
-                ));
+                card.push(Span::styled(head, theme::heading()));
             }
             card.extend(tail);
             heads.push((out.len(), *seq));
@@ -1203,11 +1195,13 @@ fn detail_lines(
                 body.push(0);
             }
         }
-        Detail::Exec { exit, timed_out, out: stdout, err } => {
+        Detail::Exec { exit, unreported, timed_out, out: stdout, err } => {
             // The headline first: whether it finished, and how. A quiet success still says so —
             // an empty detail reads as a broken tool.
             let (label, colour) = if *timed_out {
                 (lang.detail_timed_out().to_string(), theme::danger())
+            } else if *unreported {
+                (lang.detail_no_exit().to_string(), theme::danger())
             } else {
                 match exit {
                     Some(0) | None => (lang.detail_ok().to_string(), theme::success()),
@@ -1218,10 +1212,7 @@ fn detail_lines(
             if stdout.trim().is_empty() && err.trim().is_empty() {
                 out.extend(row(
                     "  ",
-                    vec![Span::styled(
-                        lang.detail_no_output().to_string(),
-                        Style::default().fg(theme::text_muted()),
-                    )],
+                    vec![Span::styled(lang.detail_no_output().to_string(), theme::muted())],
                 ));
             }
             for spans in plain(stdout.trim_end(), theme::text()) {
@@ -1255,7 +1246,7 @@ fn detail_lines(
                 let inner = inner as usize;
                 let place = markdown::truncate_to(&format!("{}:{}", h.path, h.line), inner);
                 let place_style = Style::default().fg(theme::tool_arg());
-                let text_style = Style::default().fg(theme::text_muted());
+                let text_style = theme::muted();
                 let room = inner.saturating_sub(markdown::display_width(&place) + 2);
                 if room >= 8 {
                     out.extend(row(
@@ -1302,7 +1293,7 @@ fn detail_lines(
                     "  ",
                     vec![Span::styled(
                         markdown::truncate_to(p, (inner as usize).max(1)),
-                        Style::default().fg(theme::text_muted()),
+                        theme::muted(),
                     )],
                 ));
             }
@@ -1453,17 +1444,11 @@ fn question_rows(
     let head_colour = if answered { theme::text_muted() } else { theme::accent() };
     let mut head = vec![Span::styled(format!("{mark} "), Style::default().fg(head_colour))];
     if let Some(h) = &step.header {
-        head.push(Span::styled(format!("[{h}] "), Style::default().fg(theme::text_muted())));
+        head.push(Span::styled(format!("[{h}] "), theme::muted()));
     }
-    head.push(Span::styled(
-        step.question.clone(),
-        Style::default().fg(theme::text_heading()).add_modifier(Modifier::BOLD),
-    ));
+    head.push(Span::styled(step.question.clone(), theme::heading()));
     if steps.len() > 1 {
-        head.push(Span::styled(
-            format!("  ∙  {}", lang.step_count(steps.len())),
-            Style::default().fg(theme::text_muted()),
-        ));
+        head.push(Span::styled(format!("  ∙  {}", lang.step_count(steps.len())), theme::muted()));
     }
     // **The question wraps.** It is the whole reason this row is up, and a long one used to be cut
     // at the right edge in silence — `ratatui` drops whatever runs past it. The wrapped part hangs
@@ -1484,7 +1469,7 @@ fn question_rows(
         // one column, and that it was not among the options is information worth that column.
         let shown = answer.replace(lang.free_mark(), "✎");
         out.push(Line::from(vec![
-            Span::styled(ANSWER_MARK.to_string(), Style::default().fg(theme::text_muted())),
+            Span::styled(ANSWER_MARK.to_string(), theme::muted()),
             Span::styled(markdown::truncate_to(&shown, room), Style::default().fg(theme::text())),
         ]));
         body.push(markdown::display_width(ANSWER_MARK) as u16);
@@ -2626,6 +2611,7 @@ mod tests {
         use crate::tool_view::{Detail, ToolState};
         let d = Detail::Exec {
             exit: Some(0),
+            unreported: false,
             timed_out: false,
             out: "Up to date".into(),
             err: String::new(),
@@ -2644,6 +2630,7 @@ mod tests {
         use crate::tool_view::{Detail, ToolState};
         let d = Detail::Exec {
             exit: Some(3),
+            unreported: false,
             timed_out: false,
             out: String::new(),
             err: "error[E0308]".into(),
@@ -2665,6 +2652,7 @@ mod tests {
         use crate::tool_view::{Detail, ToolState};
         let d = Detail::Exec {
             exit: Some(0),
+            unreported: false,
             timed_out: false,
             out: String::new(),
             err: String::new(),

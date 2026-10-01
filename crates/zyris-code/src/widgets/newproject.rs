@@ -37,10 +37,7 @@ pub fn draw(frame: &mut Frame, area: Rect, form: &Form, lang: crate::lang::Lang)
     if let Some(err) = &form.error {
         lines.push(Line::from(Span::styled(err.clone(), Style::default().fg(theme::danger()))));
     }
-    lines.push(Line::from(Span::styled(
-        lang.project_form_keys().to_string(),
-        Style::default().fg(theme::text_muted()),
-    )));
+    lines.push(Line::from(Span::styled(lang.project_form_keys().to_string(), theme::muted())));
 
     frame.render_widget(Paragraph::new(lines), inner);
 }
@@ -64,7 +61,7 @@ fn field_line(
     let label = format!("{label} ");
     let room = width.saturating_sub(display_width(&label) + 2).max(1);
     let mut spans = vec![
-        Span::styled(label, Style::default().fg(theme::text_muted())),
+        Span::styled(label, theme::muted()),
         Span::styled("> ", Style::default().fg(theme::accent())),
     ];
     let caret = Style::default().fg(theme::accent());
@@ -82,7 +79,7 @@ fn field_line(
     let (before, after) = if on { text.split_at(at) } else { ("", text.as_str()) };
     let (lead, left, under, right, trail) = window(before, after, room, on);
     let body = Style::default().fg(theme::text());
-    let mark = Style::default().fg(theme::text_muted());
+    let mark = theme::muted();
     if lead {
         spans.push(Span::styled("…", mark));
     }

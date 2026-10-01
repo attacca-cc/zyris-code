@@ -69,8 +69,8 @@ pub fn card(a: &Answering, width: u16, room: usize, lang: crate::lang::Lang) -> 
                 &mut owners,
                 wrap::line(
                     Line::from(vec![
-                        Span::styled("  ", Style::default().fg(theme::text_muted())),
-                        Span::styled(format!("{q}  "), Style::default().fg(theme::text_muted())),
+                        Span::styled("  ", theme::muted()),
+                        Span::styled(format!("{q}  "), theme::muted()),
                         Span::styled(
                             ans,
                             Style::default().fg(if skipped {
@@ -92,16 +92,13 @@ pub fn card(a: &Answering, width: u16, room: usize, lang: crate::lang::Lang) -> 
         let step = a.current();
         let mut head = vec![Span::styled("? ", Style::default().fg(theme::accent()))];
         if let Some(h) = &step.header {
-            head.push(Span::styled(format!("[{h}] "), Style::default().fg(theme::text_muted())));
+            head.push(Span::styled(format!("[{h}] "), theme::muted()));
         }
-        head.push(Span::styled(
-            step.question.clone(),
-            Style::default().fg(theme::text_heading()).add_modifier(Modifier::BOLD),
-        ));
+        head.push(Span::styled(step.question.clone(), theme::heading()));
         if a.steps.len() > 1 {
             head.push(Span::styled(
                 format!("  ∙  {}/{}", a.step + 1, a.steps.len()),
-                Style::default().fg(theme::text_muted()),
+                theme::muted(),
             ));
         }
         add(&mut body, &mut owners, wrap::line(Line::from(head), w), None);
@@ -167,7 +164,7 @@ pub fn card(a: &Answering, width: u16, room: usize, lang: crate::lang::Lang) -> 
     let mut lines =
         vec![Line::from(Span::styled("─".repeat(w), Style::default().fg(theme::accent())))];
     lines.extend(body[top..top + shown].iter().cloned());
-    lines.push(Line::from(Span::styled(hint, Style::default().fg(theme::text_muted()))));
+    lines.push(Line::from(Span::styled(hint, theme::muted())));
     // The rule is drawn above the body, so a caret on body line `y` is on screen line `y + 1` —
     // and the window may have scrolled, hence the `top`.
     let caret = caret.map(|(x, y)| (x as u16, (y + 1).saturating_sub(top) as u16));
@@ -262,10 +259,7 @@ fn row_lines(
                 ),
             ];
             if let Some(d) = &opt.description {
-                spans.push(Span::styled(
-                    format!("  ‒ {d}"),
-                    Style::default().fg(theme::text_muted()),
-                ));
+                spans.push(Span::styled(format!("  ‒ {d}"), theme::muted()));
             }
             Line::from(spans)
         }

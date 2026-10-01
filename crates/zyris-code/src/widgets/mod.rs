@@ -46,7 +46,7 @@ pub mod todos;
 pub mod transcript;
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::Span;
 use ratatui::widgets::{Block, Borders, Clear};
 use ratatui::Frame;
@@ -526,10 +526,7 @@ pub(crate) fn overlay(frame: &mut Frame, area: Rect, w: u16, h: u16, title: &str
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(crate::theme::accent()))
-        .title(Span::styled(
-            format!(" {title} "),
-            Style::default().fg(crate::theme::text_heading()).add_modifier(Modifier::BOLD),
-        ));
+        .title(Span::styled(format!(" {title} "), crate::theme::heading()));
     let inner = block.inner(box_area);
     frame.render_widget(block, box_area);
     inner
