@@ -109,7 +109,7 @@ pub fn draw(
                 },
             },
         },
-        Style::default().fg(theme::text_muted()),
+        theme::muted(),
     )));
     if let Some(note) = &form.note {
         lines.push(Line::from(Span::styled(
@@ -156,10 +156,7 @@ fn row(label: &str, value: String, filled: bool, focused: bool, width: usize) ->
             marker.to_string(),
             Style::default().fg(if focused { theme::accent() } else { theme::border_light() }),
         ),
-        Span::styled(
-            format!("{label}{}", " ".repeat(pad)),
-            Style::default().fg(theme::text_muted()),
-        ),
+        Span::styled(format!("{label}{}", " ".repeat(pad)), theme::muted()),
         Span::styled(
             format!(" {value}"),
             Style::default().fg(colour).add_modifier(if focused {

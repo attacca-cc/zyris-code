@@ -66,7 +66,7 @@ pub fn lines(items: &[Todo], lang: Lang, width: usize, rows: usize) -> Vec<Line<
     let mut out: Vec<Line<'static>> =
         ordered.iter().take(shown).enumerate().map(|(i, todo)| row(todo, i + 1, width)).collect();
     if shown < items.len() {
-        let muted = Style::default().fg(theme::text_muted());
+        let muted = theme::muted();
         out.push(Line::from(vec![
             Span::raw(PAD),
             Span::styled(
@@ -114,7 +114,7 @@ fn row(todo: &Todo, number: usize, width: usize) -> Line<'static> {
     Line::from(vec![
         Span::raw(PAD),
         Span::styled(mark, Style::default().fg(dot)),
-        Span::styled(head, Style::default().fg(theme::text_muted())),
+        Span::styled(head, theme::muted()),
         Span::styled(truncate_to(&title, room), title_style),
     ])
 }

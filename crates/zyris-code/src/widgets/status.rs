@@ -41,7 +41,7 @@ pub fn left_spans(state: &State) -> Vec<Span<'static>> {
                 if state.agent.is_empty() { "-" } else { state.agent.as_str() },
                 PROJECT_WIDTH,
             ),
-            Style::default().fg(theme::text_muted()),
+            theme::muted(),
         ),
     ];
 
@@ -61,10 +61,7 @@ pub fn left_spans(state: &State) -> Vec<Span<'static>> {
     // could not check. Spaced apart from mode·agent, which are one set on their own.
     if let Some(name) = &state.project_name {
         left.push(Span::styled(" ∙ ", Style::default().fg(theme::border_light())));
-        left.push(Span::styled(
-            crate::markdown::truncate_to(name, PROJECT_WIDTH),
-            Style::default().fg(theme::text_muted()),
-        ));
+        left.push(Span::styled(crate::markdown::truncate_to(name, PROJECT_WIDTH), theme::muted()));
     }
     left
 }
@@ -127,7 +124,7 @@ fn usage_spans(state: &State) -> Vec<Span<'static>> {
 /// One `label value` segment — the label muted, the number readable.
 fn kv(label: &'static str, value: String) -> Vec<Span<'static>> {
     vec![
-        Span::styled(label, Style::default().fg(theme::text_muted())),
+        Span::styled(label, theme::muted()),
         Span::styled(" ", Style::default()),
         Span::styled(value, Style::default().fg(theme::text())),
     ]

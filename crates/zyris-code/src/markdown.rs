@@ -160,7 +160,7 @@ pub fn render_rich(src: &str, width: u16) -> Rendered {
         match event {
             Event::Start(Tag::Heading { .. }) => {
                 styles.push(style);
-                style = Style::default().fg(theme::text_heading()).add_modifier(Modifier::BOLD);
+                style = theme::heading();
             }
             Event::End(TagEnd::Heading(_)) => {
                 flush_at!("", false);
@@ -188,7 +188,7 @@ pub fn render_rich(src: &str, width: u16) -> Rendered {
             Event::Start(Tag::BlockQuote(_)) => {
                 flush_at!(&item_indent, false);
                 styles.push(style);
-                style = Style::default().fg(theme::text_muted());
+                style = theme::muted();
                 quote += 1;
             }
             Event::End(TagEnd::BlockQuote(_)) => {

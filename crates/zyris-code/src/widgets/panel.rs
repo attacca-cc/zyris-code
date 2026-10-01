@@ -56,10 +56,7 @@ pub fn draw(frame: &mut Frame, area: Rect, panel: &mut Panel, lang: crate::lang:
     let inner_w = w.saturating_sub(2) as usize;
     // **The key hint wraps like everything else in the box.** It was one line cut at the border,
     // and on a narrow terminal the half that said what `d` and `u` do was the half that went.
-    let hint = wrap::line(
-        Line::from(Span::styled(keys, Style::default().fg(theme::text_muted()))),
-        inner_w,
-    );
+    let hint = wrap::line(Line::from(Span::styled(keys, theme::muted())), inner_w);
     // The rows the foot keeps, whichever sentence is up. **A box that resizes under the keys is
     // what all of this exists to prevent** — that is why `foot` holds every sentence, not one.
     let foot_rows =
