@@ -427,9 +427,11 @@ async fn run_app() -> ExitCode {
                 {
                     let watching = conn.clone();
                     let bridge = bridge.clone();
+                    let notice_drop = notice.clone();
                     tokio::spawn(async move {
                         let reason = watching.closed().await;
                         tracing::warn!(%reason, "the connection dropped. Runner reattaches");
+                        notice_drop.dropped();
                         bridge.frame(app::Frame::Disconnected(reason.to_string()));
                     });
                 }

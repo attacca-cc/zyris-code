@@ -47,6 +47,13 @@ impl Notice {
         self.0.connected.store(true, Ordering::SeqCst);
     }
 
+    /// The connection dropped, so the dial is starting over. **The watcher wakes up again** and
+    /// the reasons collected so far are forgotten, so what it reports is about this outage.
+    pub fn dropped(&self) {
+        *self.0.last.lock().unwrap() = None;
+        self.0.connected.store(false, Ordering::SeqCst);
+    }
+
     /// A layer that also routes failures flowing to the log through here.
     ///
     /// **It doesn't select by message text** — if the upstream changes the wording, it would silently not be caught.
@@ -102,18 +109,20 @@ impl Notice {
             let mut said_waiting = false;
             loop {
                 tokio::time::sleep(Duration::from_secs(1)).await;
+                // **Connected, so there is nothing to say.** The watcher keeps running instead of
+                // returning, because a connection that drops later dials again and can fail again
+                // (see `dropped`).
                 if notice.0.connected.load(Ordering::SeqCst) {
-                    return;
-                }
-                // If there's a screen, the screen speaks — the shell doesn't cut in.
-                if bridge.has_screen() {
+                    waited = 0;
+                    said_waiting = false;
                     continue;
                 }
                 waited += 1;
                 let why = notice.0.last.lock().unwrap().clone();
+                let screen = bridge.has_screen();
                 let Some(why) = why else {
                     // No error yet — waiting for approval.
-                    if notice.0.hushed.load(Ordering::SeqCst) {
+                    if screen || notice.0.hushed.load(Ordering::SeqCst) {
                         continue;
                     }
                     if waited >= FIRST && !said_waiting {
@@ -122,17 +131,30 @@ impl Notice {
                     }
                     continue;
                 };
-                // Once at the 3rd second, then every 15 seconds. The seconds in between are silent.
-                let speak = match waited.checked_sub(FIRST) {
-                    Some(0) => true,
-                    Some(since) => since.is_multiple_of(REPEAT),
-                    None => false,
-                };
-                if speak {
+                if !speak_now(waited) {
+                    continue;
+                }
+                if screen {
+                    // **A dial that keeps failing is told to the screen**, as a frame: writing to
+                    // the shell would cut into what ratatui drew. It lands on the activity line
+                    // beside "Connecting...", with how long it has been going on.
+                    bridge.frame(crate::app::Frame::Disconnected(
+                        crate::lang::current().still_dialing(waited, &why),
+                    ));
+                } else {
                     red(&crate::lang::current().server_unreachable(waited, &why));
                 }
             }
         });
+    }
+}
+
+/// Once at the 3rd second, then every 15 seconds. The seconds in between are silent.
+fn speak_now(waited: u64) -> bool {
+    match waited.checked_sub(FIRST) {
+        Some(0) => true,
+        Some(since) => since.is_multiple_of(REPEAT),
+        None => false,
     }
 }
 
@@ -317,6 +339,24 @@ mod tests {
         if cfg!(windows) {
             assert!(!named.starts_with("/tmp"), "a unix path was named on Windows: {named:?}");
         }
+    }
+
+    /// The watcher speaks at 3 s and then every 15 s while a dial keeps failing.
+    #[test]
+    fn a_failing_dial_is_repeated_not_dropped() {
+        let at: Vec<u64> = (0..=50).filter(|w| speak_now(*w)).collect();
+        assert_eq!(at, [3, 18, 33, 48]);
+    }
+
+    /// A drop re-arms the watcher and forgets the old reasons.
+    #[test]
+    fn a_drop_rearms_the_watcher() {
+        let n = Notice::new();
+        n.remember("old".into());
+        n.connected();
+        n.dropped();
+        assert!(!n.0.connected.load(Ordering::SeqCst));
+        assert!(n.0.last.lock().unwrap().is_none());
     }
 
     /// Once connected, the watcher falls silent. Otherwise text gets printed over the screen.

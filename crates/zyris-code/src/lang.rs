@@ -748,6 +748,14 @@ impl Lang {
         }
     }
 
+    /// The dial has been failing for `secs` seconds; shown on the activity line next to "Connecting...".
+    pub fn still_dialing(self, secs: u64, why: &str) -> String {
+        match self {
+            Lang::Ko => format!("{secs}초째 연결하지 못했습니다: {why}"),
+            Lang::En => format!("still can't connect after {secs}s: {why}"),
+        }
+    }
+
     // ── Commands (`/clear` · `/cwd` · `/config` · `/agent` · `/undo` · `/changes`)
     pub fn clear_done(self) -> &'static str {
         self.pick(
