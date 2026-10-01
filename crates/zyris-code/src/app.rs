@@ -957,6 +957,16 @@ impl PasteBurst {
 }
 
 /// How long a notice stays on screen. Plenty to read one sentence.
+/// **`ZYRIS_CODE_REDUCE_MOTION` stops the blink and the breath.** Both are clocks read through
+/// `blink_ms` and `breath_ms`; frozen at zero the dot stays lit and the text stays at full colour,
+/// and the tick has nothing to redraw for them. Read once, like the rest of the environment.
+fn reduce_motion() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("ZYRIS_CODE_REDUCE_MOTION").is_ok_and(|v| !v.is_empty() && v != "0")
+    })
+}
+
 pub const STATUS_WINDOW: Duration = Duration::from_secs(6);
 /// How long an error keeps the notice line against a neutral notice (`State::set_status`).
 const ERROR_HOLD: Duration = Duration::from_secs(3);
@@ -1226,6 +1236,9 @@ impl State {
     /// has been going; which frames were drawn along the way is the drawing side's business and
     /// must not change the tempo.
     pub fn breath_ms(&self) -> u64 {
+        if reduce_motion() {
+            return 0;
+        }
         self.breath_origin.elapsed().as_millis() as u64
     }
 
@@ -1234,6 +1247,9 @@ impl State {
     /// **Read at draw time, from a clock**, for the same reason as [`State::breath_ms`]: the tempo
     /// belongs to time, not to how many frames happened to be drawn along the way.
     pub fn blink_ms(&self) -> u64 {
+        if reduce_motion() {
+            return 0;
+        }
         self.blink_origin.elapsed().as_millis() as u64
     }
 

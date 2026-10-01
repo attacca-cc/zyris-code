@@ -2551,9 +2551,13 @@ impl Lang {
     // ── Conn (errors that surface in the status bar · timeline)
     pub fn server_timeout(self, secs: u64) -> String {
         match self {
-            Lang::Ko => format!("서버가 {secs}초 안에 답하지 않았습니다"),
-            Lang::En => format!("The server didn't answer within {secs}s"),
+            Lang::Ko => format!("서버가 {secs}초 안에 답하지 않아 연결을 닫고 다시 잇습니다"),
+            Lang::En => format!("The server didn't answer within {secs}s; reconnecting"),
         }
+    }
+    /// Said before an error on the activity line, so it does not rest on colour alone.
+    pub fn error_prefix(self) -> &'static str {
+        self.pick("오류: ", "Error: ")
     }
     pub fn no_credential_dir(self) -> &'static str {
         self.pick(

@@ -56,11 +56,12 @@ pub fn parts_at(
     // looked identical on the one line that exists to say what is going on. `set_error` marks
     // the ones that mean something is wrong.
     if let Some(s) = state.status_at(now) {
-        let colour = match state.status_severity_at(now) {
-            crate::app::Severity::Error => theme::danger(),
-            crate::app::Severity::Notice => theme::notice(),
+        return match state.status_severity_at(now) {
+            crate::app::Severity::Error => {
+                (theme::danger(), format!("{}{s}", lang.error_prefix()), "")
+            }
+            crate::app::Severity::Notice => (theme::notice(), s.to_string(), ""),
         };
-        return (colour, s.to_string(), "");
     }
     // **Waiting is not failing.** Before the first enrolment is approved there is nothing wrong
     // yet — the code is on screen and a person is walking to a browser.
