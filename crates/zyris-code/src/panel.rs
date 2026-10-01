@@ -747,11 +747,7 @@ fn manager_form_lines(form: &ManagerForm, lang: Lang) -> Vec<Line<'static>> {
                     "",
                     pad = label_w - display_width(&field.label) + 2
                 ),
-                if on {
-                    Style::default().fg(theme::text_heading()).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(theme::text_muted())
-                },
+                if on { theme::heading() } else { theme::muted() },
             ),
         ];
         let value = if on {
@@ -790,7 +786,7 @@ fn manager_form_lines(form: &ManagerForm, lang: Lang) -> Vec<Line<'static>> {
         if form.complaint.is_some() {
             Style::default().fg(theme::warning())
         } else {
-            Style::default().fg(theme::text_muted())
+            theme::muted()
         },
     )));
     lines
@@ -863,12 +859,9 @@ fn manager_lines(manager: &Manager) -> Vec<Line<'static>> {
                 if on { "● " } else { "○ " },
                 Style::default().fg(if on { theme::success() } else { theme::text_muted() }),
             ),
-            Span::styled(
-                row.title.clone(),
-                Style::default().fg(theme::text_heading()).add_modifier(Modifier::BOLD),
-            ),
+            Span::styled(row.title.clone(), theme::heading()),
             Span::styled(" ‒ ", Style::default().fg(theme::border_light())),
-            Span::styled(row.subtitle.clone(), Style::default().fg(theme::text_muted())),
+            Span::styled(row.subtitle.clone(), theme::muted()),
         ]));
     }
     lines.push(blank());
@@ -882,7 +875,7 @@ fn manager_lines(manager: &Manager) -> Vec<Line<'static>> {
                         "",
                         gap = label_w - display_width(label) + DETAIL_GAP
                     ),
-                    Style::default().fg(theme::text_muted()),
+                    theme::muted(),
                 ),
                 Span::styled(value.clone(), Style::default().fg(theme::text())),
             ]));
@@ -975,18 +968,12 @@ pub fn skills(lang: Lang, skills: &[SkillInfo]) -> Panel {
     for s in skills {
         lines.push(Line::from(vec![
             Span::styled("∙ ", Style::default().fg(theme::accent())),
-            Span::styled(
-                s.name.clone(),
-                Style::default().fg(theme::text_heading()).add_modifier(Modifier::BOLD),
-            ),
+            Span::styled(s.name.clone(), theme::heading()),
         ]));
         // **Two columns, so the sentence starts under the name it belongs to** — the same two
         // columns `∙ ` takes, which is also what a wrapped line hangs under (`wrap::line`).
         if !s.description.trim().is_empty() {
-            lines.push(Line::from(Span::styled(
-                format!("  {}", s.description),
-                Style::default().fg(theme::text_muted()),
-            )));
+            lines.push(Line::from(Span::styled(format!("  {}", s.description), theme::muted())));
         }
     }
     Panel::new(lang.title_skills().into(), lines)
@@ -1007,11 +994,8 @@ pub fn account(
         if scopes.is_empty() { lang.acc_none().to_string() } else { scopes.join(", ") };
     let lines = vec![
         Line::from(vec![
-            Span::styled(
-                name.to_string(),
-                Style::default().fg(theme::text_heading()).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(format!("  ({email})"), Style::default().fg(theme::text_muted())),
+            Span::styled(name.to_string(), theme::heading()),
+            Span::styled(format!("  ({email})"), theme::muted()),
         ]),
         blank(),
         kv(lang.acc_id(), user_id.to_string()),
@@ -1158,11 +1142,7 @@ fn form_lines(form: &Form) -> Vec<Line<'static>> {
                     pad = label_w.saturating_sub(display_width(label)),
                     gap = LABEL_GAP
                 ),
-                if on {
-                    Style::default().fg(theme::text_heading()).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(theme::text())
-                },
+                if on { theme::heading() } else { Style::default().fg(theme::text()) },
             ),
             Span::styled("< ", bracket),
             Span::styled(
@@ -1187,13 +1167,13 @@ fn form_lines(form: &Form) -> Vec<Line<'static>> {
 /// One `label  value` row — the label muted, the value readable.
 fn kv(label: &'static str, value: String) -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!("{label}  "), Style::default().fg(theme::text_muted())),
+        Span::styled(format!("{label}  "), theme::muted()),
         Span::styled(value, Style::default().fg(theme::text())),
     ])
 }
 
 fn muted(text: String) -> Line<'static> {
-    Line::from(Span::styled(text, Style::default().fg(theme::text_muted())))
+    Line::from(Span::styled(text, theme::muted()))
 }
 
 fn blank() -> Line<'static> {

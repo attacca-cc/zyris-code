@@ -23,7 +23,7 @@
 
 use std::sync::atomic::{AtomicU8, Ordering};
 
-use ratatui::style::Color;
+use ratatui::style::{Color, Modifier, Style};
 
 /// Which palette is in use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -411,6 +411,16 @@ pub fn text_muted() -> Color {
 
 pub fn text_heading() -> Color {
     selected().text_heading()
+}
+
+/// Quiet text: hints, labels, secondary detail.
+pub fn muted() -> Style {
+    Style::default().fg(text_muted())
+}
+
+/// A heading: the heading colour, bold.
+pub fn heading() -> Style {
+    Style::default().fg(text_heading()).add_modifier(Modifier::BOLD)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
