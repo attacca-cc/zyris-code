@@ -427,11 +427,14 @@ impl Lang {
             (Lang::En, true) => "Ctrl+P to fold",
             (Lang::En, false) => "Ctrl+P to open",
         };
-        match self {
+        // **Folded, Enter reads the plan instead of approving it.**
+        match (self, open) {
             // **`∙`, not `·`.** The middle dot is East Asian Ambiguous: one column here and two
             // on a terminal set for CJK, which shifts everything after it on the row.
-            Lang::Ko => format!("Enter 승인 ∙ 고칠 점은 그냥 적으세요 ∙ {fold}"),
-            Lang::En => format!("Enter approves ∙ type to ask for changes ∙ {fold}"),
+            (Lang::Ko, true) => format!("Enter 승인 ∙ 고칠 점은 그냥 적으세요 ∙ {fold}"),
+            (Lang::En, true) => format!("Enter approves ∙ type to ask for changes ∙ {fold}"),
+            (Lang::Ko, false) => format!("Enter 펼쳐 읽기 ∙ 고칠 점은 그냥 적으세요 ∙ {fold}"),
+            (Lang::En, false) => format!("Enter opens the plan ∙ type to ask for changes ∙ {fold}"),
         }
     }
     pub fn plan_more(self, n: usize) -> String {

@@ -1803,8 +1803,16 @@ pub fn on_key(state: &State, key: KeyEvent) -> Vec<Action> {
         // **Enter on an empty draft approves the plan.** With a plan up, Enter with nothing typed
         // had no meaning at all, and approval is the one thing that must be a single key — typing
         // is how changes are asked for, so the two cannot both be "press Enter with words".
+        //
+        // **Only once it has been opened.** A plan is folded by default, so approving on the first
+        // Enter meant approving something unread (and lifting the plan-mode fence): while folded,
+        // Enter opens it instead.
         KeyCode::Enter if state.plan.is_some() && state.input.text.trim().is_empty() => {
-            vec![Action::Submit(state.lang.plan_approved().to_string())]
+            if state.plan.as_ref().is_some_and(|p| p.open) {
+                vec![Action::Submit(state.lang.plan_approved().to_string())]
+            } else {
+                vec![Action::TogglePlan]
+            }
         }
         // **Blank is empty.** A space or a stray Shift+Enter sent a message of nothing — a turn
         // spent on it — while the arm above already read the same draft as empty.
@@ -9721,7 +9729,12 @@ mod tests {
         assert_eq!(s.plan.as_ref().map(|p| p.seq), Some(5), "the plan never reached the screen");
         assert!(!s.plan_decided);
 
-        // Enter on an empty draft is what sends the approval.
+        // The plan starts folded: the first Enter opens it and approves nothing.
+        assert_eq!(on_key(&s, key(KeyCode::Enter, KeyModifiers::NONE)), vec![Action::TogglePlan]);
+        apply(&mut s, &Action::TogglePlan);
+        assert!(!s.plan_decided, "a folded plan was approved unread");
+
+        // Enter on an empty draft, once it is open, is what sends the approval.
         let keys = on_key(&s, key(KeyCode::Enter, KeyModifiers::NONE));
         let Some(Action::Submit(said)) = keys.first() else {
             panic!("Enter did not approve: {keys:?}")
@@ -11855,8 +11868,11 @@ mod interaction {
         sync_gate(&bridge, &s);
         assert!(matches!(bridge.decide(&write), Decision::Refuse(_)), "undecided, yet writable");
 
-        for action in on_key(&s, key(KeyCode::Enter, KeyModifiers::NONE)) {
-            apply(&mut s, &action);
+        // The first Enter only opens the folded plan; the second approves it.
+        for _ in 0..2 {
+            for action in on_key(&s, key(KeyCode::Enter, KeyModifiers::NONE)) {
+                apply(&mut s, &action);
+            }
         }
         sync_gate(&bridge, &s);
         assert_eq!(bridge.decide(&write), Decision::Run, "the approval never reached the gate");
