@@ -4427,6 +4427,13 @@ fn switch_on(caps: crate::term::Caps) {
     // and `$ZYRIS_CODE_MOUSE=0` is how somebody declines to pay it.
     if caps.mouse {
         take_the_mouse(true);
+    } else {
+        // **Without the mouse, the wheel must not become arrow keys.** Terminals turn it into Up/Down
+        // on the alternate screen when nothing is tracking it, and Up on an empty draft is history
+        // recall: spinning the wheel over the conversation loaded old messages into the input.
+        // Alternate scroll (`?1007`) is what does that; it is given back by `restore_terminal`.
+        write_raw("\x1b[?1007l");
+        ALT_SCROLL_OFF.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     // Coming back from another window, the terminal sometimes does not restore the
     // screen for us. We have to know focus came back to redraw the whole thing.
@@ -4448,6 +4455,9 @@ fn switch_on(caps: crate::term::Caps) {
     // glyph is merely cut at that line, keeping the damage to one line.
     terminal_feature("line wrap off", crossterm::terminal::DisableLineWrap);
 }
+
+/// Whether `switch_on` turned the terminal's alternate-scroll mode off, so `restore_terminal` puts it back.
+static ALT_SCROLL_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// The two settings that are pushed onto a stack in the terminal, and popped by `restore_terminal`:
 /// the kitty keyboard flags and the window title.
@@ -4615,6 +4625,9 @@ pub fn restore_terminal() {
     // Line wrapping is something the shell uses. Not restoring it makes long commands
     // look cut off in the shell.
     terminal_feature("line wrap on", crossterm::terminal::EnableLineWrap);
+    if ALT_SCROLL_OFF.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        write_raw("\x1b[?1007h");
+    }
     // The shell's own title, kept by `push_stacks`.
     write_raw("\x1b[23;0t");
     ratatui::restore();
