@@ -183,7 +183,7 @@ impl Lang {
         self.pick("중단하는 중…", "Stopping…")
     }
     pub fn idle(self) -> &'static str {
-        self.pick("쉬는 중", "Taking a break")
+        self.pick("대기 중", "Idle")
     }
     pub fn esc_stops(self) -> &'static str {
         self.pick("Esc 중단", "Esc stops")
@@ -290,13 +290,13 @@ impl Lang {
     /// alone is not a message, and "still running" is the one of them that must not be missed
     /// (issue #32, 2026-09-18).
     pub fn subagent_running(self) -> &'static str {
-        self.pick("실행 중", "running")
+        self.pick("실행 중", "Running")
     }
     pub fn subagent_done(self) -> &'static str {
-        self.pick("완료", "done")
+        self.pick("완료", "Done")
     }
     pub fn subagent_failed(self) -> &'static str {
-        self.pick("실패", "failed")
+        self.pick("실패", "Failed")
     }
     /// The head of a report row. **A failure says so in words as well as in colour** — colour
     /// alone is not a message.
@@ -304,8 +304,8 @@ impl Lang {
         match (self, ok) {
             (Lang::Ko, true) => "작업 결과 ∙ 완료",
             (Lang::Ko, false) => "작업 결과 ∙ 실패",
-            (Lang::En, true) => "Job result ∙ done",
-            (Lang::En, false) => "Job result ∙ failed",
+            (Lang::En, true) => "Job result ∙ Done",
+            (Lang::En, false) => "Job result ∙ Failed",
         }
     }
     /// What the activity line wears while the agent is **thinking and nothing is running**: the
@@ -324,10 +324,10 @@ impl Lang {
     pub fn job_ended(self, id: &str, ok: bool, secs: u64) -> String {
         let took = self.duration(secs);
         match (self, ok) {
-            (Lang::Ko, true) => format!("배경 {id} 완료 ∙ {took}"),
-            (Lang::Ko, false) => format!("배경 {id} 실패 ∙ {took}"),
-            (Lang::En, true) => format!("background {id} done ∙ {took}"),
-            (Lang::En, false) => format!("background {id} failed ∙ {took}"),
+            (Lang::Ko, true) => format!("배경 {id} ∙ 완료 ∙ {took}"),
+            (Lang::Ko, false) => format!("배경 {id} ∙ 실패 ∙ {took}"),
+            (Lang::En, true) => format!("Background {id} ∙ Done ∙ {took}"),
+            (Lang::En, false) => format!("Background {id} ∙ Failed ∙ {took}"),
         }
     }
     // **A background job no longer takes the activity line** (user decision, 2026-09-18, issue
@@ -555,7 +555,7 @@ impl Lang {
         self.pick("기본", "default")
     }
     pub fn running(self) -> &'static str {
-        self.pick("작업 중", "running")
+        self.pick("실행 중", "Running")
     }
 
     pub fn unknown_command(self, what: &str, help: &str) -> String {
@@ -2726,6 +2726,28 @@ mod tests {
             (7325, "2h 2m"),
         ] {
             assert_eq!(Lang::En.duration(secs), want, "{secs}s");
+        }
+    }
+
+    /// **One noun per state, the same on every row** (B24).
+    #[test]
+    fn one_noun_per_state_on_every_row() {
+        for (lang, running, done, failed, stopped, idle) in [
+            (Lang::En, "Running", "Done", "Failed", "Stopped", "Idle"),
+            (Lang::Ko, "실행 중", "완료", "실패", "중단됨", "대기 중"),
+        ] {
+            assert_eq!(lang.running(), running);
+            assert_eq!(lang.subagent_running(), running);
+            assert_eq!(lang.subagent_done(), done);
+            assert_eq!(lang.run_done(), done);
+            assert_eq!(lang.detail_ok(), done);
+            assert_eq!(lang.subagent_failed(), failed);
+            assert_eq!(lang.run_stopped(), stopped);
+            assert_eq!(lang.idle(), idle);
+            assert!(lang.report_head(true).ends_with(done));
+            assert!(lang.report_head(false).ends_with(failed));
+            assert!(lang.job_ended("b1", true, 3).contains(done));
+            assert!(lang.job_ended("b1", false, 3).contains(failed));
         }
     }
 
